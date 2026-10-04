@@ -49,6 +49,15 @@ if (ENGINE_ENABLE_HIP)
     DEPENDS qwen38_flash_next_session_test qwen38_flash_next_snapshot_test
     qwen38_flash_next_dequant_ops_test)
 
+  add_executable(qwen38_flash_next_dense_gemm_bench EXCLUDE_FROM_ALL
+    dense_gemm_bench.cpp)
+  target_link_libraries(qwen38_flash_next_dense_gemm_bench PRIVATE
+    gufo_qwen38_flash_next hip::host)
+
+  add_executable(qwen38_flash_next_attn_bench EXCLUDE_FROM_ALL attn_bench.cpp)
+  target_link_libraries(qwen38_flash_next_attn_bench PRIVATE
+    gufo_qwen38_flash_next hip::host)
+
   add_executable(qwen38_flash_next_gpu_probe EXCLUDE_FROM_ALL gpu_probe.cpp
     mtp_audit.cpp)
   target_link_libraries(qwen38_flash_next_gpu_probe PRIVATE
