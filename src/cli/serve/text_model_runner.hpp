@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -27,6 +28,11 @@ using TextRunnerToken = ContinuationToken;
 struct TextPromptContext {
   virtual ~TextPromptContext() = default;
   std::vector<std::uint8_t> cache_identity;
+  std::vector<ContinuationInputPrefix> cache_prefixes;
+  [[nodiscard]] std::span<const std::uint8_t> CacheIdentity(
+      std::size_t token_count) const {
+    return PrefixInputIdentity(cache_identity, cache_prefixes, token_count);
+  }
 };
 
 struct TextPreparedPrompt {
@@ -50,10 +56,22 @@ struct TextRunnerDiskCacheOptions {
   std::size_t shared_prefix_min_tokens{128};
   /// Bound on shared-prefix snapshots written while prefilling one request.
   std::size_t shared_prefix_max_boundaries{4};
+  /// A request snapshot is written to disk only when it extends the longest
+  /// stored prefix of its prompt by at least this many tokens. Zero writes
+  /// every request's snapshot.
+  std::size_t snapshot_stride_tokens{0};
 };
 
 /// Host snapshot budget after accounting for cgroup limits and headroom.
 [[nodiscard]] std::size_t HostSnapshotBudgetBytes();
+/// Caps the in-RAM retained-snapshot budget. The budget is otherwise half of
+/// MemAvailable as seen at startup, which is measured before the model is
+/// loaded and so is far more permissive than the steady state allows. Zero
+/// means no cap.
+void SetHostSnapshotBudgetCap(std::size_t bytes) noexcept;
+/// Number of immutable in-RAM snapshot entries kept beyond the live sessions.
+/// Zero keeps one per session. The byte budget still bounds retention.
+void SetHostSnapshotExtraEntries(std::size_t entries) noexcept;
 
 enum class TextExecutionPlanKind : std::uint8_t {
   kSerial,
@@ -150,6 +168,9 @@ class TextRunnerState : public ContinuationState {
 public:
   using CancellationCheck = std::function<bool()>;
 
+  void SetStopAtEos(bool value) noexcept { stop_at_eos_ = value; }
+  [[nodiscard]] bool stop_at_eos() const noexcept { return stop_at_eos_; }
+
   /// Installs a request-scoped cancellation check for model calls that can
   /// yield internally. Implementations that only yield between work units may
   /// keep the default no-op behavior.
@@ -160,6 +181,9 @@ public:
       const noexcept {
     return {};
   }
+
+private:
+  bool stop_at_eos_{true};
 };
 
 /// Immutable model-owned continuation payload.
@@ -208,6 +232,14 @@ public:
   [[nodiscard]] virtual TextRunnerResourceClaim ResourceClaim() const = 0;
   [[nodiscard]] virtual std::vector<TextExecutionPlan> SupportedPlans()
       const = 0;
+
+  /// Lazily built only for constrained requests; normal text loads pay nothing.
+  [[nodiscard]] virtual std::shared_ptr<const sampling::ConstraintVocabulary>
+  BuildConstraintVocabulary() const {
+    throw std::invalid_argument("model does not support structured output");
+  }
+  [[nodiscard]] std::shared_ptr<const sampling::TokenConstraint> BindConstraint(
+      std::shared_ptr<const sampling::JsonConstraint> grammar) const;
 
   [[nodiscard]] virtual std::vector<TextRunnerToken> Tokenize(
       std::string_view text) const = 0;
@@ -322,6 +354,13 @@ public:
   /// Restores a version-compatible serialized payload into an existing state.
   virtual void RestorePersistentSnapshot(
       TextRunnerState& state, std::span<const std::uint8_t> payload) const;
+
+private:
+  mutable std::mutex constraint_mutex_;
+  mutable std::shared_ptr<const sampling::ConstraintVocabulary>
+      constraint_vocabulary_;
+  mutable std::vector<std::shared_ptr<const sampling::TokenConstraint>>
+      constraints_;
 };
 
 /// Bounded pool of opaque runner states with exact-prefix continuation reuse.
@@ -415,7 +454,8 @@ public:
       const sampling::SamplingConfig& sampling,
       const CancellationCheck& is_cancelled = {},
       std::shared_ptr<const TextPromptContext> context = {},
-      bool reuse_prompt = true, std::size_t cache_prefix_tokens = 0);
+      bool reuse_prompt = true, std::size_t cache_prefix_tokens = 0,
+      bool stop_at_eos = true);
   [[nodiscard]] Request Acquire(std::vector<TextRunnerToken> prompt,
                                 const CancellationCheck& is_cancelled = {});
 

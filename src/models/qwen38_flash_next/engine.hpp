@@ -124,8 +124,11 @@ public:
 
   /// Makes the session state equal to `prompt`: keeps the longest common
   /// prefix with the current tokens, reprocesses the rest.
+  /// `lookahead` holds the tokens that follow `prompt` (the next prefill
+  /// chunk), so their n-gram rows can be read while this chunk computes.
   [[nodiscard]] bool Sync(std::span<const std::int32_t> prompt,
-                          std::string* error_msg = nullptr);
+                          std::string* error_msg = nullptr,
+                          std::span<const std::int32_t> lookahead = {});
   [[nodiscard]] bool Evaluate(std::int32_t token,
                               std::string* error_msg = nullptr);
   struct DecodeResult {
@@ -189,6 +192,11 @@ public:
     std::uint64_t cycles{0};
     std::uint64_t drafted{0};
     std::uint64_t accepted{0};
+    /// Cycles by verify width, widths[0] counting ordinary single-token decode.
+    /// The per-width cycle cost is steep and occupancy-dependent, so a change
+    /// in this shape explains a change in throughput that drafted/accepted
+    /// totals cannot.
+    std::uint64_t widths[kMaxMtpDraftTokens + 1]{};
   };
   [[nodiscard]] const SpeculativeStats& Statistics() const noexcept {
     return stats_;
@@ -204,8 +212,9 @@ public:
   [[nodiscard]] std::unique_ptr<SessionSnapshot> SaveSnapshot(
       std::string* error_msg = nullptr) const;
   /// Replaces this session's context with a snapshot of the same model.
-  /// Image snapshots require ConfigureVision with the matching immutable
-  /// prompt first; pixel data is not serialized. Text snapshots clear images.
+  /// Image snapshots require matching consumed images via ConfigureVision;
+  /// the attached prompt may append future images. Pixels are not serialized.
+  /// Text snapshots clear images; reattach the request after restoring.
   [[nodiscard]] bool RestoreSnapshot(const SessionSnapshot& snapshot,
                                      std::string* error_msg = nullptr);
   [[nodiscard]] bool RestoreSnapshot(std::span<const std::uint8_t> payload,
@@ -216,12 +225,14 @@ private:
   Session(std::shared_ptr<Model> model, std::unique_ptr<rocm::Session> session);
 
   bool Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
-            bool prefill = false);
+            bool prefill = false,
+            std::span<const std::int32_t> lookahead = {});
   /// Trunk rows the draft block may still read: [hidden_base_, size).
   [[nodiscard]] std::uint32_t KeptHiddenRows() const noexcept;
   bool DraftCatchUp(std::int32_t next_token, bool propose,
                     std::string* error_msg,
-                    MtpCandidateLogits* candidates = nullptr);
+                    MtpCandidateLogits* candidates = nullptr,
+                    bool with_token = false);
   bool DraftReplay(std::int32_t next_token, std::vector<std::int32_t>* replay,
                    std::int32_t* hidden_row, std::string* error_msg) const;
   static bool DraftCatchUpBatch(std::span<const AdvanceRequest> requests,
@@ -250,7 +261,9 @@ private:
   std::uint32_t hidden_base_{0};  ///< first position whose hidden row is kept
   MtpLengthController draft_length_;
   SpeculativeStats stats_;
-  std::vector<std::uint8_t> image_identity_;
+  std::shared_ptr<const qwen::vision::Prompt> image_prompt_;
+  [[nodiscard]] std::span<const std::uint8_t> ImageIdentity(
+      std::size_t token_count) const;
   bool valid_{true};
   [[nodiscard]] bool MtpEnabled() const noexcept;
 };

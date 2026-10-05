@@ -6,6 +6,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -313,7 +315,9 @@ void CheckHcDownProjection(const void* w, const void* tiled,
                      hipMemcpyDeviceToDevice),
            "HC projection copy");
   q::SiluScale(activated, 0.25F, count, nullptr);
-  q::NarrowActivations(activated, reference + 8, false, count, nullptr);
+  q::NarrowActivations(activated, reference + 8, false, count, count,
+                       "projection_ops_test.cpp:318", "test", "hc_guard", count,
+                       1, nullptr);
   std::vector<__half> expected(count + 16), actual(count + 16);
   CheckHip(hipMemcpy(expected.data(), reference,
                      expected.size() * sizeof(__half), hipMemcpyDeviceToHost),
@@ -475,7 +479,9 @@ double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
   if (!q::W8A8Gemm(d_w, d_tiled, d_w8, batch, m, k, nullptr)) {
     throw std::runtime_error("W8A8 GEMM rejected the shape");
   }
-  q::NarrowActivations(d_x, d_x_half, false, x.size(), nullptr);
+  q::NarrowActivations(d_x, d_x_half, false, x.size(), x.size(),
+                       "projection_ops_test.cpp:481", "test", "w8a8", batch, k,
+                       nullptr);
   if (!q::DenseF16Gemm(d_w, d_x_half, d_f16, batch, m, k, nullptr)) {
     throw std::runtime_error("dense F16 GEMM rejected the shape");
   }
@@ -827,10 +833,113 @@ void CheckMtpOutputHead(float input_scale) {
     CheckHip(hipFree(p), "MTP free");
 }
 
+// Go/no-go for requantizing dense trunk tensors. The byte saving is only real
+// speed if the vector kernel sustains a comparable fraction of peak bandwidth
+// in the regime decode actually runs in, which is streaming rather than cached.
+// Blocks are filled with random bytes: this measures the memory path, not
+// arithmetic, so no quantizer is needed and nothing depends on quantization
+// error. ggml type ids: 8 Q8_0, 12 Q4_K, 13 Q5_K, 14 Q6_K.
+struct GemvType {
+  int id;
+  const char* name;
+  std::size_t bytes_per_block;
+  int block;
+};
+
+void BenchQuantizedGemv(int rows, int cols) {
+  constexpr int kTokens = 1;
+  constexpr int kIters = 60;
+  const GemvType types[] = {{8, "Q8_0", 34, 32},
+                            {12, "Q4_K", 144, 256},
+                            {13, "Q5_K", 176, 256},
+                            {14, "Q6_K", 210, 256}};
+  const std::size_t elems = std::size_t(rows) * cols;
+  const std::size_t largest =
+      elems / 256 * 210 > elems / 32 * 34 ? elems / 256 * 210 : elems / 32 * 34;
+  std::vector<std::uint8_t> host(largest);
+  std::uint32_t seed = 0x9E3779B9U;
+  for (auto& b : host)
+    b = static_cast<std::uint8_t>(NextRandom(&seed) >> 24);
+  std::vector<float> x(kTokens * cols);
+  for (auto& v : x)
+    v = Uniform(&seed, 1.0F);
+  void* dw = nullptr;
+  float* dx = nullptr;
+  float* out = nullptr;
+  std::int32_t* ids = nullptr;
+  CheckHip(hipMalloc(&dw, largest), "bench weights");
+  CheckHip(hipMalloc(&dx, x.size() * sizeof(float)), "bench input");
+  CheckHip(hipMalloc(&out, std::size_t(rows) * kTokens * sizeof(float)),
+           "bench output");
+  CheckHip(hipMalloc(&ids, sizeof(std::int32_t)), "bench expert ids");
+  CheckHip(hipMemcpy(dw, host.data(), largest, hipMemcpyHostToDevice),
+           "bench weights up");
+  CheckHip(
+      hipMemcpy(dx, x.data(), x.size() * sizeof(float), hipMemcpyHostToDevice),
+      "bench input up");
+  const std::int32_t zero = 0;
+  CheckHip(hipMemcpy(ids, &zero, sizeof(zero), hipMemcpyHostToDevice),
+           "expert id");
+
+  // A single production tensor is far smaller than the 96 MiB L2, so repeating
+  // it measures cache bandwidth instead of the streaming behaviour a decode
+  // step sees. Only rows scaled past L2 can decide this.
+  const bool dram_bound = largest > (96u << 20);
+  std::printf("gemv %6dx%-5d %-12s", rows, cols,
+              dram_bound ? "DRAM-bound" : "cache-resident");
+  double ref_ms = 0.0;
+  for (const auto& t : types) {
+    if (cols % t.block != 0) {
+      std::printf("  %s n/a", t.name);
+      continue;
+    }
+    const std::size_t bytes = elems / t.block * t.bytes_per_block;
+    auto time = [&] {
+      for (int i = 0; i < 10; ++i)
+        qfn_mmq_moe_vec(t.id, dw, dx, ids, out, rows, cols, kTokens, 1, 1,
+                        nullptr);
+      CheckHip(hipDeviceSynchronize(), "bench warmup");
+      hipEvent_t a, b;
+      CheckHip(hipEventCreate(&a), "event create");
+      CheckHip(hipEventCreate(&b), "event create");
+      CheckHip(hipEventRecord(a), "event record");
+      for (int i = 0; i < kIters; ++i)
+        qfn_mmq_moe_vec(t.id, dw, dx, ids, out, rows, cols, kTokens, 1, 1,
+                        nullptr);
+      CheckHip(hipEventRecord(b), "event record");
+      CheckHip(hipEventSynchronize(b), "event sync");
+      float ms = 0.0F;
+      CheckHip(hipEventElapsedTime(&ms, a, b), "elapsed");
+      CheckHip(hipEventDestroy(a), "event destroy");
+      CheckHip(hipEventDestroy(b), "event destroy");
+      return double(ms) / kIters;
+    };
+    const double ms = time();
+    if (ref_ms == 0.0)
+      ref_ms = ms;
+    std::printf("  %s %7.3f ms %6.1f GB/s %5.1f%%", t.name, ms,
+                double(bytes) / (ms * 1e-3) / 1e9, 100.0 * ms / ref_ms);
+  }
+  std::printf("%s\n", dram_bound ? "" : "   <- not representative");
+  for (void* p : {dw, static_cast<void*>(dx), static_cast<void*>(out),
+                  static_cast<void*>(ids)})
+    CheckHip(hipFree(p), "bench free");
+}
+
 }  // namespace
 
 int main() {
   try {
+    // Timing harness, not a correctness check: opt in so CI stays fast.
+    if (std::getenv("GUFO_Q6K_BENCH") != nullptr) {
+      // Production shapes first, then working sets far larger than L2, then
+      // the full output-head width.
+      BenchQuantizedGemv(6144, 2560);
+      BenchQuantizedGemv(640, 2560);
+      BenchQuantizedGemv(131072, 2560);
+      BenchQuantizedGemv(248320, 2560);
+      return 0;
+    }
     CheckRoutedQ8Placement();
     CheckSmallProjection(q::WeightType::kF32, 513, 2560);
     CheckSmallProjection(q::WeightType::kF32, 96, 2560);
@@ -838,6 +947,7 @@ int main() {
     CheckSmallProjection(q::WeightType::kF16, 7, 131);
     CheckDecodeGrouping(64, 2560);
     CheckDecodeGrouping(320, 10240);
+    CheckDecodeGrouping(10240, 320);
     CheckDecodeGrouping(2561, 2560);
     CheckDecodeGrouping(12289, 2560);
     CheckDecodeGrouping(65537, 2560);

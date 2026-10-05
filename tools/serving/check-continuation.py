@@ -5,6 +5,7 @@ Use a private server with --served-model-name cache-test. Add --cache-disk
 only when checking restart persistence; in-memory reuse needs no disk cache.
 Run once per AR/speculative backend. Reports contain synthetic requests and
 completion hashes, never logits. --image adds an image to each conversation.
+Use --append-image to introduce it after a cached text-only turn.
 """
 
 import argparse
@@ -82,15 +83,23 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--restore", type=Path)
     parser.add_argument("--image", type=Path)
+    parser.add_argument("--append-image", action="store_true",
+                        help="Append --image after a cached text-only turn")
+    parser.add_argument("--reasoning-effort", choices=("low", "medium", "high", "xhigh"),
+                        help="Effort for thinking-on cases; thinking-off cases remain off")
     parser.add_argument("--tools", action="store_true",
                         help="Resume after a completed tool response")
     parser.add_argument("--discard-assistant", action="store_true",
                         help="Drop the interrupted assistant and send '.' like an agent client")
+    parser.add_argument("--drop-reasoning", action="store_true",
+                        help="Omit reasoning_content from replayed assistants like OpenAI clients")
     parser.add_argument("--prefix-repetitions", type=int, default=32,
                         help="Length of the synthetic shared system prefix")
     parser.add_argument("--case", action="append", choices=CASES,
                         help="Run only this case (repeatable for focused checks)")
     args = parser.parse_args()
+    if args.append_image and not args.image:
+        parser.error("--append-image requires --image")
     reports = []
     if args.restore:
         previous = json.loads(args.restore.read_text())
@@ -131,6 +140,13 @@ def main():
                      "Follow the user instruction carefully and answer accurately. " *
                      args.prefix_repetitions},
                     {"role": "user", "content": content}]
+                root_messages = None
+                if args.append_image:
+                    first_user = {"role": "user", "content":
+                                  "Remember these instructions for my next request."}
+                    root_messages = [messages[0], first_user]
+                    messages[1:1] = [first_user,
+                                     {"role": "assistant", "content": "Ready."}]
                 if args.tools:
                     messages.extend([
                         {"role": "assistant", "content": "", "reasoning_content": "Read the fixture.",
@@ -148,10 +164,21 @@ def main():
                     body["tools"] = [{"type": "function", "function": {
                         "name": "read_fixture", "description": "Read the fixture.",
                         "parameters": {"type": "object", "properties": {}}}}]
-                initial = {**body, "messages": list(messages), "cache_prompt": False}
-                assistant, elapsed = call(args.url, initial, field)
-                if not preserve:
-                    assistant.pop("reasoning_content")
+                if thinking and args.reasoning_effort:
+                    body["reasoning_effort"] = args.reasoning_effort
+                initial = {**body, "messages": list(messages),
+                           "cache_prompt": bool(args.append_image)}
+
+                def interrupt():
+                    if root_messages is not None:
+                        call(args.url, {**body, "messages": root_messages,
+                                        "stream": False, "max_tokens": 1,
+                                        "cache_prompt": False})
+                    return call(args.url, initial, field)
+
+                assistant, elapsed = interrupt()
+                if not preserve or args.drop_reasoning:
+                    assistant.pop("reasoning_content", None)
                 if not args.discard_assistant:
                     messages.append(assistant)
                 messages.append({"role": "user", "content":
@@ -161,7 +188,13 @@ def main():
                 measured = metrics(resumed)
                 if measured["cached"] < 128:
                     raise RuntimeError(f"{name}: interrupted conversation lost its prefix: {measured}")
-                if args.discard_assistant and measured["prefill"] > 16:
+                # With preservation disabled, the next user turn removes
+                # reasoning from the preceding tool cycle too. Its short
+                # suffix must be recomputed; the earlier image/user prefix
+                # must remain cached.
+                rewritten_tool_reasoning = args.tools and not preserve
+                max_suffix = 96 if rewritten_tool_reasoning else 16
+                if args.discard_assistant and measured["prefill"] > max_suffix:
                     raise RuntimeError(f"{name}: discarded assistant caused re-prefill: {measured}")
                 repeated = call(args.url, body)
                 cold = call(args.url, {**body, "cache_prompt": False})
@@ -172,9 +205,9 @@ def main():
                 # Recreate the interrupted history from a cold first turn.
                 # A one-shot full prefill has different matrix shapes; report
                 # that comparison separately from exact cache/history replay.
-                replayed_assistant, _ = call(args.url, initial, field)
-                if not preserve:
-                    replayed_assistant.pop("reasoning_content")
+                replayed_assistant, _ = interrupt()
+                if not preserve or args.drop_reasoning:
+                    replayed_assistant.pop("reasoning_content", None)
                 if replayed_assistant != assistant:
                     raise RuntimeError(f"{name}: cold interrupted stream did not replay")
                 replayed = call(args.url, body)
@@ -182,8 +215,11 @@ def main():
                     raise RuntimeError(f"{name}: cold conversation replay changed output")
                 if measured["accepted"] > measured["proposed"]:
                     raise RuntimeError(f"{name}: invalid speculative accounting")
+                followup_assistant = dict(resumed["choices"][0]["message"])
+                if not preserve or args.drop_reasoning:
+                    followup_assistant.pop("reasoning_content", None)
                 followup_body = {**body, "max_tokens": 8, "messages": [
-                    *body["messages"], resumed["choices"][0]["message"],
+                    *body["messages"], followup_assistant,
                     {"role": "user", "content": "What number did I ask you to reply with?"}]}
                 followup = call(args.url, followup_body)
                 if metrics(followup)["cached"] < measured["cached"]:
@@ -192,6 +228,9 @@ def main():
                     raise RuntimeError(f"{name}: third-turn snapshot changed seeded output")
                 report = {"case": name, "request": body, "sha256": digest(resumed),
                           "discard_assistant": args.discard_assistant,
+                          "drop_reasoning": args.drop_reasoning,
+                          "rewritten_tool_reasoning": rewritten_tool_reasoning,
+                          "append_image": args.append_image,
                           "interrupt_seconds": elapsed, **measured, "exact": True,
                           "full_prefill_equal": digest(resumed) == digest(cold),
                           "followup": {"request": followup_body,

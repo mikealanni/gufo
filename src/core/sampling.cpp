@@ -1,6 +1,7 @@
 #include "src/core/sampling.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <limits>
 #include <random>
@@ -157,9 +158,33 @@ void ApplyMinP(std::vector<Candidate>* candidates,
          static_cast<std::uint64_t>(random_device());
 }
 
+/// exp(x) for x <= 0 to about 1e-7 relative error, branch free so the loop
+/// that sums the normalizer over the whole vocabulary vectorizes. Only the
+/// truncation boundary of top-p depends on it; drawn probabilities use exp.
+[[nodiscard]] inline float FastExpNonPositive(float x) noexcept {
+  x = std::max(x, -87.0F);
+  const float t = x * 1.44269504088896341F;
+  const float whole = std::floor(t);
+  const float f = t - whole;
+  float p = 1.32154771e-06F;
+  p = p * f + 1.52527338e-05F;
+  p = p * f + 1.54035304e-04F;
+  p = p * f + 1.33335581e-03F;
+  p = p * f + 9.61812911e-03F;
+  p = p * f + 5.55041087e-02F;
+  p = p * f + 2.40226507e-01F;
+  p = p * f + 6.93147181e-01F;
+  p = p * f + 1.0F;
+  const auto bits = static_cast<std::int32_t>(whole) + 127;
+  return p * std::bit_cast<float>(bits << 23);
+}
+
 }  // namespace
 
 void SamplingConfig::Validate() const {
+  if (constraint && (!constraint->grammar || !constraint->vocabulary ||
+                     constraint->vocabulary->size() == 0))
+    throw std::invalid_argument("sampling constraint is incomplete");
   if (!std::isfinite(temperature) || temperature < 0.0F) {
     throw std::invalid_argument(
         "sampling temperature must be finite and nonnegative");
@@ -198,7 +223,7 @@ bool SamplingConfig::uses_random_sampling() const noexcept {
 }
 
 bool SamplingConfig::can_use_unmodified_argmax() const noexcept {
-  return temperature == 0.0F && !penalties_enabled();
+  return !constraint && temperature == 0.0F && !penalties_enabled();
 }
 
 SamplingDistribution::SamplingDistribution(std::vector<Probability> entries)
@@ -366,6 +391,11 @@ SamplingDistribution BuildDistribution(
     std::span<const float> logits, const SamplingConfig& config,
     std::span<const TokenId> prompt_tokens,
     std::span<const TokenId> generated_tokens) {
+  if (config.constraint) {
+    SamplerState sampler(config, prompt_tokens);
+    sampler.Accept(generated_tokens);
+    return sampler.Distribution(logits);
+  }
   std::unordered_map<TokenId, TokenPenalty> counts;
   if (config.frequency_penalty != 0 || config.presence_penalty != 0) {
     for (const auto token : generated_tokens) {
@@ -400,12 +430,15 @@ SamplerState::SamplerState(SamplingConfig config,
       history_(initial_history.begin(), initial_history.end()),
       rng_state_(InitialRngState(config.seed)) {
   config_.Validate();
+  if (config_.constraint)
+    constraint_state_ = config_.constraint->grammar->Start();
   TrimHistory();
   RebuildPenaltyCounts();
 }
 
 SamplerState::SamplerState(const SamplerState& other)
     : config_(other.config_),
+      constraint_state_(other.constraint_state_),
       history_(other.history_),
       penalty_counts_(other.penalty_counts_),
       rng_state_(other.rng_state_),
@@ -416,12 +449,38 @@ SamplerState& SamplerState::operator=(const SamplerState& other) {
     return *this;
   }
   config_ = other.config_;
+  constraint_state_ = other.constraint_state_;
   history_ = other.history_;
   penalty_counts_ = other.penalty_counts_;
   candidate_scratch_.clear();
   rng_state_ = other.rng_state_;
   pending_sample_ = other.pending_sample_;
   return *this;
+}
+
+SamplerState SamplerState::WithoutConstraint() const {
+  auto copy = *this;
+  copy.config_.constraint.reset();
+  copy.constraint_state_.clear();
+  return copy;
+}
+
+std::vector<float> SamplerState::ConstrainedLogits(
+    std::span<const float> logits, std::span<const TokenId> ids) const {
+  const auto mask = config_.constraint->Allowed(constraint_state_);
+  if ((!ids.empty() && ids.size() != logits.size()) ||
+      (ids.empty() && logits.size() != mask->size()))
+    throw std::invalid_argument(
+        "JSON constraint vocabulary differs from logits");
+  std::vector<float> masked(logits.begin(), logits.end());
+  for (std::size_t i = 0; i < masked.size(); ++i) {
+    const auto token = ids.empty() ? i : ids[i];
+    if (token >= mask->size())
+      throw std::invalid_argument("invalid compact token ID");
+    if (!(*mask)[token])
+      masked[i] = -std::numeric_limits<float>::infinity();
+  }
+  return masked;
 }
 
 const SamplingConfig& SamplerState::config() const noexcept {
@@ -451,6 +510,8 @@ void SamplerState::CopyDrawStateFrom(const SamplerState& other) noexcept {
 }
 
 void SamplerState::ResetHistory(std::span<const TokenId> tokens) {
+  if (config_.constraint)
+    constraint_state_ = config_.constraint->grammar->Start();
   pending_sample_.reset();
   penalty_counts_.clear();
   history_.assign(tokens.begin(), tokens.end());
@@ -463,6 +524,13 @@ void SamplerState::Accept(TokenId token) {
 }
 
 void SamplerState::Accept(std::span<const TokenId> tokens) {
+  if (config_.constraint) {
+    auto next = constraint_state_;
+    for (const auto token : tokens)
+      next = config_.constraint->vocabulary->Accept(
+          *config_.constraint->grammar, next, token);
+    constraint_state_ = std::move(next);
+  }
   if (config_.frequency_penalty != 0 || config_.presence_penalty != 0) {
     for (const auto token : tokens) {
       auto found = std::ranges::lower_bound(penalty_counts_, token, {},
@@ -483,6 +551,15 @@ void SamplerState::Accept(std::span<const TokenId> tokens) {
 
 SamplingDistribution SamplerState::Distribution(
     std::span<const float> logits) const {
+  if (config_.constraint) {
+    if (config_.temperature == 0) {
+      config_.Validate();
+      return SamplingDistribution({{SampleConstrainedGreedy(logits), 1.0}},
+                                  1.0);
+    }
+    const auto masked = ConstrainedLogits(logits);
+    return WithoutConstraint().Distribution(masked);
+  }
   config_.Validate();
   if (logits.empty() || logits.size() > std::numeric_limits<TokenId>::max())
     throw std::invalid_argument("invalid sampling vocabulary size");
@@ -506,6 +583,10 @@ SamplingDistribution SamplerState::Distribution(
 
 SamplingDistribution SamplerState::Distribution(
     std::span<const float> logits, std::span<const TokenId> token_ids) const {
+  if (config_.constraint) {
+    const auto masked = ConstrainedLogits(logits, token_ids);
+    return WithoutConstraint().Distribution(masked, token_ids);
+  }
   if (logits.size() != token_ids.size())
     throw std::invalid_argument("compact logits and token IDs differ in size");
   std::vector<TokenPenalty> penalties;
@@ -543,8 +624,16 @@ TokenId SamplerState::Sample(std::span<const float> logits) {
       throw std::invalid_argument("pending sample exceeds vocabulary");
     }
     const auto token = *pending_sample_;
+    if (config_.constraint &&
+        !config_.constraint->Allowed(constraint_state_)->at(token))
+      throw std::runtime_error("pending sample violates JSON constraint");
     pending_sample_.reset();
     return token;
+  }
+  if (config_.constraint) {
+    const auto distribution = Distribution(logits);
+    return config_.temperature == 0 ? distribution.best_token()
+                                    : distribution.Sample(&rng_state_);
   }
   if (config_.temperature == 0.0F) {
     return SampleGreedy(logits);
@@ -647,6 +736,37 @@ TokenId SamplerState::SampleGreedy(std::span<const float> logits) const {
   return best_token;
 }
 
+TokenId SamplerState::SampleConstrainedGreedy(
+    std::span<const float> logits) const {
+  const auto mask = config_.constraint->Allowed(constraint_state_);
+  if (logits.size() != mask->size())
+    throw std::invalid_argument(
+        "JSON constraint vocabulary differs from logits");
+  // Read the mask directly: greedy constraints need neither a copied vocabulary
+  // of masked logits nor a cloned sampler/history. Preserve token-ID tie order.
+  double best_logit = -std::numeric_limits<double>::infinity();
+  TokenId best_token = 0;
+  bool found = false;
+  for (std::size_t index = 0; index < logits.size(); ++index) {
+    if (!(*mask)[index] || !std::isfinite(logits[index]))
+      continue;
+    const double value = penalty_counts_.empty()
+                             ? static_cast<double>(logits[index])
+                             : AdjustedLogit(index, logits[index]);
+    if (!std::isfinite(value))
+      throw std::runtime_error(
+          "sampling penalties produced a non-finite logit");
+    if (value > best_logit) {
+      best_logit = value;
+      best_token = static_cast<TokenId>(index);
+      found = true;
+    }
+  }
+  if (!found)
+    throw std::runtime_error("logit distribution contains no finite values");
+  return best_token;
+}
+
 SamplingDistribution SamplerState::LinearDistribution(
     std::span<const float> logits) const {
   std::vector<Probability> candidates;
@@ -694,6 +814,7 @@ void SamplerState::PrepareSelected(std::span<const float> logits) {
     }
     return adjusted;
   };
+  const bool plain = penalty_counts_.empty();
   const auto select_best = [&](std::size_t limit) {
     candidate_scratch_.clear();
     candidate_scratch_.reserve(limit);
@@ -701,9 +822,17 @@ void SamplerState::PrepareSelected(std::span<const float> logits) {
       if (!std::isfinite(logits[index])) {
         continue;
       }
+      // Scanning in token order, an equal value never beats a kept entry, so a
+      // full heap only admits strictly larger logits.
+      if (plain && candidate_scratch_.size() >= limit &&
+          static_cast<double>(logits[index]) <=
+              candidate_scratch_.front().value) {
+        continue;
+      }
       const Probability candidate{
           .token = static_cast<TokenId>(index),
-          .value = read_adjusted(index),
+          .value =
+              plain ? static_cast<double>(logits[index]) : read_adjusted(index),
       };
       if (candidate_scratch_.size() < limit) {
         candidate_scratch_.push_back(candidate);
@@ -745,21 +874,48 @@ void SamplerState::PrepareSelected(std::span<const float> logits) {
   } else if (config_.top_p < 1.0F && logits.size() > 1024) {
     double maximum = -std::numeric_limits<double>::infinity();
     bool found = false;
-    for (std::size_t index = 0; index < logits.size(); ++index) {
-      if (!std::isfinite(logits[index])) {
-        continue;
+    if (plain) {
+      float best = -std::numeric_limits<float>::infinity();
+      for (std::size_t index = 0; index < logits.size(); ++index) {
+        const float logit = logits[index];
+        best = std::isfinite(logit) ? std::max(best, logit) : best;
       }
-      maximum = std::max(maximum, read_adjusted(index));
-      found = true;
+      found = std::isfinite(best);
+      maximum = static_cast<double>(best);
+      const float inverse_temperature = 1.0F / config_.temperature;
+      constexpr std::size_t kBlock = 4096;
+      for (std::size_t begin = 0; found && begin < logits.size();
+           begin += kBlock) {
+        const std::size_t end = std::min(logits.size(), begin + kBlock);
+        float block_sum = 0.0F;
+        for (std::size_t index = begin; index < end; ++index) {
+          const float logit = logits[index];
+          block_sum +=
+              std::isfinite(logit)
+                  ? FastExpNonPositive((logit - best) * inverse_temperature)
+                  : 0.0F;
+        }
+        full_softmax_sum += static_cast<double>(block_sum);
+      }
+    } else {
+      for (std::size_t index = 0; index < logits.size(); ++index) {
+        if (!std::isfinite(logits[index])) {
+          continue;
+        }
+        maximum = std::max(maximum, read_adjusted(index));
+        found = true;
+      }
+      if (found) {
+        for (std::size_t index = 0; index < logits.size(); ++index) {
+          if (std::isfinite(logits[index])) {
+            full_softmax_sum += std::exp((read_adjusted(index) - maximum) /
+                                         config_.temperature);
+          }
+        }
+      }
     }
     if (!found) {
       throw std::runtime_error("logit distribution contains no finite values");
-    }
-    for (std::size_t index = 0; index < logits.size(); ++index) {
-      if (std::isfinite(logits[index])) {
-        full_softmax_sum +=
-            std::exp((read_adjusted(index) - maximum) / config_.temperature);
-      }
     }
     if (!(full_softmax_sum > 0.0) || !std::isfinite(full_softmax_sum)) {
       throw std::runtime_error("logit softmax normalization failed");
@@ -770,14 +926,44 @@ void SamplerState::PrepareSelected(std::span<const float> logits) {
     const std::size_t initial_keep = std::min(
         logits.size(), std::max(initial_top_p_candidates,
                                 std::max<std::size_t>(config_.min_keep, 1)));
-    select_best(initial_keep);
-
-    double selected_mass = 0.0;
-    for (const auto& candidate : candidate_scratch_) {
-      selected_mass +=
-          std::exp((candidate.value - maximum) / config_.temperature);
+    const double target_mass =
+        static_cast<double>(config_.top_p) * full_softmax_sum;
+    const auto selected_mass_of = [&]() {
+      double mass = 0.0;
+      for (const auto& candidate : candidate_scratch_) {
+        mass += std::exp((candidate.value - maximum) / config_.temperature);
+      }
+      return mass;
+    };
+    bool covered = false;
+    if (plain && config_.min_keep <= 1) {
+      // Gather every token within a few logits of the best instead of keeping
+      // a heap of the top 256: the nucleus is a prefix of that sorted set, and
+      // the set is widened until its mass covers top-p, so the kept prefix is
+      // the same one a full sort would give.
+      double ratio = 1.0e-4;
+      for (int attempt = 0; attempt < 3 && !covered; ++attempt) {
+        const double threshold =
+            maximum +
+            static_cast<double>(config_.temperature) * std::log(ratio);
+        candidate_scratch_.clear();
+        for (std::size_t index = 0; index < logits.size(); ++index) {
+          const double logit = static_cast<double>(logits[index]);
+          if (logit >= threshold && std::isfinite(logit)) {
+            candidate_scratch_.push_back(
+                {.token = static_cast<TokenId>(index), .value = logit});
+          }
+        }
+        std::ranges::sort(candidate_scratch_, IsBetterProbability);
+        covered =
+            !candidate_scratch_.empty() && selected_mass_of() >= target_mass;
+        ratio *= 1.0e-4;
+      }
+    } else {
+      select_best(initial_keep);
+      covered = selected_mass_of() >= target_mass;
     }
-    if (selected_mass < static_cast<double>(config_.top_p) * full_softmax_sum) {
+    if (!covered) {
       select_all();
     }
   } else {

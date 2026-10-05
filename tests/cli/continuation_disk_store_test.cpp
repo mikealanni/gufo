@@ -47,7 +47,9 @@ using gufo::server::TextRunnerSnapshot;
 using gufo::server::TextRunnerState;
 using gufo::server::TextRunnerToken;
 
-constexpr std::size_t kFakePayloadBytes = 16;
+constexpr std::size_t kDefaultFakePayloadBytes = 16;
+std::size_t g_fake_payload_bytes = kDefaultFakePayloadBytes;
+std::size_t FakePayloadBytes() { return g_fake_payload_bytes; }
 constexpr std::size_t kDiskHeaderBytes = 96;
 
 void Expect(bool condition, std::string_view message) {
@@ -122,7 +124,7 @@ public:
       : value(snapshot_value), position(snapshot_position) {}
 
   [[nodiscard]] std::size_t PayloadBytes() const noexcept override {
-    return kFakePayloadBytes;
+    return FakePayloadBytes();
   }
 
   std::uint64_t value;
@@ -236,7 +238,7 @@ public:
 
   [[nodiscard]] std::size_t SnapshotPayloadBytes(
       const TextRunnerState&) const override {
-    return kFakePayloadBytes;
+    return FakePayloadBytes();
   }
 
   [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Snapshot(
@@ -256,18 +258,20 @@ public:
   [[nodiscard]] std::size_t PersistentSnapshotPayloadBytes(
       const TextRunnerSnapshot& snapshot) const override {
     (void)RequireFakeSnapshot(snapshot);
-    return kFakePayloadBytes;
+    return FakePayloadBytes();
   }
 
   [[nodiscard]] std::size_t SerializePersistentSnapshot(
       const TextRunnerSnapshot& snapshot,
       std::span<std::uint8_t> destination) const override {
     const auto& saved = RequireFakeSnapshot(snapshot);
-    if (destination.size() != kFakePayloadBytes) {
+    if (destination.size() != FakePayloadBytes()) {
       throw std::invalid_argument("fake destination size mismatch");
     }
     PutLittleEndian<std::uint64_t>(destination, 0, saved.value);
     PutLittleEndian<std::uint64_t>(destination, 8, saved.position);
+    for (std::size_t i = 16; i < destination.size(); ++i)
+      destination[i] = static_cast<std::uint8_t>(i * 31U + saved.value);
     return destination.size();
   }
 
@@ -276,16 +280,20 @@ public:
                                 const SnapshotSink& sink) const override {
     if (before_stream)
       before_stream();
-    std::array<std::uint8_t, kFakePayloadBytes> bytes{};
+    std::vector<std::uint8_t> bytes(FakePayloadBytes());
     (void)SerializePersistentSnapshot(snapshot, bytes);
     sink(std::span(bytes).first(7));
-    sink(std::span(bytes).subspan(7));
+    for (std::size_t offset = 7; offset < bytes.size();) {
+      const std::size_t count = std::min<std::size_t>(1000003, bytes.size() - offset);
+      sink(std::span(bytes).subspan(offset, count));
+      offset += count;
+    }
   }
 
   void RestorePersistentSnapshot(
       TextRunnerState& state,
       std::span<const std::uint8_t> payload) const override {
-    if (payload.size() != kFakePayloadBytes) {
+    if (payload.size() != FakePayloadBytes()) {
       throw std::invalid_argument("fake payload size mismatch");
     }
     auto& destination = RequireFakeState(state);
@@ -333,7 +341,7 @@ std::vector<std::filesystem::path> CacheFiles(
 std::size_t ExpectedFileBytes(std::size_t identity_bytes,
                               std::size_t token_count) {
   return kDiskHeaderBytes + identity_bytes +
-         token_count * sizeof(std::uint32_t) + kFakePayloadBytes;
+         token_count * sizeof(std::uint32_t) + FakePayloadBytes();
 }
 
 ContinuationDiskStore::SaveResult SaveTokens(
@@ -356,6 +364,16 @@ void TestSha256KnownVector() {
   Expect(gufo::crypto::Sha256Hex(input) ==
              "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
          "shared SHA-256 implementation matches the standard vector");
+  gufo::crypto::Sha256Hasher incremental;
+  incremental.Update(std::span(input).first(1));
+  gufo::crypto::Sha256Hasher first;
+  first.Update(std::span(input).first(1));
+  Expect(incremental.Digest() == first.Finish(),
+         "prefix digest matches an independently finished hash");
+  incremental.Update(std::span(input).subspan(1));
+  const auto complete = incremental.Digest();
+  Expect(complete == incremental.Finish(),
+         "reading a prefix digest does not consume incremental state");
 
   TemporaryDirectory directory;
   const auto path = directory.path() / "artifact.gguf";
@@ -375,7 +393,7 @@ void TestRestartRestoreAndCompatibilityIdentity() {
   {
     ContinuationDiskStore store(StoreOptions(directory.path()));
     const auto saved = SaveTokens(store, writer, {1, 2, 3}, *snapshot);
-    Expect(saved.stored && saved.payload_bytes == kFakePayloadBytes,
+    Expect(saved.stored && saved.payload_bytes == FakePayloadBytes(),
            "first process atomically stores a persistent snapshot");
     Expect(
         store.entry_count() == 1 && store.retained_bytes() == saved.file_bytes,
@@ -733,8 +751,9 @@ void TestStartupRejectsUnsafeAndInvalidFiles() {
       StoreOptions(directory.path()),
       [&](const ContinuationDiskEvent& event) { events.push_back(event); });
   Expect(
-      restarted.entry_count() == 2 && CacheFiles(directory.path()).size() == 2,
-      "startup indexes only checksum-valid regular entries");
+      restarted.entry_count() == 3 && CacheFiles(directory.path()).size() == 3,
+      "startup indexes structurally valid regular entries without hashing "
+      "payloads");
   Expect(
       std::filesystem::exists(target) && !std::filesystem::exists(unsafe_link),
       "unsafe symlink is removed without following its target");
@@ -744,12 +763,6 @@ void TestStartupRejectsUnsafeAndInvalidFiles() {
                             return event.reason ==
                                    ContinuationDiskEventReason::kCorrupt;
                           }) &&
-          std::ranges::any_of(
-              events,
-              [](const ContinuationDiskEvent& event) {
-                return event.reason ==
-                       ContinuationDiskEventReason::kChecksumMismatch;
-              }) &&
           std::ranges::any_of(events,
                               [](const ContinuationDiskEvent& event) {
                                 return event.reason ==
@@ -768,6 +781,14 @@ void TestStartupRejectsUnsafeAndInvalidFiles() {
   }
   Expect(compatible_hits == 1,
          "the remaining compatible startup entry restores exactly");
+  Expect(std::ranges::any_of(events,
+                             [](const ContinuationDiskEvent& event) {
+                               return event.reason ==
+                                      ContinuationDiskEventReason::
+                                          kChecksumMismatch;
+                             }) &&
+             restarted.entry_count() == 2,
+         "a payload checksum failure is caught and removed on restore");
   auto incompatible_state = incompatible.CreateState();
   Expect(
       RestoreTokens(restarted, incompatible, *incompatible_state, {4, 4, 9})
@@ -889,6 +910,15 @@ void TestSharedPrefixBoundariesAndExactDedup() {
   Expect(restored.restored && restored.token_count == 3 &&
              RequireFakeState(*state).value == 77,
          "new conversation restores the shared prefix");
+
+  // The longest stored prefix drives the snapshot stride policy.
+  const auto prefix_tokens = [&](std::vector<TextRunnerToken> tokens) {
+    return store.LongestStoredPrefixTokens(runner, tokens);
+  };
+  Expect(prefix_tokens({7, 7, 7, 9}) == 3 && prefix_tokens({7, 7, 7}) == 3 &&
+             prefix_tokens({7, 7, 7, 1, 2, 6}) == 5 &&
+             prefix_tokens({7, 7}) == 0 && prefix_tokens({8, 7, 7, 7}) == 0,
+         "longest stored prefix counts only complete entries");
 
   // Saving the same tokens again touches instead of rewriting.
   const std::size_t retained_before = store.retained_bytes();
@@ -1048,7 +1078,134 @@ void TestImageIdentitySurvivesRestart() {
   Expect(!store.Touch(runner, prompt), "disk dedup respects image identity");
 }
 
+void TestAppendedImagePrefixesSurviveRestart() {
+  using gufo::server::ContinuationInputPrefix;
+  TemporaryDirectory directory;
+  FakeRunner runner("image-prefix-cache");
+  const std::vector<TextRunnerToken> prompt{1, 2, 3, 248056, 4, 5, 248056, 6};
+  const auto tokens = std::span<const TextRunnerToken>(prompt);
+  const std::vector<std::uint8_t> a{10}, b{20}, ab{30}, ba{40};
+  const std::vector<ContinuationInputPrefix> prefixes{{3, {}}, {6, a}};
+  {
+    ContinuationDiskStore store(StoreOptions(directory.path()));
+    Expect(store.Save(runner, tokens.first(3), *MakeSnapshot(runner, 10, 3))
+               .stored,
+           "text prefix persists without future image identity");
+    Expect(store.Save(runner, tokens.first(5), *MakeSnapshot(runner, 20, 5), a)
+               .stored,
+           "first-image prefix persists independently of the second image");
+    Expect(store.Save(runner, tokens, *MakeSnapshot(runner, 30, 8), ab).stored,
+           "full two-image checkpoint is persisted");
+  }
+  ContinuationDiskStore store(StoreOptions(directory.path()));
+  auto state = runner.CreateState();
+  auto result =
+      store.RestoreLongestPrefix(runner, *state, tokens, ab, 7, prefixes);
+  Expect(result.restored && result.token_count == 8 &&
+             RequireFakeState(*state).value == 30,
+         "exact disk retry finds its fallback under an earlier image identity");
+  const std::vector<std::uint8_t> ac{50};
+  result = store.RestoreLongestPrefix(runner, *state, tokens, ac, 7, prefixes);
+  Expect(result.restored && result.token_count == 5 &&
+             RequireFakeState(*state).value == 20,
+         "changing only the second image restores the first-image checkpoint");
+  const std::vector<ContinuationInputPrefix> reordered{{3, {}}, {6, b}};
+  result = store.RestoreLongestPrefix(runner, *state, tokens, ba, 7, reordered);
+  Expect(result.restored && result.token_count == 3 &&
+             RequireFakeState(*state).value == 10,
+         "reordered or changed first image restores only the text prefix");
+  result = store.RestoreLongestPrefix(runner, *state, tokens);
+  Expect(result.restored && result.token_count == 3,
+         "literal image-pad text cannot recover visual state");
+  const std::vector<ContinuationInputPrefix> moved{{2, {}}};
+  result = store.RestoreLongestPrefix(runner, *state, tokens, b, 0, moved);
+  Expect(!result.restored,
+         "moving the first image before the checkpoint invalidates reuse");
+}
+
+
+void TestMultiBlockImageRoundTripAndCorruption() {
+  // Larger than two 8 MiB checksum blocks, ending in a partial block.
+  g_fake_payload_bytes = (std::size_t{20} << 20) + 123;
+  constexpr std::size_t kLimit = std::size_t{64} << 20;
+  TemporaryDirectory directory;
+  const FakeRunner runner("multi-block");
+  {
+    ContinuationDiskStore store(StoreOptions(directory.path(), kLimit, kLimit));
+    auto snapshot = MakeSnapshot(runner, 0xABCDEF, 5);
+    Expect(SaveTokens(store, runner, {1, 2, 3}, *snapshot).stored,
+           "multi-block image is stored");
+  }
+  {
+    ContinuationDiskStore restarted(StoreOptions(directory.path(), kLimit, kLimit));
+    auto state = runner.CreateState();
+    const auto restored = RestoreTokens(restarted, runner, *state, {1, 2, 3, 4});
+    Expect(restored.restored && RequireFakeState(*state).value == 0xABCDEF,
+           "multi-block image restores after a restart");
+  }
+  const auto files = CacheFiles(directory.path());
+  Expect(files.size() == 1, "one multi-block file is stored");
+  {
+    // Flip one byte inside the second checksum block.
+    std::fstream stream(files.front(),
+                        std::ios::binary | std::ios::in | std::ios::out);
+    stream.seekg(std::streamoff(12) << 20);
+    char value = 0;
+    stream.read(&value, 1);
+    value ^= static_cast<char>(0x33);
+    stream.seekp(std::streamoff(12) << 20);
+    stream.write(&value, 1);
+  }
+  {
+    ContinuationDiskStore restarted(StoreOptions(directory.path(), kLimit, kLimit));
+    auto state = runner.CreateState();
+    Expect(!RestoreTokens(restarted, runner, *state, {1, 2, 3, 4}).restored,
+           "corruption in a later block is a deterministic miss");
+    Expect(CacheFiles(directory.path()).empty(),
+           "the corrupt multi-block file is removed on restore");
+  }
+  g_fake_payload_bytes = kDefaultFakePayloadBytes;
+}
+
+void TestLegacyVersionOneFileStillRestores() {
+  TemporaryDirectory directory;
+  const FakeRunner runner("legacy-v1");
+  {
+    ContinuationDiskStore store(StoreOptions(directory.path()));
+    auto snapshot = MakeSnapshot(runner, 0x5151, 2);
+    Expect(SaveTokens(store, runner, {7, 8}, *snapshot).stored,
+           "image is stored before conversion to version 1");
+  }
+  const auto files = CacheFiles(directory.path());
+  Expect(files.size() == 1, "one file to convert");
+  std::vector<std::uint8_t> image;
+  {
+    std::ifstream input(files.front(), std::ios::binary);
+    image.assign(std::istreambuf_iterator<char>(input),
+                 std::istreambuf_iterator<char>());
+  }
+  // Rewrite it the way version 1 did: version field 1, one SHA-256 over the
+  // whole image with the checksum field zeroed.
+  image[8] = 1;
+  std::fill(image.begin() + 32, image.begin() + 96, std::uint8_t{0});
+  const std::string checksum = gufo::crypto::Sha256Hex(image);
+  std::copy(checksum.begin(), checksum.end(), image.begin() + 32);
+  {
+    std::ofstream output(files.front(), std::ios::binary | std::ios::trunc);
+    output.write(reinterpret_cast<const char*>(image.data()),
+                 static_cast<std::streamsize>(image.size()));
+  }
+  ContinuationDiskStore restarted(StoreOptions(directory.path()));
+  auto state = runner.CreateState();
+  const auto restored = RestoreTokens(restarted, runner, *state, {7, 8, 9});
+  Expect(restored.restored && RequireFakeState(*state).value == 0x5151,
+         "a version 1 file still restores with its legacy checksum");
+}
+
 int main() {
+  TestMultiBlockImageRoundTripAndCorruption();
+  TestLegacyVersionOneFileStillRestores();
+  TestAppendedImagePrefixesSurviveRestart();
   TestBoundedAsyncPersistenceDoesNotBlockLookup();
   TestIndexedPrefixLookup();
   TestImageIdentitySurvivesRestart();

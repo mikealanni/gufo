@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <stop_token>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 
@@ -65,6 +66,7 @@ struct ScheduledRequest {
   std::shared_ptr<const TextPromptContext> prompt_context;
   bool cache_prompt{true};
   std::size_t cache_prefix_tokens{0};
+  bool stop_at_eos{true};
   std::size_t token_limit{1};
   sampling::SamplingConfig sampling;
   TextGenerationScheduler::CancellationCheck external_cancellation;
@@ -133,12 +135,19 @@ void PublishTerminal(const std::shared_ptr<ScheduledRequest>& request,
   request->output_condition.notify_all();
 }
 
+/// Queue cost of one streamed piece. A token whose decoded text is empty still
+/// occupies a queue slot, so it is charged one byte: a zero cost would let an
+/// unbounded number of them accumulate behind a slow consumer.
+[[nodiscard]] std::size_t QueuedPieceCost(std::string_view piece) noexcept {
+  return std::max<std::size_t>(piece.size(), 1);
+}
+
 [[nodiscard]] bool PublishPiece(
     const std::shared_ptr<ScheduledRequest>& request, std::string piece) {
   if (!request->publish_token_pieces) {
     return true;
   }
-  const std::size_t piece_bytes = piece.size();
+  const std::size_t piece_bytes = QueuedPieceCost(piece);
   {
     const std::lock_guard<std::mutex> lock(request->output_mutex);
     if (request->buffered_output_bytes > request->max_buffered_output_bytes ||
@@ -525,7 +534,7 @@ struct TextGenerationScheduler::Impl {
                      DeadlineExceeded(request);
             },
             std::move(request->prompt_context), request->cache_prompt,
-            request->cache_prefix_tokens);
+            request->cache_prefix_tokens, request->stop_at_eos);
         if (!request->runner_request) {
           CompleteCancelled(request);
           continue;
@@ -704,7 +713,8 @@ struct TextGenerationScheduler::Impl {
     const auto piece = request->stop_filter.enabled()
                            ? request->stop_filter.Push(selection.piece)
                            : selection.piece;
-    if (!piece.empty() && !PublishPiece(request, piece)) {
+    if ((!piece.empty() || !request->stop_filter.enabled()) &&
+        !PublishPiece(request, piece)) {
       CompleteFailure(request,
                       std::make_exception_ptr(TextGenerationError(
                           TextGenerationErrorCode::kOutputBackpressure,
@@ -1143,6 +1153,22 @@ struct TextGenerationScheduler::Impl {
     decoding.clear();
   }
 
+  static std::shared_ptr<ScheduledRequest> PopShortestPrefill(
+      std::deque<std::shared_ptr<ScheduledRequest>>& prefilling) {
+    const auto remaining = [](const std::shared_ptr<ScheduledRequest>& r) {
+      const std::size_t done =
+          r->result.cached_prompt_tokens + r->result.prefill_tokens;
+      return r->result.prompt_tokens > done ? r->result.prompt_tokens - done
+                                            : std::size_t{0};
+    };
+    const auto it = std::min_element(
+        prefilling.begin(), prefilling.end(),
+        [&](const auto& a, const auto& b) { return remaining(a) < remaining(b); });
+    auto request = std::move(*it);
+    prefilling.erase(it);
+    return request;
+  }
+
   void Run(const std::stop_token& stop_token) noexcept {
     std::deque<std::shared_ptr<ScheduledRequest>> prefilling;
     std::deque<std::shared_ptr<ScheduledRequest>> decoding;
@@ -1203,8 +1229,7 @@ struct TextGenerationScheduler::Impl {
                       });
       if (!prefilling.empty() && !decoding.empty() &&
           (!due_decoder || assemble_initial_batch)) {
-        auto request = std::move(prefilling.front());
-        prefilling.pop_front();
+        auto request = PopShortestPrefill(prefilling);
         StepPrefill(request, true);
         if (!IsTerminal(request)) {
           if (request->runner_request.SnapshotPending()) {
@@ -1250,8 +1275,7 @@ struct TextGenerationScheduler::Impl {
         continue;
       }
 
-      auto request = std::move(prefilling.front());
-      prefilling.pop_front();
+      auto request = PopShortestPrefill(prefilling);
       StepPrefill(request, false, !capturing.empty());
       if (!IsTerminal(request)) {
         if (request->runner_request.SnapshotPending()) {
@@ -1340,6 +1364,7 @@ TextGenerationScheduler::Result TextGenerationScheduler::Request::Wait(
 
   while (true) {
     std::string piece;
+    bool has_piece = false;
     bool terminal = false;
     {
       std::unique_lock<std::mutex> lock(impl_->request->output_mutex);
@@ -1348,8 +1373,9 @@ TextGenerationScheduler::Result TextGenerationScheduler::Request::Wait(
                !impl_->request->output_pieces.empty();
       });
       if (!impl_->request->output_pieces.empty()) {
+        has_piece = true;
         const std::size_t piece_bytes =
-            impl_->request->output_pieces.front().size();
+            QueuedPieceCost(impl_->request->output_pieces.front());
         piece = std::move(impl_->request->output_pieces.front());
         impl_->request->output_pieces.pop_front();
         impl_->request->buffered_output_bytes -= piece_bytes;
@@ -1361,7 +1387,7 @@ TextGenerationScheduler::Result TextGenerationScheduler::Request::Wait(
       }
     }
 
-    if (!piece.empty() && deliver_pieces && on_token) {
+    if (has_piece && deliver_pieces && on_token) {
       try {
         if (!on_token(piece)) {
           consumer_cancelled = true;
@@ -1472,6 +1498,7 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
   request->prompt_context = std::move(metadata.prompt_context);
   request->cache_prompt = metadata.cache_prompt;
   request->cache_prefix_tokens = metadata.cache_prefix_tokens;
+  request->stop_at_eos = metadata.stop_at_eos;
   request->token_limit =
       max_tokens > 0 ? std::min(max_tokens, available) : available;
   request->sampling = sampling;

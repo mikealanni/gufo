@@ -2,10 +2,13 @@
 
 #include <arpa/inet.h>
 
+#include <array>
 #include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -29,6 +32,7 @@
 #include "src/cli/serve/image_api.hpp"
 #include "src/cli/serve/inference_backend.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/text_model_runner.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime_api.h>
@@ -465,9 +469,12 @@ void PrintServeHelp(std::string_view program_name,
     std::size_t max_buffered_output_bytes_total =
         server::kDefaultMaxBufferedOutputBytesTotal;
     std::filesystem::path cache_disk_directory;
+    std::size_t cache_ram_bytes = 0;
+    std::size_t cache_ram_entries = 0;
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
     std::size_t cache_disk_staging_bytes = 0;
+    std::size_t cache_disk_stride_tokens = 0;
     bool log_progress = false;
 
     gufo::cli::ArgParser parser(
@@ -561,6 +568,14 @@ void PrintServeHelp(std::string_view program_name,
     parser.AddOption("", "--cache-disk", "DIR",
                      "Opt-in restart-safe continuation cache directory",
                      "Cache", &cache_disk_directory);
+    parser.AddOption("", "--cache-ram-bytes", "N",
+                     "In-RAM retained-snapshot budget cap (default: 0 = half "
+                     "of MemAvailable at startup)",
+                     "Cache", &cache_ram_bytes);
+    parser.AddOption("", "--cache-ram-entries", "N",
+                     "Immutable in-RAM snapshots kept beyond the live sessions "
+                     "(default: 0 = one per session)",
+                     "Cache", &cache_ram_entries);
     parser.AddOption("", "--cache-disk-bytes", "N",
                      "Retained disk-cache byte budget (default: " +
                          std::to_string(cache_disk_bytes) + ")",
@@ -569,6 +584,11 @@ void PrintServeHelp(std::string_view program_name,
                      "RAM limit for queued snapshots and each disk read "
                      "(default: 0 = auto, at most 1 GiB and 1/8 available RAM)",
                      "Cache", &cache_disk_staging_bytes);
+    parser.AddOption("", "--cache-disk-stride-tokens", "N",
+                     "Write a request's snapshot to disk only when it extends "
+                     "the longest stored prefix by this many tokens "
+                     "(default: 0 = every request)",
+                     "Cache", &cache_disk_stride_tokens);
     parser.AddFlag("", "--log-progress", "Log live prefill and decode progress",
                    "Logging", &log_progress);
     ServerOptionHelpTargets server_help;
@@ -918,9 +938,12 @@ int RunServe(std::span<const char* const> args) {
     std::size_t max_buffered_output_bytes_total =
         server::kDefaultMaxBufferedOutputBytesTotal;
     std::filesystem::path cache_disk_directory;
+    std::size_t cache_ram_bytes = 0;
+    std::size_t cache_ram_entries = 0;
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
     std::size_t cache_disk_staging_bytes = 0;
+    std::size_t cache_disk_stride_tokens = 0;
     bool log_progress = false;
 
     gufo::cli::ArgParser llm_parser(
@@ -1010,6 +1033,15 @@ int RunServe(std::span<const char* const> args) {
     llm_parser.AddOption("", "--cache-disk", "DIR",
                          "Opt-in restart-safe continuation cache directory",
                          "Cache", &cache_disk_directory);
+    llm_parser.AddOption("", "--cache-ram-bytes", "N",
+                         "In-RAM retained-snapshot budget cap (default: 0 = "
+                         "half of MemAvailable at startup)",
+                         "Cache", &cache_ram_bytes);
+    llm_parser.AddOption(
+        "", "--cache-ram-entries", "N",
+        "Immutable in-RAM snapshots kept beyond the live sessions "
+        "(default: 0 = one per session)",
+        "Cache", &cache_ram_entries);
     llm_parser.AddOption("", "--cache-disk-bytes", "N",
                          "Retained disk-cache byte budget (default: " +
                              std::to_string(cache_disk_bytes) + ")",
@@ -1019,6 +1051,11 @@ int RunServe(std::span<const char* const> args) {
         "RAM limit for queued snapshots and each disk read "
         "(default: 0 = auto, at most 1 GiB and 1/8 available RAM)",
         "Cache", &cache_disk_staging_bytes);
+    llm_parser.AddOption(
+        "", "--cache-disk-stride-tokens", "N",
+        "Write a request's snapshot to disk only when it extends the longest "
+        "stored prefix by this many tokens (default: 0 = every request)",
+        "Cache", &cache_disk_stride_tokens);
     llm_parser.AddFlag("", "--log-progress",
                        "Log live prefill and decode progress", "Logging",
                        &log_progress);
@@ -1119,33 +1156,41 @@ int RunServe(std::span<const char* const> args) {
     std::string err;
     ModelLoadLog load_log("text", model);
     backend = std::make_shared<server::InferenceBackend>();
-    if (!backend->load(model, &err, max_context, session_count,
-                       server::TextPrefillPolicy{
-                           .decode_active_tokens = prefill_chunk_tokens,
-                       },
-                       server::TextSchedulerPolicy{
-                           .max_pending_requests = max_pending_requests,
-                           .max_pending_requests_per_client =
-                               max_pending_requests_per_client,
-                           .max_output_bytes_per_request = max_output_bytes,
-                           .max_buffered_output_bytes_per_request =
-                               max_buffered_output_bytes,
-                           .max_buffered_output_bytes_total =
-                               max_buffered_output_bytes_total,
-                           .request_timeout =
-                               std::chrono::milliseconds{
-                                   static_cast<std::chrono::milliseconds::rep>(
-                                       request_timeout_ms)},
-                           .log_progress = log_progress,
-                       },
-                       speculative_config,
-                       server::TextDiskCacheConfig{
-                           .directory = cache_disk_directory,
-                           .capacity_bytes = cache_disk_bytes,
-                           .staging_capacity_bytes = cache_disk_staging_bytes,
-                           .model_artifact_fingerprint = {},
-                       },
-                       vision_model_path)) {
+    if (!backend->load(
+            model, &err, max_context, session_count,
+            server::TextPrefillPolicy{
+                .decode_active_tokens = prefill_chunk_tokens,
+            },
+            server::TextSchedulerPolicy{
+                .max_pending_requests = max_pending_requests,
+                .max_pending_requests_per_client =
+                    max_pending_requests_per_client,
+                .max_output_bytes_per_request = max_output_bytes,
+                .max_buffered_output_bytes_per_request =
+                    max_buffered_output_bytes,
+                .max_buffered_output_bytes_total =
+                    max_buffered_output_bytes_total,
+                .request_timeout =
+                    std::chrono::milliseconds{
+                        static_cast<std::chrono::milliseconds::rep>(
+                            request_timeout_ms)},
+                .log_progress = log_progress,
+            },
+            speculative_config,
+            [&] {
+              // Applied before any session is created, so the
+              // continuation cache never reserves more than this.
+              server::SetHostSnapshotBudgetCap(cache_ram_bytes);
+              server::SetHostSnapshotExtraEntries(cache_ram_entries);
+              return server::TextDiskCacheConfig{
+                  .directory = cache_disk_directory,
+                  .capacity_bytes = cache_disk_bytes,
+                  .staging_capacity_bytes = cache_disk_staging_bytes,
+                  .snapshot_stride_tokens = cache_disk_stride_tokens,
+                  .model_artifact_fingerprint = {},
+              };
+            }(),
+            vision_model_path)) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
       return 1;
     }

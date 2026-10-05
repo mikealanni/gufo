@@ -172,6 +172,11 @@ public:
   /// the device for MtpForward. kVerify permits Rollback (at most
   /// max_speculative rows). kPrefill uses consistent prompt arithmetic at
   /// every chunk width.
+  /// Tokens that follow the next prefill chunk. Their n-gram rows are read
+  /// while the current chunk runs. Cleared when a Forward call consumes it.
+  void SetPleLookahead(std::span<const std::int32_t> tokens) const noexcept {
+    ple_lookahead_ = tokens;
+  }
   [[nodiscard]] bool Forward(Session& session,
                              std::span<const std::int32_t> tokens,
                              std::uint32_t n_logits, float* logits,
@@ -320,6 +325,10 @@ private:
   /// Reuse or populate the F16 activation staging buffer.
   void PrepareHalfInput(const float* x, std::uint32_t rows,
                         std::uint32_t cols) const;
+  /// Whether a dense Q4_K/Q5_K/Q5_1 matrix fits the F16 weight scratch.
+  bool Expandable(const DeviceTensor& w) const;
+  /// Expands w into s_.w_half (stream-ordered); nullptr if it cannot.
+  const __half* ExpandHalf(const DeviceTensor& w) const;
   /// Whether a wide dense Q8_0 projection takes the F16 WMMA GEMM.
   bool DenseF16Route(const DeviceTensor& w, std::uint32_t n_tokens) const;
   void RoutedHints(const DeviceTensor& w, std::uint32_t n_tokens) const;
@@ -353,6 +362,7 @@ private:
   bool PleFetch(Session& s, std::span<const std::int32_t> tokens,
                 bool speculative, std::string* error_msg) const;
   bool WaitPle(std::string* error_msg) const;
+  void StartPleAhead(Session& session) const;
   bool Ple(const DeviceLayer& l, Session& s, std::uint32_t n_tokens, float* res,
            bool speculative, std::string* error_msg,
            bool embeddings_ready = false) const;
@@ -393,9 +403,10 @@ private:
   /// Runs `body` eagerly, or as the session's captured graph for `key`
   /// when `graph` is set. A prefix may leave its work queued so the host
   /// can wait for disk reads while the GPU computes it.
+  /// `label` names the pass in the GUFO_GRAPH_LOG=1 capture/launch log.
   bool Run(Session& session, std::uint64_t key, bool graph,
            const std::function<bool()>& body, std::string* error_msg,
-           bool synchronize = true) const;
+           bool synchronize = true, const char* label = "trunk") const;
 
   const DeviceModel* model_{nullptr};
   NgramTable* ngram_{nullptr};
@@ -408,7 +419,10 @@ private:
   // Scratch, sized for max_batch tokens. Names follow reference.cpp.
   struct Scratch {
     std::int32_t* tokens;
-    void* x_half;   ///< activations narrowed to the weight's 16-bit type
+    void* x_half;  ///< activations narrowed to the weight's 16-bit type
+    std::size_t half_capacity{0};  ///< element capacity of x_half
+    void* w_half;  ///< F16 copy of one dense K-quant/Q5_1 matrix (wide batches)
+    std::size_t w_half_capacity{0};  ///< element capacity of w_half
     void* x_q8[2];  ///< Q8_1 activations of a decode batch, alternating
     void* x_q8t;    ///< tiled Q8 activations of a wide batch (W8A8 route)
     float* res;
@@ -454,6 +468,9 @@ private:
     // moe
     float* router;
     std::int32_t* ids;
+    /// Expert 0 for the dense quantized head, which the MoE vector kernel
+    /// reads as a one-expert weight.
+    std::int32_t* dense_ids;
     std::uint32_t* expert_counts;
     // Routed WMMA route: 16-row padded bucket bounds, scatter cursors, the
     // compact row -> (token, slot) maps and the tiled Q8 gathered rows.
@@ -518,6 +535,21 @@ private:
   /// Pinned: the n-gram rows go up with hipMemcpyAsync, and a pageable
   /// source would not be ordered against the kernels behind it.
   float* host_emb_{nullptr};
+  /// Second pinned n-gram buffer. Prefill reads the next chunk's rows into
+  /// whichever buffer the current chunk is not using, so the table reads run
+  /// while the GPU computes instead of after it.
+  float* host_emb_ahead_{nullptr};
+  mutable const float* ple_src_{nullptr};  ///< rows the next upload reads
+  struct PleAhead {
+    bool valid{false};
+    const Session* owner{nullptr};
+    std::vector<std::int32_t> tokens;
+    NgramHistory before;  ///< session state the read assumed
+    NgramHistory after;   ///< session state once these tokens are consumed
+    float* buffer{nullptr};
+  };
+  mutable PleAhead ple_ahead_;
+  mutable std::span<const std::int32_t> ple_lookahead_;
   mutable std::vector<std::uint32_t> host_rows_;
   mutable bool ple_pending_{false};
   // Pinned host staging the launched (or captured) work reads and writes.
@@ -535,6 +567,17 @@ private:
   mutable int routed_tile_cols_{0};
   float* logits_host_{nullptr};
   std::int32_t* mtp_token_host_{nullptr};
+  /// Draft-head vocabulary subset (GUFO_MTP_VOCAB): the first rows of the
+  /// output matrix plus a tail range holding the special tokens. Verification
+  /// still scores the full vocabulary, so only drafting is approximate.
+  std::uint32_t mtp_head_rows_{0};
+  std::uint32_t mtp_tail_rows_{0};
+  std::uint32_t mtp_tail_base_{0};
+  [[nodiscard]] std::uint32_t MtpTokenId(std::uint32_t index) const noexcept {
+    return mtp_head_rows_ != 0 && index >= mtp_head_rows_
+               ? index - mtp_head_rows_ + mtp_tail_base_
+               : index;
+  }
   MtpCandidateLogits* mtp_candidates_host_{nullptr};
   /// The model geometry allows the wide mixer route (see Combine).
   bool wide_mixer_{false};

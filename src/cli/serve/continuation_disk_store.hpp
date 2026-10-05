@@ -147,11 +147,15 @@ public:
   /// Drains accepted writes. Shutdown also drains automatically.
   void Flush();
 
-  /// Restores the longest exact saved prefix of prompt into state.
+  /// Restores the longest exact saved prefix of prompt into state. When a
+  /// stable boundary is supplied, a later checkpoint requires an earlier
+  /// saved prefix too, so legacy full-prompt files cannot bypass migration.
   [[nodiscard]] RestoreResult RestoreLongestPrefix(
       const TextModelRunner& runner, TextRunnerState& state,
       std::span<const TextRunnerToken> prompt,
-      std::span<const std::uint8_t> input_identity = {});
+      std::span<const std::uint8_t> input_identity = {},
+      std::size_t stable_prefix_tokens = 0,
+      std::span<const ContinuationInputPrefix> input_prefixes = {});
 
   /// Prefix lengths that prompt shares with stored entries but that no entry
   /// holds exactly.
@@ -166,6 +170,13 @@ public:
   [[nodiscard]] std::vector<std::size_t> SharedPrefixBoundaries(
       const TextModelRunner& runner, std::span<const TextRunnerToken> prompt,
       std::size_t min_tokens, std::size_t max_boundaries,
+      std::span<const std::uint8_t> input_identity = {},
+      std::span<const ContinuationInputPrefix> input_prefixes = {});
+
+  /// Token count of the longest completed entry that is a prefix of tokens,
+  /// or zero when none exists. Queued saves are not counted.
+  [[nodiscard]] std::size_t LongestStoredPrefixTokens(
+      const TextModelRunner& runner, std::span<const TextRunnerToken> tokens,
       std::span<const std::uint8_t> input_identity = {});
 
   /// Marks the exact entry for tokens as recently used without reading it.

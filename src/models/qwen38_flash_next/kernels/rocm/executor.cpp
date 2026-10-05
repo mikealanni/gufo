@@ -5,9 +5,12 @@
 #include <bit>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string_view>
 #include <type_traits>
@@ -48,7 +51,8 @@ T* Alloc(std::vector<void*>& allocations, std::size_t count,
     allocations.push_back(nullptr);
     return nullptr;
   }
-  (void)hipMemset(p, 0, bytes);
+  RecordAllocation("scratch", p, bytes);
+  (void)GuardedMemset(GUFO_SITE, p, 0, bytes);
   allocations.push_back(p);
   if (allocated_bytes)
     *allocated_bytes += bytes;
@@ -63,6 +67,8 @@ WeightType SmallType(GgmlType type) {
       return WeightType::kF16;
     case GgmlType::kQ8_0:
       return WeightType::kQ8_0;
+    case GgmlType::kQ6_K:
+      return WeightType::kQ6_K;
     case GgmlType::kF32:
       return WeightType::kF32;
     default:
@@ -73,6 +79,14 @@ WeightType SmallType(GgmlType type) {
 // The tier's tiled kernels compute whole column tiles; below this width the
 // matrix-vector kernels read each weight once per row and win outright.
 constexpr std::uint32_t kVecBatch = 8;
+// The widest dense trunk matrix: the linear-attention input stack.
+constexpr std::size_t kDequantHalfMaxElems = std::size_t{16384} * 2560;
+
+bool DenseVecType(GgmlType type) {
+  return type == GgmlType::kQ4_K || type == GgmlType::kQ5_K ||
+         type == GgmlType::kQ5_1 || type == GgmlType::kQ6_K;
+}
+
 // Keep prompt arithmetic independent of chunk width. A scoped, per-thread
 // policy also lets the output head retain its existing logits-row arithmetic.
 thread_local bool prefill_phase = false;
@@ -134,9 +148,11 @@ std::uint32_t IndexerCapacity(const Config& c, std::uint32_t batch,
 Session::~Session() {
   TrimRollback(0);
   for (auto& [key, exec] : graphs_) {
+    ForgetGraphMemcpyNodes(key);
     (void)hipGraphExecDestroy(exec);
   }
   for (void* p : allocations_) {
+    ForgetAllocation(p);
     (void)hipFree(p);
   }
 }
@@ -149,8 +165,10 @@ void Session::RestoreVisionLayout(const qwen::vision::RopeLayout& layout,
   for (auto& attention : attention_)
     attention.rope = vision_input_.rope();
   if (previous != vision_input_.rope()) {
-    for (const auto& [key, graph] : graphs_)
+    for (auto& [key, graph] : graphs_) {
+      ForgetGraphMemcpyNodes(key);
       (void)hipGraphExecDestroy(graph);
+    }
     graphs_.clear();
     warmed_.clear();
   }
@@ -166,8 +184,10 @@ void Session::ConfigureVision(
   for (auto& attention : attention_)
     attention.rope = vision_input_.rope();
   if (previous != vision_input_.rope()) {
-    for (const auto& [key, graph] : graphs_)
+    for (auto& [key, graph] : graphs_) {
+      ForgetGraphMemcpyNodes(key);
       (void)hipGraphExecDestroy(graph);
+    }
     graphs_.clear();
     warmed_.clear();
   }
@@ -196,22 +216,131 @@ std::size_t Session::AllocatedBytes() const noexcept {
   return allocated_bytes_ + rollback_bytes_ + vision_input_.Bytes();
 }
 
+namespace {
+
+// Rollback-trim experiment knobs. GUFO_ROLLBACK_TRIM=0 keeps every rollback
+// row allocated for the life of the session; GUFO_ROLLBACK_FORCE_TRIM=1 trims
+// to zero at the end of every speculative batch, which frees rows under the
+// graphs the session already captured.
+bool EnvFlag(const char* name, bool fallback) {
+  const char* v = std::getenv(name);
+  if (v == nullptr || v[0] == '\0')
+    return fallback;
+  return v[0] != '0';
+}
+
+// Rollback row lifetime. Freeing a row is what makes a captured graph unsafe:
+// the row addresses are baked into the graph's kernel arguments. Several
+// sessions can be mid-flight on the one executor stream, so a free triggered by
+// one conversation can outlive the graphs of another. The rows are small and
+// bounded, so they are allocated once at full depth and never freed.
+bool KeepRollbackRows() {
+  static const bool keep = [] {
+    if (const char* v = std::getenv("GUFO_ROLLBACK_NEVER_FREE")) {
+      return v[0] != '0';
+    }
+    if (const char* t = std::getenv("GUFO_ROLLBACK_TRIM")) {
+      return t[0] == '0';  // legacy spelling: trimming off means never free
+    }
+    return true;  // never free by default
+  }();
+  return keep;
+}
+
+bool ForceRollbackTrim() {
+  static const bool force = EnvFlag("GUFO_ROLLBACK_FORCE_TRIM", false);
+  return force;
+}
+
+/// Adapts the registry's string_view entry point to the core hook signature.
+void RecordAllocationSite(const char* site, const void* base,
+                          std::size_t bytes) {
+  RecordAllocation(site, base, bytes);
+}
+
+// GUFO_TRIM_COUNT=1: trims that freed a row, and graphs dropped or recaptured
+// because of them, so the cost of invalidation is measurable per request.
+struct TrimCounters {
+  bool enabled = [] {
+    const char* v = std::getenv("GUFO_TRIM_COUNT");
+    return v != nullptr && v[0] == '1';
+  }();
+  std::mutex mutex;
+  std::uint64_t trims = 0;           ///< trims that actually freed a row
+  std::uint64_t rows_freed = 0;      ///< rows released by those trims
+  std::uint64_t graphs_dropped = 0;  ///< live graphs destroyed by a trim
+  std::uint64_t recaptures = 0;      ///< shapes forced to capture again
+  std::uint64_t captures = 0;        ///< graph captures performed
+  std::string last_request;
+
+  void Trim(std::size_t dropped) {
+    const std::lock_guard lock(mutex);
+    ++trims;
+    graphs_dropped += dropped;
+  }
+  void Rows(std::size_t n) {
+    const std::lock_guard lock(mutex);
+    rows_freed += n;
+  }
+  void Recaptured(std::size_t n) {
+    const std::lock_guard lock(mutex);
+    recaptures += n;
+  }
+  void Captured() {
+    const std::lock_guard lock(mutex);
+    ++captures;
+  }
+  void Request(const std::string& id) {
+    const std::lock_guard lock(mutex);
+    last_request = id;
+  }
+  void Report() {
+    const std::lock_guard lock(mutex);
+    if (!enabled)
+      return;
+    std::fprintf(stderr,
+                 "trim count request=%s trims=%llu rows_freed=%llu "
+                 "graphs_dropped=%llu recaptures=%llu captures=%llu\n",
+                 last_request.c_str(), static_cast<unsigned long long>(trims),
+                 static_cast<unsigned long long>(rows_freed),
+                 static_cast<unsigned long long>(graphs_dropped),
+                 static_cast<unsigned long long>(recaptures),
+                 static_cast<unsigned long long>(captures));
+    trims = rows_freed = graphs_dropped = recaptures = captures = 0;
+  }
+};
+TrimCounters g_trim_counters;
+
+}  // namespace
+
+void ReportTrimCounters(const char* tag) {
+  g_trim_counters.Request(tag != nullptr ? tag : "");
+  g_trim_counters.Report();
+}
+
 void Session::TrimRollback(std::uint32_t depth) noexcept {
+  if (KeepRollbackRows())
+    return;
   if (depth >= rollback_depth_)
     return;
-  // Keep graphs whose rows still exist. Deeper verifier graphs capture
-  // discarded pointers; ordinary decode and MTP graphs do not.
-  for (auto it = graphs_.begin(); it != graphs_.end();) {
-    if ((it->first & (std::uint64_t{1} << 32)) != 0 &&
-        (it->first & (std::uint64_t{1} << 40)) == 0 &&
-        (it->first & 0xFFFFU) > depth + 1) {
-      (void)hipGraphExecDestroy(it->second);
-      it = graphs_.erase(it);
-    } else {
-      ++it;
-    }
+  // Every captured graph holds the rollback row addresses in its kernel
+  // arguments, so freeing any row leaves every live graph replaying stale
+  // pointers. Only the rows below `depth` are proven untouched by the trim, and
+  // which graph used which row is not recoverable from the key, so all graphs
+  // go and every shape recaptures against the addresses that survive.
+  const std::size_t dropped = graphs_.size();
+  const std::size_t recaptures = warmed_.size();
+  g_trim_counters.Trim(dropped);
+  g_trim_counters.Recaptured(recaptures);
+  for (auto& [key, exec] : graphs_) {
+    ForgetGraphMemcpyNodes(key);
+    (void)hipGraphExecDestroy(exec);
   }
+  graphs_.clear();
+  warmed_.clear();
+  g_trim_counters.Rows(rollback_depth_ - depth);
   for (auto row = depth; row < rollback_depth_; ++row) {
+    ForgetAllocation(rollback_allocations_[row], GUFO_SITE);
     (void)hipFree(rollback_allocations_[row]);
     for (auto& layer : linear_) {
       layer.conv_snapshots.rows[row] = nullptr;
@@ -238,19 +367,19 @@ void Session::Reset() {
   const Config& c = owner_->config();
   for (auto& l : linear_) {
     if (l.state != nullptr) {
-      (void)hipMemset(l.conv_state, 0,
-                      static_cast<std::size_t>(c.ssm_conv_kernel - 1) *
-                          c.SsmConvChannels() * sizeof(float));
-      (void)hipMemset(l.state, 0,
-                      static_cast<std::size_t>(c.ssm_num_v_heads) *
-                          c.ssm_head_dim * c.ssm_head_dim * sizeof(float));
+      (void)GuardedMemset(GUFO_SITE, l.conv_state, 0,
+                          static_cast<std::size_t>(c.ssm_conv_kernel - 1) *
+                              c.SsmConvChannels() * sizeof(float));
+      (void)GuardedMemset(GUFO_SITE, l.state, 0,
+                          static_cast<std::size_t>(c.ssm_num_v_heads) *
+                              c.ssm_head_dim * c.ssm_head_dim * sizeof(float));
     }
   }
   blocks_ = 0;
   if (ple_history_ != nullptr) {
-    (void)hipMemset(ple_history_, 0,
-                    static_cast<std::size_t>(c.PleConvHistory()) * c.HcDim() *
-                        sizeof(float));
+    (void)GuardedMemset(GUFO_SITE, ple_history_, 0,
+                        static_cast<std::size_t>(c.PleConvHistory()) *
+                            c.HcDim() * sizeof(float));
   }
 }
 
@@ -260,20 +389,27 @@ Executor::~Executor() {
   if (ple_pending_) {
     (void)ngram_->WaitRead();
   }
+  ForgetAllocation(batch_logits_);
   (void)hipFree(batch_logits_);
+  ForgetAllocation(batch_gdn_host_);
   (void)hipHostFree(batch_gdn_host_);
+  ForgetAllocation(batch_controls_);
   (void)hipHostFree(batch_controls_);
+  ForgetAllocation(batch_candidates_host_);
   (void)hipHostFree(batch_candidates_host_);
   for (void* p : allocations_) {
+    ForgetAllocation(p);
     (void)hipFree(p);
   }
   for (void* p :
-       {static_cast<void*>(host_emb_), static_cast<void*>(control_host_),
+       {static_cast<void*>(host_emb_), static_cast<void*>(host_emb_ahead_),
+        static_cast<void*>(control_host_),
         static_cast<void*>(tokens_host_), static_cast<void*>(logits_host_),
         static_cast<void*>(mtp_token_host_), static_cast<void*>(counts_host_),
         static_cast<void*>(mtp_candidates_host_),
         static_cast<void*>(tiles_host_)}) {
     if (p != nullptr) {
+      ForgetAllocation(p);
       (void)hipHostFree(p);
     }
   }
@@ -292,6 +428,11 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
                                            NgramTable* ngram, Options options,
                                            std::string* error_msg) {
   std::unique_ptr<Executor> e(new Executor());
+  // Snapshot copies bypassed the guard entirely until now, so the one place
+  // that knows the registry hands it over.
+  gufo::hip::SnapshotTransfer::SetRangeCheck(&CheckDeviceRange);
+  gufo::hip::SnapshotTransfer::SetAllocRecord(&RecordAllocationSite);
+  gufo::hip::SnapshotTransfer::SetAllocForget(&ForgetAllocation);
   e->model_ = &model;
   e->ngram_ = ngram;
   e->options_ = options;
@@ -330,6 +471,15 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   auto f32 = [&](std::size_t n) { return Alloc<float>(a, n, error_msg); };
   s.tokens = Alloc<std::int32_t>(a, T, error_msg);
   s.x_half = Alloc<std::uint16_t>(a, T * model.max_half_cols(), error_msg);
+  s.half_capacity = s.x_half != nullptr ? T * model.max_half_cols() : 0;
+  // Wide batches expand one dense Q4_K/Q5_K/Q5_1 matrix at a time. The output
+  // head is larger than any trunk projection but never runs a wide batch.
+  if (const std::size_t n =
+          std::min(model.max_dequant_elems(), kDequantHalfMaxElems);
+      n > 0) {
+    s.w_half = Alloc<std::uint16_t>(a, n, error_msg);
+    s.w_half_capacity = s.w_half != nullptr ? n : 0;
+  }
   for (void*& slot : s.x_q8) {
     slot = Alloc<std::uint8_t>(
         a,
@@ -390,15 +540,27 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     s.ple_history_scratch =
         f32(static_cast<std::size_t>(c.PleConvHistory()) * hc_dim);
     void* pinned = nullptr;
-    if (!Check(hipHostMalloc(&pinned, T * c.PleEmbeddingDim() * sizeof(float)),
+    if (!Check(GuardedHostMalloc(GUFO_SITE, &pinned,
+                                 T * c.PleEmbeddingDim() * sizeof(float)),
                "pinned n-gram buffer", error_msg)) {
       return nullptr;
     }
     e->host_emb_ = static_cast<float*>(pinned);
+    e->ple_src_ = e->host_emb_;
+    void* ahead = nullptr;
+    if (!Check(GuardedHostMalloc(GUFO_SITE, &ahead,
+                                 T * c.PleEmbeddingDim() * sizeof(float)),
+               "pinned n-gram lookahead buffer", error_msg)) {
+      return nullptr;
+    }
+    e->host_emb_ahead_ = static_cast<float*>(ahead);
     e->host_rows_.resize(T * c.ple_heads);
   }
   s.router = f32(T * (c.num_experts + 1));
   s.ids = Alloc<std::int32_t>(a, slots, error_msg);
+  // The vector kernel reads one expert id per token row, so a dense call
+  // needs a zero id for every row it can be given (Dense slices by T).
+  s.dense_ids = Alloc<std::int32_t>(a, T, error_msg);
   s.expert_counts = Alloc<std::uint32_t>(a, c.num_experts, error_msg);
   {
     const std::size_t compact = RoutedCompactRows(slots, c.num_experts);
@@ -423,25 +585,28 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     void* control = nullptr;
     void* tokens = nullptr;
     void* logits = nullptr;
-    if (!Check(hipHostMalloc(&control, sizeof(Session::Control)),
+    if (!Check(GuardedHostMalloc(GUFO_SITE, &control, sizeof(Session::Control)),
                "pinned control buffer", error_msg) ||
-        !Check(hipHostMalloc(&tokens, T * sizeof(std::int32_t)),
+        !Check(GuardedHostMalloc(GUFO_SITE, &tokens, T * sizeof(std::int32_t)),
                "pinned token buffer", error_msg) ||
-        !Check(hipHostMalloc(&logits, static_cast<std::size_t>(
-                                          e->options_.max_logit_rows) *
-                                          c.vocab_size * sizeof(float)),
+        !Check(GuardedHostMalloc(
+                   GUFO_SITE, &logits,
+                   static_cast<std::size_t>(e->options_.max_logit_rows) *
+                       c.vocab_size * sizeof(float)),
                "pinned logits buffer", error_msg)) {
       return nullptr;
     }
     void* counts = nullptr;
-    if (!Check(hipHostMalloc(&counts, c.num_experts * sizeof(std::uint32_t)),
+    if (!Check(GuardedHostMalloc(GUFO_SITE, &counts,
+                                 c.num_experts * sizeof(std::uint32_t)),
                "pinned expert counts", error_msg)) {
       return nullptr;
     }
     e->counts_host_ = static_cast<std::uint32_t*>(counts);
     void* tiles = nullptr;
-    if (!Check(hipHostMalloc(&tiles, 3 * RoutedTileCapacity(slots, c) *
-                                         sizeof(std::int32_t)),
+    if (!Check(GuardedHostMalloc(
+                   GUFO_SITE, &tiles,
+                   3 * RoutedTileCapacity(slots, c) * sizeof(std::int32_t)),
                "pinned routed tile map", error_msg)) {
       return nullptr;
     }
@@ -452,10 +617,26 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   }
   // The wide mixer route (F16 norm for the epilogue, tiled Q8 norm for the
   // W8A8 down projection) needs the four-stream geometry, 32-wide blocks and
-  // a Q8_0 down projection.
+  // a Q8_0 down projection, or a Q5_1 one, which reads the F16 norm through
+  // an expanded copy.
   e->wide_mixer_ = c.hc_count == 4 && c.hidden_size % 32 == 0 &&
                    !model.layers().empty() &&
-                   model.layers()[0].hc_ffn.down.type == GgmlType::kQ8_0;
+                   (model.layers()[0].hc_ffn.down.type == GgmlType::kQ8_0 ||
+                    model.layers()[0].hc_ffn.down.type == GgmlType::kQ5_1);
+  const char* mtp_vocab = std::getenv("GUFO_MTP_VOCAB");
+  constexpr int kDefaultMtpVocab = 131072;
+  const int mtp_vocab_rows =
+      mtp_vocab != nullptr ? std::atoi(mtp_vocab) : kDefaultMtpVocab;
+  if (mtp_vocab_rows > 0) {
+    constexpr std::uint32_t kTailBase = 248044;  // first special token id
+    const auto rows = static_cast<std::uint32_t>(mtp_vocab_rows);
+    const std::uint32_t vocab = c.vocab_size;
+    if (vocab > kTailBase && rows % 256 == 0 && rows + 512 < kTailBase) {
+      e->mtp_head_rows_ = rows;
+      e->mtp_tail_base_ = kTailBase;
+      e->mtp_tail_rows_ = vocab - kTailBase;
+    }
+  }
   if (model.has_mtp()) {
     // The trunk's kept rows are session-owned. Its transient residual and
     // mixer buffers are free while MTP constructs its input. The split
@@ -472,11 +653,12 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     // Final selection consumes intermediate IDs before writing its scores.
     // Pack those scores behind the 64 returned IDs for one host transfer.
     s.mtp_scores = reinterpret_cast<float*>(s.mtp_ids + kMtpCandidates);
-    if (!Check(hipHostMalloc(&e->mtp_token_host_, sizeof(std::int32_t)),
+    if (!Check(GuardedHostMalloc(GUFO_SITE, &e->mtp_token_host_,
+                                 sizeof(std::int32_t)),
                "pinned draft token", error_msg) ||
-        !Check(
-            hipHostMalloc(&e->mtp_candidates_host_, sizeof(MtpCandidateLogits)),
-            "pinned draft candidates", error_msg)) {
+        !Check(GuardedHostMalloc(GUFO_SITE, &e->mtp_candidates_host_,
+                                 sizeof(MtpCandidateLogits)),
+               "pinned draft candidates", error_msg)) {
       return nullptr;
     }
     std::construct_at(e->mtp_candidates_host_);
@@ -577,6 +759,8 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
   if (!Check(hipDeviceSynchronize(), "session init", error_msg)) {
     return nullptr;
   }
+  std::fprintf(stderr, "[qwen38] prefill_tile=%u session_scratch_bytes=%zu\n",
+               options_.max_batch, s->allocated_bytes_);
   return s;
 }
 
@@ -597,15 +781,25 @@ bool Executor::EnsureRollback(Session& session, std::uint32_t depth,
       c.num_layers - c.num_layers / c.full_attention_interval;
   const std::size_t ple =
       c.ple_layer >= 0 ? std::size_t{c.PleConvHistory()} * c.HcDim() : 0;
-  session.rollback_allocations_.reserve(depth);
-  session.ngram_snapshots_.resize(depth);
-  for (auto row = session.rollback_depth_; row < depth; ++row) {
+  // Never-free mode reaches full depth on the first request, so a later trim
+  // can never shorten the row array a graph was captured against. Both the row
+  // allocations and the host-side row arrays must be sized from this, or
+  // ngram_snapshots_ ends up shorter than the rows it is indexed by.
+  const auto target =
+      KeepRollbackRows()
+          ? std::min<std::size_t>(options_.max_speculative - 1,
+                                  std::size(session.ple_snapshots_.rows))
+          : depth;
+  session.rollback_allocations_.reserve(target);
+  session.ngram_snapshots_.resize(target);
+  for (auto row = session.rollback_depth_; row < target; ++row) {
     const auto state = GdnRollbackRowFloats(row, c.ssm_num_k_heads,
                                             c.ssm_num_v_heads, c.ssm_head_dim);
     const auto bytes = (linear * (conv + state) + ple) * sizeof(float);
     float* allocation = nullptr;
     if (!Check(hipMalloc(&allocation, bytes), "rollback allocation", error_msg))
       return false;
+    RecordAllocation("rollback", allocation, bytes);
     session.rollback_allocations_.push_back(allocation);
     session.rollback_bytes_ += bytes;
     auto* next = allocation;
@@ -786,15 +980,37 @@ void Executor::PrepareHalfInput(const float* x, std::uint32_t rows,
     return;
   }
   NarrowActivations(x, s_.x_half, false, static_cast<std::size_t>(rows) * cols,
-                    stream_);
+                    s_.half_capacity, "executor.cpp:794", "hc-mix", "x", rows,
+                    cols, stream_);
   half_src_ = x;
   half_rows_ = rows;
   half_cols_ = cols;
   half_bf16_ = false;
 }
 
+bool Executor::Expandable(const DeviceTensor& w) const {
+  return (w.type == GgmlType::kQ4_K || w.type == GgmlType::kQ5_K ||
+          w.type == GgmlType::kQ5_1) &&
+         static_cast<std::size_t>(w.rows) * w.cols <= s_.w_half_capacity &&
+         w.cols <= model_->max_half_cols();
+}
+
+const __half* Executor::ExpandHalf(const DeviceTensor& w) const {
+  auto* half = static_cast<__half*>(s_.w_half);
+  return Expandable(w) &&
+                 DequantizeHalf(w.data, w.type, half,
+                                static_cast<std::size_t>(w.rows) * w.cols,
+                                stream_)
+             ? half
+             : nullptr;
+}
+
 bool Executor::DenseF16Route(const DeviceTensor& w,
                              std::uint32_t n_tokens) const {
+  // Q8_0 only. The row-wise F16 GEMM narrows its weights through NarrowKernel,
+  // which reads float32 input, so a K-quant tensor faults with an illegal
+  // memory access rather than merely losing precision. K-quant dense weights
+  // take the MMVQ route instead.
   return w.type == GgmlType::kQ8_0 && MatrixRows(n_tokens) &&
          w.rows >= kDenseF16MinRows && w.cols <= kDenseF16MaxCols &&
          w.cols <= model_->max_half_cols();
@@ -845,7 +1061,81 @@ bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
     }
     return true;
   }
-  if (!MatrixRows(n_tokens)) {
+  // Any type the half and small-matrix paths cannot read goes through the
+  // quantized vector kernel, one token slice at a time. This covers both the
+  // decode width (which would otherwise reach SmallGemm, whose RowElement is
+  // hand-written per type) and the wide batch (which would otherwise reach the
+  // HIP_R_16F GEMM). Both reinterpret weight bytes and overrun the buffer.
+  if (!HalfGemmable(w.type)) {
+    // Verify-width batches read each weight row once for all their tokens
+    // rather than once per token.
+    if (n_tokens > 1 && n_tokens <= kVecBatch && DenseVecType(w.type)) {
+      if (qfn_mmq_dense_vec(static_cast<int>(w.type), w.data, x, out,
+                            static_cast<int>(w.rows), static_cast<int>(w.cols),
+                            static_cast<int>(n_tokens), stream_) != 0) {
+        AssignError(error_msg, "quantized dense projection failed");
+        return false;
+      }
+      return true;
+    }
+    // Wide batches expand the matrix to F16 once and take hipBLASLt; the
+    // expansion reproduces the CPU reference's values bit for bit.
+    if (const __half* weights =
+            MatrixRows(n_tokens) ? ExpandHalf(w) : nullptr) {
+      const std::uint32_t piece =
+          static_cast<std::uint32_t>(options_.max_batch);
+      for (std::uint32_t r0 = 0; r0 < n_tokens; r0 += piece) {
+        const std::uint32_t rows = std::min(piece, n_tokens - r0);
+        PrepareHalfInput(x + static_cast<std::size_t>(r0) * w.cols, rows,
+                         w.cols);
+        if (!DenseHalfWeightGemm(weights, static_cast<const __half*>(s_.x_half),
+                                 out + static_cast<std::size_t>(r0) * w.rows,
+                                 rows, w.rows, w.cols, stream_)) {
+          AssignError(error_msg, "dequantized F16 GEMM failed");
+          return false;
+        }
+      }
+      return true;
+    }
+    const std::uint32_t piece = static_cast<std::uint32_t>(options_.max_batch);
+    for (std::uint32_t r0 = 0; r0 < n_tokens; r0 += piece) {
+      const auto rows = std::min(piece, n_tokens - r0);
+      if (qfn_mmq_moe_vec(
+              static_cast<int>(w.type), w.data,
+              x + static_cast<std::size_t>(r0) * w.cols, s_.dense_ids,
+              out + static_cast<std::size_t>(r0) * w.rows,
+              static_cast<int>(w.rows), static_cast<int>(w.cols),
+              static_cast<int>(rows), 1, 1, stream_, nullptr, nullptr) != 0) {
+        AssignError(error_msg, "quantized dense projection failed");
+        return false;
+      }
+    }
+    return true;
+  }
+  // Q6_K has no tiled dense tier. A decode-width head reads 522 MB of
+  // weights, so it goes through the quantized MoE vector kernel (expert 0)
+  // rather than SmallGemm, whose per-element F32 dequantization runs at a
+  // fraction of memory bandwidth. Wider batches keep the row-wise GEMV.
+  if (w.type == GgmlType::kQ6_K && !MatrixRows(n_tokens)) {
+    if (n_tokens > 1) {
+      if (qfn_mmq_dense_vec(static_cast<int>(w.type), w.data, x, out,
+                            static_cast<int>(w.rows), static_cast<int>(w.cols),
+                            static_cast<int>(n_tokens), stream_) != 0) {
+        AssignError(error_msg, "quantized head projection failed");
+        return false;
+      }
+      return true;
+    }
+    if (qfn_mmq_moe_vec(static_cast<int>(w.type), w.data, x, s_.dense_ids, out,
+                        static_cast<int>(w.rows), static_cast<int>(w.cols),
+                        static_cast<int>(n_tokens), 1, 1, stream_, nullptr,
+                        nullptr) != 0) {
+      AssignError(error_msg, "quantized head projection failed");
+      return false;
+    }
+    return true;
+  }
+  if (!MatrixRows(n_tokens) || w.type == GgmlType::kQ6_K) {
     SmallGemm(w.data, SmallType(w.type), x, out, n_tokens, w.rows, w.cols,
               stream_);
     return true;
@@ -868,16 +1158,40 @@ bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
   }
   const bool bf16 = w.type == GgmlType::kBF16;
   const hipDataType type = bf16 ? HIP_R_16BF : HIP_R_16F;
-  if (!(half_src_ == x && half_rows_ == n_tokens && half_cols_ == w.cols &&
-        half_bf16_ == bf16)) {
-    NarrowActivations(x, s_.x_half, bf16, static_cast<std::size_t>(n) * k,
-                      stream_);
-    half_src_ = x;
-    half_rows_ = n_tokens;
-    half_cols_ = w.cols;
-    half_bf16_ = bf16;
+  // The half buffer holds one batch of activations, so a request wider than
+  // that is fed in slices rather than narrowing past the end of the buffer.
+  // The guard in NarrowActivations is kept: it is what turns a silent
+  // out-of-bounds write into a named abort if this arithmetic is ever wrong.
+  const std::size_t per_row = static_cast<std::size_t>(k);
+  const std::size_t slice_cap = per_row != 0 ? s_.half_capacity / per_row : 0;
+  for (std::uint32_t done = 0; done < n;) {
+    const auto slice = static_cast<std::uint32_t>(
+        std::min<std::size_t>({slice_cap, n - done}));
+    if (slice == 0) {
+      AssignError(error_msg, "half activation buffer is too narrow for K");
+      return false;
+    }
+    const float* const xs = x + static_cast<std::size_t>(done) * per_row;
+    if (!(half_src_ == xs && half_rows_ == slice && half_cols_ == w.cols &&
+          half_bf16_ == bf16)) {
+      NarrowActivations(xs, s_.x_half, bf16,
+                        static_cast<std::size_t>(slice) * per_row,
+                        s_.half_capacity, "executor.cpp:897", "dense-f16", "w",
+                        slice, w.cols, stream_);
+      half_src_ = xs;
+      half_rows_ = slice;
+      half_cols_ = w.cols;
+      half_bf16_ = bf16;
+    }
+    if (!blaslt_->Gemm(
+            w.data, s_.x_half,
+            out + static_cast<std::size_t>(done) * static_cast<std::size_t>(m),
+            type, m, static_cast<int>(slice), k, error_msg)) {
+      return false;
+    }
+    done += slice;
   }
-  return blaslt_->Gemm(w.data, s_.x_half, out, type, m, n, k, error_msg);
+  return true;
 }
 
 void Executor::RoutedHints(const DeviceTensor& w,
@@ -959,10 +1273,11 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   }
   routed_tile_cols_ = qfn_mmq_routed_tile_cols_for_counts(
       counts_host_, static_cast<int>(c.num_experts));
-  return n_tiles == 0 || Check(hipMemcpyAsync(s_.routed_tiles, tiles_host_,
-                                              n_tiles * sizeof(std::int32_t),
-                                              hipMemcpyHostToDevice, stream_),
-                               "routed tile map upload", error_msg);
+  return n_tiles == 0 ||
+         Check(GuardedMemcpyAsync(GUFO_SITE, s_.routed_tiles, tiles_host_,
+                                  n_tiles * sizeof(std::int32_t),
+                                  hipMemcpyHostToDevice, stream_),
+               "routed tile map upload", error_msg);
 }
 
 bool Executor::Experts(const DeviceTensor& w, const float* x,
@@ -1001,6 +1316,17 @@ bool Executor::Experts(const DeviceTensor& w, const float* x,
       case GgmlType::kQ8_0:
         rc = qfn_mmq_q8_0_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
         break;
+      case GgmlType::kIQ3_S:
+        rc = qfn_mmq_iq3_s_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
+        break;
+      case GgmlType::kIQ4_XS:
+        rc =
+            qfn_mmq_iq4_xs_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
+        break;
+      case GgmlType::kIQ4_NL:
+        rc =
+            qfn_mmq_iq4_nl_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
+        break;
       default:
         break;
     }
@@ -1020,7 +1346,8 @@ bool Executor::GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
                           a.cols == b.cols && a.experts == b.experts;
   if (!MatrixRows(n_tokens) && n_used <= 32 && same_shape &&
       (a.type == GgmlType::kQ4_K || a.type == GgmlType::kQ5_K ||
-       a.type == GgmlType::kQ8_0)) {
+       a.type == GgmlType::kQ8_0 || a.type == GgmlType::kIQ3_S ||
+       a.type == GgmlType::kIQ4_XS || a.type == GgmlType::kIQ4_NL)) {
     if (qfn_mmq_moe_gated_vec(
             static_cast<int>(a.type), a.data, b.data, x, ids, out,
             static_cast<int>(a.rows), static_cast<int>(a.cols),
@@ -1110,12 +1437,28 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
   }
   const bool extras = n_tokens <= options_.max_batch &&
                       c.hidden_size <= model_->max_half_cols();
+  // Q5_1 mixers take the same fused route through F16 copies of their
+  // weights; the int8 down kernel only reads Q8_0.
+  const bool half_mixer =
+      m.up.type != GgmlType::kQ8_0 && Expandable(m.up) && Expandable(m.down);
   const bool fused_projection =
       xn_half_ && n_tokens >= 96 && extras && c.hc_count == 4 &&
       c.hidden_size == 2560 && c.hc_low_rank == 320 &&
-      m.up.type == GgmlType::kQ8_0 && m.up.rows == c.HcDim() &&
+      (m.up.type == GgmlType::kQ8_0 || half_mixer) && m.up.rows == c.HcDim() &&
       m.up.cols == c.hc_low_rank;
-  if (fused_projection) {
+  if (fused_projection && half_mixer) {
+    const std::size_t low = static_cast<std::size_t>(n_tokens) * c.hc_low_rank;
+    const __half* down = ExpandHalf(m.down);
+    if (down == nullptr ||
+        !DenseHalfWeightGemm(down, s_.xn_half, s_.lo, n_tokens, m.down.rows,
+                             m.down.cols, stream_)) {
+      AssignError(error_msg, "dequantized HC down projection failed");
+      return false;
+    }
+    SiluScale(s_.lo, 1.0F / static_cast<float>(c.hc_count), low, stream_);
+    NarrowActivations(s_.lo, s_.hc_gate, false, low, low, "executor.cpp:hc",
+                      "hc-mix", "down", n_tokens, c.hc_low_rank, stream_);
+  } else if (fused_projection) {
     // The up projection writes x_half; keep its input in the gate buffer.
     if (!HcDownF16Gemm(m.down.data, s_.xn_q8t,
                        reinterpret_cast<__half*>(s_.hc_gate), n_tokens,
@@ -1124,7 +1467,15 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
       return false;
     }
   } else {
-    if (xn_half_) {
+    if (xn_half_ && m.down.type != GgmlType::kQ8_0) {
+      // The wide route left only F16 and tiled Q8 norms; the generic
+      // projection reads the F32 one.
+      RmsNormRows(res, m.norm.f32(), s_.xn, n_tokens, c.HcDim(), c.hc_count,
+                  c.rms_eps, stream_);
+      if (!Dense(m.down, s_.xn, s_.lo, n_tokens, error_msg)) {
+        return false;
+      }
+    } else if (xn_half_) {
       if (!W8A8Gemm(m.down.data, s_.xn_q8t, s_.lo, n_tokens, m.down.rows,
                     m.down.cols, stream_)) {
         AssignError(error_msg, "W8A8 mixer down projection failed");
@@ -1152,11 +1503,13 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
   half_src_ = nullptr;
   if (xn_half_) {
     if (fused_projection) {
-      if (!HcMixF16Gemm(m.up.data, reinterpret_cast<const __half*>(s_.hc_gate),
+      const void* up = half_mixer ? ExpandHalf(m.up) : m.up.data;
+      if (up == nullptr ||
+          !HcMixF16Gemm(up, reinterpret_cast<const __half*>(s_.hc_gate),
                         s_.xn_half, fused_inject ? m.inject.f32() : nullptr,
                         mixed, static_cast<__half*>(s_.x_half), s_.x_q8t,
-                        inject, n_tokens, c.hidden_size, c.hc_low_rank,
-                        stream_)) {
+                        inject, n_tokens, c.hidden_size, c.hc_low_rank, stream_,
+                        half_mixer)) {
         AssignError(error_msg, "fused HC projection failed");
         return false;
       }
@@ -1208,6 +1561,25 @@ bool Executor::PleFetch(Session& session, std::span<const std::int32_t> tokens,
   }
   const Config& c = config();
   const auto n = static_cast<std::uint32_t>(tokens.size());
+  if (ple_ahead_.valid) {
+    const auto& a = ple_ahead_;
+    const bool match =
+        !speculative && a.owner == &session && a.tokens.size() == tokens.size() &&
+        std::equal(tokens.begin(), tokens.end(), a.tokens.begin()) &&
+        a.before.prev == session.ngram_.prev;
+    ple_ahead_.valid = false;
+    if (match) {
+      // Rows for this chunk were requested while the previous one ran.
+      session.ngram_ = a.after;
+      ple_src_ = a.buffer;
+      ple_pending_ = true;
+      return true;
+    }
+    // A different chunk follows: finish the abandoned read before the table
+    // can start another.
+    (void)ngram_->WaitRead();
+  }
+  ple_src_ = host_emb_;
   // Only proper prefixes need snapshots; the full batch keeps its live state.
   if (speculative) {
     for (std::uint32_t i = 0; i < n; ++i) {
@@ -1232,6 +1604,33 @@ bool Executor::PleFetch(Session& session, std::span<const std::int32_t> tokens,
   return ple_pending_;
 }
 
+void Executor::StartPleAhead(Session& session) const {
+  const auto next = ple_lookahead_;
+  ple_lookahead_ = {};
+  const Config& c = config();
+  if (next.empty() || next.size() > options_.max_batch || ple_pending_ ||
+      ple_ahead_.valid || host_emb_ahead_ == nullptr) {
+    return;
+  }
+  NgramHistory after = session.ngram_;
+  HashNgramRows(c, after, next,
+                std::span<std::uint32_t>(host_rows_.data(),
+                                         next.size() * c.ple_heads));
+  float* target = ple_src_ == host_emb_ ? host_emb_ahead_ : host_emb_;
+  if (!ngram_->StartRead(
+          std::span<const std::uint32_t>(host_rows_.data(),
+                                         next.size() * c.ple_heads),
+          std::span<float>(target, next.size() * c.PleEmbeddingDim()))) {
+    return;
+  }
+  ple_ahead_.valid = true;
+  ple_ahead_.owner = &session;
+  ple_ahead_.tokens.assign(next.begin(), next.end());
+  ple_ahead_.before = session.ngram_;
+  ple_ahead_.after = after;
+  ple_ahead_.buffer = target;
+}
+
 bool Executor::WaitPle(std::string* error_msg) const {
   const bool ok = ple_pending_ && ngram_->WaitRead();
   ple_pending_ = false;
@@ -1249,11 +1648,14 @@ bool Executor::Ple(const DeviceLayer& l, Session& session, std::uint32_t n,
       static_cast<std::size_t>(n) * c.PleEmbeddingDim();
   if (!embeddings_ready &&
       (!WaitPle(error_msg) ||
-       !Check(hipMemcpyAsync(s_.ple_emb, host_emb_, emb_count * sizeof(float),
-                             hipMemcpyHostToDevice, stream_),
+       !Check(GuardedMemcpyAsync(GUFO_SITE, s_.ple_emb, ple_src_,
+                                 emb_count * sizeof(float),
+                                 hipMemcpyHostToDevice, stream_),
               "n-gram upload", error_msg))) {
     return false;
   }
+  if (!embeddings_ready)
+    StartPleAhead(session);
   const std::uint32_t hc_dim = c.HcDim();
   Q8Input emb;
   if (!Quantize(s_.ple_emb, n, c.PleEmbeddingDim(), &emb, error_msg) ||
@@ -1300,6 +1702,14 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
           l.ssm_in.data, static_cast<const __half*>(s_.x_half),
           l.ssm_conv1d.f32(), s.conv_state, s_.qkvz, s_.conv_scratch, n_tokens,
           l.ssm_in.rows, l.ssm_in.cols, channels, c.ssm_conv_kernel, stream_);
+    } else if (!projections_ready && !speculative && n_tokens >= 1024 &&
+               n_tokens <= options_.max_batch && Expandable(l.ssm_in)) {
+      const __half* weights = ExpandHalf(l.ssm_in);
+      PrepareHalfInput(x, n_tokens, l.ssm_in.cols);
+      convolved = DenseF16SsmGemm(
+          weights, static_cast<const __half*>(s_.x_half), l.ssm_conv1d.f32(),
+          s.conv_state, s_.qkvz, s_.conv_scratch, n_tokens, l.ssm_in.rows,
+          l.ssm_in.cols, channels, c.ssm_conv_kernel, stream_, true);
     }
     if (!projections_ready && !convolved &&
         !Dense(l.ssm_in, x, s_.qkvz, n_tokens, error_msg)) {
@@ -1326,10 +1736,21 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
   const bool tiled = MatrixRows(n_tokens) &&
                      l.ssm_out.type == GgmlType::kQ8_0 &&
                      n_tokens <= options_.max_batch;
+  const bool expand_out = MatrixRows(n_tokens) &&
+                          n_tokens <= options_.max_batch &&
+                          Expandable(l.ssm_out);
   const bool half_output =
-      tiled && l.ssm_out.rows == 2560 && l.ssm_out.cols == 6144;
+      (tiled || expand_out) && l.ssm_out.rows == 2560 && l.ssm_out.cols == 6144;
   auto* out_half =
       half_output ? reinterpret_cast<__half*>(s_.gdn_out) : nullptr;
+  // The F16 rows feed a K = 6144 projection: their 12,288 B pitch is a
+  // multiple of 4 KiB, so the 128 token rows of a tile all fetch from one
+  // memory channel. Padding the pitch by 256 B cuts that projection by a third.
+  constexpr std::uint32_t kGdnOutPadHalves = 128;
+  const std::uint32_t out_pitch =
+      half_output
+          ? static_cast<std::uint32_t>(l.ssm_out.cols) + kGdnOutPadHalves
+          : 0;
   GatedDeltaNet(qkv, qkv_stride, z, z_stride, s_.alpha_beta, l.ssm_conv1d.f32(),
                 l.ssm_a.f32(), l.ssm_dt.f32(), l.ssm_norm.f32(), s.conv_state,
                 s_.conv_scratch, s_.qn, s_.kn, s_.gdn_raw, s.state, s_.gdn_out,
@@ -1338,13 +1759,23 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                 speculative ? s.conv_snapshots : RollbackRows{}, n_tokens,
                 c.ssm_num_k_heads, c.ssm_num_v_heads, c.ssm_head_dim,
                 c.ssm_conv_kernel, MatrixRows(n_tokens) && !speculative,
-                convolved, c.rms_eps, stream_, out_half);
+                convolved, c.rms_eps, stream_, out_half, out_pitch);
   if (!project_output) {
+    return true;
+  }
+  if (half_output && expand_out) {
+    const __half* weights = ExpandHalf(l.ssm_out);
+    if (weights == nullptr ||
+        !DenseHalfWeightGemm(weights, out_half, out, n_tokens, l.ssm_out.rows,
+                             l.ssm_out.cols, stream_, out_pitch)) {
+      AssignError(error_msg, "SSM output dequantized F16 GEMM failed");
+      return false;
+    }
     return true;
   }
   if (half_output) {
     if (!DenseF16Gemm(l.ssm_out.data, out_half, out, n_tokens, l.ssm_out.rows,
-                      l.ssm_out.cols, stream_)) {
+                      l.ssm_out.cols, stream_, out_pitch)) {
       AssignError(error_msg, "SSM output F16 GEMM failed");
       return false;
     }
@@ -1378,17 +1809,19 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   if (!l.attn_qkv.empty()) {
     const bool fused_projection =
         !projections_ready && n_tokens >= 1024 &&
-        n_tokens <= options_.max_batch && DenseF16Route(l.attn_qkv, n_tokens) &&
+        n_tokens <= options_.max_batch &&
+        (DenseF16Route(l.attn_qkv, n_tokens) || Expandable(l.attn_qkv)) &&
         l.attn_qkv.rows == 13312 && l.attn_qkv.cols == 2560 &&
         c.num_heads == 24 && c.num_kv_heads == 2 && c.head_dim == 256 &&
         c.rotary_dim == 64;
-    if (fused_projection) {
+    const bool expand = fused_projection && Expandable(l.attn_qkv);
+    if (fused_projection && (expand || HalfGemmable(l.attn_qkv.type))) {
+      const void* weights = expand ? ExpandHalf(l.attn_qkv) : l.attn_qkv.data;
       PrepareHalfInput(x, n_tokens, l.attn_qkv.cols);
       prepared = AttentionF16Gemm(
-          l.attn_qkv.data, static_cast<const __half*>(s_.x_half),
-          l.attn_q_norm.f32(), l.attn_k_norm.f32(), s_.q, s_.attn_gate,
-          s.k_cache, s.v_cache, n_tokens, pos, c.rope_theta, c.rms_eps, stream_,
-          s.rope);
+          weights, static_cast<const __half*>(s_.x_half), l.attn_q_norm.f32(),
+          l.attn_k_norm.f32(), s_.q, s_.attn_gate, s.k_cache, s.v_cache,
+          n_tokens, pos, c.rope_theta, c.rms_eps, stream_, s.rope, expand);
       if (!prepared) {
         AssignError(error_msg, "fused attention projection failed");
         return false;
@@ -1480,11 +1913,12 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   // Wide batches run the fused WMMA kernel (never inside a graph: the kv
   // extent is a host value), output gate included, skipping the key tiles
   // no query of a block selected; the per-token kernel covers the rest.
-  if (last_only && !Check(hipMemsetAsync(s_.ctx, 0,
-                                         static_cast<std::size_t>(n_tokens) *
-                                             c.AttentionQDim() * sizeof(float),
-                                         stream_),
-                          "draft attention output initialization", error_msg)) {
+  if (last_only &&
+      !Check(GuardedMemsetAsync(GUFO_SITE, s_.ctx, 0,
+                                static_cast<std::size_t>(n_tokens) *
+                                    c.AttentionQDim() * sizeof(float),
+                                stream_),
+             "draft attention output initialization", error_msg)) {
     return false;
   }
   if (MatrixRows(n_tokens) &&
@@ -1521,9 +1955,9 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   if (ExpertMatrixRows(n_tokens)) {
     ExpertCounts(s_.ids, s_.expert_counts, n_tokens, c.num_experts, used,
                  stream_);
-    if (!Check(hipMemcpyAsync(counts_host_, s_.expert_counts,
-                              c.num_experts * sizeof(std::uint32_t),
-                              hipMemcpyDeviceToHost, stream_),
+    if (!Check(GuardedMemcpyAsync(GUFO_SITE, counts_host_, s_.expert_counts,
+                                  c.num_experts * sizeof(std::uint32_t),
+                                  hipMemcpyDeviceToHost, stream_),
                "expert counts download", error_msg) ||
         !Check(hipEventRecord(counts_ready_, stream_), "expert counts event",
                error_msg)) {
@@ -1586,10 +2020,12 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
   // F16 matrix-core GEMM per (expert, row tile).
   const bool wmma_experts = ExpertMatrixRows(n_tokens) &&
                             (l.ffn_gate_exps.type == GgmlType::kQ4_K ||
-                             l.ffn_gate_exps.type == GgmlType::kQ5_K) &&
+                             l.ffn_gate_exps.type == GgmlType::kQ5_K ||
+                             l.ffn_gate_exps.type == GgmlType::kIQ3_S) &&
                             l.ffn_up_exps.type == l.ffn_gate_exps.type &&
                             (l.ffn_down_exps.type == GgmlType::kQ5_1 ||
-                             l.ffn_down_exps.type == GgmlType::kQ8_0) &&
+                             l.ffn_down_exps.type == GgmlType::kQ8_0 ||
+                             l.ffn_down_exps.type == GgmlType::kIQ4_NL) &&
                             c.hidden_size % 256 == 0 && c.expert_ff % 64 == 0;
   if (wmma_experts) {
     RoutedCompact(s_.ids, s_.expert_counts, s_.routed_bounds, s_.routed_cursors,
@@ -1601,7 +2037,8 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
           half_cols_ == c.hidden_size && !half_bf16_)) {
       NarrowActivations(x, s_.x_half, false,
                         static_cast<std::size_t>(n_tokens) * c.hidden_size,
-                        stream_);
+                        s_.half_capacity, "executor.cpp:1644", "routed", "x",
+                        n_tokens, c.hidden_size, stream_);
       half_src_ = x;
       half_rows_ = n_tokens;
       half_cols_ = c.hidden_size;
@@ -1611,46 +2048,72 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     // Large batches pair the gate/up projections and apply SwiGLU without
     // materializing the gate. Smaller buckets favor separate projections.
     auto* up_half = reinterpret_cast<__half*>(s_.up_e);
-    const WeightType gate_type = l.ffn_gate_exps.type == GgmlType::kQ5_K
-                                     ? WeightType::kQ5_K
-                                     : WeightType::kQ4_K;
+    const WeightType gate_type =
+        l.ffn_gate_exps.type == GgmlType::kQ5_K    ? WeightType::kQ5_K
+        : l.ffn_gate_exps.type == GgmlType::kIQ3_S ? WeightType::kIQ3_S
+                                                   : WeightType::kQ4_K;
+    // The paired gate/up kernel caches whole K-quant superblocks; IQ3_S
+    // runs the two projections separately.
+    // IQ3_S decodes its codebook per tile, so wide batches take the
+    // 128-token map when it exists.
+    const bool wide_gate_up =
+        gate_type == WeightType::kIQ3_S && routed_tile_rows_ == 48 &&
+        routed_pair_rows_ == 128 && routed_pair_tiles_ != 0;
+    const std::int32_t* gate_up_tiles =
+        s_.routed_tiles + (wide_gate_up ? routed_pair_offset_ : 0);
+    const std::uint32_t gate_up_n_tiles =
+        wide_gate_up ? routed_pair_tiles_ : routed_n_tiles_;
+    const std::uint32_t gate_up_rows = wide_gate_up ? 128 : routed_tile_rows_;
     const bool gated_ok =
-        n_tokens >= 1024 && routed_tile_rows_ == 48
+        n_tokens >= 1024 && routed_tile_rows_ == 48 &&
+                (gate_type != WeightType::kIQ3_S || wide_gate_up)
             ? RoutedGatedF16Gemm(
                   l.ffn_gate_exps.data, l.ffn_up_exps.data, gate_type, x_half,
                   s_.routed_tiles + routed_pair_offset_, routed_pair_tiles_,
                   routed_pair_rows_, s_.routed_bounds, s_.rows_token,
                   s_.rows_slot, up_half, c.expert_ff, c.hidden_size, stream_)
             : (RoutedF16Gemm(l.ffn_gate_exps.data, gate_type, x_half,
-                             s_.routed_tiles, routed_n_tiles_,
-                             routed_tile_rows_, s_.routed_bounds, s_.rows_token,
-                             s_.rows_slot, nullptr, s_.gate_e, nullptr,
-                             c.expert_ff, c.hidden_size, stream_) &&
+                             gate_up_tiles, gate_up_n_tiles, gate_up_rows,
+                             s_.routed_bounds, s_.rows_token, s_.rows_slot,
+                             nullptr, s_.gate_e, nullptr, c.expert_ff,
+                             c.hidden_size, stream_) &&
                RoutedF16Gemm(l.ffn_up_exps.data, gate_type, x_half,
-                             s_.routed_tiles, routed_n_tiles_,
-                             routed_tile_rows_, s_.routed_bounds, s_.rows_token,
-                             s_.rows_slot, s_.gate_e, nullptr, up_half,
-                             c.expert_ff, c.hidden_size, stream_));
+                             gate_up_tiles, gate_up_n_tiles, gate_up_rows,
+                             s_.routed_bounds, s_.rows_token, s_.rows_slot,
+                             s_.gate_e, nullptr, up_half, c.expert_ff,
+                             c.hidden_size, stream_));
     if (!gated_ok) {
       AssignError(error_msg, "routed F16 gate/up GEMM failed");
       return false;
     }
-    const WeightType down_type = l.ffn_down_exps.type == GgmlType::kQ8_0
-                                     ? WeightType::kQ8_0
-                                     : WeightType::kQ5_1;
+    const WeightType down_type =
+        l.ffn_down_exps.type == GgmlType::kQ8_0     ? WeightType::kQ8_0
+        : l.ffn_down_exps.type == GgmlType::kIQ4_NL ? WeightType::kIQ4_NL
+                                                    : WeightType::kQ5_1;
     // Larger down tiles amortize weight decoding. Reuse the 64-token map
     // when it has no more padded rows than the 48-token map.
     const bool wide_down =
-        (down_type == WeightType::kQ5_1 || down_type == WeightType::kQ8_0) &&
+        (down_type == WeightType::kQ5_1 || down_type == WeightType::kQ8_0 ||
+         down_type == WeightType::kIQ4_NL) &&
         routed_tile_rows_ == 48 && routed_64_tiles_ != 0 &&
         routed_64_tiles_ * 4 <= routed_n_tiles_ * 3;
     // The down projection's rows are F16 too: the epilogue reads half the
     // bytes of the largest routed intermediate.
-    if (!RoutedF16Gemm(l.ffn_down_exps.data, down_type, up_half,
-                       s_.routed_tiles + (wide_down ? routed_n_tiles_ : 0),
-                       wide_down ? routed_64_tiles_ : routed_n_tiles_,
-                       wide_down ? 64 : routed_tile_rows_, s_.routed_bounds,
-                       s_.rows_slot, s_.rows_slot, nullptr, nullptr,
+    const bool down_128 = down_type == WeightType::kIQ4_NL &&
+                          routed_tile_rows_ == 48 && routed_pair_rows_ == 128 &&
+                          routed_pair_tiles_ != 0;
+    const std::int32_t* down_tiles =
+        s_.routed_tiles + (down_128    ? routed_pair_offset_
+                           : wide_down ? routed_n_tiles_
+                                       : 0);
+    const std::uint32_t down_n_tiles = down_128    ? routed_pair_tiles_
+                                       : wide_down ? routed_64_tiles_
+                                                   : routed_n_tiles_;
+    const std::uint32_t down_rows =
+        down_128 ? 128 : (wide_down ? 64 : routed_tile_rows_);
+    if (!RoutedF16Gemm(l.ffn_down_exps.data, down_type, up_half, down_tiles,
+                       down_n_tiles, down_rows, s_.routed_bounds, s_.rows_slot,
+                       s_.rows_slot, nullptr, nullptr,
                        reinterpret_cast<__half*>(s_.down_e), c.hidden_size,
                        c.expert_ff, stream_)) {
       AssignError(error_msg, "routed F16 down GEMM failed");
@@ -1698,9 +2161,9 @@ bool Executor::CopyTrunkHidden(const Session& session, std::span<float> hidden,
     AssignError(error_msg, "invalid trunk hidden diagnostic input");
     return false;
   }
-  return Check(hipMemcpyAsync(hidden.data(), session.mtp_.target_hidden,
-                              hidden.size_bytes(), hipMemcpyDeviceToHost,
-                              stream_),
+  return Check(GuardedMemcpyAsync(
+                   GUFO_SITE, hidden.data(), session.mtp_.target_hidden,
+                   hidden.size_bytes(), hipMemcpyDeviceToHost, stream_),
                "trunk hidden download", error_msg) &&
          Check(hipStreamSynchronize(stream_), "trunk hidden", error_msg);
 }
@@ -1708,30 +2171,52 @@ bool Executor::CopyTrunkHidden(const Session& session, std::span<float> hidden,
 bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
                        bool candidates, std::string* error_msg) const {
   const DeviceTensor& output = model_->output();
-  if (!HcMix(head, res, false, s_.mixed, nullptr, 1, error_msg) ||
-      !Dense(output, s_.mixed, s_.logits, 1, error_msg)) {
+  if (!HcMix(head, res, false, s_.mixed, nullptr, 1, error_msg)) {
+    return false;
+  }
+  std::uint32_t head_rows = output.rows;
+  std::size_t row_bytes = 0;
+  if (mtp_head_rows_ != 0) {
+    if (output.type == core::GgmlType::kQ6_K && output.cols % 256 == 0)
+      row_bytes = std::size_t{output.cols} / 256 * 210;
+    else if (output.type == core::GgmlType::kQ8_0 && output.cols % 32 == 0)
+      row_bytes = std::size_t{output.cols} / 32 * 34;
+  }
+  if (row_bytes != 0) {
+    DeviceTensor first = output;
+    first.rows = mtp_head_rows_;
+    DeviceTensor tail = output;
+    tail.rows = mtp_tail_rows_;
+    tail.data = static_cast<std::uint8_t*>(output.data) +
+                row_bytes * mtp_tail_base_;
+    if (!Dense(first, s_.mixed, s_.logits, 1, error_msg) ||
+        !Dense(tail, s_.mixed, s_.logits + mtp_head_rows_, 1, error_msg)) {
+      return false;
+    }
+    head_rows = mtp_head_rows_ + mtp_tail_rows_;
+  } else if (!Dense(output, s_.mixed, s_.logits, 1, error_msg)) {
     return false;
   }
   if (candidates)
     MtpTopCandidates(s_.logits, s_.mtp_ids, s_.mtp_scratch_ids, s_.mtp_scores,
-                     output.rows, stream_);
+                     head_rows, stream_);
   if (token) {
-    Argmax(s_.logits, s_.mtp_argmax, s_.mtp_token, 1, output.rows, stream_);
-    if (!Check(
-            hipMemcpyAsync(mtp_token_host_, s_.mtp_token, sizeof(std::int32_t),
-                           hipMemcpyDeviceToHost, stream_),
-            "draft token download", error_msg)) {
+    Argmax(s_.logits, s_.mtp_argmax, s_.mtp_token, 1, head_rows, stream_);
+    if (!Check(GuardedMemcpyAsync(GUFO_SITE, mtp_token_host_, s_.mtp_token,
+                                  sizeof(std::int32_t), hipMemcpyDeviceToHost,
+                                  stream_),
+               "draft token download", error_msg)) {
       return false;
     }
   }
   if (candidates) {
-    const auto count = std::min<std::size_t>(output.rows, kMtpCandidates);
+    const auto count = std::min<std::size_t>(head_rows, kMtpCandidates);
     static_assert(offsetof(MtpCandidateLogits, logits) ==
                   kMtpCandidates * sizeof(std::uint32_t));
     const auto bytes =
         offsetof(MtpCandidateLogits, logits) + count * sizeof(float);
-    if (!Check(hipMemcpyAsync(mtp_candidates_host_, s_.mtp_ids, bytes,
-                              hipMemcpyDeviceToHost, stream_),
+    if (!Check(GuardedMemcpyAsync(GUFO_SITE, mtp_candidates_host_, s_.mtp_ids,
+                                  bytes, hipMemcpyDeviceToHost, stream_),
                "draft candidates download", error_msg)) {
       return false;
     }
@@ -1739,18 +2224,60 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
   return true;
 }
 
+namespace {
+
+// GUFO_GRAPH_LOG=1: one line per capture, with running launch/eager counts
+// per pass, so graph use on the verify and draft paths is observable.
+struct GraphLog {
+  bool enabled = [] {
+    const char* v = std::getenv("GUFO_GRAPH_LOG");
+    return v != nullptr && v[0] == '1';
+  }();
+  std::mutex mutex;
+  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> counts;
+
+  void Count(const char* label, bool launched) {
+    if (!enabled)
+      return;
+    const std::lock_guard lock(mutex);
+    auto& [launches, eager] = counts[label];
+    ++(launched ? launches : eager);
+  }
+  void Capture(const char* label, std::uint64_t key) {
+    if (!enabled)
+      return;
+    const std::lock_guard lock(mutex);
+    std::fprintf(stderr, "graph capture label=%s key=0x%llx", label,
+                 static_cast<unsigned long long>(key));
+    for (const auto& [name, c] : counts)
+      std::fprintf(stderr, " %s:launch=%llu,eager=%llu", name.c_str(),
+                   static_cast<unsigned long long>(c.first),
+                   static_cast<unsigned long long>(c.second));
+    std::fprintf(stderr, "\n");
+  }
+};
+GraphLog g_graph_log;
+
+}  // namespace
+
 bool Executor::Run(Session& session, std::uint64_t key, bool graph,
                    const std::function<bool()>& body, std::string* error_msg,
-                   bool synchronize) const {
+                   bool synchronize, const char* label) const {
   // A batch shape runs eagerly once before it is captured: the first pass
   // grows the GEMM tier's arena, which capture forbids.
   if (graph && session.warmed_.contains(key)) {
     hipGraphExec_t exec = nullptr;
+    // A graph is recorded, instantiated and launched for the first time under
+    // one lock, so a snapshot thread cannot be creating device resources while
+    // the runtime is still wiring the new graph up. Replays take no lock.
+    std::unique_lock<std::mutex> first_launch(
+        gufo::hip::SnapshotTransfer::DeviceMutex(), std::defer_lock);
     if (const auto it = session.graphs_.find(key);
         it != session.graphs_.end()) {
       exec = it->second;
     } else {
       hipGraph_t captured = nullptr;
+      first_launch.lock();
       // Frozen peer sessions can copy snapshots on independent nonblocking
       // streams while the scheduler records this session's decode graph.
       if (!Check(
@@ -1770,20 +2297,30 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
       const bool instantiated =
           Check(hipGraphInstantiate(&exec, captured, nullptr, nullptr, 0),
                 "graph instantiate", error_msg);
+      // Only a graph that instantiated will be replayed, so only it keeps the
+      // nodes the free path must not free underneath.
+      if (instantiated)
+        RecordGraphMemcpyNodes(key, captured);
       (void)hipGraphDestroy(captured);
       if (!instantiated) {
         return false;
       }
       session.graphs_.emplace(key, exec);
+      g_graph_log.Capture(label, key);
+      g_trim_counters.Captured();
     }
     if (!Check(hipGraphLaunch(exec, stream_), "graph launch", error_msg)) {
       return false;
     }
+    if (first_launch.owns_lock())
+      first_launch.unlock();
+    g_graph_log.Count(label, true);
   } else {
     if (!body()) {
       return false;
     }
     session.warmed_.insert(key);
+    g_graph_log.Count(label, false);
   }
   return !synchronize ||
          Check(hipStreamSynchronize(stream_), "forward", error_msg);
@@ -1794,6 +2331,14 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
                        std::string* error_msg) const {
   const bool speculative = mode == ForwardMode::kVerify;
   PrefillPhase phase(mode == ForwardMode::kPrefill);
+  // A lookahead belongs to exactly one prefill call.
+  struct LookaheadScope {
+    std::span<const std::int32_t>& ref;
+    ~LookaheadScope() { ref = {}; }
+  } lookahead_scope{ple_lookahead_};
+  if (mode != ForwardMode::kPrefill)
+    ple_lookahead_ = {};
+  SetGuardTokens(tokens.size());
   selected_logits_ = nullptr;
   const Config& c = config();
   const auto n = static_cast<std::uint32_t>(tokens.size());
@@ -1877,7 +2422,8 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
                          graph_pool_grid, 0, first_layer, error_msg);
     };
     constexpr std::uint64_t kPrefixKey = std::uint64_t{1} << 35;
-    if (!Run(session, key | kPrefixKey, graph, prefix, error_msg, false)) {
+    if (!Run(session, key | kPrefixKey, graph, prefix, error_msg, false,
+             speculative ? "verify-prefix" : "decode-prefix")) {
       return false;
     }
   }
@@ -1892,7 +2438,8 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
       !WaitPle(error_msg)) {
     return false;
   }
-  if (!Run(session, key, graph, body, error_msg)) {
+  if (!Run(session, key, graph, body, error_msg, true,
+           speculative ? "verify" : "decode")) {
     return false;
   }
   if (n_logits > 0 && logits != nullptr) {
@@ -1923,12 +2470,13 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                            std::string* error_msg) const {
   const Config& c = config();
   if (first_layer == 0) {
-    if (!Check(hipMemcpyAsync(session.control_, control_host_,
-                              sizeof(Session::Control), hipMemcpyHostToDevice,
-                              stream_),
+    if (!Check(GuardedMemcpyAsync(GUFO_SITE, session.control_, control_host_,
+                                  sizeof(Session::Control),
+                                  hipMemcpyHostToDevice, stream_),
                "control upload", error_msg) ||
-        !Check(hipMemcpyAsync(s_.tokens, tokens_host_, n * sizeof(std::int32_t),
-                              hipMemcpyHostToDevice, stream_),
+        !Check(GuardedMemcpyAsync(GUFO_SITE, s_.tokens, tokens_host_,
+                                  n * sizeof(std::int32_t),
+                                  hipMemcpyHostToDevice, stream_),
                "token upload", error_msg)) {
       return false;
     }
@@ -1984,8 +2532,8 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
   // needed across calls belongs to this session.
   const auto kept = std::min(n, options_.max_speculative);
   if (session.mtp_enabled_ &&
-      !Check(hipMemcpyAsync(
-                 session.mtp_.target_hidden,
+      !Check(GuardedMemcpyAsync(
+                 GUFO_SITE, session.mtp_.target_hidden,
                  s_.res + static_cast<std::size_t>(n - kept) * c.HcDim(),
                  static_cast<std::size_t>(kept) * c.HcDim() * sizeof(float),
                  hipMemcpyDeviceToDevice, stream_),
@@ -2005,10 +2553,10 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       return false;
     }
     if (download_logits &&
-        !Check(hipMemcpyAsync(logits_host_, s_.logits,
-                              static_cast<std::size_t>(n_logits) *
-                                  c.vocab_size * sizeof(float),
-                              hipMemcpyDeviceToHost, stream_),
+        !Check(GuardedMemcpyAsync(GUFO_SITE, logits_host_, s_.logits,
+                                  static_cast<std::size_t>(n_logits) *
+                                      c.vocab_size * sizeof(float),
+                                  hipMemcpyDeviceToHost, stream_),
                "logits download", error_msg)) {
       return false;
     }
@@ -2026,8 +2574,8 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
   }
   session.spec_tokens_ = 0;
   if (logits != nullptr &&
-      !Check(hipMemcpyAsync(
-                 logits_host_,
+      !Check(GuardedMemcpyAsync(
+                 GUFO_SITE, logits_host_,
                  VerificationLogits() +
                      static_cast<std::size_t>(keep - 1) * c.vocab_size,
                  c.vocab_size * sizeof(float), hipMemcpyDeviceToHost, stream_),
@@ -2048,9 +2596,10 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
       RestoreGdnState(l.state, l.state_snapshots, keep, c.ssm_num_k_heads,
                       c.ssm_num_v_heads, stream_);
       if (!Check(hipGetLastError(), "state rollback", error_msg) ||
-          !Check(hipMemcpyAsync(l.conv_state, l.conv_snapshots.rows[slot],
-                                conv_elems * sizeof(float),
-                                hipMemcpyDeviceToDevice, stream_),
+          !Check(GuardedMemcpyAsync(GUFO_SITE, l.conv_state,
+                                    l.conv_snapshots.rows[slot],
+                                    conv_elems * sizeof(float),
+                                    hipMemcpyDeviceToDevice, stream_),
                  "conv rollback", error_msg)) {
         return false;
       }
@@ -2058,9 +2607,10 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
     if (session.ple_history_ != nullptr) {
       const std::size_t hist =
           static_cast<std::size_t>(c.PleConvHistory()) * c.HcDim();
-      if (!Check(hipMemcpyAsync(
-                     session.ple_history_, session.ple_snapshots_.rows[slot],
-                     hist * sizeof(float), hipMemcpyDeviceToDevice, stream_),
+      if (!Check(GuardedMemcpyAsync(GUFO_SITE, session.ple_history_,
+                                    session.ple_snapshots_.rows[slot],
+                                    hist * sizeof(float),
+                                    hipMemcpyDeviceToDevice, stream_),
                  "PLE rollback", error_msg)) {
         return false;
       }
@@ -2079,6 +2629,10 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
   }
   if (logits != nullptr) {
     std::copy_n(logits_host_, c.vocab_size, logits);
+  }
+  if (ForceRollbackTrim()) {
+    // Frees rows the session's captured graphs may still name.
+    session.TrimRollback(0);
   }
   return true;
 }
@@ -2129,7 +2683,9 @@ SnapshotHeader MakeSnapshotHeader(const Config& c, bool has_mtp,
   h.ple_elems = c.ple_layer >= 0 ? c.PleConvHistory() * c.HcDim() : 0;
   h.has_mtp = has_mtp ? 1 : 0;
   h.position = session.position();
-  h.image_count = session.VisionLayout().images.size();
+  h.image_count = std::ranges::count_if(
+      session.VisionLayout().images,
+      [&](const auto& image) { return image.offset < h.position; });
   return h;
 }
 
@@ -2306,9 +2862,10 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
   }
   return WalkSnapshot(h, &session,
                       [&](void* device, std::uint64_t offset,
-                          std::uint64_t bytes, const char*) {
+                          std::uint64_t bytes, const char* what) {
                         if (!session.CheckCancellation(error_msg))
                           return false;
+                        CheckDeviceRange(what, "snapshot src", device, bytes);
                         transfer.Copy(payload.data() + offset, device, bytes);
                         return true;
                       }) != 0;
@@ -2373,7 +2930,8 @@ bool Executor::RestoreSnapshot(Session& session,
     AssignError(error_msg, e.what());
     return false;
   }
-  if (!layout.images.empty() && layout != session.VisionLayout()) {
+  if (!layout.images.empty() &&
+      layout.Prefix(h.position) != session.VisionLayout().Prefix(h.position)) {
     AssignError(error_msg,
                 "image snapshot layout does not match its prompt attachment");
     return false;
@@ -2394,8 +2952,9 @@ bool Executor::RestoreSnapshot(Session& session,
                    [&](void* device, std::uint64_t offset, std::uint64_t bytes,
                        const char* what) {
                      return session.CheckCancellation(error_msg) &&
-                            Check(hipMemcpy(device, payload.data() + offset,
-                                            bytes, hipMemcpyHostToDevice),
+                            Check(GuardedMemcpy(GUFO_SITE, device,
+                                                payload.data() + offset, bytes,
+                                                hipMemcpyHostToDevice),
                                   what, error_msg);
                    }) == 0) {
     session.Reset();
@@ -2434,9 +2993,9 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
       stream_);
   GatherArgmaxCandidates(VerificationLogits(), s_.mtp_ids, s_.mtp_argmax,
                          static_cast<std::uint32_t>(rows), vocab, stream_);
-  return Check(hipMemcpyAsync(predictions.data(), s_.mtp_argmax,
-                              predictions.size_bytes(), hipMemcpyDeviceToHost,
-                              stream_),
+  return Check(GuardedMemcpyAsync(GUFO_SITE, predictions.data(), s_.mtp_argmax,
+                                  predictions.size_bytes(),
+                                  hipMemcpyDeviceToHost, stream_),
                "greedy MTP predictions download", error_msg) &&
          Check(hipStreamSynchronize(stream_), "greedy MTP verification",
                error_msg);
@@ -2448,6 +3007,7 @@ bool Executor::MtpForward(Session& session,
                           std::string* error_msg,
                           const float* hidden_source) const {
   const auto n = static_cast<std::uint32_t>(tokens.size());
+  SetGuardTokens(n);
   if (session.owner_ != this ||
       std::any_of(tokens.begin(), tokens.end(), [&](auto t) {
         return t < 0 || static_cast<std::uint32_t>(t) >= config().vocab_size;
@@ -2506,14 +3066,18 @@ bool Executor::MtpForward(Session& session,
                    output.candidates != nullptr, error_msg,
                    graph ? graph_pool : pool, hidden_source, output.trace);
   };
-  if (!Run(session, key, graph, body, error_msg)) {
+  if (!Run(session, key, graph, body, error_msg, true, "mtp")) {
     return false;
   }
   if (output.token != nullptr) {
-    *output.token = *mtp_token_host_;
+    *output.token =
+        static_cast<std::int32_t>(MtpTokenId(static_cast<std::uint32_t>(
+            *mtp_token_host_)));
   }
   if (output.candidates != nullptr) {
     *output.candidates = *mtp_candidates_host_;
+    for (std::size_t i = 0; i < output.candidates->size; ++i)
+      output.candidates->ids[i] = MtpTokenId(output.candidates->ids[i]);
   }
   session.mtp_.position = pos + n;
   if (sparse)
@@ -2532,17 +3096,18 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
   const auto copy_trace = [&](const float* source,
                               std::span<float> destination) {
     return destination.empty() ||
-           Check(hipMemcpyAsync(destination.data(), source,
-                                destination.size_bytes(), hipMemcpyDeviceToHost,
-                                stream_),
+           Check(GuardedMemcpyAsync(GUFO_SITE, destination.data(), source,
+                                    destination.size_bytes(),
+                                    hipMemcpyDeviceToHost, stream_),
                  "MTP trace download", error_msg);
   };
-  if (!Check(hipMemcpyAsync(session.control_, control_host_,
-                            sizeof(Session::Control), hipMemcpyHostToDevice,
-                            stream_),
+  if (!Check(GuardedMemcpyAsync(GUFO_SITE, session.control_, control_host_,
+                                sizeof(Session::Control), hipMemcpyHostToDevice,
+                                stream_),
              "control upload", error_msg) ||
-      !Check(hipMemcpyAsync(s_.tokens, tokens_host_, n * sizeof(std::int32_t),
-                            hipMemcpyHostToDevice, stream_),
+      !Check(GuardedMemcpyAsync(GUFO_SITE, s_.tokens, tokens_host_,
+                                n * sizeof(std::int32_t), hipMemcpyHostToDevice,
+                                stream_),
              "token upload", error_msg)) {
     return false;
   }
@@ -2644,8 +3209,9 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
       return false;
   }
   const float* last = s_.mtp_res + tail_last;
-  if (!Check(hipMemcpyAsync(session.mtp_.h, last, hc_dim * sizeof(float),
-                            hipMemcpyDeviceToDevice, stream_),
+  if (!Check(GuardedMemcpyAsync(GUFO_SITE, session.mtp_.h, last,
+                                hc_dim * sizeof(float), hipMemcpyDeviceToDevice,
+                                stream_),
              "MTP hidden carry", error_msg)) {
     return false;
   }

@@ -90,6 +90,10 @@ public:
   [[nodiscard]] std::size_t max_q8_cols() const noexcept {
     return max_q8_cols_;
   }
+  /// Largest dense Q4_K/Q5_K/Q5_1 matrix, in elements (0 when there is none).
+  [[nodiscard]] std::size_t max_dequant_elems() const noexcept {
+    return max_dequant_elems_;
+  }
 
 private:
   DeviceModel() = default;
@@ -105,6 +109,7 @@ private:
   std::size_t bytes_{0};
   std::size_t max_half_cols_{1};
   std::size_t max_q8_cols_{32};
+  std::size_t max_dequant_elems_{0};
 };
 
 }  // namespace gufo::models::qwen38_flash_next::rocm

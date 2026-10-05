@@ -14,6 +14,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <future>
 #include <iomanip>
 #include <limits>
 #include <list>
@@ -55,9 +56,34 @@ TextRunnerDescriptor DescriptorForInput(
   return descriptor;
 }
 
+template<class Visit>
+void VisitInputRanges(std::size_t token_count,
+                      std::span<const std::uint8_t> identity,
+                      std::span<const ContinuationInputPrefix> prefixes,
+                      Visit&& visit) {
+  std::size_t begin = 0;
+  for (const auto& prefix : prefixes) {
+    const auto end = std::min(prefix.token_count, token_count);
+    if (end < begin)
+      throw std::invalid_argument("input identity boundaries are invalid");
+    visit(begin, end, std::span<const std::uint8_t>(prefix.identity));
+    if (end == token_count)
+      return;
+    begin = end + 1;
+  }
+  visit(begin, token_count, identity);
+}
+
 constexpr std::array<std::uint8_t, 8> kMagic = {'G', 'U', 'F', 'O',
                                                 'K', 'V', 'C', '1'};
-constexpr std::uint32_t kFileVersion = 1;
+// Version 1 stores one SHA-256 over the whole image, which one thread hashes
+// at about 1 GB/s and so bounds every restore. Version 2 hashes 8 MiB blocks
+// on a few threads and checksums the block digests. Both stay readable.
+constexpr std::uint32_t kLegacyFileVersion = 1;
+constexpr std::uint32_t kFileVersion = 2;
+constexpr std::size_t kTreeBlockBytes = std::size_t{8} << 20;
+constexpr std::size_t kTreeWorkers = 6;
+constexpr std::string_view kTreeTag = "gufo-kvc-tree-v1";
 constexpr std::size_t kChecksumBytes = 64;
 constexpr std::size_t kMagicOffset = 0;
 constexpr std::size_t kFileVersionOffset = 8;
@@ -282,6 +308,90 @@ bool ReadAll(int descriptor, std::span<std::uint8_t> bytes) noexcept {
   return true;
 }
 
+/// SHA-256 of a file image, as stored in its header (checksum field read as
+/// zeros), computed on a worker while the reader is still filling the image.
+/// SHA-256 runs slower than the disk, so hashing after the read costs both.
+class PipelinedChecksum {
+public:
+  PipelinedChecksum(const std::uint8_t* data, std::size_t size)
+      : data_(data), size_(size), worker_([this] { Run(); }) {}
+  ~PipelinedChecksum() { Abort(); }
+  PipelinedChecksum(const PipelinedChecksum&) = delete;
+  PipelinedChecksum& operator=(const PipelinedChecksum&) = delete;
+
+  /// The first `bytes` of the image are now valid.
+  void Advance(std::size_t bytes) {
+    {
+      const std::lock_guard lock(mutex_);
+      available_ = std::min(bytes, size_);
+    }
+    changed_.notify_one();
+  }
+
+  /// Waits for the whole image and returns its digest.
+  [[nodiscard]] std::string Finish() {
+    Advance(size_);
+    if (worker_.joinable())
+      worker_.join();
+    return std::move(digest_);
+  }
+
+  void Abort() {
+    {
+      const std::lock_guard lock(mutex_);
+      aborted_ = true;
+    }
+    changed_.notify_one();
+    if (worker_.joinable())
+      worker_.join();
+  }
+
+private:
+  void Run() {
+    try {
+      crypto::Sha256Hasher hasher;
+      static constexpr std::array<std::uint8_t, kChecksumBytes> kZeros{};
+      constexpr std::size_t kBlank = kChecksumOffset;
+      constexpr std::size_t kBlankEnd = kChecksumOffset + kChecksumBytes;
+      std::size_t hashed = 0;
+      while (hashed < size_) {
+        std::size_t upto = 0;
+        {
+          std::unique_lock lock(mutex_);
+          changed_.wait(lock, [&] { return aborted_ || available_ > hashed; });
+          if (aborted_)
+            return;
+          upto = available_;
+        }
+        while (hashed < upto) {
+          if (hashed >= kBlank && hashed < kBlankEnd) {
+            const std::size_t count = std::min(upto, kBlankEnd) - hashed;
+            hasher.Update(std::span(kZeros.data(), count));
+            hashed += count;
+            continue;
+          }
+          const std::size_t stop =
+              hashed < kBlank ? std::min(upto, kBlank) : upto;
+          hasher.Update(std::span(data_ + hashed, stop - hashed));
+          hashed = stop;
+        }
+      }
+      digest_ = hasher.FinishHex();
+    } catch (...) {
+      digest_.clear();
+    }
+  }
+
+  const std::uint8_t* data_;
+  std::size_t size_;
+  std::mutex mutex_;
+  std::condition_variable changed_;
+  std::size_t available_{0};
+  bool aborted_{false};
+  std::string digest_;
+  std::thread worker_;
+};
+
 bool HasSuffix(std::string_view value, std::string_view suffix) noexcept {
   return value.size() >= suffix.size() &&
          value.substr(value.size() - suffix.size()) == suffix;
@@ -293,6 +403,200 @@ enum class ParseFailure : std::uint8_t {
   kChecksum,
 };
 
+/// Vector storage that is not zero-filled on resize: a restore overwrites
+/// every byte, and clearing gigabytes first costs a full pass over them.
+template<typename T>
+struct DefaultInitAllocator : std::allocator<T> {
+  template<typename U>
+  struct rebind {
+    using other = DefaultInitAllocator<U>;
+  };
+  using std::allocator<T>::allocator;
+  template<typename U>
+  void construct(U* pointer) noexcept(
+      std::is_nothrow_default_constructible_v<U>) {
+    ::new (static_cast<void*>(pointer)) U;
+  }
+  template<typename U, typename... Args>
+  void construct(U* pointer, Args&&... args) {
+    ::new (static_cast<void*>(pointer)) U(std::forward<Args>(args)...);
+  }
+};
+using ImageBuffer = std::vector<std::uint8_t, DefaultInitAllocator<std::uint8_t>>;
+
+using BlockDigest = std::array<std::uint8_t, 32>;
+
+/// Digest of the block at `offset` in the image. The stored checksum field
+/// reads as zeros, exactly as when the checksum was computed.
+BlockDigest TreeBlockDigest(const std::uint8_t* data, std::size_t offset,
+                            std::size_t length) {
+  static constexpr std::array<std::uint8_t, kChecksumBytes> kZeros{};
+  constexpr std::size_t kBlankEnd = kChecksumOffset + kChecksumBytes;
+  crypto::Sha256Hasher hasher;
+  std::size_t at = 0;
+  while (at < length) {
+    const std::size_t position = offset + at;
+    if (position >= kChecksumOffset && position < kBlankEnd) {
+      const std::size_t count = std::min(length - at, kBlankEnd - position);
+      hasher.Update(std::span(kZeros.data(), count));
+      at += count;
+      continue;
+    }
+    const std::size_t stop = position < kChecksumOffset
+                                 ? std::min(length - at, kChecksumOffset - position)
+                                 : length - at;
+    hasher.Update(std::span(data + at, stop));
+    at += stop;
+  }
+  return hasher.Finish();
+}
+
+/// Checksum of an image as a hash over its block digests, so the blocks can
+/// be hashed in parallel while the image is still being read or produced.
+class TreeChecksum {
+public:
+  explicit TreeChecksum(std::size_t total_bytes) : total_(total_bytes) {}
+  ~TreeChecksum() { Drain(); }
+  TreeChecksum(const TreeChecksum&) = delete;
+  TreeChecksum& operator=(const TreeChecksum&) = delete;
+
+  /// Verification: bytes [0, valid) of `data` are final and stay in place.
+  void AdvanceRef(const std::uint8_t* data, std::size_t valid) {
+    valid = std::min(valid, total_);
+    while (submitted_ + kTreeBlockBytes <= valid)
+      SubmitRef(data, kTreeBlockBytes);
+  }
+  [[nodiscard]] std::string FinishRef(const std::uint8_t* data) {
+    AdvanceRef(data, total_);
+    if (submitted_ < total_)
+      SubmitRef(data, total_ - submitted_);
+    return Root();
+  }
+
+  /// Production: bytes arrive in order and are copied into blocks.
+  void Append(std::span<const std::uint8_t> bytes) {
+    while (!bytes.empty()) {
+      const std::size_t room = kTreeBlockBytes - block_.size();
+      const std::size_t count = std::min(room, bytes.size());
+      block_.insert(block_.end(), bytes.begin(), bytes.begin() + count);
+      bytes = bytes.subspan(count);
+      if (block_.size() == kTreeBlockBytes)
+        SubmitOwned();
+    }
+  }
+  [[nodiscard]] std::string FinishOwned() {
+    if (!block_.empty())
+      SubmitOwned();
+    return Root();
+  }
+
+private:
+  void Launch(std::future<BlockDigest> task) {
+    if (inflight_.size() >= kTreeWorkers)
+      Retire();
+    inflight_.push_back(std::move(task));
+  }
+  void SubmitRef(const std::uint8_t* data, std::size_t length) {
+    const std::size_t offset = submitted_;
+    submitted_ += length;
+    Launch(std::async(std::launch::async, [data, offset, length] {
+      return TreeBlockDigest(data + offset, offset, length);
+    }));
+  }
+  void SubmitOwned() {
+    const std::size_t offset = submitted_;
+    submitted_ += block_.size();
+    Launch(std::async(std::launch::async,
+                      [block = std::move(block_), offset]() {
+                        return TreeBlockDigest(block.data(), offset,
+                                               block.size());
+                      }));
+    block_ = {};
+    block_.reserve(kTreeBlockBytes);
+  }
+  void Retire() {
+    digests_.push_back(inflight_.front().get());
+    inflight_.pop_front();
+  }
+  void Drain() noexcept {
+    for (auto& task : inflight_) {
+      try {
+        task.wait();
+      } catch (...) {
+      }
+    }
+    inflight_.clear();
+  }
+  [[nodiscard]] std::string Root() {
+    while (!inflight_.empty())
+      Retire();
+    crypto::Sha256Hasher hasher;
+    hasher.Update({reinterpret_cast<const std::uint8_t*>(kTreeTag.data()),
+                   kTreeTag.size()});
+    std::array<std::uint8_t, 8> size_bytes{};
+    for (std::size_t i = 0; i < size_bytes.size(); ++i)
+      size_bytes[i] = static_cast<std::uint8_t>(total_ >> (8 * i));
+    hasher.Update(size_bytes);
+    for (const auto& digest : digests_)
+      hasher.Update(digest);
+    return hasher.FinishHex();
+  }
+
+  std::size_t total_;
+  std::size_t submitted_{0};
+  std::vector<std::uint8_t> block_;
+  std::deque<std::future<BlockDigest>> inflight_;
+  std::vector<BlockDigest> digests_;
+};
+
+/// Checksums an image while it is read. The scheme follows the file version
+/// in the header, which is known once the first bytes have arrived.
+class ImageChecksum {
+public:
+  ImageChecksum(const std::uint8_t* data, std::size_t size)
+      : data_(data), size_(size), tree_(size) {}
+
+  /// The first `bytes` of the image are now valid.
+  void Advance(std::size_t bytes) {
+    valid_ = std::min(bytes, size_);
+    if (mode_ == Mode::kUndecided &&
+        valid_ >= kFileVersionOffset + sizeof(std::uint32_t)) {
+      std::uint32_t version = 0;
+      const std::span<const std::uint8_t> head(data_, valid_);
+      mode_ = GetLittleEndian(head, kFileVersionOffset, &version) &&
+                      version == kLegacyFileVersion
+                  ? Mode::kLegacy
+                  : Mode::kTree;
+      if (mode_ == Mode::kLegacy)
+        legacy_.emplace(data_, size_);
+    }
+    if (mode_ == Mode::kLegacy)
+      legacy_->Advance(valid_);
+    else if (mode_ == Mode::kTree)
+      tree_.AdvanceRef(data_, valid_);
+  }
+
+  /// Waits for the whole image and returns its digest; empty when the image
+  /// is too short to carry a header.
+  [[nodiscard]] std::string Finish() {
+    Advance(size_);
+    if (mode_ == Mode::kLegacy)
+      return legacy_->Finish();
+    if (mode_ == Mode::kTree)
+      return tree_.FinishRef(data_);
+    return {};
+  }
+
+private:
+  enum class Mode { kUndecided, kLegacy, kTree };
+  const std::uint8_t* data_;
+  std::size_t size_;
+  std::size_t valid_{0};
+  Mode mode_{Mode::kUndecided};
+  std::optional<PipelinedChecksum> legacy_;
+  TreeChecksum tree_;
+};
+
 struct ParsedImage {
   TextRunnerPersistenceDescriptor persistence;
   std::vector<TextRunnerToken> tokens;
@@ -300,8 +604,9 @@ struct ParsedImage {
   std::size_t payload_bytes{0};
 };
 
-ParseFailure ParseAndVerifyImage(std::vector<std::uint8_t>* image,
-                                 ParsedImage* parsed) {
+ParseFailure ParseAndVerifyImage(
+    ImageBuffer* image, ParsedImage* parsed,
+    const std::string* precomputed_checksum = nullptr) {
   if (image == nullptr || parsed == nullptr || image->size() < kHeaderBytes ||
       !std::equal(kMagic.begin(), kMagic.end(),
                   image->begin() + kMagicOffset)) {
@@ -319,10 +624,10 @@ ParseFailure ParseAndVerifyImage(std::vector<std::uint8_t>* image,
       !GetLittleEndian(readonly, kIdentityBytesOffset, &identity_bytes_u32) ||
       !GetLittleEndian(readonly, kTokenCountOffset, &token_count_u32) ||
       !GetLittleEndian(readonly, kPayloadBytesOffset, &payload_bytes_u64) ||
-      file_version != kFileVersion || payload_version == 0 ||
-      identity_bytes_u32 == 0 || identity_bytes_u32 > kMaxIdentityBytes ||
-      token_count_u32 == 0 || token_count_u32 > kMaxTokenCount ||
-      payload_bytes_u64 == 0 ||
+      (file_version != kFileVersion && file_version != kLegacyFileVersion) ||
+      payload_version == 0 || identity_bytes_u32 == 0 ||
+      identity_bytes_u32 > kMaxIdentityBytes || token_count_u32 == 0 ||
+      token_count_u32 > kMaxTokenCount || payload_bytes_u64 == 0 ||
       payload_bytes_u64 >
           static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
     return ParseFailure::kCorrupt;
@@ -348,10 +653,19 @@ ParseFailure ParseAndVerifyImage(std::vector<std::uint8_t>* image,
   if (!IsLowerHexDigest(stored_checksum)) {
     return ParseFailure::kCorrupt;
   }
-  std::fill_n(image->begin() + kChecksumOffset, kChecksumBytes, 0);
-  const std::string computed_checksum = crypto::Sha256Hex(*image);
-  std::copy(stored_checksum.begin(), stored_checksum.end(),
-            image->begin() + kChecksumOffset);
+  std::string computed_checksum;
+  if (precomputed_checksum != nullptr && !precomputed_checksum->empty()) {
+    computed_checksum = *precomputed_checksum;
+  } else if (file_version == kLegacyFileVersion) {
+    std::fill_n(image->begin() + kChecksumOffset, kChecksumBytes, 0);
+    computed_checksum = crypto::Sha256Hex(*image);
+    std::copy(stored_checksum.begin(), stored_checksum.end(),
+              image->begin() + kChecksumOffset);
+  } else {
+    TreeChecksum tree(image->size());
+    tree.AdvanceRef(image->data(), image->size());
+    computed_checksum = tree.FinishRef(image->data());
+  }
   if (computed_checksum != stored_checksum) {
     return ParseFailure::kChecksum;
   }
@@ -727,9 +1041,10 @@ struct ContinuationDiskStore::Impl {
   }
 
   [[nodiscard]] bool ReadImage(std::string_view filename,
-                               std::vector<std::uint8_t>* image,
+                               ImageBuffer* image,
                                ContinuationDiskEventReason* failure_reason,
-                               std::size_t* file_bytes = nullptr) const {
+                               std::size_t* file_bytes = nullptr,
+                               std::string* checksum = nullptr) const {
     if (image == nullptr || failure_reason == nullptr) {
       return false;
     }
@@ -756,13 +1071,63 @@ struct ContinuationDiskStore::Impl {
       return false;
     }
     image->resize(static_cast<std::size_t>(status.st_size));
-    if (!ReadAll(file.get(), *image)) {
+    std::optional<ImageChecksum> pipeline;
+    if (checksum != nullptr)
+      pipeline.emplace(image->data(), image->size());
+    // One reader tops out near 1.3 GB/s through the page cache; a window of
+    // parallel preads reaches the device rate. Chunks retire in order, so the
+    // checksum always sees a contiguous valid prefix.
+    constexpr std::size_t kReadChunk = std::size_t{8} * 1024U * 1024U;
+    constexpr std::size_t kReadWorkers = 6;
+    const std::size_t total = image->size();
+    const std::size_t chunks = (total + kReadChunk - 1) / kReadChunk;
+    const int descriptor = file.get();
+    std::uint8_t* const base = image->data();
+    const std::size_t chunk_bytes = kReadChunk;
+    const auto read_chunk = [descriptor, base, total,
+                             chunk_bytes](std::size_t index) {
+      const std::size_t offset = index * chunk_bytes;
+      const std::size_t count = std::min(chunk_bytes, total - offset);
+      std::size_t done = 0;
+      while (done < count) {
+        const ssize_t got = ::pread(descriptor, base + offset + done,
+                                    count - done,
+                                    static_cast<off_t>(offset + done));
+        if (got < 0 && errno == EINTR)
+          continue;
+        if (got <= 0)
+          return false;
+        done += static_cast<std::size_t>(got);
+      }
+      return true;
+    };
+    std::deque<std::future<bool>> window;
+    std::size_t retired = 0;
+    bool read_ok = true;
+    const auto retire_oldest = [&] {
+      const bool chunk_ok = window.front().get();
+      window.pop_front();
+      ++retired;
+      read_ok = read_ok && chunk_ok;
+      if (read_ok && pipeline)
+        pipeline->Advance(std::min(retired * kReadChunk, total));
+    };
+    for (std::size_t index = 0; index < chunks && read_ok; ++index) {
+      if (window.size() >= kReadWorkers)
+        retire_oldest();
+      if (read_ok)
+        window.push_back(std::async(std::launch::async, read_chunk, index));
+    }
+    while (!window.empty())
+      retire_oldest();
+    if (!read_ok) {
       *failure_reason = ContinuationDiskEventReason::kIoFailure;
       return false;
     }
     std::uint8_t trailing = 0;
     while (true) {
-      const ssize_t count = ::read(file.get(), &trailing, 1);
+      const ssize_t count =
+          ::pread(descriptor, &trailing, 1, static_cast<off_t>(total));
       if (count < 0 && errno == EINTR) {
         continue;
       }
@@ -773,6 +1138,106 @@ struct ContinuationDiskStore::Impl {
       }
       break;
     }
+    // Recovery reads every retained file at startup; leaving them cached
+    // starves the GPU weight upload of host memory.
+    (void)::posix_fadvise(file.get(), 0, 0, POSIX_FADV_DONTNEED);
+    if (pipeline)
+      *checksum = pipeline->Finish();
+    return true;
+  }
+
+  [[nodiscard]] bool ReadHeader(std::string_view filename, ParsedImage* parsed,
+                                ContinuationDiskEventReason* failure_reason,
+                                std::size_t* file_bytes) const {
+    struct stat status{};
+    if (!SafeRegularFile(filename, &status)) {
+      *failure_reason = ContinuationDiskEventReason::kUnsafeFile;
+      return false;
+    }
+    if (status.st_size > 0)
+      *file_bytes = static_cast<std::size_t>(status.st_size);
+    if (status.st_size <= 0 ||
+        static_cast<std::uint64_t>(status.st_size) >
+            static_cast<std::uint64_t>(options.staging_capacity_bytes)) {
+      *failure_reason = status.st_size > 0
+                            ? ContinuationDiskEventReason::kStagingCapacity
+                            : ContinuationDiskEventReason::kCorrupt;
+      return false;
+    }
+    if (static_cast<std::size_t>(status.st_size) < kHeaderBytes) {
+      *failure_reason = ContinuationDiskEventReason::kCorrupt;
+      return false;
+    }
+    const ScopedFileDescriptor file(
+        ::openat(directory_fd, std::string(filename).c_str(),
+                 O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+    if (!file) {
+      *failure_reason = ContinuationDiskEventReason::kIoFailure;
+      return false;
+    }
+    std::vector<std::uint8_t> head(kHeaderBytes);
+    if (!ReadAll(file.get(), head)) {
+      *failure_reason = ContinuationDiskEventReason::kIoFailure;
+      return false;
+    }
+    std::uint32_t file_version = 0;
+    std::uint32_t payload_version = 0;
+    std::uint32_t identity_bytes_u32 = 0;
+    std::uint32_t token_count_u32 = 0;
+    std::uint64_t payload_bytes_u64 = 0;
+    const std::span<const std::uint8_t> header(head);
+    *failure_reason = ContinuationDiskEventReason::kCorrupt;
+    if (!std::equal(kMagic.begin(), kMagic.end(), head.begin() + kMagicOffset) ||
+        !GetLittleEndian(header, kFileVersionOffset, &file_version) ||
+        !GetLittleEndian(header, kPayloadVersionOffset, &payload_version) ||
+        !GetLittleEndian(header, kIdentityBytesOffset, &identity_bytes_u32) ||
+        !GetLittleEndian(header, kTokenCountOffset, &token_count_u32) ||
+        !GetLittleEndian(header, kPayloadBytesOffset, &payload_bytes_u64) ||
+        (file_version != kFileVersion && file_version != kLegacyFileVersion) ||
+        payload_version == 0 || identity_bytes_u32 == 0 ||
+        identity_bytes_u32 > kMaxIdentityBytes || token_count_u32 == 0 ||
+        token_count_u32 > kMaxTokenCount || payload_bytes_u64 == 0 ||
+        payload_bytes_u64 > static_cast<std::uint64_t>(
+                                std::numeric_limits<std::size_t>::max())) {
+      return false;
+    }
+    const std::size_t identity_bytes = identity_bytes_u32;
+    const std::size_t token_count = token_count_u32;
+    const auto payload_bytes = static_cast<std::size_t>(payload_bytes_u64);
+    try {
+      if (CheckedFileBytes(identity_bytes, token_count, payload_bytes) !=
+          static_cast<std::size_t>(status.st_size)) {
+        return false;
+      }
+    } catch (...) {
+      return false;
+    }
+    const std::string stored_checksum(
+        reinterpret_cast<const char*>(head.data() + kChecksumOffset),
+        kChecksumBytes);
+    if (!IsLowerHexDigest(stored_checksum))
+      return false;
+    head.resize(kHeaderBytes + identity_bytes + token_count * 4U);
+    if (!ReadAll(file.get(),
+                 std::span<std::uint8_t>(head).subspan(kHeaderBytes))) {
+      *failure_reason = ContinuationDiskEventReason::kIoFailure;
+      return false;
+    }
+    (void)::posix_fadvise(file.get(), 0, 0, POSIX_FADV_DONTNEED);
+    parsed->persistence.payload_version = payload_version;
+    parsed->persistence.compatibility_identity.resize(identity_bytes);
+    std::memcpy(parsed->persistence.compatibility_identity.data(),
+                head.data() + kHeaderBytes, identity_bytes);
+    parsed->tokens.resize(token_count);
+    std::size_t token_offset = kHeaderBytes + identity_bytes;
+    const std::span<const std::uint8_t> readonly(head);
+    for (TextRunnerToken& token : parsed->tokens) {
+      if (!GetLittleEndian(readonly, token_offset, &token))
+        return false;
+      token_offset += sizeof(std::uint32_t);
+    }
+    parsed->payload_offset = token_offset;
+    parsed->payload_bytes = payload_bytes;
     return true;
   }
 
@@ -801,12 +1266,11 @@ struct ContinuationDiskStore::Impl {
         continue;
       }
 
-      std::vector<std::uint8_t> image;
       ContinuationDiskEventReason failure_reason =
           ContinuationDiskEventReason::kCorrupt;
       ParsedImage parsed;
       std::size_t file_bytes = 0;
-      if (!ReadImage(filename, &image, &failure_reason, &file_bytes)) {
+      if (!ReadHeader(filename, &parsed, &failure_reason, &file_bytes)) {
         if (failure_reason == ContinuationDiskEventReason::kStagingCapacity) {
           // A smaller RAM budget must not destroy a previously valid cache.
           // Account the file for LRU/retention, but never index unverified
@@ -832,17 +1296,6 @@ struct ContinuationDiskStore::Impl {
         Emit(ContinuationDiskEventAction::kRemoved, failure_reason, 0, 0, 0);
         continue;
       }
-      const ParseFailure parse_failure = ParseAndVerifyImage(&image, &parsed);
-      if (parse_failure != ParseFailure::kNone) {
-        RemoveFileOnly(filename);
-        Emit(ContinuationDiskEventAction::kRemoved,
-             parse_failure == ParseFailure::kChecksum
-                 ? ContinuationDiskEventReason::kChecksumMismatch
-                 : ContinuationDiskEventReason::kCorrupt,
-             image.size(), 0, 0);
-        continue;
-      }
-
       std::filesystem::file_time_type last_access =
           directory_entry.last_write_time(error);
       if (error) {
@@ -856,7 +1309,7 @@ struct ContinuationDiskStore::Impl {
         if (duplicate->last_access >= last_access) {
           RemoveFileOnly(filename);
           Emit(ContinuationDiskEventAction::kRemoved,
-               ContinuationDiskEventReason::kExactReplacement, image.size(),
+               ContinuationDiskEventReason::kExactReplacement, file_bytes,
                parsed.payload_bytes, parsed.tokens.size());
           continue;
         }
@@ -867,7 +1320,7 @@ struct ContinuationDiskStore::Impl {
           .key_hash = digest,
           .persistence = std::move(parsed.persistence),
           .tokens = std::move(parsed.tokens),
-          .file_bytes = image.size(),
+          .file_bytes = file_bytes,
           .payload_bytes = parsed.payload_bytes,
           .last_access = last_access,
       });
@@ -1013,7 +1466,7 @@ struct ContinuationDiskStore::Impl {
     }
     bool valid = true;
     try {
-      crypto::Sha256Hasher hasher;
+      TreeChecksum tree(header.size() + payload_bytes);
       std::size_t written = 0;
       const auto sink = [&](std::span<const std::uint8_t> bytes) {
         // Keep write sizes bounded and checksum each byte exactly once.
@@ -1023,7 +1476,7 @@ struct ContinuationDiskStore::Impl {
           if (!WriteAll(temporary.get(), chunk)) {
             throw std::runtime_error("continuation disk write failed");
           }
-          hasher.Update(chunk);
+          tree.Append(chunk);
           bytes = bytes.subspan(chunk.size());
         }
       };
@@ -1038,7 +1491,7 @@ struct ContinuationDiskStore::Impl {
       if (written != payload_bytes) {
         throw std::runtime_error("snapshot serialization truncated");
       }
-      const auto checksum = hasher.FinishHex();
+      const auto checksum = tree.FinishOwned();
       if (::lseek(temporary.get(), kChecksumOffset, SEEK_SET) < 0 ||
           !WriteAll(temporary.get(),
                     {reinterpret_cast<const std::uint8_t*>(checksum.data()),
@@ -1049,6 +1502,7 @@ struct ContinuationDiskStore::Impl {
       valid = false;
     }
     valid = valid && ::fsync(temporary.get()) == 0;
+    (void)::posix_fadvise(temporary.get(), 0, 0, POSIX_FADV_DONTNEED);
     const int raw_descriptor = temporary.release();
     if (::close(raw_descriptor) != 0) {
       valid = false;
@@ -1197,10 +1651,31 @@ struct ContinuationDiskStore::Impl {
     return root->second.Find(prompt).longest.value_or(entries.end());
   }
 
+  [[nodiscard]] EntryIterator FindLongestInputCandidate(
+      const TextModelRunner& runner, std::span<const TextRunnerToken> prompt,
+      std::span<const std::uint8_t> input_identity,
+      std::span<const ContinuationInputPrefix> input_prefixes) {
+    auto best = entries.end();
+    VisitInputRanges(
+        prompt.size(), input_identity, input_prefixes,
+        [&](auto begin, auto end, auto identity) {
+          const auto descriptor = DescriptorForInput(runner, identity);
+          const auto candidate =
+              FindLongestCandidate(*descriptor.persistence, prompt.first(end));
+          if (candidate != entries.end() && candidate->tokens.size() >= begin &&
+              (best == entries.end() ||
+               candidate->tokens.size() > best->tokens.size()))
+            best = candidate;
+        });
+    return best;
+  }
+
   [[nodiscard]] RestoreResult RestoreLongestPrefix(
       const TextModelRunner& runner, TextRunnerState& state,
       std::span<const TextRunnerToken> prompt,
-      std::span<const std::uint8_t> input_identity) {
+      std::span<const std::uint8_t> input_identity,
+      std::size_t stable_prefix_tokens,
+      std::span<const ContinuationInputPrefix> input_prefixes) {
     const auto descriptor = DescriptorForInput(runner, input_identity);
     if (!descriptor.persistence.has_value()) {
       Emit(ContinuationDiskEventAction::kMiss,
@@ -1209,18 +1684,29 @@ struct ContinuationDiskStore::Impl {
     }
 
     while (true) {
-      const EntryIterator candidate =
-          FindLongestCandidate(*descriptor.persistence, prompt);
+      const EntryIterator candidate = FindLongestInputCandidate(
+          runner, prompt, input_identity, input_prefixes);
       if (candidate == entries.end()) {
         Emit(ContinuationDiskEventAction::kMiss,
              ContinuationDiskEventReason::kNotFound, 0, 0, 0);
         return {};
       }
+      if (stable_prefix_tokens != 0 &&
+          candidate->tokens.size() > stable_prefix_tokens &&
+          FindLongestInputCandidate(runner, prompt.first(stable_prefix_tokens),
+                                    input_identity,
+                                    input_prefixes) == entries.end()) {
+        Emit(ContinuationDiskEventAction::kMiss,
+             ContinuationDiskEventReason::kNotFound, 0, 0, 0);
+        return {};
+      }
 
-      std::vector<std::uint8_t> image;
+      ImageBuffer image;
       ContinuationDiskEventReason failure_reason =
           ContinuationDiskEventReason::kCorrupt;
-      if (!ReadImage(candidate->filename, &image, &failure_reason)) {
+      std::string checksum;
+      if (!ReadImage(candidate->filename, &image, &failure_reason, nullptr,
+                     &checksum)) {
         const std::size_t file_bytes = candidate->file_bytes;
         const std::size_t payload_bytes = candidate->payload_bytes;
         const std::size_t token_count = candidate->tokens.size();
@@ -1233,7 +1719,8 @@ struct ContinuationDiskStore::Impl {
       }
 
       ParsedImage parsed;
-      const ParseFailure parse_failure = ParseAndVerifyImage(&image, &parsed);
+      const ParseFailure parse_failure =
+          ParseAndVerifyImage(&image, &parsed, &checksum);
       if (parse_failure != ParseFailure::kNone ||
           parsed.persistence != candidate->persistence ||
           parsed.tokens != candidate->tokens ||
@@ -1292,15 +1779,29 @@ struct ContinuationDiskStore::Impl {
   [[nodiscard]] std::vector<std::size_t> SharedPrefixBoundaries(
       const TextModelRunner& runner, std::span<const TextRunnerToken> prompt,
       std::size_t min_tokens, std::size_t max_boundaries,
-      std::span<const std::uint8_t> input_identity) {
+      std::span<const std::uint8_t> input_identity,
+      std::span<const ContinuationInputPrefix> input_prefixes) {
     const auto descriptor = DescriptorForInput(runner, input_identity);
     if (!descriptor.persistence.has_value() || max_boundaries == 0) {
       return {};
     }
-    const auto root = prefixes.find(PrefixKey(*descriptor.persistence));
-    if (root == prefixes.end())
-      return {};
-    auto boundaries = root->second.Find(prompt, true).shared_boundaries;
+    std::vector<std::size_t> boundaries;
+    VisitInputRanges(
+        prompt.size(), input_identity, input_prefixes,
+        [&](auto begin, auto end, auto identity) {
+          const auto scoped = DescriptorForInput(runner, identity);
+          const auto root = prefixes.find(PrefixKey(*scoped.persistence));
+          if (root == prefixes.end())
+            return;
+          for (const auto count :
+               root->second.Find(prompt.first(end), true).shared_boundaries) {
+            if (count >= begin && count < prompt.size())
+              boundaries.push_back(count);
+          }
+        });
+    std::ranges::sort(boundaries);
+    boundaries.erase(std::unique(boundaries.begin(), boundaries.end()),
+                     boundaries.end());
     std::erase_if(boundaries,
                   [min_tokens](auto length) { return length < min_tokens; });
     // Keep the longest ones: they save the most prefill when they hit.
@@ -1310,6 +1811,21 @@ struct ContinuationDiskStore::Impl {
           boundaries.end() - static_cast<std::ptrdiff_t>(max_boundaries));
     }
     return boundaries;
+  }
+
+  [[nodiscard]] std::size_t LongestStoredPrefixTokens(
+      const TextModelRunner& runner, std::span<const TextRunnerToken> tokens,
+      std::span<const std::uint8_t> input_identity) {
+    const auto descriptor = DescriptorForInput(runner, input_identity);
+    if (!descriptor.persistence.has_value()) {
+      return 0;
+    }
+    const auto root = prefixes.find(PrefixKey(*descriptor.persistence));
+    if (root == prefixes.end()) {
+      return 0;
+    }
+    const auto match = root->second.Find(tokens);
+    return match.longest ? (*match.longest)->tokens.size() : 0;
   }
 
   [[nodiscard]] bool Touch(const TextModelRunner& runner,
@@ -1454,25 +1970,41 @@ ContinuationDiskStore::RestoreResult
 ContinuationDiskStore::RestoreLongestPrefix(
     const TextModelRunner& runner, TextRunnerState& state,
     std::span<const TextRunnerToken> prompt,
-    std::span<const std::uint8_t> input_identity) {
+    std::span<const std::uint8_t> input_identity,
+    std::size_t stable_prefix_tokens,
+    std::span<const ContinuationInputPrefix> input_prefixes) {
+  if (stable_prefix_tokens > prompt.size())
+    throw std::invalid_argument("stable cache prefix exceeds prompt length");
   const ScopedOperationPermit permit(impl_->operation_gate, false);
   if (!permit) {
     impl_->Emit(ContinuationDiskEventAction::kMiss,
                 ContinuationDiskEventReason::kBusy, 0, 0, prompt.size());
     return {};
   }
-  return impl_->RestoreLongestPrefix(runner, state, prompt, input_identity);
+  return impl_->RestoreLongestPrefix(runner, state, prompt, input_identity,
+                                     stable_prefix_tokens, input_prefixes);
 }
 
 std::vector<std::size_t> ContinuationDiskStore::SharedPrefixBoundaries(
     const TextModelRunner& runner, std::span<const TextRunnerToken> prompt,
     std::size_t min_tokens, std::size_t max_boundaries,
-    std::span<const std::uint8_t> input_identity) {
+    std::span<const std::uint8_t> input_identity,
+    std::span<const ContinuationInputPrefix> input_prefixes) {
   const ScopedOperationPermit permit(impl_->operation_gate, false);
   if (!permit)
     return {};
   return impl_->SharedPrefixBoundaries(runner, prompt, min_tokens,
-                                       max_boundaries, input_identity);
+                                       max_boundaries, input_identity,
+                                       input_prefixes);
+}
+
+std::size_t ContinuationDiskStore::LongestStoredPrefixTokens(
+    const TextModelRunner& runner, std::span<const TextRunnerToken> tokens,
+    std::span<const std::uint8_t> input_identity) {
+  const ScopedOperationPermit permit(impl_->operation_gate, false);
+  if (!permit)
+    return 0;
+  return impl_->LongestStoredPrefixTokens(runner, tokens, input_identity);
 }
 
 bool ContinuationDiskStore::Touch(

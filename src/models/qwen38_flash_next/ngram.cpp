@@ -15,8 +15,10 @@ namespace gufo::models::qwen38_flash_next {
 namespace {
 
 constexpr std::size_t kPage = 4096;
-// Keep enough direct reads outstanding while layer 0 runs.
-constexpr std::size_t kWorkers = 32;
+// Threads waiting on n-gram I/O. The gather is NVMe-latency bound, so this
+// wants queue depth rather than cores.
+constexpr std::size_t kIoWorkers = 128;
+constexpr std::size_t kIoOversubscribe = 4;
 constexpr std::size_t kReadBatch = 8;
 constexpr std::size_t kBatchJobs = 1024;
 constexpr std::size_t kCacheBytes = 8 * 1024 * 1024;
@@ -109,8 +111,13 @@ std::unique_ptr<NgramTable> NgramTable::Open(
     }
     return nullptr;
   }
+  // The n-gram gather is NVMe-latency bound, not CPU bound: rows are sorted,
+  // so one read already spans a whole page and amplification is ~1x. What
+  // the read needs is queue depth, so oversubscribe the pool past the core
+  // count instead of waiting on I/O with idle threads.
   const std::size_t workers = std::min(
-      kWorkers, static_cast<std::size_t>(std::thread::hardware_concurrency()));
+      kIoWorkers, static_cast<std::size_t>(std::thread::hardware_concurrency()) *
+                      kIoOversubscribe);
   for (std::size_t i = 0; i < std::max<std::size_t>(1, workers); ++i) {
     t->workers_.emplace_back([raw = t.get()] { raw->Worker(); });
   }

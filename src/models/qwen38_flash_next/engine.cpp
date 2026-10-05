@@ -7,6 +7,10 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <atomic>
+#include <cstdlib>
+#include <mutex>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -24,8 +28,25 @@ namespace gufo::models::qwen38_flash_next {
 namespace {
 
 // gfx1151 pp4096 at depths 0/4096: the 512/1024/2048/4096 sweep favored
-// 2048; larger chunks used more scratch without improving throughput.
-constexpr std::uint32_t kPrefillChunkTokens = 2048;
+// 2048. Re-measured cold at 32k depth (Q4_K_XL, MTP off, -j 1, 2 rounds) the
+// ordering changes: 4096 gives 1282.3 tok/s vs 1202.1 at 2048 (+6.7%), and
+// 8192/16384 plateau at +5.5%. Session scratch grows 24 MiB. Decode and
+// follow-up cache are unchanged, so 4096 is the default; GUFO_PREFILL_TILE
+// overrides it for re-measurement.
+//   tile   2048    4096    8192   16384
+//   tok/s 1202.1  1282.3  1268.0  1269.8
+//   MiB     6473    6497    6545    6641
+std::uint32_t PrefillChunkTokens() {
+  if (const char* const raw = std::getenv("GUFO_PREFILL_TILE");
+      raw != nullptr && raw[0] != '\0') {
+    char* end = nullptr;
+    const unsigned long value = std::strtoul(raw, &end, 10);
+    if (end != raw && value >= 128 && value <= 65536) {
+      return static_cast<std::uint32_t>(value);
+    }
+  }
+  return 4096;
+}
 
 void AssignError(std::string* error_msg, std::string_view message) {
   if (error_msg != nullptr) {
@@ -198,7 +219,7 @@ std::uint32_t Model::VocabSize() const noexcept {
 }
 
 std::uint32_t Model::PrefillCapacity() const noexcept {
-  return std::min(kPrefillChunkTokens, options_.max_context);
+  return std::min(PrefillChunkTokens(), options_.max_context);
 }
 
 bool Model::HasMtp() const noexcept {
@@ -278,16 +299,23 @@ void Session::SetCancellationCheck(std::function<bool()> check) {
 
 void Session::ConfigureVision(
     std::shared_ptr<const qwen::vision::Prompt> prompt) {
-  const auto identity =
-      prompt ? prompt->cache_identity : std::vector<std::uint8_t>{};
-  if (!tokens_.empty() && identity != image_identity_)
+  const auto identity = prompt ? prompt->IdentityForPrefix(tokens_.size())
+                               : std::span<const std::uint8_t>{};
+  if (!tokens_.empty() &&
+      !std::ranges::equal(identity, ImageIdentity(tokens_.size())))
     Reset();
   const bool was_valid = valid_;
   valid_ = false;
-  session_->ConfigureVision(std::move(prompt), model_->vision_,
+  session_->ConfigureVision(prompt, model_->vision_,
                             model_->executor_->stream());
-  image_identity_ = identity;
+  image_prompt_ = std::move(prompt);
   valid_ = was_valid;
+}
+
+std::span<const std::uint8_t> Session::ImageIdentity(
+    std::size_t token_count) const {
+  return image_prompt_ ? image_prompt_->IdentityForPrefix(token_count)
+                       : std::span<const std::uint8_t>{};
 }
 
 std::uint32_t Session::KeptHiddenRows() const noexcept {
@@ -300,7 +328,8 @@ std::uint64_t Session::SnapshotBytes() const {
   if (!valid_)
     return 0;
   return SessionSnapshotHostBytes(static_cast<std::uint32_t>(tokens_.size()),
-                                  model_->VocabSize(), image_identity_.size()) +
+                                  model_->VocabSize(),
+                                  ImageIdentity(tokens_.size()).size()) +
          model_->executor_->SnapshotBytes(*session_, KeptHiddenRows());
 }
 
@@ -312,11 +341,12 @@ std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(
     return nullptr;
   }
   const auto token_count = static_cast<std::uint32_t>(tokens_.size());
+  const auto identity = ImageIdentity(token_count);
   const std::uint32_t hidden_rows = KeptHiddenRows();
   const std::uint64_t executor_bytes =
       model_->executor_->SnapshotBytes(*session_, hidden_rows);
   const std::uint64_t host_bytes = SessionSnapshotHostBytes(
-      token_count, model_->VocabSize(), image_identity_.size());
+      token_count, model_->VocabSize(), identity.size());
   std::unique_ptr<SessionSnapshot> snapshot(
       new SessionSnapshot(host_bytes + executor_bytes));
   std::uint8_t* out = snapshot->data_.get();
@@ -328,15 +358,14 @@ std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(
       .hidden_rows = hidden_rows,
       .executor_bytes = executor_bytes,
       .draft_policy = draft_length_.State(),
-      .image_identity_bytes =
-          static_cast<std::uint32_t>(image_identity_.size()),
+      .image_identity_bytes = static_cast<std::uint32_t>(identity.size()),
       .policy_concurrency = model_->DecodeConcurrency(),
   };
   std::memcpy(out, &header, sizeof(header));
   out += sizeof(header);
-  if (!image_identity_.empty())
-    std::memcpy(out, image_identity_.data(), image_identity_.size());
-  out += image_identity_.size();
+  if (!identity.empty())
+    std::memcpy(out, identity.data(), identity.size());
+  out += identity.size();
   std::memcpy(out, tokens_.data(), tokens_.size() * sizeof(std::int32_t));
   out += tokens_.size() * sizeof(std::int32_t);
   std::memcpy(out, logits_.data(), logits_.size() * sizeof(float));
@@ -388,7 +417,8 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
   const std::uint8_t* in = payload.data() + sizeof(header);
   std::vector<std::uint8_t> image_identity(in,
                                            in + header.image_identity_bytes);
-  if (!image_identity.empty() && image_identity != image_identity_) {
+  if (!image_identity.empty() &&
+      !std::ranges::equal(image_identity, ImageIdentity(header.token_count))) {
     AssignError(error_msg,
                 "image snapshot requires its matching prompt attachment");
     return false;
@@ -424,7 +454,6 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
     AssignError(error_msg, "session snapshot positions are inconsistent");
     return false;
   }
-  image_identity_ = std::move(image_identity);
   tokens_ = std::move(tokens);
   logits_ = std::move(logits);
   hidden_base_ = info.position - info.hidden_rows;
@@ -488,7 +517,7 @@ bool Session::DraftReplay(std::int32_t next_token,
 
 bool Session::DraftCatchUp(std::int32_t next_token, bool propose,
                            std::string* error_msg,
-                           MtpCandidateLogits* candidates) {
+                           MtpCandidateLogits* candidates, bool with_token) {
   std::vector<std::int32_t> replay;
   std::int32_t hidden_row = 0;
   if (!DraftReplay(next_token, &replay, &hidden_row, error_msg))
@@ -498,7 +527,9 @@ bool Session::DraftCatchUp(std::int32_t next_token, bool propose,
   auto& exec = *model_->executor_;
   if (!exec.MtpForward(
           *session_, replay, hidden_row,
-          {.token = propose && candidates == nullptr ? &draft_token_ : nullptr,
+          {.token = propose && (candidates == nullptr || with_token)
+                        ? &draft_token_
+                        : nullptr,
            .candidates = candidates},
           error_msg)) {
     return false;
@@ -529,7 +560,7 @@ bool Session::DraftCatchUpBatch(std::span<const AdvanceRequest> requests,
 }
 
 bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
-                   bool prefill) {
+                   bool prefill, std::span<const std::int32_t> lookahead) {
   rocm::Executor& exec = *model_->executor_;
   for (std::size_t off = 0; off < tokens.size(); off += exec.max_batch()) {
     const std::size_t n =
@@ -541,6 +572,12 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
     }
     const auto mode = prefill ? rocm::Executor::ForwardMode::kPrefill
                               : rocm::Executor::ForwardMode::kDecode;
+    if (prefill) {
+      const auto rest = tokens.subspan(off + n);
+      const auto source = rest.empty() ? lookahead : rest;
+      exec.SetPleLookahead(source.first(
+          std::min<std::size_t>(source.size(), exec.max_batch())));
+    }
     if (!exec.Forward(*session_, chunk, 1, logits_.data(), mode, error_msg)) {
       return false;
     }
@@ -552,7 +589,8 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
 }
 
 bool Session::Sync(std::span<const std::int32_t> prompt,
-                   std::string* error_msg) {
+                   std::string* error_msg,
+                   std::span<const std::int32_t> lookahead) {
   if (prompt.empty()) {
     AssignError(error_msg, "prompt is empty");
     return false;
@@ -578,7 +616,7 @@ bool Session::Sync(std::span<const std::int32_t> prompt,
     common = 0;
   }
   valid_ = false;
-  const bool ok = Feed(prompt.subspan(common), error_msg, true);
+  const bool ok = Feed(prompt.subspan(common), error_msg, true, lookahead);
   valid_ = ok;
   return ok;
 }
@@ -599,6 +637,123 @@ bool Session::Evaluate(std::int32_t token, std::string* error_msg) {
   return ok;
 }
 
+namespace {
+
+/// Streaming sink for draft-slot calibration pairs, enabled by
+/// GUFO_CALIB_LOG=<path>. Pairs are appended as verification retires them, so a
+/// long-lived server writes a bounded amount per token and never accumulates
+/// them in memory. Offline fitting consumes the file, not the process.
+class CalibrationLog {
+public:
+  static void Append(const char* path, std::uint32_t depth,
+                     std::uint32_t context, float confidence,
+                     bool accepted) noexcept {
+    if (path == nullptr || path[0] == '\0' || confidence < 0.0F) {
+      return;
+    }
+    std::FILE* file = std::fopen(path, "ae");
+    if (file == nullptr) {
+      return;
+    }
+    std::fprintf(file, "%u,%u,%.6f,%d\n", depth, context, confidence,
+                 accepted ? 1 : 0);
+    std::fclose(file);
+  }
+
+  [[nodiscard]] static const char* Path() noexcept {
+    const char* path = std::getenv("GUFO_CALIB_LOG");
+    return path != nullptr ? path : "";
+  }
+};
+
+}  // namespace
+
+namespace {
+
+// GUFO_MTP_LOG=1: acceptance per chain position, and where the target's token
+// sat in the draft head's own ranking when a draft was rejected.
+struct MtpRejectLog {
+  static constexpr std::size_t kPositions = kMaxMtpDraftTokens + 1;
+  static constexpr std::size_t kRanks = 5;  // 1, 2, 3, 4+ in candidates, absent
+  bool enabled = [] {
+    const char* v = std::getenv("GUFO_MTP_LOG");
+    return v != nullptr && v[0] == '1';
+  }();
+  std::mutex mutex;
+  std::array<std::uint64_t, kPositions> proposed{};
+  std::array<std::uint64_t, kPositions> accepted{};
+  std::array<std::array<std::uint64_t, kRanks>, kPositions> rank{};
+  std::uint64_t cycles = 0;
+  std::uint64_t sampled_cycles = 0;
+  std::atomic<std::uint64_t> anchor_ns{0};
+  std::atomic<std::uint64_t> verify_ns{0};
+  std::atomic<std::uint64_t> verify_calls{0};
+  std::atomic<std::uint64_t> prepare_ns{0};
+  std::atomic<std::uint64_t> forward_ns{0};
+  std::atomic<std::uint64_t> finish_ns{0};
+  std::atomic<std::uint64_t> step_cycles{0};
+  std::atomic<std::uint64_t> step_tokens{0};
+
+  void Record(std::size_t position, bool accept, int target_rank,
+              bool sampled) {
+    const std::lock_guard lock(mutex);
+    if (position >= kPositions)
+      return;
+    ++proposed[position];
+    if (accept) {
+      ++accepted[position];
+    } else {
+      ++rank[position][static_cast<std::size_t>(
+          std::clamp(target_rank, 0, static_cast<int>(kRanks) - 1))];
+    }
+    if (position == 1) {
+      ++cycles;
+      sampled_cycles += sampled ? 1 : 0;
+      if (cycles % 200 == 0)
+        Print();
+    }
+  }
+  void Print() const {
+    const double sc = step_cycles.load() > 0
+                          ? static_cast<double>(step_cycles.load())
+                          : 1.0;
+    std::fprintf(stderr,
+                 "mtp-log step prepare=%.2f forward=%.2f finish=%.2f ms/cycle "
+                 "tokens/cycle=%.2f\n",
+                 static_cast<double>(prepare_ns.load()) / 1e6 / sc,
+                 static_cast<double>(forward_ns.load()) / 1e6 / sc,
+                 static_cast<double>(finish_ns.load()) / 1e6 / sc,
+                 static_cast<double>(step_tokens.load()) / sc);
+    const double c = cycles > 0 ? static_cast<double>(cycles) : 1.0;
+    std::fprintf(stderr,
+                 "mtp-log cycles=%llu sampled=%llu anchor=%.2fms/cycle "
+                 "verify=%.2fms/cycle (%.1f calls/cycle)\n",
+                 static_cast<unsigned long long>(cycles),
+                 static_cast<unsigned long long>(sampled_cycles),
+                 static_cast<double>(anchor_ns.load()) / 1e6 / c,
+                 static_cast<double>(verify_ns.load()) / 1e6 / c,
+                 static_cast<double>(verify_calls.load()) / c);
+    for (std::size_t p = 1; p < kPositions; ++p) {
+      if (proposed[p] == 0)
+        continue;
+      std::fprintf(
+          stderr,
+          "mtp-log pos=%zu reached=%llu accept=%.1f%% reject: 2nd=%llu 3rd=%llu "
+          "4th=%llu absent=%llu\n",
+          p, static_cast<unsigned long long>(proposed[p]),
+          100.0 * static_cast<double>(accepted[p]) /
+              static_cast<double>(proposed[p]),
+          static_cast<unsigned long long>(rank[p][1]),
+          static_cast<unsigned long long>(rank[p][2]),
+          static_cast<unsigned long long>(rank[p][3]),
+          static_cast<unsigned long long>(rank[p][4]));
+    }
+  }
+};
+MtpRejectLog g_mtp_log;
+
+}  // namespace
+
 struct Session::PendingDecode {
   std::vector<std::int32_t> chain;
   std::vector<MtpProposal> proposals;
@@ -612,6 +767,29 @@ struct Session::PendingDecode {
   std::uint64_t draft_rng{0};
   MtpCandidateLogits candidates;
   std::int32_t draft{0};
+  /// Top-1 mass of each drafted slot, indexed by depth and -1 when the slot
+  /// carries no signal (the first draft, which the predictor does not score).
+  std::array<float, kMaxMtpDraftTokens> slot_confidence{};
+  /// Top four draft-head ids per chain index, filled only under GUFO_MTP_LOG.
+  std::array<std::array<std::int32_t, 4>, kMaxMtpDraftTokens + 1> slot_top{};
+  void NoteTop(std::size_t index) {
+    if (!g_mtp_log.enabled || index >= slot_top.size())
+      return;
+    for (std::size_t i = 0; i < 4; ++i)
+      slot_top[index][i] = i < candidates.size
+                               ? static_cast<std::int32_t>(candidates.ids[i])
+                               : -1;
+  }
+  int TopRank(std::size_t index, std::int32_t token) const {
+    if (index >= slot_top.size())
+      return 4;
+    for (int i = 0; i < 4; ++i) {
+      if (slot_top[index][static_cast<std::size_t>(i)] == token)
+        return i;
+    }
+    return 4;
+  }
+  PendingDecode() { slot_confidence.fill(-1.0F); }
 };
 
 void Session::AppendDraft(PendingDecode& pending) {
@@ -657,7 +835,14 @@ bool Session::PrepareDecode(const DecodeRequest& request,
     result->stop = true;
     return true;
   }
+  const auto anchor_t0 = std::chrono::steady_clock::now();
   const auto anchor = static_cast<std::int32_t>(sampler.Sample(logits_));
+  if (g_mtp_log.enabled) {
+    g_mtp_log.anchor_ns += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - anchor_t0)
+            .count());
+  }
   if (is_stop(anchor)) {
     result->stop = true;
     return true;
@@ -676,15 +861,20 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   const bool sampled = sampler.config().uses_random_sampling();
   const bool gpu_greedy = sampler.config().can_use_unmodified_argmax();
   const bool gpu_verification = gpu_greedy;
-  if (!defer_head && !DraftCatchUp(anchor, true, error_msg,
-                                   sampled ? &pending->candidates : nullptr)) {
+  const bool log_top = g_mtp_log.enabled && !defer_head;
+  if (!defer_head &&
+      !DraftCatchUp(anchor, true, error_msg,
+                    sampled || log_top ? &pending->candidates : nullptr,
+                    !sampled)) {
     return false;
   }
+  if (log_top)
+    pending->NoteTop(1);
   // A cycle-local proposal stream needs no pending RNG state in snapshots.
   // Target verification keeps its own draws after this independent seed.
   pending->draft_rng =
       sampled ? sampling::NextRandom(sampler.mutable_rng_state()) : 0;
-  pending->draft_sampler = sampler;
+  pending->draft_sampler = sampler.WithoutConstraint();
   pending->draft_sampler->Accept(static_cast<sampling::TokenId>(anchor));
   pending->chain = {anchor};
   pending->draft = draft_token_;
@@ -700,13 +890,29 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   if (!defer_head) {
     while (pending->chain.size() < width) {
       AppendDraft(*pending);
-      if (pending->chain.size() < width &&
-          !exec.MtpForward(
-              *session_, std::span<const std::int32_t>(&pending->draft, 1), -1,
-              {.token = sampled ? nullptr : &pending->draft,
-               .candidates = sampled ? &pending->candidates : nullptr},
-              error_msg)) {
-        return false;
+      if (pending->chain.size() < width) {
+        if (!exec.MtpForward(*session_,
+                             std::span<const std::int32_t>(&pending->draft, 1),
+                             -1,
+                             {.token = sampled ? nullptr : &pending->draft,
+                              .candidates = &pending->candidates},
+                             error_msg)) {
+          return false;
+        }
+        pending->NoteTop(pending->chain.size());
+        // Stop before a slot the predictor is unlikely to win. Verification is
+        // unchanged, so this only gives up speculative positions.
+        if (!sampled) {
+          const float confidence = DraftConfidence(pending->candidates);
+          if (pending->chain.size() >= 2 &&
+              pending->chain.size() - 1 < kMaxMtpDraftTokens) {
+            pending->slot_confidence[pending->chain.size() - 1] = confidence;
+          }
+          const float min_conf = MinDraftConfidence();
+          if (min_conf > 0.0F && confidence < min_conf) {
+            break;
+          }
+        }
       }
     }
   }
@@ -732,6 +938,11 @@ bool Session::FinishDecode(const DecodeRequest& request,
     return request.stop_at_eos && model_->IsStopToken(token);
   };
   if (!pending.speculative) {
+    // Ordinary decode is a cycle too. Leaving it uncounted made `cycles` a
+    // speculative-only denominator, so any configuration that fell back to
+    // plain decode reported an inflated per-cycle cost.
+    stats_.cycles += 1;
+    stats_.widths[0] += 1;
     draft_length_.ObserveArToken();
     hidden_base_ = base;
     tokens_.push_back(anchor);
@@ -758,6 +969,10 @@ bool Session::FinishDecode(const DecodeRequest& request,
         result->stop = true;
         break;
       }
+      if (g_mtp_log.enabled) {
+        g_mtp_log.Record(keep, prediction.index == chain[keep],
+                         pending.TopRank(keep, prediction.index), false);
+      }
       if (prediction.index != chain[keep]) {
         break;
       }
@@ -766,12 +981,31 @@ bool Session::FinishDecode(const DecodeRequest& request,
       continue;
     }
     if (sampled) {
+      const auto verify_t0 = std::chrono::steady_clock::now();
       const auto verified =
           VerifyMtpProposal(std::span<const float>(verify_logits_)
                                 .subspan((keep - 1) * vocab, vocab),
                             proposals[keep - 1], sampler);
+      if (g_mtp_log.enabled) {
+        g_mtp_log.verify_ns += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - verify_t0)
+                .count());
+        ++g_mtp_log.verify_calls;
+      }
       const auto token = static_cast<std::int32_t>(verified.token);
       const bool accepted = verified.accepted;
+      if (g_mtp_log.enabled) {
+        int rank = 4;
+        const auto& support = proposals[keep - 1];
+        for (std::size_t i = 0; i < support.size && i < 4; ++i) {
+          if (static_cast<std::int32_t>(support.ids[i]) == token) {
+            rank = static_cast<int>(i);
+            break;
+          }
+        }
+        g_mtp_log.Record(keep, accepted, rank, true);
+      }
       if (is_stop(token)) {
         result->stop = true;
         break;
@@ -807,6 +1041,14 @@ bool Session::FinishDecode(const DecodeRequest& request,
   stats_.cycles += 1;
   stats_.drafted += k - 1;
   stats_.accepted += keep - 1;
+  stats_.widths[std::min<std::size_t>(k - 1, kMaxMtpDraftTokens)] += 1;
+  {
+    const char* path = CalibrationLog::Path();
+    for (std::uint32_t depth = 0; depth + 1 < k; ++depth) {
+      CalibrationLog::Append(path, depth, base, pending.slot_confidence[depth],
+                             depth + 1 < keep);
+    }
+  }
   // A target stop ends the request; it does not classify the remaining
   // proposals as failed predictions.
   draft_length_.Observe(keep - 1, result->stop ? keep - 1 : k - 1, base);
@@ -833,13 +1075,17 @@ bool Session::DecodeStep(std::size_t max_tokens,
   valid_ = false;
   const DecodeRequest request{this, max_tokens, &sampler, result, stop_at_eos};
   PendingDecode pending;
+  const auto step_t0 = std::chrono::steady_clock::now();
   if (!PrepareDecode(request, &pending, error_msg)) {
+    rocm::ReportTrimCounters("decode_step");
     return false;
   }
   if (pending.chain.empty()) {
     valid_ = true;
+    rocm::ReportTrimCounters("decode_step_empty");
     return true;
   }
+  const auto step_t1 = std::chrono::steady_clock::now();
   float* logits = !pending.speculative       ? logits_.data()
                   : pending.gpu_verification ? nullptr
                                              : verify_logits_.data();
@@ -848,10 +1094,25 @@ bool Session::DecodeStep(std::size_t max_tokens,
           pending.speculative ? rocm::Executor::ForwardMode::kVerify
                               : rocm::Executor::ForwardMode::kDecode,
           error_msg)) {
+    rocm::ReportTrimCounters("decode_step_forward");
     return false;
   }
+  const auto step_t2 = std::chrono::steady_clock::now();
   const bool ok = FinishDecode(request, pending, error_msg);
+  if (g_mtp_log.enabled && pending.speculative) {
+    const auto step_t3 = std::chrono::steady_clock::now();
+    const auto ns = [](auto a, auto b) {
+      return static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+    };
+    g_mtp_log.prepare_ns += ns(step_t0, step_t1);
+    g_mtp_log.forward_ns += ns(step_t1, step_t2);
+    g_mtp_log.finish_ns += ns(step_t2, step_t3);
+    g_mtp_log.step_tokens += result->tokens.size();
+    ++g_mtp_log.step_cycles;
+  }
   valid_ = ok;
+  rocm::ReportTrimCounters("decode_step");
   return ok;
 }
 

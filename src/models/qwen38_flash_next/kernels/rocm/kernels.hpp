@@ -6,7 +6,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string_view>
 
+#include "src/core/gguf_reader.hpp"
 #include "src/models/qwen/vision/rope.hpp"
 
 /// Model-private HIP launchers for everything outside the quantized GEMM
@@ -42,6 +44,9 @@ enum class WeightType : std::uint32_t {
   kQ8_0 = 8,
   kQ4_K = 12,
   kQ5_K = 13,
+  kQ6_K = 14,
+  kIQ4_NL = 20,
+  kIQ3_S = 21,
   kBF16 = 30,
 };
 
@@ -136,7 +141,16 @@ void SigmoidMul(float* x, const float* g, std::size_t count,
 /// the narrow projections (routers, alpha/beta, indexer, inject) that the
 /// quantized tier does not cover.
 /// Converts `count` floats to BF16 (or F16) for a 16-bit hipBLAS GEMM.
+/// Narrow `count` float activations into a half or bfloat16 buffer.
+/// `capacity` is the destination buffer's element capacity in output units. The
+/// check is permanent rather than an assert: an over-large count reads past the
+/// source and writes past the destination, which faults on the device and
+/// reports nothing useful, so the call site and the offending extents are named
+/// here instead.
 void NarrowActivations(const float* x, void* out, bool bf16, std::size_t count,
+                       std::size_t capacity, const char* site,
+                       const char* layer, const char* tensor,
+                       std::size_t tokens, std::size_t width,
                        hipStream_t stream);
 
 /// W8A8 route for wide batches over Q8_0 weights: activations quantized per
@@ -156,12 +170,82 @@ void W8A8GemmWave64(const void* w, const void* x_tiled, float* out,
 
 /// Q8_0 HC down projection [320,10240], SiLU(x / 4), then F16 output.
 /// Matches the separate operators' rounding. Supports at least 96 tokens.
+/// Weight types the F16 GEMM family can read. Its kernels index weights as
+/// half or float32, so a quantized tensor must never reach one: the bytes are
+/// reinterpreted and the kernel reads far past the end of the buffer.
+constexpr bool HalfGemmable(core::GgmlType type) noexcept {
+  return type == core::GgmlType::kF16 || type == core::GgmlType::kBF16 ||
+         type == core::GgmlType::kQ8_0;
+}
+
+/// Allocation registry. Every device buffer that a GEMM can be handed is
+/// recorded with the name of the tensor or workspace that owns it, so a fault
+/// inside a library kernel can be attributed to a named allocation instead of
+/// a raw pointer. The address arithmetic is deliberately tolerant: a pointer
+/// just past the end of a buffer is still attributed to it.
+struct AllocationRecord {
+  std::string_view name;
+  std::uintptr_t base;
+  std::size_t bytes;
+};
+void RecordAllocation(std::string_view name, const void* base,
+                      std::size_t bytes);
+/// Owner of `p`, with the offset into it and its total size. Null if unknown.
+std::string_view AllocationOwner(const void* p, std::size_t* offset,
+                                 std::size_t* bytes);
+/// Drops the records of a buffer about to be freed. The range is kept as a
+/// tombstone, so a later copy that still names it is reported together with the
+/// site that freed it instead of being silently unattributed.
+void ForgetAllocation(const void* base, const char* free_site = "");
+/// Memcpy nodes baked into a captured graph, with the capture key. Called
+/// right after capture; forgetting them mirrors hipGraphExecDestroy.
+void RecordGraphMemcpyNodes(std::uint64_t key, hipGraph_t graph);
+void ForgetGraphMemcpyNodes(std::uint64_t key);
+
+/// Copy guard: every device copy and fill of this model goes through these.
+/// A registered destination or source whose [offset, offset + bytes) runs past
+/// its owner logs the site, owner, offset, bytes and current token count, then
+/// aborts. Unregistered pointers (host memory, pool scratch) are not checked.
+#define GUFO_GUARD_STR2(x) #x
+#define GUFO_GUARD_STR(x) GUFO_GUARD_STR2(x)
+#define GUFO_SITE __FILE__ ":" GUFO_GUARD_STR(__LINE__)
+void SetGuardTokens(std::size_t tokens);
+/// GUFO_TRIM_COUNT=1: reports and resets the rollback-trim and graph-capture
+/// counters, so the cost of dropping graphs on a free can be attributed.
+void ReportTrimCounters(const char* tag);
+/// hipHostMalloc that records the pinned buffer, so copies to and from host
+/// staging are bounds-checked too.
+template<typename T>
+hipError_t GuardedHostMalloc(const char* site, T** ptr, std::size_t bytes,
+                             unsigned int flags = hipHostMallocDefault) {
+  const hipError_t status = hipHostMalloc(ptr, bytes, flags);
+  if (status == hipSuccess)
+    RecordAllocation(site, *ptr, bytes);
+  return status;
+}
+void CheckDeviceRange(const char* site, const char* role, const void* p,
+                      std::size_t bytes);
+hipError_t GuardedMemcpy(const char* site, void* dst, const void* src,
+                         std::size_t bytes, hipMemcpyKind kind);
+hipError_t GuardedMemcpyAsync(const char* site, void* dst, const void* src,
+                              std::size_t bytes, hipMemcpyKind kind,
+                              hipStream_t stream);
+hipError_t GuardedMemcpy2D(const char* site, void* dst, std::size_t dpitch,
+                           const void* src, std::size_t spitch,
+                           std::size_t width, std::size_t height,
+                           hipMemcpyKind kind);
+hipError_t GuardedMemset(const char* site, void* dst, int value,
+                         std::size_t bytes);
+hipError_t GuardedMemsetAsync(const char* site, void* dst, int value,
+                              std::size_t bytes, hipStream_t stream);
+
 bool HcDownF16Gemm(const void* w, const void* x_tiled, __half* out,
                    std::uint32_t n_tokens, hipStream_t stream);
 
 /// Stacked Q8_0 QKV projection [13312,2560], head normalization and RoPE.
 /// Writes Q/gates in F32 and K/V caches in F16, preserving separate rounding.
 /// Fixed geometry: 24 query heads, two KV heads, 256 dimensions, 64 rotary.
+/// half_weights reads F16 weight rows (a dequantized copy) instead of Q8_0.
 /// Requires at least 1024 tokens; cache capacity must include position +
 /// tokens.
 bool AttentionF16Gemm(const void* weights, const __half* input,
@@ -169,23 +253,41 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
                       float* gate, __half* keys, __half* values,
                       std::uint32_t n_tokens, const std::uint32_t* position,
                       float theta, float eps, hipStream_t stream,
-                      const qwen::vision::DeviceRope* rope = nullptr);
+                      const qwen::vision::DeviceRope* rope = nullptr,
+                      bool half_weights = false);
 
 /// Exact Q8_0 HC up projection and F16-input mixer for the Flash Next
 /// 2560-hidden, rank-320 geometry. Returns false below 96 tokens or for other
 /// shapes. low_rank must not overlap mixed_half; side outputs are optional.
+/// half_weights reads F16 up rows (a dequantized copy) instead of Q8_0.
 bool HcMixF16Gemm(const void* up, const __half* low_rank, const __half* xn,
                   const float* inject_w, float* mixed, __half* mixed_half,
                   void* mixed_q8, float* inject, std::uint32_t n_tokens,
-                  std::uint32_t hidden, std::uint32_t rank, hipStream_t stream);
+                  std::uint32_t hidden, std::uint32_t rank, hipStream_t stream,
+                  bool half_weights = false);
 
 /// F16 activation rows [batch][k], Q8_0 weights dequantized to F16 in LDS,
 /// F32 accumulation. out is [batch][m]. Unsupported shapes launch nothing.
 bool UnquantizedF16Gemm(const void* w, const __half* x, float* out,
                         std::size_t batch, std::size_t m, std::size_t k,
                         hipStream_t stream);
+/// Expands a Q4_K, Q5_K, Q5_1, IQ4_NL, IQ4_XS or IQ3_S matrix of `count`
+/// elements (whole blocks) to F16.
+/// Each value is rounded exactly as the CPU reference computes it in float
+/// (no fused multiply-add), then rounded once to F16. Other types launch
+/// nothing and return false.
+bool DequantizeHalf(const void* w, core::GgmlType type, __half* out,
+                    std::size_t count, hipStream_t stream);
+/// `ldx` is the element pitch between activation rows (0 means k). Rows whose
+/// byte pitch is a multiple of 4 KiB alias onto one memory channel and fetch
+/// several times slower, so wide activations are padded by the producer.
 bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
-                  std::size_t m, std::size_t k, hipStream_t stream);
+                  std::size_t m, std::size_t k, hipStream_t stream,
+                  std::size_t ldx = 0);
+/// DenseF16Gemm's tile plan over F16 weight rows [m][k] (a dequantized copy).
+bool DenseHalfWeightGemm(const __half* w, const __half* x, float* out,
+                         std::size_t batch, std::size_t m, std::size_t k,
+                         hipStream_t stream, std::size_t ldx = 0);
 
 /// SSM Q8_0 projection fused with its four-tap convolution. Supports
 /// [m=16384,k=2560,channels=10240] and at least 1024 tokens. qkvz retains
@@ -194,11 +296,12 @@ bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
 /// history is read only; pass convolved=true to GatedDeltaNet to consume
 /// this result and update history. Speculative snapshots need all raw QKV
 /// rows and must use DenseF16Gemm instead. Unsupported shapes launch nothing.
+/// half_weights reads F16 weight rows (a dequantized copy) instead of Q8_0.
 bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
                      const float* history, float* qkvz, float* convolved,
                      std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
                      std::uint32_t channels, std::uint32_t kernel,
-                     hipStream_t stream);
+                     hipStream_t stream, bool half_weights = false);
 
 /// Routed expert GEMMs. RoutedCompact sorts the (token, slot) assignments
 /// by expert into `rows_token`/`rows_slot` (RoutedCompactRows(slots,
@@ -299,7 +402,8 @@ void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    std::uint32_t k_heads, std::uint32_t v_heads,
                    std::uint32_t d, std::uint32_t kernel, bool row_split,
                    bool convolved, float eps, hipStream_t stream,
-                   __half* out_half = nullptr);
+                   __half* out_half = nullptr,
+                   std::uint32_t out_half_pitch = 0);
 
 /// Private rows for one request in a decode batch. Scratch regions and all
 /// recurrent/history/rollback buffers must be disjoint between requests.
