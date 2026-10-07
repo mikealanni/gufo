@@ -13,6 +13,7 @@
 #include <cerrno>
 #include <charconv>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -24,6 +25,7 @@
 #include <ranges>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <system_error>
 #include <thread>
 #include <utility>
@@ -35,6 +37,7 @@
 #include "src/cli/serve/image_api.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/openai_chat.hpp"
+#include "src/cli/serve/poison.hpp"
 #include "src/cli/serve/sampling_request.hpp"
 #include "src/cli/serve/stop_sequences.hpp"
 #include "src/cli/serve/tts_service.hpp"
@@ -51,6 +54,28 @@ namespace {
 
 std::atomic<int> shutdown_signal{0};
 static_assert(std::atomic<int>::is_always_lock_free);
+
+constexpr int kPoisonedFailureStreak = 5;
+std::atomic<int> internal_failure_streak{0};
+
+void NoteInternalFailure(std::string_view detail) {
+  cli::ExitOnPoisonedContext(detail);
+  const int streak =
+      internal_failure_streak.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (streak < kPoisonedFailureStreak) {
+    return;
+  }
+  if (const char* keep = std::getenv("GUFO_KEEP_POISONED");
+      keep != nullptr && keep[0] != '\0' && keep[0] != '0') {
+    return;
+  }
+  std::fprintf(stderr,
+               "fatal: %d consecutive internal errors, assuming a poisoned GPU "
+               "context; exiting non-zero\n  last detail: %.*s\n",
+               streak, static_cast<int>(detail.size()), detail.data());
+  std::fflush(nullptr);
+  std::_Exit(70);
+}
 
 void RequestShutdown(int signal) noexcept {
   // A signal may arrive on any model/HTTP worker. Only a lock-free atomic
@@ -1658,6 +1683,9 @@ void HttpServer::handle_connection(int client_fd) {
         resp.log_details += " error_code=" + resp.stream_log->error_code;
       }
     }
+    if (resp.status < 400 && req.path == "/v1/chat/completions") {
+      internal_failure_streak.store(0, std::memory_order_relaxed);
+    }
     if (resp.status >= 400) {
       try {
         const auto body = json::parse(resp.body);
@@ -1698,6 +1726,7 @@ void HttpServer::handle_connection(int client_fd) {
     const auto duration_ms = std::chrono::duration<double, std::milli>(
                                  std::chrono::steady_clock::now() - start_time)
                                  .count();
+    NoteInternalFailure(e.what());
     HttpResponse resp = Err(500, "Internal Server Error", e.what(),
                             "internal_error", "server_exception");
     resp.headers.emplace_back("X-Request-ID", req.request_id);
@@ -1711,6 +1740,7 @@ void HttpServer::handle_connection(int client_fd) {
     const auto duration_ms = std::chrono::duration<double, std::milli>(
                                  std::chrono::steady_clock::now() - start_time)
                                  .count();
+    NoteInternalFailure("unknown server error");
     HttpResponse resp =
         Err(500, "Internal Server Error", "unknown server error",
             "internal_error", "server_exception");

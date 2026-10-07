@@ -5301,10 +5301,13 @@ bool LaunchRoutedGatedF16(const void* gate, const void* up, WeightType type,
       return true;
     case WeightType::kIQ3_S:
       if constexpr (BN == 128) {
+        const std::uint32_t* grid_table = Iq3sGridDevice();
+        if (grid_table == nullptr || up == nullptr)
+          return false;
         hipLaunchKernelGGL(
             (RoutedF16GEMMKernel<WeightType::kIQ3_S, 128, BN, 2, true>), grid,
             dim3(kThreads), 0, stream, gate, x, tiles, pad_bounds, rows_in,
-            rows_out, nullptr, nullptr, out, m, k, up, Iq3sGridDevice());
+            rows_out, nullptr, nullptr, out, m, k, up, grid_table);
         return true;
       }
       return false;
