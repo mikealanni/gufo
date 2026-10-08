@@ -29,6 +29,9 @@ if (ENGINE_ENABLE_HIP)
     add_qwen38_flash_next_test(${name} gufo_qwen38_flash_next "hip;gpu;gfx1151")
   endforeach()
 
+  add_executable(qwen38_flash_next_routed_gemm_bench EXCLUDE_FROM_ALL routed_gemm_bench.cpp)
+  target_link_libraries(qwen38_flash_next_routed_gemm_bench PRIVATE gufo_qwen38_flash_next)
+
   add_executable(qwen38_flash_next_session_test EXCLUDE_FROM_ALL session_test.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_cache.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_disk_store.cpp
