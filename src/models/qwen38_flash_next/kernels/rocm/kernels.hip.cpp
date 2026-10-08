@@ -4425,7 +4425,21 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
     static_assert(kLdsBytes >= 16 * (BM + 2) * sizeof(float));
     if (out_half != nullptr) {
       constexpr unsigned stride = BM + 2;
+      constexpr int kRounds = 16 * BM / (256 * 2);
       float* scratch = reinterpret_cast<float*>(lds);
+      // Destination rows for every (token tile, round), loaded together so
+      // their latency overlaps instead of repeating behind each barrier.
+      std::int32_t dsts[kTokTiles][kRounds];
+#pragma unroll
+      for (int j = 0; j < kTokTiles; ++j) {
+#pragma unroll
+        for (int round = 0; round < kRounds; ++round) {
+          const unsigned tr = ((round * 256 + tid) * 2) / BM;
+          const unsigned t = t_local + j * 16 + tr;
+          dsts[j][round] =
+              t < unsigned(bucket_rows) ? rows_out[bucket_begin + t] : -1;
+        }
+      }
 #pragma unroll
       for (int j = 0; j < kTokTiles; ++j) {
 #pragma unroll
@@ -4437,12 +4451,12 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
         }
         __syncthreads();
 #pragma unroll
-        for (int round = 0; round < 16 * BM / (256 * 2); ++round) {
+        for (int round = 0; round < kRounds; ++round) {
           const unsigned flat = (round * 256 + tid) * 2;
           const unsigned tr = flat / BM, row = flat % BM;
-          const unsigned t = t_local + j * 16 + tr, r = r_block + row;
-          if (t < unsigned(bucket_rows) && r < m) {
-            const int dst = rows_out[bucket_begin + t];
+          const unsigned r = r_block + row;
+          if (r < m) {
+            const int dst = dsts[j][round];
             if (dst >= 0) {
               float2 v =
                   *reinterpret_cast<const float2*>(scratch + tr * stride + row);
