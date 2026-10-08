@@ -66,6 +66,17 @@ double TimeMs(const std::function<bool()>& fn) {
   return ms / kIters;
 }
 
+std::uint64_t Hash(const void* device, std::size_t bytes) {
+  std::vector<std::uint8_t> host(bytes);
+  Check(hipMemcpy(host.data(), device, bytes, hipMemcpyDeviceToHost), "hash");
+  std::uint64_t h = 1469598103934665603ULL;
+  for (std::uint8_t b : host) {
+    h ^= b;
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -126,6 +137,9 @@ int main(int argc, char** argv) {
   Check(hipMalloc(&d_up_out, (slots + 8192) * kFf * sizeof(__half)), "malloc");
   Check(hipMalloc(&d_down_out, (slots + 8192) * kHidden * sizeof(__half)),
         "malloc");
+  Check(hipMemset(d_up_out, 0, (slots + 8192) * kFf * sizeof(__half)), "memset");
+  Check(hipMemset(d_down_out, 0, (slots + 8192) * kHidden * sizeof(__half)),
+        "memset");
 
   const std::size_t compact = q::RoutedCompactRows(slots, kExperts);
   std::int32_t* d_ids = Upload(ids);
@@ -158,8 +172,11 @@ int main(int argc, char** argv) {
                                  128, d_bounds, d_rows_token, d_rows_slot,
                                  d_up_out, kFf, kHidden, nullptr);
   });
-  std::printf("pair  IQ3_S gate+up : %7.3f ms/call  %5.1f TFLOPS (real rows)\n",
-              pair_ms, flop_pair / (pair_ms * 1e9));
+  std::printf("pair  IQ3_S gate+up : %7.3f ms/call  %5.1f TFLOPS (real rows)  "
+              "hash %016llx\n",
+              pair_ms, flop_pair / (pair_ms * 1e9),
+              static_cast<unsigned long long>(
+                  Hash(d_up_out, slots * kFf * sizeof(__half))));
 
   const double down_ms = TimeMs([&] {
     return q::RoutedF16Gemm(d_down, q::WeightType::kIQ4_NL, d_u, d_t128,
@@ -167,8 +184,11 @@ int main(int argc, char** argv) {
                             d_bounds, d_rows_slot, d_rows_slot, nullptr,
                             nullptr, d_down_out, kHidden, kFf, nullptr);
   });
-  std::printf("down  IQ4_NL (128) : %7.3f ms/call  %5.1f TFLOPS (real rows)\n",
-              down_ms, flop_down / (down_ms * 1e9));
+  std::printf("down  IQ4_NL (128) : %7.3f ms/call  %5.1f TFLOPS (real rows)  "
+              "hash %016llx\n",
+              down_ms, flop_down / (down_ms * 1e9),
+              static_cast<unsigned long long>(
+                  Hash(d_down_out, slots * kHidden * sizeof(__half))));
 
   const double down48_ms = TimeMs([&] {
     return q::RoutedF16Gemm(d_down, q::WeightType::kIQ4_NL, d_u, d_t48,
