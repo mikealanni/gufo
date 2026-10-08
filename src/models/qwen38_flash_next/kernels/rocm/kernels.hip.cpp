@@ -4066,6 +4066,9 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
   uint4 f_codes_hi[kWaveRowTiles];  ///< Q8_0: the block's second 16 codes
   uint4 f_qh[kWaveRowTiles][2];     ///< Q5_K: the superblock's high bits
   std::uint32_t f_high[kWaveRowTiles];
+  std::uint32_t f_i3_qh[kWaveRowTiles];    ///< IQ3_S: word with the high-bit byte
+  std::uint32_t f_i3_sc[kWaveRowTiles];    ///< IQ3_S: word with the scale byte
+  int f_i3_ib32[kWaveRowTiles];            ///< IQ3_S: sub-block in its super-block
   std::uint32_t f_dm[kWaveRowTiles];  ///< Q5_1: d | m; Q8_0: d
   int f_sb32[kWaveRowTiles];          ///< Q4_K: the K block in its superblock
   constexpr int kActFetch = BN <= 64 ? 2 : 4;
@@ -4077,6 +4080,7 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
   constexpr int kActChunks = BN * BK * 4;
   static_assert(kActChunks <= kActFetch * 256);
   const __half* a_src[kActFetch];
+  bool a_ok[kActFetch];
   int a_slot[kActFetch];
 #pragma unroll
   for (int i = 0; i < kActFetch; ++i) {
@@ -4087,8 +4091,12 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
     const std::int32_t src = (chunk < kActChunks && c_row < bucket_rows)
                                  ? rows_in[bucket_begin + c_row]
                                  : -1;
+    // Dead rows read row 0 of x (always valid) and are zeroed after the
+    // load: straight-line loads keep the outstanding-load count static, so
+    // the wait lands at the first use instead of right after the fetch.
+    a_ok[i] = src >= 0;
     a_src[i] = src >= 0 ? x + (static_cast<std::size_t>(src) * k) + (sub * 8)
-                        : nullptr;
+                        : x;
     // s_act[(kb * 4 + quarter) * kActStride + t]
     a_slot[i] = chunk < kActChunks ? (sub * kActStride) + t : -1;
   }
@@ -4126,9 +4134,15 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
         std::uint32_t sg = 0;
         __builtin_memcpy(q, blk + 2 + ib32 * 8, 8);
         __builtin_memcpy(&sg, blk + 74 + ib32 * 4, 4);
-        const std::uint32_t sc = ib32 % 2 == 0 ? (blk[106 + ib32 / 2] & 0x0FU)
-                                               : (blk[106 + ib32 / 2] >> 4U);
-        f_codes[u] = make_uint4(q[0], q[1], sg, blk[66 + ib32] | (sc << 8U));
+        // Raw 16-bit words holding the high-bit byte and the scale byte; the
+        // bytes are picked out in commit_stage, so nothing consumes these
+        // loads before the compute.
+        f_i3_qh[u] = *reinterpret_cast<const std::uint16_t*>(
+            blk + 66 + (ib32 & ~1));
+        f_i3_sc[u] = *reinterpret_cast<const std::uint16_t*>(
+            blk + 106 + ((ib32 / 2) & ~1));
+        f_i3_ib32[u] = ib32;
+        f_codes[u] = make_uint4(q[0], q[1], sg, 0u);
       } else if constexpr (kQ8) {
         // block_q8_0 is 34 bytes, so the code loads are 2-byte aligned.
         const auto* blk = f_ptr[u] + ((kb0 + f_c) * 34);
@@ -4181,9 +4195,7 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
     }
 #pragma unroll
     for (int i = 0; i < kActFetch; ++i) {
-      a_data[i] = a_src[i] != nullptr
-                      ? *reinterpret_cast<const uint4*>(a_src[i] + (kb0 * 32))
-                      : make_uint4(0u, 0u, 0u, 0u);
+      a_data[i] = *reinterpret_cast<const uint4*>(a_src[i] + (kb0 * 32));
     }
   };
 
@@ -4192,6 +4204,17 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
     for (int u = 0; u < kWaveRowTiles; ++u) {
       const int row = (tid >> 1) + (u * 128);
       std::uint32_t scale_bias = 0;
+      if constexpr (kI3) {
+        // Fold the sub-block's scale nibble into the staged chunk here, once
+        // the fetch has had the whole compute stage to land.
+        const int ib32 = f_i3_ib32[u];
+        const std::uint32_t qh = (f_i3_qh[u] >> (8 * (ib32 & 1))) & 0xFFU;
+        const std::uint32_t scale_byte =
+            (f_i3_sc[u] >> (8 * ((ib32 >> 1) & 1))) & 0xFFU;
+        const std::uint32_t sc =
+            ib32 % 2 == 0 ? (scale_byte & 0x0FU) : (scale_byte >> 4U);
+        f_codes[u].w = qh | (sc << 8U);
+      }
       if constexpr (kQ8) {
         s_codes[swizzle(row, 2 * f_c)] = f_codes[u];
         s_codes[swizzle(row, (2 * f_c) + 1)] = f_codes_hi[u];
@@ -4247,7 +4270,8 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
 #pragma unroll
     for (int i = 0; i < kActFetch; ++i) {
       if (a_slot[i] >= 0) {
-        s_act[a_slot[i]] = a_data[i];
+        s_act[a_slot[i]] =
+            a_ok[i] ? a_data[i] : make_uint4(0u, 0u, 0u, 0u);
       }
     }
   };
