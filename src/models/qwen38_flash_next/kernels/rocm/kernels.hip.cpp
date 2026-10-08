@@ -518,14 +518,38 @@ __global__ void HcCombineKernel(float* res, const float* block_out,
   }
 }
 
+/// Residual rows are float4 groups in F32, or the same four elements stored as
+/// F16 on large wide-prefill chunks (halving the combine's residual traffic).
+/// Stores saturate at the F16 range instead of overflowing to infinity.
+__device__ __forceinline__ float4 LoadResRow(const float* p) {
+  return *reinterpret_cast<const float4*>(p);
+}
+__device__ __forceinline__ float4 LoadResRow(const __half* p) {
+  const float2 a = __half22float2(*reinterpret_cast<const __half2*>(p));
+  const float2 b = __half22float2(*reinterpret_cast<const __half2*>(p + 2));
+  return float4{a.x, a.y, b.x, b.y};
+}
+__device__ __forceinline__ float SaturateHalf(float x) {
+  return x != x ? x : fminf(fmaxf(x, -65504.0F), 65504.0F);
+}
+__device__ __forceinline__ void StoreResRow(float* p, float4 v) {
+  *reinterpret_cast<float4*>(p) = v;
+}
+__device__ __forceinline__ void StoreResRow(__half* p, float4 v) {
+  *reinterpret_cast<__half2*>(p) =
+      __floats2half2_rn(SaturateHalf(v.x), SaturateHalf(v.y));
+  *reinterpret_cast<__half2*>(p + 2) =
+      __floats2half2_rn(SaturateHalf(v.z), SaturateHalf(v.w));
+}
+
 /// HcCombineKernel over one token's whole hyper-connection row (all streams,
 /// float4 lanes): a block owns streams * hidden elements in up to
 /// kMaxChunks float4 per thread, keeps the updated residual in registers
 /// between the two passes, reduces the four stream norms in one block
 /// reduction, and quantizes each 32-wide block over its eight lanes with a
 /// four-code store. Rows of four streams up to 2,560 wide.
-template<typename XnT>
-__global__ void HcCombineVec4Kernel(float* res, const float* block_out,
+template<typename XnT, typename ResT = float>
+__global__ void HcCombineVec4Kernel(ResT* res, const float* block_out,
                                     const float* inject,
                                     std::uint32_t inject_parts,
                                     const float* gamma, XnT* xn, void* xn_q8,
@@ -546,7 +570,7 @@ __global__ void HcCombineVec4Kernel(float* res, const float* block_out,
     }
     w[s] = 2.0f * SigmoidF(logit / static_cast<float>(kStreams));
   }
-  float* dst = res + static_cast<std::size_t>(t) * hc_dim;
+  ResT* dst = res + static_cast<std::size_t>(t) * hc_dim;
   const float* src = block_out + static_cast<std::size_t>(t) * hidden;
   const std::uint32_t chunks = static_cast<std::uint32_t>(hc_dim / 4);
   float4 v[kMaxChunks];
@@ -559,11 +583,11 @@ __global__ void HcCombineVec4Kernel(float* res, const float* block_out,
       const std::uint32_t s = e / hidden;
       const std::uint32_t i = e - (s * hidden);
       const float ws = w[s];
-      const float4 r = *reinterpret_cast<const float4*>(dst + e);
+      const float4 r = LoadResRow(dst + e);
       const float4 b = *reinterpret_cast<const float4*>(src + i);
       v[c] = float4{r.x + b.x * ws, r.y + b.y * ws, r.z + b.z * ws,
                     r.w + b.w * ws};
-      *reinterpret_cast<float4*>(dst + e) = v[c];
+      StoreResRow(dst + e, v[c]);
       const float sq =
           v[c].x * v[c].x + v[c].y * v[c].y + v[c].z * v[c].z + v[c].w * v[c].w;
 #pragma unroll
@@ -657,8 +681,9 @@ __global__ void HcCombineVec4Kernel(float* res, const float* block_out,
 /// their weights and the gated shared expert (MoeEpilogueVec4Kernel), so the
 /// block output never round-trips memory. Threads own hidden lanes (up to
 /// three float4 each) across the four streams.
+template<typename ResT>
 __global__ void HcCombineMoeF16Kernel(
-    float* res, const __half* expert_out, const float* weights,
+    ResT* res, const __half* expert_out, const float* weights,
     const float* shared_out, const float* gate, std::uint32_t gate_stride,
     std::uint32_t used, const float* inject, std::uint32_t inject_parts,
     const float* gamma, __half* xn, void* xn_q8, std::uint32_t hidden,
@@ -679,7 +704,7 @@ __global__ void HcCombineMoeF16Kernel(
     }
     w[s] = 2.0f * SigmoidF(logit / static_cast<float>(kStreams));
   }
-  float* dst = res + static_cast<std::size_t>(t) * hc_dim;
+  ResT* dst = res + static_cast<std::size_t>(t) * hc_dim;
   // The block output: sum of the weighted expert rows plus the gated shared
   // expert, per hidden chunk.
   const float g = SigmoidF(gate[static_cast<std::size_t>(t) * gate_stride]);
@@ -711,10 +736,10 @@ __global__ void HcCombineMoeF16Kernel(
       v[s][c] = float4{0.0F, 0.0F, 0.0F, 0.0F};
       if (i < hidden) {
         const std::size_t e = (static_cast<std::size_t>(s) * hidden) + i;
-        const float4 r = *reinterpret_cast<const float4*>(dst + e);
+        const float4 r = LoadResRow(dst + e);
         v[s][c] = float4{r.x + b.x * w[s], r.y + b.y * w[s], r.z + b.z * w[s],
                          r.w + b.w * w[s]};
-        *reinterpret_cast<float4*>(dst + e) = v[s][c];
+        StoreResRow(dst + e, v[s][c]);
         ss[s] += v[s][c].x * v[s][c].x + v[s][c].y * v[s][c].y +
                  v[s][c].z * v[s][c].z + v[s][c].w * v[s][c].w;
       }
@@ -4721,38 +4746,89 @@ void HcCombine(float* res, const float* block_out, const float* inject,
                      inject_parts, gamma, xn, nullptr, hidden, streams, eps);
 }
 
-bool HcCombineMoeF16(float* res, const __half* expert_out, const float* weights,
+bool HcCombineMoeF16(void* res, const __half* expert_out, const float* weights,
                      const float* shared_out, const float* gate,
                      std::uint32_t gate_stride, std::uint32_t used,
                      const float* inject, std::uint32_t inject_parts,
                      const float* gamma, __half* xn, void* xn_q8,
                      std::uint32_t n_tokens, std::uint32_t hidden,
-                     std::uint32_t streams, float eps, hipStream_t stream) {
+                     std::uint32_t streams, float eps, hipStream_t stream,
+                     bool res_half) {
   if (streams != 4 || hidden % 128 != 0 || hidden > 3 * 4 * kThreads ||
       gamma == nullptr || xn_q8 == nullptr) {
     return false;
   }
-  hipLaunchKernelGGL(HcCombineMoeF16Kernel, dim3(n_tokens), dim3(kThreads), 0,
-                     stream, res, expert_out, weights, shared_out, gate,
-                     gate_stride, used, inject, inject_parts, gamma, xn, xn_q8,
-                     hidden, eps);
+  if (res_half) {
+    hipLaunchKernelGGL(HcCombineMoeF16Kernel<__half>, dim3(n_tokens),
+                       dim3(kThreads), 0, stream, static_cast<__half*>(res),
+                       expert_out, weights, shared_out, gate, gate_stride, used,
+                       inject, inject_parts, gamma, xn, xn_q8, hidden, eps);
+    return true;
+  }
+  hipLaunchKernelGGL(HcCombineMoeF16Kernel<float>, dim3(n_tokens),
+                     dim3(kThreads), 0, stream, static_cast<float*>(res),
+                     expert_out, weights, shared_out, gate, gate_stride, used,
+                     inject, inject_parts, gamma, xn, xn_q8, hidden, eps);
   return true;
 }
 
-void HcCombineF16(float* res, const float* block_out, const float* inject,
+namespace {
+__global__ void ResToHalfKernel(const float* __restrict__ src,
+                                __half* __restrict__ dst, std::size_t groups) {
+  const std::size_t g =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (g < groups) {
+    StoreResRow(dst + g * 4, LoadResRow(src + g * 4));
+  }
+}
+__global__ void ResToFloatKernel(const __half* __restrict__ src,
+                                 float* __restrict__ dst, std::size_t groups) {
+  const std::size_t g =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (g < groups) {
+    StoreResRow(dst + g * 4, LoadResRow(src + g * 4));
+  }
+}
+}  // namespace
+
+void ResidualToHalf(const float* src, __half* dst, std::size_t count,
+                    hipStream_t stream) {
+  const std::size_t groups = count / 4;
+  hipLaunchKernelGGL(ResToHalfKernel, dim3((groups + kThreads - 1) / kThreads),
+                     dim3(kThreads), 0, stream, src, dst, groups);
+}
+
+void ResidualToFloat(const __half* src, float* dst, std::size_t count,
+                     hipStream_t stream) {
+  const std::size_t groups = count / 4;
+  hipLaunchKernelGGL(ResToFloatKernel, dim3((groups + kThreads - 1) / kThreads),
+                     dim3(kThreads), 0, stream, src, dst, groups);
+}
+
+void HcCombineF16(void* res, const float* block_out, const float* inject,
                   std::uint32_t inject_parts, const float* gamma, __half* xn,
                   void* xn_q8, std::uint32_t n_tokens, std::uint32_t hidden,
-                  std::uint32_t streams, float eps, hipStream_t stream) {
+                  std::uint32_t streams, float eps, hipStream_t stream,
+                  bool res_half) {
   // F16 prefill keeps the same reduction even for a one-token tail.
   if (streams == 4 && hidden % 128 == 0 && hidden <= 2560) {
-    hipLaunchKernelGGL(HcCombineVec4Kernel<__half>, dim3(n_tokens),
-                       dim3(kThreads), 0, stream, res, block_out, inject,
-                       inject_parts, gamma, xn, xn_q8, hidden, eps);
+    if (res_half) {
+      hipLaunchKernelGGL((HcCombineVec4Kernel<__half, __half>), dim3(n_tokens),
+                         dim3(kThreads), 0, stream,
+                         static_cast<__half*>(res), block_out, inject,
+                         inject_parts, gamma, xn, xn_q8, hidden, eps);
+      return;
+    }
+    hipLaunchKernelGGL((HcCombineVec4Kernel<__half, float>), dim3(n_tokens),
+                       dim3(kThreads), 0, stream, static_cast<float*>(res),
+                       block_out, inject, inject_parts, gamma, xn, xn_q8, hidden,
+                       eps);
     return;
   }
   hipLaunchKernelGGL(HcCombineKernel<__half>, dim3(n_tokens, streams),
-                     dim3(kThreads), 0, stream, res, block_out, inject,
-                     inject_parts, gamma, xn, xn_q8, hidden, streams, eps);
+                     dim3(kThreads), 0, stream, static_cast<float*>(res),
+                     block_out, inject, inject_parts, gamma, xn, xn_q8, hidden,
+                     streams, eps);
 }
 
 void SiluScale(float* x, float scale, std::size_t count, hipStream_t stream) {

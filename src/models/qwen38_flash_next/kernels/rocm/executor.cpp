@@ -490,6 +490,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   s.x_q8t =
       Alloc<std::uint8_t>(a, Q8TiledBytes(T, model.max_q8_cols()), error_msg);
   s.res = f32(T * hc_dim);
+  s.res_h = Alloc<__half>(a, T * hc_dim, error_msg);
   s.xn = f32(T * hc_dim);
   s.xn_half = Alloc<__half>(a, T * hc_dim, error_msg);
   s.xn_q8t = Alloc<std::uint8_t>(a, Q8TiledBytes(T, hc_dim), error_msg);
@@ -1393,8 +1394,8 @@ bool Executor::GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
   return true;
 }
 
-void Executor::Combine(float* res, const float* gamma,
-                       std::uint32_t n_tokens) const {
+void Executor::Combine(void* res, const float* gamma, std::uint32_t n_tokens,
+                       bool res_half) const {
   const Config& c = config();
   // Wide batches hand the next mixer an F16 norm for its epilogue and the
   // same norm quantized into the tiled Q8 layout for its W8A8 down
@@ -1410,7 +1411,7 @@ void Executor::Combine(float* res, const float* gamma,
                         s_.router + c.num_experts, c.num_experts + 1,
                         c.num_experts_used, s_.inject, inject_parts_, gamma,
                         s_.xn_half, s_.xn_q8t, n_tokens, c.hidden_size,
-                        c.hc_count, c.rms_eps, stream_)) {
+                        c.hc_count, c.rms_eps, stream_, res_half)) {
       return;
     }
     MoeEpilogueVec4F16(down, s_.weights, s_.shexp_out,
@@ -1421,11 +1422,12 @@ void Executor::Combine(float* res, const float* gamma,
   if (xn_half_) {
     HcCombineF16(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn_half,
                  s_.xn_q8t, n_tokens, c.hidden_size, c.hc_count, c.rms_eps,
-                 stream_);
+                 stream_, res_half);
     return;
   }
-  HcCombine(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn, n_tokens,
-            c.hidden_size, c.hc_count, c.rms_eps, stream_);
+  HcCombine(static_cast<float*>(res), s_.block_out, s_.inject, inject_parts_,
+            gamma, s_.xn, n_tokens, c.hidden_size, c.hc_count, c.rms_eps,
+            stream_);
 }
 
 bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
@@ -2503,13 +2505,45 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
   }
   const auto& layers = model_->layers();
   bool normed = false;  ///< xn holds the next mixer's grouped norm of res
+  // Large wide-prefill chunks keep the residual in F16 between the combines,
+  // which halves the combine kernels' DRAM traffic (the normalized xn is still
+  // formed from the unrounded sum). Wherever the residual is read as F32 (the
+  // first mixer norm, the PLE layer, the head and MTP after the last layer)
+  // it is converted back first. Decode and verification keep F32.
+  constexpr std::uint32_t kResidualHalfMinRows = 1024;
+  const bool res_half_mode =
+      prefill_phase && wide_mixer_ && MatrixRows(n) && !speculative &&
+      n >= kResidualHalfMinRows && c.hc_count == 4 &&
+      c.hidden_size % 128 == 0 && c.hidden_size <= 2560;
+  bool res_is_half = false;
+  const std::size_t res_count = static_cast<std::size_t>(n) * c.HcDim();
+  const auto residual_to_half = [&] {
+    ResidualToHalf(s_.res, s_.res_h, res_count, stream_);
+    res_is_half = true;
+  };
+  const auto residual_to_float = [&] {
+    ResidualToFloat(s_.res_h, s_.res, res_count, stream_);
+    res_is_half = false;
+  };
+  const auto combine = [&](const float* gamma) {
+    Combine(res_is_half ? static_cast<void*>(s_.res_h)
+                        : static_cast<void*>(s_.res),
+            gamma, n, res_is_half);
+  };
+  if (res_half_mode) {
+    residual_to_half();
+  }
   for (std::uint32_t il = first_layer; il < end_layer; ++il) {
     if (!session.CheckCancellation(error_msg))
       return false;
     const DeviceLayer& l = layers[il];
-    if (c.IsPleLayer(il) &&
-        !Ple(l, session, n, s_.res, speculative, error_msg)) {
-      return false;
+    if (c.IsPleLayer(il)) {
+      if (res_is_half) {
+        residual_to_float();
+      }
+      if (!Ple(l, session, n, s_.res, speculative, error_msg)) {
+        return false;
+      }
     }
     if (!HcMix(l.hc_attn, s_.res, normed, s_.mixed, s_.inject, n, error_msg)) {
       return false;
@@ -2528,7 +2562,10 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
 
     // Each combine also norms the residual for the mixer that follows it,
     // unless PLE rewrites the residual first.
-    Combine(s_.res, l.hc_ffn.norm.f32(), n);
+    if (res_half_mode && !res_is_half) {
+      residual_to_half();
+    }
+    combine(l.hc_ffn.norm.f32());
     if (!HcMix(l.hc_ffn, s_.res, true, s_.mixed, s_.inject, n, error_msg) ||
         !Moe(l, s_.mixed, s_.block_out, n, error_msg)) {
       return false;
@@ -2538,8 +2575,14 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
             ? (c.IsPleLayer(il + 1) ? nullptr
                                     : layers[il + 1].hc_attn.norm.f32())
             : model_->hc_head().norm.f32();
-    Combine(s_.res, next_norm, n);
+    if (next_norm == nullptr && res_is_half) {
+      residual_to_float();  // PLE rewrites the residual in F32 next
+    }
+    combine(next_norm);
     normed = next_norm != nullptr;
+  }
+  if (res_is_half) {
+    residual_to_float();
   }
   if (end_layer < c.num_layers) {
     return true;

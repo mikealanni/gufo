@@ -356,7 +356,8 @@ private:
   void CombineBatch(float* res, const float* gamma, std::uint32_t rows) const;
   /// Residual update by the block output plus the grouped norm for the next
   /// mixer (`gamma`); wide batches write it as F16 and tiled Q8.
-  void Combine(float* res, const float* gamma, std::uint32_t n_tokens) const;
+  void Combine(void* res, const float* gamma, std::uint32_t n_tokens,
+               bool res_half = false) const;
   /// Hashes the batch's n-gram rows and starts reading them from disk, so
   /// the read overlaps the layers before the PLE one.
   bool PleFetch(Session& s, std::span<const std::int32_t> tokens,
@@ -426,6 +427,7 @@ private:
     void* x_q8[2];  ///< Q8_1 activations of a decode batch, alternating
     void* x_q8t;    ///< tiled Q8 activations of a wide batch (W8A8 route)
     float* res;
+    __half* res_h;  ///< F16 residual of large wide-prefill chunks (see ForwardBody)
     float* xn;
     __half* xn_half;  ///< xn as F16 on the F16 mixer input route
     void* xn_q8t;     ///< xn as tiled Q8 for the W8A8 mixer down projection

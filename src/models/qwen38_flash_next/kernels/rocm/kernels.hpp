@@ -103,23 +103,29 @@ void HcCombine(float* res, const float* block_out, const float* inject,
 /// A non-null `xn_q8` also receives the norm quantized into the tiled Q8
 /// layout (`Q8TiledBytes(n_tokens, streams * hidden)`) for the W8A8 down
 /// projection; hidden must be a multiple of 32.
-void HcCombineF16(float* res, const float* block_out, const float* inject,
+void HcCombineF16(void* res, const float* block_out, const float* inject,
                   std::uint32_t inject_parts, const float* gamma, __half* xn,
                   void* xn_q8, std::uint32_t n_tokens, std::uint32_t hidden,
-                  std::uint32_t streams, float eps, hipStream_t stream);
+                  std::uint32_t streams, float eps, hipStream_t stream, bool res_half = false);
+/// Residual rows between F32 and F16 storage (count = elements, a multiple of
+/// four). The F16 form is used by large wide-prefill chunks; stores saturate.
+void ResidualToHalf(const float* src, __half* dst, std::size_t count,
+                    hipStream_t stream);
+void ResidualToFloat(const __half* src, float* dst, std::size_t count,
+                     hipStream_t stream);
 /// HcCombineF16 with the MoE epilogue fused in: the block output is
 /// MoeEpilogueVec4F16's result over `expert_out` ([tokens][used][hidden]
 /// F16 rows), `weights`, the gated shared expert; it is formed in
 /// registers and never written. Returns false (launching nothing) for a
 /// geometry the fused kernel does not cover (four 2,560-wide streams with a
 /// norm and the tiled Q8 output are required).
-bool HcCombineMoeF16(float* res, const __half* expert_out, const float* weights,
+bool HcCombineMoeF16(void* res, const __half* expert_out, const float* weights,
                      const float* shared_out, const float* gate,
                      std::uint32_t gate_stride, std::uint32_t used,
                      const float* inject, std::uint32_t inject_parts,
                      const float* gamma, __half* xn, void* xn_q8,
                      std::uint32_t n_tokens, std::uint32_t hidden,
-                     std::uint32_t streams, float eps, hipStream_t stream);
+                     std::uint32_t streams, float eps, hipStream_t stream, bool res_half = false);
 
 /// x[i] = silu(x[i] * scale), in place over `count` floats.
 void SiluScale(float* x, float scale, std::size_t count, hipStream_t stream);
