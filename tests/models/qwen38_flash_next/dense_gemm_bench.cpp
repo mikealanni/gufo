@@ -10,6 +10,7 @@
 // output, so launch-order changes can be checked for identical results.
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+#include <hipblaslt/hipblaslt.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -335,6 +336,76 @@ int main(int argc, char** argv) try {
       for (void* p : {static_cast<void*>(w), static_cast<void*>(x),
                       static_cast<void*>(y_lib), static_cast<void*>(y_own)})
         CheckHip(hipFree(p), "hipFree");
+    }
+  }
+
+  // Vendor-library ceiling at the production shapes (diagnostic): every
+  // hipBLASLt candidate for the same projections with 16-bit weights, to bound
+  // what a hand-written kernel could reach on this chip.
+  if (std::getenv("GUFO_LIB_CEILING") != nullptr) {
+    hipblasLtHandle_t handle = nullptr;
+    if (hipblasLtCreate(&handle) != HIPBLAS_STATUS_SUCCESS) {
+      std::printf("ceiling: hipblasLtCreate failed\n");
+    } else {
+      struct Shape { const char* name; int m, k; };
+      for (const Shape sh : {Shape{"ssm 16384x2560", 16384, 2560},
+                             Shape{"attn 13312x2560", 13312, 2560},
+                             Shape{"out 2560x6144", 2560, 6144}}) {
+        const int n = static_cast<int>(tokens);
+        for (const auto type : {HIP_R_16F, HIP_R_16BF}) {
+          hipblasLtMatmulDesc_t op = nullptr;
+          hipblasLtMatrixLayout_t lw = nullptr, lx = nullptr, ly = nullptr;
+          const hipblasOperation_t t = HIPBLAS_OP_T, nn = HIPBLAS_OP_N;
+          hipblasLtMatmulDescCreate(&op, HIPBLAS_COMPUTE_32F, HIP_R_32F);
+          hipblasLtMatmulDescSetAttribute(op, HIPBLASLT_MATMUL_DESC_TRANSA, &t,
+                                          sizeof(t));
+          hipblasLtMatmulDescSetAttribute(op, HIPBLASLT_MATMUL_DESC_TRANSB, &nn,
+                                          sizeof(nn));
+          hipblasLtMatrixLayoutCreate(&lw, type, sh.k, sh.m, sh.k);
+          hipblasLtMatrixLayoutCreate(&lx, type, sh.k, n, sh.k);
+          hipblasLtMatrixLayoutCreate(&ly, HIP_R_32F, sh.m, n, sh.m);
+          hipblasLtMatmulPreference_t pref = nullptr;
+          hipblasLtMatmulPreferenceCreate(&pref);
+          const std::size_t ws_bytes = std::size_t{64} << 20;
+          hipblasLtMatmulPreferenceSetAttribute(
+              pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_bytes,
+              sizeof(ws_bytes));
+          std::vector<hipblasLtMatmulHeuristicResult_t> cand(48);
+          int count = 0;
+          hipblasLtMatmulAlgoGetHeuristic(handle, op, lw, lx, ly, ly, pref,
+                                          static_cast<int>(cand.size()),
+                                          cand.data(), &count);
+          auto* w = Zeros(std::size_t{2} * sh.m * sh.k);
+          auto* x = Zeros(std::size_t{2} * n * sh.k);
+          auto* y = Zeros(std::size_t{4} * n * sh.m);
+          void* ws = Zeros(ws_bytes);
+          const float one = 1.0F, zero = 0.0F;
+          double best = 0.0;
+          int best_i = -1;
+          for (int i = 0; i < count; ++i) {
+            if (cand[i].state != HIPBLAS_STATUS_SUCCESS) continue;
+            bool ok = true;
+            const double ms = MedianMs(
+                [&] {
+                  if (hipblasLtMatmul(handle, op, &one, w, lw, x, lx, &zero, y,
+                                      ly, y, ly, &cand[i].algo, ws, ws_bytes,
+                                      nullptr) != HIPBLAS_STATUS_SUCCESS)
+                    ok = false;
+                },
+                5);
+            if (!ok) continue;
+            const double tf = 2.0 * n * sh.m * sh.k / ms / 1e9;
+            if (tf > best) { best = tf; best_i = i; }
+          }
+          std::printf("ceiling %-16s %s  %d candidates, best %6.2f TFLOPS (#%d)\n",
+                      sh.name, type == HIP_R_16F ? "f16 " : "bf16", count, best,
+                      best_i);
+          CheckHip(hipFree(w), "hipFree");
+          CheckHip(hipFree(x), "hipFree");
+          CheckHip(hipFree(y), "hipFree");
+          CheckHip(hipFree(ws), "hipFree");
+        }
+      }
     }
   }
   return 0;
