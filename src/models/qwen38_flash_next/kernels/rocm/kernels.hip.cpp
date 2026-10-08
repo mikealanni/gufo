@@ -3945,6 +3945,14 @@ __device__ __forceinline__ std::uint32_t Iq3sBytes(const uint4& chunk, int g,
   return ((magnitudes ^ mask) + neg) ^ 0x80808080U;
 }
 
+// A 16-byte load from a 2-byte aligned address. Going through memcpy into an
+// array element keeps the destination in scratch memory, which forces the
+// prefetch to wait for its global load and then bounce through scratch.
+typedef uint4 UnalignedUint4 __attribute__((aligned(2)));
+__device__ __forceinline__ uint4 LoadUint4Aligned2(const std::uint8_t* p) {
+  return *reinterpret_cast<const UnalignedUint4*>(p);
+}
+
 template<WeightType kType, int BM, int BN, int BK, bool kPair = false>
 __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
     const void* __restrict__ w, const __half* __restrict__ x,
@@ -4106,7 +4114,7 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
         // block_iq4_nl is 18 bytes: d, then the 16 code bytes.
         const auto* blk = f_ptr[u] + ((kb0 + f_c) * 18);
         f_dm[u] = *reinterpret_cast<const std::uint16_t*>(blk);
-        __builtin_memcpy(&f_codes[u], blk + 2, 16);
+        f_codes[u] = LoadUint4Aligned2(blk + 2);
       } else if constexpr (kI3) {
         // One 32-element sub-block per thread: its 8 grid indices, 4 sign
         // bytes, high index bits and scale nibble packed into one chunk.
@@ -4125,8 +4133,8 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
         // block_q8_0 is 34 bytes, so the code loads are 2-byte aligned.
         const auto* blk = f_ptr[u] + ((kb0 + f_c) * 34);
         f_dm[u] = *reinterpret_cast<const std::uint16_t*>(blk);
-        __builtin_memcpy(&f_codes[u], blk + 2, 16);
-        __builtin_memcpy(&f_codes_hi[u], blk + 18, 16);
+        f_codes[u] = LoadUint4Aligned2(blk + 2);
+        f_codes_hi[u] = LoadUint4Aligned2(blk + 18);
       } else {
         constexpr int kBlockChunks = kQ5K ? 11 : 9;
         constexpr int kCodeChunk = kQ5K ? 3 : 1;
