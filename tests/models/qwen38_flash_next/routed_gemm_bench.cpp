@@ -22,7 +22,7 @@ constexpr std::size_t kTokens = 4096;
 constexpr std::size_t kUsed = 10;
 constexpr std::size_t kExperts = 512;
 constexpr std::size_t kHidden = 2560;
-constexpr std::size_t kFf = 512;
+constexpr std::size_t kFf = 640;
 constexpr int kWarmup = 3;
 constexpr int kIters = 20;
 
