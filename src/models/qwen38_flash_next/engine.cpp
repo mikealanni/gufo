@@ -465,22 +465,7 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
 }
 
 SessionSnapshot::SessionSnapshot(std::uint64_t size)
-    : data_(new std::uint8_t[size]), size_(size) {
-  // Snapshot copies first-touch hundreds of MiB. Let Linux back the interior
-  // with transparent huge pages instead of faulting one 4 KiB page at a time.
-  // Advise only complete pages belonging to this allocation; this is optional
-  // and does not pin memory or change the serialized payload.
-  const long page = sysconf(_SC_PAGESIZE);
-  if (page > 0) {
-    const auto address = reinterpret_cast<std::uintptr_t>(data_.get());
-    const auto skip = (page - address % page) % page;
-    if (size > skip) {
-      const auto length = (size - skip) / page * page;
-      if (length != 0)
-        (void)madvise(data_.get() + skip, length, MADV_HUGEPAGE);
-    }
-  }
-}
+    : data_(new std::uint8_t[size]), size_(size) {}
 
 bool SessionSnapshot::CopyTo(
     std::span<std::uint8_t> destination) const noexcept {
