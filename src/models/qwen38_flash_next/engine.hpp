@@ -16,6 +16,7 @@
 #include "src/models/qwen/vision/encoder.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
+#include "src/models/qwen38_flash_next/lookup_draft.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
 
 namespace gufo::core {
@@ -197,6 +198,10 @@ public:
     /// in this shape explains a change in throughput that drafted/accepted
     /// totals cannot.
     std::uint64_t widths[kMaxMtpDraftTokens + 1]{};
+    /// Cycles drafted from the token history instead of the MTP predictor.
+    std::uint64_t suffix_cycles{0};
+    std::uint64_t suffix_drafted{0};
+    std::uint64_t suffix_accepted{0};
   };
   [[nodiscard]] const SpeculativeStats& Statistics() const noexcept {
     return stats_;
@@ -260,6 +265,11 @@ private:
   std::vector<float> verify_logits_;
   std::uint32_t hidden_base_{0};  ///< first position whose hidden row is kept
   MtpLengthController draft_length_;
+  /// Retrieval drafts over tokens_; extended lazily by SyncLookup.
+  LookupIndex lookup_;
+  std::size_t suffix_cooldown_until_{
+      0};  ///< position until which history drafts need a long match
+  void SyncLookup();
   SpeculativeStats stats_;
   std::shared_ptr<const qwen::vision::Prompt> image_prompt_;
   [[nodiscard]] std::span<const std::uint8_t> ImageIdentity(

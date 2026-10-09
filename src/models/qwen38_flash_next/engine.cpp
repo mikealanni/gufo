@@ -287,6 +287,8 @@ void Session::Reset() {
   valid_ = false;
   session_->Reset();
   tokens_.clear();
+  lookup_ = LookupIndex{};
+  suffix_cooldown_until_ = 0;
   hidden_base_ = 0;
   draft_length_.Reset();
   model_->executor_->MtpRewind(*session_, 0);
@@ -455,6 +457,7 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
     return false;
   }
   tokens_ = std::move(tokens);
+  lookup_ = LookupIndex{};
   logits_ = std::move(logits);
   hidden_base_ = info.position - info.hidden_rows;
   draft_token_ = 0;
@@ -739,7 +742,62 @@ MtpRejectLog g_mtp_log;
 
 }  // namespace
 
+namespace {
+
+/// Retrieval drafting from the token history (on; GUFO_SUFFIX=0 disables): when
+/// the context ends in a phrase of at least GUFO_SUFFIX_MIN tokens that
+/// occurred earlier, the tokens that followed it replace the MTP chain for that
+/// cycle.
+struct SuffixSettings {
+  bool enabled{false};
+  bool log{false};
+  std::uint32_t min_match{16};
+  std::uint32_t max_draft{kMaxMtpDraftTokens};
+};
+
+const SuffixSettings& Suffix() {
+  static const SuffixSettings settings = [] {
+    SuffixSettings s;
+    const auto number = [](const char* name, std::uint32_t fallback,
+                           std::uint32_t low, std::uint32_t high) {
+      const char* raw = std::getenv(name);
+      if (raw == nullptr)
+        return fallback;
+      return std::clamp<std::uint32_t>(
+          static_cast<std::uint32_t>(std::strtoul(raw, nullptr, 10)), low,
+          high);
+    };
+    s.enabled = number("GUFO_SUFFIX", 1, 0, 1) != 0;
+    s.log = number("GUFO_SUFFIX_LOG", 0, 0, 1) != 0;
+    s.min_match = number("GUFO_SUFFIX_MIN", 16, LookupIndex::kGram, 64);
+    s.max_draft =
+        number("GUFO_SUFFIX_MAX", kMaxMtpDraftTokens, 1, kMaxMtpDraftTokens);
+    return s;
+  }();
+  return settings;
+}
+
+MtpProposal PointMassProposal(std::int32_t token) {
+  MtpProposal proposal;
+  proposal.size = 1;
+  proposal.ids[0] = static_cast<sampling::TokenId>(token);
+  proposal.probabilities[0] = 1.0F;
+  proposal.token = proposal.ids[0];
+  proposal.probability = 1.0F;
+  return proposal;
+}
+
+}  // namespace
+
+void Session::SyncLookup() {
+  if (lookup_.size() > tokens_.size())
+    lookup_ = LookupIndex{};
+  for (std::size_t i = lookup_.size(); i < tokens_.size(); ++i)
+    lookup_.Append(tokens_[i]);
+}
+
 struct Session::PendingDecode {
+  bool suffix{false};  ///< chain came from the token history, not the predictor
   std::vector<std::int32_t> chain;
   std::vector<MtpProposal> proposals;
   std::uint32_t base{0};
@@ -830,6 +888,46 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   }
   if (is_stop(anchor)) {
     result->stop = true;
+    return true;
+  }
+  // Retrieval drafts: the token history may already contain what follows this
+  // phrase. The index includes the anchor, which is committed in every outcome.
+  std::vector<std::int32_t> history_draft;
+  if (Suffix().enabled && MtpEnabled() && cap > 1) {
+    SyncLookup();
+    lookup_.Append(anchor);
+    std::uint32_t matched = 0;
+    // After a poor round only a long match is trusted for a while.
+    const std::uint32_t needed = tokens_.size() < suffix_cooldown_until_
+                                     ? std::max(Suffix().min_match, 48U)
+                                     : Suffix().min_match;
+    history_draft = lookup_.Draft(
+        needed, std::min<std::size_t>(cap - 1, Suffix().max_draft), &matched);
+    if (Suffix().log && !history_draft.empty()) {
+      std::fprintf(stderr, "suffix: pos=%zu match=%u draft=%zu\n",
+                   tokens_.size(), matched, history_draft.size());
+    }
+  }
+  if (!history_draft.empty()) {
+    const bool sampled = sampler.config().uses_random_sampling();
+    const bool gpu_greedy = sampler.config().can_use_unmodified_argmax();
+    if (!defer_head && !DraftCatchUp(anchor, false, error_msg))
+      return false;
+    pending->suffix = true;
+    pending->chain = {anchor};
+    for (const auto token : history_draft) {
+      pending->chain.push_back(token);
+      if (sampled)
+        pending->proposals.push_back(PointMassProposal(token));
+    }
+    pending->width = pending->chain.size();
+    pending->base = static_cast<std::uint32_t>(tokens_.size());
+    pending->speculative = true;
+    pending->sampled = sampled;
+    pending->gpu_greedy = gpu_greedy;
+    pending->gpu_verification = gpu_greedy;
+    if (!pending->gpu_verification && verify_logits_.empty())
+      verify_logits_.resize(exec.max_speculative() * model_->VocabSize());
     return true;
   }
   if (!MtpEnabled() || width < 2) {
@@ -1027,16 +1125,28 @@ bool Session::FinishDecode(const DecodeRequest& request,
   stats_.drafted += k - 1;
   stats_.accepted += keep - 1;
   stats_.widths[std::min<std::size_t>(k - 1, kMaxMtpDraftTokens)] += 1;
-  {
+  if (pending.suffix) {
+    // History drafts say nothing about the predictor's acceptance, so they
+    // stay out of its adaptive length controller and calibration log.
+    stats_.suffix_cycles += 1;
+    stats_.suffix_drafted += k - 1;
+    stats_.suffix_accepted += keep - 1;
+    if ((keep - 1) * 2 < k - 1)
+      suffix_cooldown_until_ = base + keep + 32;
+    if (Suffix().log) {
+      std::fprintf(stderr, "suffix: round base=%u drafted=%u accepted=%u\n",
+                   base, k - 1, keep - 1);
+    }
+  } else {
     const char* path = CalibrationLog::Path();
     for (std::uint32_t depth = 0; depth + 1 < k; ++depth) {
       CalibrationLog::Append(path, depth, base, pending.slot_confidence[depth],
                              depth + 1 < keep);
     }
+    // A target stop ends the request; it does not classify the remaining
+    // proposals as failed predictions.
+    draft_length_.Observe(keep - 1, result->stop ? keep - 1 : k - 1, base);
   }
-  // A target stop ends the request; it does not classify the remaining
-  // proposals as failed predictions.
-  draft_length_.Observe(keep - 1, result->stop ? keep - 1 : k - 1, base);
 
   // The next call knows the next sampled anchor. Defer draft catch-up until
   // then, retaining this session's target hidden rows across interleaving.
@@ -1348,6 +1458,8 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
     }
   }
   if (batch_drafts && items.size() == requests.size() &&
+      std::none_of(pending.begin(), pending.end(),
+                   [](const auto& p) { return p.suffix; }) &&
       std::ranges::all_of(requests,
                           [](const auto& r) { return r.outcome->completed; })) {
     const auto ms = std::chrono::duration<float, std::milli>(
