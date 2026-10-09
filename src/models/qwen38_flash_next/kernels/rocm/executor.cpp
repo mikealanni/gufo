@@ -2039,7 +2039,8 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
   const bool wmma_experts = ExpertMatrixRows(n_tokens) &&
                             (l.ffn_gate_exps.type == GgmlType::kQ4_K ||
                              l.ffn_gate_exps.type == GgmlType::kQ5_K ||
-                             l.ffn_gate_exps.type == GgmlType::kIQ3_S) &&
+                             l.ffn_gate_exps.type == GgmlType::kIQ3_S ||
+                             l.ffn_gate_exps.type == GgmlType::kIQ4_XS) &&
                             l.ffn_up_exps.type == l.ffn_gate_exps.type &&
                             (l.ffn_down_exps.type == GgmlType::kQ5_1 ||
                              l.ffn_down_exps.type == GgmlType::kQ8_0 ||
@@ -2067,9 +2068,10 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     // materializing the gate. Smaller buckets favor separate projections.
     auto* up_half = reinterpret_cast<__half*>(s_.up_e);
     const WeightType gate_type =
-        l.ffn_gate_exps.type == GgmlType::kQ5_K    ? WeightType::kQ5_K
-        : l.ffn_gate_exps.type == GgmlType::kIQ3_S ? WeightType::kIQ3_S
-                                                   : WeightType::kQ4_K;
+        l.ffn_gate_exps.type == GgmlType::kQ5_K     ? WeightType::kQ5_K
+        : l.ffn_gate_exps.type == GgmlType::kIQ3_S  ? WeightType::kIQ3_S
+        : l.ffn_gate_exps.type == GgmlType::kIQ4_XS ? WeightType::kIQ4_XS
+                                                    : WeightType::kQ4_K;
     // The paired gate/up kernel caches whole K-quant superblocks; IQ3_S
     // runs the two projections separately.
     // IQ3_S decodes its codebook per tile, so wide batches take the
@@ -2084,6 +2086,7 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     const std::uint32_t gate_up_rows = wide_gate_up ? 128 : routed_tile_rows_;
     const bool gated_ok =
         n_tokens >= 1024 && routed_tile_rows_ == 48 &&
+                gate_type != WeightType::kIQ4_XS &&
                 (gate_type != WeightType::kIQ3_S || wide_gate_up)
             ? RoutedGatedF16Gemm(
                   l.ffn_gate_exps.data, l.ffn_up_exps.data, gate_type, x_half,

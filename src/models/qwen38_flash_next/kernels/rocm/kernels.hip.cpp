@@ -3904,6 +3904,7 @@ __device__ __forceinline__ std::size_t RoutedF16RowBytes(std::size_t k) {
          : kType == WeightType::kQ5_1   ? (k / 32) * sizeof(Q5_1Block)
          : kType == WeightType::kIQ4_NL ? (k / 32) * 18
          : kType == WeightType::kIQ3_S  ? (k / 256) * 110
+         : kType == WeightType::kIQ4_XS ? (k / 256) * 136
                                         : (k / 32) * sizeof(Q8_0Block);
 }
 
@@ -3999,6 +4000,7 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
   constexpr bool kQ5K = kType == WeightType::kQ5_K;
   constexpr bool kQ8 = kType == WeightType::kQ8_0;
   constexpr bool kNL = kType == WeightType::kIQ4_NL;
+  constexpr bool kXs = kType == WeightType::kIQ4_XS;
   constexpr bool kI3 = kType == WeightType::kIQ3_S;
   constexpr bool kKQuant = kType == WeightType::kQ4_K || kQ5K;
   // 16-byte code chunks per row and stage: Q4_K's nibble pair and Q5_1's
@@ -4148,6 +4150,17 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
         const auto* blk = f_ptr[u] + ((kb0 + f_c) * 18);
         f_dm[u] = *reinterpret_cast<const std::uint16_t*>(blk);
         f_codes[u] = LoadUint4Aligned2(blk + 2);
+      } else if constexpr (kXs) {
+        // block_iq4_xs: d, scales_h, scales_l[4], then 8 sub-blocks of 16
+        // code bytes. The 6-bit scale is formed in commit_stage.
+        const int kb = kb0 + f_c;
+        const int ib32 = kb % 8;
+        const std::uint8_t* blk = f_ptr[u] + (kb / 8) * 136;
+        f_dm[u] = *reinterpret_cast<const std::uint16_t*>(blk);
+        f_i3_qh[u] = *reinterpret_cast<const std::uint16_t*>(blk + 2);
+        f_i3_sc[u] = *reinterpret_cast<const std::uint32_t*>(blk + 4);
+        f_i3_ib32[u] = ib32;
+        f_codes[u] = LoadUint4Aligned2(blk + 8 + ib32 * 16);
       } else if constexpr (kI3) {
         // One 32-element sub-block per thread: its 8 grid indices, 4 sign
         // bytes, high index bits and scale nibble packed into one chunk.
@@ -4253,6 +4266,21 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
       if constexpr (kQ8) {
       } else if constexpr (kNL) {
         scale_bias = f_live[u] ? f_dm[u] : 0U;  // half2 (d, 0)
+      } else if constexpr (kXs) {
+        const int ib32 = f_i3_ib32[u];
+        const std::uint32_t ls =
+            ((f_i3_sc[u] >> (8 * (ib32 / 2) + 4 * (ib32 & 1))) & 0x0FU) |
+            (((f_i3_qh[u] >> (2 * ib32)) & 3U) << 4U);
+        const float d = __half2float(
+            __ushort_as_half(static_cast<unsigned short>(f_dm[u])));
+        scale_bias =
+            f_live[u]
+                ? __builtin_bit_cast(
+                      std::uint32_t,
+                      __floats2half2_rn(
+                          d * static_cast<float>(static_cast<int>(ls) - 32),
+                          0.0F))
+                : 0U;
       } else if constexpr (kI3) {
         const float d = __half2float(
             __ushort_as_half(static_cast<unsigned short>(f_dm[u])));
@@ -4310,7 +4338,7 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
     }
   }
 
-  constexpr bool kSigned = kQ8 || kNL || kI3;
+  constexpr bool kSigned = kQ8 || kNL || kXs || kI3;
   const __half2 magic = __floats2half2_rn(kSigned ? -1152.0F : -1024.0F,
                                           kSigned ? -1152.0F : -1024.0F);
   const auto compute_stage = [&]() {
@@ -4344,7 +4372,7 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
           for (int g = 0; g < 8; ++g) {
             nib[g] = Iq3sBytes(r, g, s_grid);
           }
-        } else if constexpr (kNL) {
+        } else if constexpr (kNL || kXs) {
           const uint4 r = raw[u][kb];
           const std::uint32_t words[4] = {r.x, r.y, r.z, r.w};
 #pragma unroll
@@ -4404,8 +4432,8 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
       }
 #pragma unroll
       for (int j = 0; j < kTokTiles; ++j) {
-        if constexpr (kPair ||
-                      ((kQ5 || kQ8 || kNL || kI3 || kKQuant) && BN >= 48)) {
+        if constexpr (kPair || ((kQ5 || kQ8 || kNL || kXs || kI3 || kKQuant) &&
+                                BN >= 48)) {
           // Keep one token tile's LDS fragments live at a time. Hoisting
           // all eight tiles spills registers and defeats the wider tile's
           // reuse of each weight decode. This is a compiler barrier only.
@@ -4413,8 +4441,8 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
         }
         // A short expert bucket has no output in the remaining token
         // tiles, so omit their WMMA work.
-        if constexpr ((kPair ||
-                       ((kQ5 || kQ8 || kNL || kI3 || kKQuant) && BN >= 48)) &&
+        if constexpr ((kPair || ((kQ5 || kQ8 || kNL || kXs || kI3 || kKQuant) &&
+                                 BN >= 48)) &&
                       kTokTiles > 1) {
           if (j >= live_tok_tiles)
             continue;
@@ -5375,6 +5403,12 @@ bool LaunchRoutedF16(const void* w, WeightType type, const __half* x,
           dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
           swiglu_gate, out, out_half, m, k, nullptr);
       return true;
+    case WeightType::kIQ4_XS:
+      hipLaunchKernelGGL(
+          (RoutedF16GEMMKernel<WeightType::kIQ4_XS, kBM, BN, kBK>), grid,
+          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
+          swiglu_gate, out, out_half, m, k, nullptr);
+      return true;
     case WeightType::kIQ3_S: {
       const std::uint32_t* grid_table = Iq3sGridDevice();
       if (grid_table == nullptr)
@@ -5398,7 +5432,7 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
                    std::size_t m, std::size_t k, hipStream_t stream) {
   const std::size_t block_elems =
       (type == WeightType::kQ4_K || type == WeightType::kQ5_K ||
-       type == WeightType::kIQ3_S)
+       type == WeightType::kIQ3_S || type == WeightType::kIQ4_XS)
           ? 256
           : 64;
   if (m == 0 || k == 0 || k % block_elems != 0 || n_tiles == 0 ||
