@@ -25,6 +25,8 @@
 #include "src/models/flint/reference.hpp"
 #include "src/models/glm53_flash/chat_template.hpp"
 #include "src/models/glm53_flash/reference.hpp"
+#include "src/models/laguna/chat_template.hpp"
+#include "src/models/laguna/reference.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/generator.hpp"
 #include "src/models/qwen/tokenizer.hpp"
@@ -258,6 +260,13 @@ void PrintModelLoadTime(std::chrono::steady_clock::time_point start,
 bool IsDeepSeekV4Flash(const core::GgufReader& reader) {
   return reader.GetMetadataString("general.architecture") == "deepseek4";
 }
+
+bool IsLaguna(const core::GgufReader& reader) {
+  return reader.GetMetadataString("general.architecture") == "laguna";
+}
+
+int RunLagunaPromptCPU(const PromptOptions& opt, const core::GgufReader& reader,
+                       std::chrono::steady_clock::time_point load_start);
 
 bool IsFlint(const core::GgufReader& reader) {
   return reader.GetMetadataString("general.architecture") == "flint";
@@ -500,6 +509,80 @@ int RunFlintPromptCPU(const PromptOptions& opt, const core::GgufReader& reader,
     };
     const auto end = std::chrono::steady_clock::now();
     std::cerr << "[Flint CPU reference] prompt=" << prompt.size() << " tok in "
+              << seconds(start, prefill_end) << " s, generated=" << generated
+              << " tok in " << seconds(prefill_end, end) << " s\n";
+  }
+  return 0;
+}
+
+// ── Laguna CPU reference ─────────────────────────────────────────────
+
+int RunLagunaPromptCPU(const PromptOptions& opt, const core::GgufReader& reader,
+                       std::chrono::steady_clock::time_point load_start) {
+  std::string err;
+  auto tokenizer = tokenization::QwenTokenizer::CreateFromGguf(reader, &err);
+  if (!tokenizer) {
+    std::cerr << "Laguna tokenizer failed: " << err << '\n';
+    return 1;
+  }
+  auto model = models::laguna::ReferenceModel::Open(opt.model_path, &err);
+  if (!model) {
+    std::cerr << "Laguna load failed: " << err << '\n';
+    PrintModelLoadTime(load_start, false);
+    return 1;
+  }
+  PrintModelLoadTime(load_start, true);
+
+  const auto reasoning = PromptReasoningOptions(opt);
+  models::laguna::ChatTemplateOptions chat_options;
+  chat_options.enable_thinking = reasoning.enabled.value_or(false);
+  const std::string rendered =
+      opt.use_chat_template
+          ? models::laguna::RenderPrompt(opt.system_prompt, opt.prompt_text,
+                                         chat_options)
+          : opt.prompt_text;
+  tokenization::TokenizerOptions encode_options;
+  encode_options.parse_special_tokens = true;
+  const auto prompt = tokenizer->Encode(rendered, encode_options);
+  if (prompt.empty()) {
+    std::cerr << "Laguna prompt produced no tokens\n";
+    return 1;
+  }
+
+  const auto stop_tokens = FlintStopTokens(reader);
+  const auto is_stop = [&](tokenization::TokenId token) {
+    return std::find(stop_tokens.begin(), stop_tokens.end(), token) !=
+           stop_tokens.end();
+  };
+
+  auto session = model->CreateSession();
+  sampling::SamplerState sampler(opt.sampling, prompt);
+  const auto start = std::chrono::steady_clock::now();
+  const std::vector<float>* logits = nullptr;
+  for (const auto token : prompt) {
+    logits = &model->Evaluate(*session, static_cast<std::int32_t>(token));
+  }
+  const auto prefill_end = std::chrono::steady_clock::now();
+
+  std::size_t generated = 0;
+  for (; generated < opt.max_tokens; ++generated) {
+    const auto token = sampler.Sample(*logits);
+    if (is_stop(token)) {
+      break;
+    }
+    sampler.Accept(token);
+    std::cout << tokenizer->DecodeToken(token) << std::flush;
+    if (generated + 1 < opt.max_tokens) {
+      logits = &model->Evaluate(*session, static_cast<std::int32_t>(token));
+    }
+  }
+  std::cout << '\n';
+  if (opt.verbose) {
+    const auto seconds = [](auto a, auto b) {
+      return std::chrono::duration<double>(b - a).count();
+    };
+    const auto end = std::chrono::steady_clock::now();
+    std::cerr << "[Laguna CPU reference] prompt=" << prompt.size() << " tok in "
               << seconds(start, prefill_end) << " s, generated=" << generated
               << " tok in " << seconds(prefill_end, end) << " s\n";
   }
@@ -1608,6 +1691,13 @@ int RunPrompt(std::span<const char* const> args) {
   }
 #endif
 
+  if (IsLaguna(*reader)) {
+    if (!opt.image_paths.empty() || !opt.vision_model_path.empty()) {
+      std::cerr << "Laguna does not support image input\n";
+      return 2;
+    }
+    return RunLagunaPromptCPU(opt, *reader, model_load_start);
+  }
   if (IsFlint(*reader)) {
     if (!opt.image_paths.empty() || !opt.vision_model_path.empty()) {
       std::cerr << "Flint does not support image input\n";
