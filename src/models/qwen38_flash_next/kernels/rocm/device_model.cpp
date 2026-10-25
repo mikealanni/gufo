@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <initializer_list>
 #include <string>
 #include <vector>
@@ -450,6 +451,20 @@ struct Uploader {
 
 }  // namespace
 
+int DeviceModel::NpuProgramFor(std::uint32_t rows,
+                               std::uint32_t* run_tokens) const noexcept {
+  std::uint32_t run = 4096;
+  if (rows < 4096) {
+    if (!npu_m_runtime_) {
+      *run_tokens = 0;
+      return -1;
+    }
+    run = std::clamp<std::uint32_t>((rows + 511) / 512 * 512, 1024, 4096);
+  }
+  *run_tokens = run;
+  return npu_m_program_[run / 512];
+}
+
 DeviceModel::~DeviceModel() {
   for (void* p : allocations_) {
     ForgetAllocation(p, GUFO_SITE);
@@ -489,12 +504,41 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   if (const char* dir = std::getenv("GUFO_NPU_DIR");
       dir != nullptr && dir[0] != '\0') {
     NpuGemm::Config cfg;
-    cfg.xclbin = std::string(dir) + "/final_4096x2560x1024_128x64x128.xclbin";
-    cfg.insts = std::string(dir) + "/insts_4096x2560x1024_128x64x128.txt";
+    // The runtime-M program serves any group size with one XCLBIN; it needs
+    // an instruction file per size, so it is used only when all are present.
+    const std::string mk = std::string(dir) + "/runtime_mk/";
+    const auto mk_insts = [&](std::uint32_t rows) {
+      return mk + "insts_" + std::to_string(rows) + "x2560x1024_128x64x128.txt";
+    };
+    bool runtime_m =
+        std::getenv("GUFO_NPU_FIXED_M") == nullptr &&
+        std::filesystem::exists(mk + "final_4096xKx1024_128x64x128.xclbin");
+    for (std::uint32_t rows = 1024; rows <= 4096 && runtime_m; rows += 512) {
+      runtime_m = std::filesystem::exists(mk_insts(rows));
+    }
+    if (runtime_m) {
+      cfg.xclbin = mk + "final_4096xKx1024_128x64x128.xclbin";
+      cfg.insts = mk_insts(4096);
+    } else {
+      cfg.xclbin = std::string(dir) + "/final_4096x2560x1024_128x64x128.xclbin";
+      cfg.insts = std::string(dir) + "/insts_4096x2560x1024_128x64x128.txt";
+    }
     std::string npu_error;
     early_npu = NpuGemm::Create(cfg, &npu_error);
     if (early_npu == nullptr) {
       std::fprintf(stderr, "NPU off: %s\n", npu_error.c_str());
+    } else if (runtime_m) {
+      bool ok = true;
+      for (std::uint32_t rows = 1024; rows < 4096 && ok; rows += 512) {
+        const int id = early_npu->AddProgram(mk_insts(rows), &npu_error);
+        ok = id >= 1;
+        m->npu_m_program_[rows / 512] = id;
+      }
+      m->npu_m_runtime_ = ok;
+      if (!ok) {
+        std::fprintf(stderr, "NPU runtime-M programs unavailable: %s\n",
+                     npu_error.c_str());
+      }
     }
   }
 #endif

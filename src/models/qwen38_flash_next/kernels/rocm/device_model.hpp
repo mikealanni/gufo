@@ -101,6 +101,12 @@ public:
   const std::vector<DeviceLayer>& layers() const noexcept { return layers_; }
   /// The NPU GEMM engine, or null when the NPU is not in use.
   NpuGemm* npu() const noexcept { return npu_.get(); }
+  /// Instruction program and padded token count of an NPU group of `rows`
+  /// rows (at most one full group). With the runtime-M program the group runs
+  /// at the smallest multiple of 512 that fits (at least 1024); otherwise only
+  /// a full group is served and the program id is -1.
+  int NpuProgramFor(std::uint32_t rows,
+                    std::uint32_t* run_tokens) const noexcept;
   [[nodiscard]] bool has_mtp() const noexcept { return has_mtp_; }
   const DeviceLayer& mtp() const noexcept { return mtp_; }
   [[nodiscard]] std::size_t resident_bytes() const noexcept { return bytes_; }
@@ -129,6 +135,10 @@ private:
   bool has_mtp_{false};
   std::vector<void*> allocations_;
   std::unique_ptr<NpuGemm> npu_;
+  /// Program id per padded group size / 512 (-1 when the runtime-M streams
+  /// are not loaded); index 8 is the full 4096-row group, program 0.
+  int npu_m_program_[9]{-1, -1, -1, -1, -1, -1, -1, -1, 0};
+  bool npu_m_runtime_{false};
   std::size_t bytes_{0};
   std::size_t max_half_cols_{1};
   std::size_t max_q8_cols_{32};
