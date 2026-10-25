@@ -242,6 +242,10 @@ private:
   BankFields bank_b_;
   std::unique_ptr<gufo::models::qwen38_flash_next::rocm::NpuGemm> npu_;
   std::vector<std::vector<int>> npu_qkv_;
+  // Q8_0 re-encode buffer for projections whose resident Q8 copy the NPU
+  // staging released; passes that do not run on the NPU rebuild it per use.
+  void* q8_fallback_{nullptr};
+  std::size_t q8_fallback_bytes_{0};
   int npu_a_[2][1]{{-1}, {-1}};
   std::vector<int> npu_c_[2];
   std::uint64_t npu_ticket_[2]{};

@@ -210,6 +210,8 @@ Executor::~Executor() {
       hipFree(const_cast<std::uint8_t**>(table));
   if (blas_ != nullptr)
     hipblasDestroy(static_cast<hipblasHandle_t>(blas_));
+  if (q8_fallback_ != nullptr)
+    hipFree(q8_fallback_);
   for (auto& [name, t] : tensors_) {
     if (t.q8_owned && t.q8 != nullptr)
       hipFree(t.q8);
@@ -621,6 +623,9 @@ bool Executor::SetupNpu(std::string*) {
       for (const DeviceTensor* t : {sw.sh_gate, sw.sh_up}) {
         auto* owned = const_cast<DeviceTensor*>(t);
         if (owned->q8_owned && owned->q8 != nullptr) {
+          q8_fallback_bytes_ = std::max<std::size_t>(
+              q8_fallback_bytes_,
+              static_cast<std::size_t>(owned->rows) * (owned->k / 32) * 34);
           hipFree(owned->q8);
           owned->q8 = nullptr;
           owned->q8_owned = false;
@@ -633,6 +638,9 @@ bool Executor::SetupNpu(std::string*) {
     for (const DeviceTensor* t : {w.attn_q, w.attn_k, w.attn_v}) {
       auto* owned = const_cast<DeviceTensor*>(t);
       if (owned->q8_owned && owned->q8 != nullptr) {
+        q8_fallback_bytes_ = std::max<std::size_t>(
+            q8_fallback_bytes_,
+            static_cast<std::size_t>(owned->rows) * (owned->k / 32) * 34);
         hipFree(owned->q8);
         owned->q8 = nullptr;
         owned->q8_owned = false;
@@ -647,6 +655,12 @@ bool Executor::SetupNpu(std::string*) {
       npu_->Wait(stream_);
       hipStreamSynchronize(stream_);
     }
+  }
+  if (q8_fallback_bytes_ != 0 &&
+      hipMalloc(&q8_fallback_, q8_fallback_bytes_ + kTailMargin) !=
+          hipSuccess) {
+    q8_fallback_ = nullptr;
+    q8_fallback_bytes_ = 0;
   }
   std::fprintf(stderr, "NPU: KDA q/k/v of %u layers\n", staged);
   return true;
@@ -890,6 +904,16 @@ void Executor::Proj(const DeviceTensor& w, const Act& x, float* out,
   if (x.q != nullptr && w.q8 != nullptr &&
       qfn::W8A8Gemm(w.q8, x.q, out, tokens, w.rows, w.k, stream_)) {
     return;
+  }
+  if (x.q != nullptr && w.q8 == nullptr && q8_fallback_ != nullptr &&
+      w.type == kTypeQ6_K && w.experts == 1 && w.k % 32 == 0 &&
+      static_cast<std::size_t>(w.rows) * (w.k / 32) * 34 <=
+          q8_fallback_bytes_) {
+    qfn::RequantToQ8_0(w.data, static_cast<std::uint32_t>(GgmlType::kQ6_K), w.k,
+                       w.rows, q8_fallback_, stream_);
+    if (qfn::W8A8Gemm(q8_fallback_, x.q, out, tokens, w.rows, w.k, stream_)) {
+      return;
+    }
   }
   Gemm(w.type, w.data, x.f, out, static_cast<int>(w.rows), tokens,
        static_cast<int>(w.k), scratch_->matvec, stream_);
