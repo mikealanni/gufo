@@ -110,7 +110,9 @@ std::optional<Config> ParseConfig(const core::GgufReader& reader,
   c.rope_base = r.F32(key("rope.freq_base"));
   c.rope_base_swa = r.F32(key("rope.freq_base_swa"));
   c.yarn_factor = r.F32(key("rope.scaling.factor"));
-  c.yarn_attn_factor = r.F32(key("rope.scaling.yarn_attn_factor"));
+  // The runtime scales cos/sin by 1 + 0.1 ln(factor); the artifact's
+  // yarn_attn_factor key differs between quantizations and is not used.
+  c.yarn_attn_factor = 1.0F + 0.1F * std::log(c.yarn_factor);
   c.yarn_beta_fast = r.F32(key("rope.scaling.yarn_beta_fast"));
   c.yarn_beta_slow = r.F32(key("rope.scaling.yarn_beta_slow"));
   c.expert_weights_scale = r.F32(key("expert_weights_scale"));

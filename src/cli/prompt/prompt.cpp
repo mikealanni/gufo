@@ -38,6 +38,7 @@
 #include "src/core/speculative/speculative_verifier.hpp"
 #include "src/models/flint/gpu/engine.hpp"
 #include "src/models/glm53_flash/engine.hpp"
+#include "src/models/laguna/gpu/engine.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
@@ -267,6 +268,10 @@ bool IsLaguna(const core::GgufReader& reader) {
 
 int RunLagunaPromptCPU(const PromptOptions& opt, const core::GgufReader& reader,
                        std::chrono::steady_clock::time_point load_start);
+#ifdef ENGINE_ENABLE_HIP
+int RunLagunaPromptGPU(const PromptOptions& opt, const core::GgufReader& reader,
+                       std::chrono::steady_clock::time_point load_start);
+#endif
 
 bool IsFlint(const core::GgufReader& reader) {
   return reader.GetMetadataString("general.architecture") == "flint";
@@ -588,6 +593,96 @@ int RunLagunaPromptCPU(const PromptOptions& opt, const core::GgufReader& reader,
   }
   return 0;
 }
+
+#ifdef ENGINE_ENABLE_HIP
+
+int RunLagunaPromptGPU(const PromptOptions& opt, const core::GgufReader& reader,
+                       std::chrono::steady_clock::time_point load_start) {
+  std::string err;
+  auto tokenizer = tokenization::QwenTokenizer::CreateFromGguf(reader, &err);
+  if (!tokenizer) {
+    std::cerr << "Laguna tokenizer failed: " << err << '\n';
+    return 1;
+  }
+  auto model = models::laguna::gpu::Model::Load(opt.model_path, {}, &err);
+  if (!model) {
+    std::cerr << "Laguna GPU load failed: " << err << '\n';
+    PrintModelLoadTime(load_start, false);
+    return 1;
+  }
+  PrintModelLoadTime(load_start, true);
+
+  const auto reasoning = PromptReasoningOptions(opt);
+  models::laguna::ChatTemplateOptions chat_options;
+  chat_options.enable_thinking = reasoning.enabled.value_or(false);
+  const std::string rendered =
+      opt.use_chat_template
+          ? models::laguna::RenderPrompt(opt.system_prompt, opt.prompt_text,
+                                         chat_options)
+          : opt.prompt_text;
+  tokenization::TokenizerOptions encode_options;
+  encode_options.parse_special_tokens = true;
+  const auto prompt = tokenizer->Encode(rendered, encode_options);
+  if (prompt.empty()) {
+    std::cerr << "Laguna prompt produced no tokens\n";
+    return 1;
+  }
+
+  const auto session = model->CreateSession(
+      static_cast<std::uint32_t>(prompt.size() + opt.max_tokens + 1 +
+                                 models::laguna::gpu::Session::kMaxVerifyRows),
+      &err);
+  if (!session) {
+    std::cerr << "Laguna GPU session creation failed: " << err << '\n';
+    return 1;
+  }
+  const auto stop_tokens = FlintStopTokens(reader);
+  const auto is_stop = [&](tokenization::TokenId token) {
+    return std::find(stop_tokens.begin(), stop_tokens.end(), token) !=
+           stop_tokens.end();
+  };
+  sampling::SamplerState sampler(opt.sampling, prompt);
+  std::vector<std::int32_t> input(prompt.begin(), prompt.end());
+  const auto start = std::chrono::steady_clock::now();
+  if (!session->Append(input, &err)) {
+    std::cerr << "Laguna GPU prefill failed: " << err << '\n';
+    return 1;
+  }
+  const auto prefill_end = std::chrono::steady_clock::now();
+
+  std::size_t generated = 0;
+  auto token = sampler.Sample(session->Logits());
+  while (generated < opt.max_tokens && !is_stop(token)) {
+    sampler.Accept(token);
+    std::cout << tokenizer->DecodeToken(token) << std::flush;
+    ++generated;
+    if (generated >= opt.max_tokens)
+      break;
+    const std::int32_t feed[1] = {static_cast<std::int32_t>(token)};
+    if (!session->Append(feed, &err)) {
+      std::cerr << "\nLaguna GPU decode failed: " << err << '\n';
+      return 1;
+    }
+    token = sampler.Sample(session->Logits());
+  }
+  std::cout << '\n';
+  if (opt.verbose) {
+    const auto seconds = [](auto a, auto b) {
+      return std::chrono::duration<double>(b - a).count();
+    };
+    const auto end = std::chrono::steady_clock::now();
+    std::cerr << "[Laguna GPU] prompt=" << prompt.size() << " tok in "
+              << seconds(start, prefill_end) << " s ("
+              << prompt.size() / seconds(start, prefill_end)
+              << " tok/s), generated=" << generated << " tok in "
+              << seconds(prefill_end, end) << " s ("
+              << generated / std::max(seconds(prefill_end, end), 1e-9)
+              << " tok/s)\n";
+  }
+  return 0;
+}
+
+#endif  // ENGINE_ENABLE_HIP
 
 #ifdef ENGINE_ENABLE_HIP
 
@@ -1696,6 +1791,11 @@ int RunPrompt(std::span<const char* const> args) {
       std::cerr << "Laguna does not support image input\n";
       return 2;
     }
+#ifdef ENGINE_ENABLE_HIP
+    if (!opt.force_cpu) {
+      return RunLagunaPromptGPU(opt, *reader, model_load_start);
+    }
+#endif
     return RunLagunaPromptCPU(opt, *reader, model_load_start);
   }
   if (IsFlint(*reader)) {
