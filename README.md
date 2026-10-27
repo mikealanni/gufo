@@ -203,7 +203,11 @@ head, so use `--speculative dflash2` there (auto costs 5% to 15% against it).
    and its instruction streams are in [tools/npu](tools/npu), so nothing else has
    to be built.
 2. Hold the GPU fabric clock at its top level (2000 MHz on this chip). This is
-   required: without it the GPU and the NPU together can hang the machine.
+   required: without it the GPU and the NPU together can hang the machine. It is
+   not a guarantee: [ROCm/TheRock#8709](https://github.com/ROCm/TheRock/issues/8709)
+   is still open, and some hosts (a Beelink GTR9 Pro, a CachyOS workstation) hung
+   with the clock held, with no machine-check record in the journal. A hang needs a
+   power cycle, so start with short runs and save your work.
    `sudo tools/npu/fabric-clock.sh hold` sets `power_dpm_force_performance_level`
    to `manual` and `pp_dpm_fclk` to the top level; `tools/npu/fabric-clock.sh status`
    must print `held` (`release` undoes it, a reboot also resets it). To hold it

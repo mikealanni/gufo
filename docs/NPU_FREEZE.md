@@ -30,10 +30,15 @@ idle gap suspends it; the second request resumes it under full GPU load.
 
 ## External evidence (October 2026)
 
-- **ROCm/TheRock#8709** — root-caused by AMD (harkgill-amd, 2026-10-06),
-  label `status: assessed`. Reproduced NPU+GPU DF failures. **Fix is a BIOS
-  with AGESA StrixHaloPI-FP11 1.0.0.2b** (from 1.0.0.2). Newer kernels do
-  not help.
+- **ROCm/TheRock#8709** — open, label `status: assessed`. An AMD engineer
+  (harkgill-amd, 2026-10-06) reproduced the NPU+GPU Data Fabric failures and
+  wrote that updating AGESA StrixHaloPI-FP11 from 1.0.0.2 to 1.0.0.2b resolved
+  it on their setup (SMU 100.9.0). Later reports there do **not** confirm it on
+  Linux: hangs persist on AGESA 1.0.0.2b with SMU 100.7.0 (ASUS ROG Flow Z13,
+  Bosgame M5), AMD asked whether the PMFW version matters, and no fix is
+  confirmed. Holding FCLK also failed on a Beelink GTR9 Pro and a CachyOS host.
+  A BIOS "Eco Mode = Disabled" workaround was reported on the GTR9 Pro. Newer
+  kernels and linux-firmware have not helped.
 - **amd/xdna-driver#1605** — same scenario, worse outcome: *"Data Fabric
   deferred-error storm + MC28 machine check + hard system hang (power cycle
   required)"*, reproduced on Ubuntu 7.0.0-38 **and mainline 7.2.6**. Notes
@@ -46,7 +51,7 @@ idle gap suspends it; the second request resumes it under full GPU load.
 
 | Mitigation | Status |
 | --- | --- |
-| BIOS/AGESA ≥ 1.0.0.2b | AMD-confirmed fix. Vendor BIOS rollouts lag. |
+| BIOS/AGESA ≥ 1.0.0.2b | AMD reports it fixes their reproducer, but Linux hosts on 1.0.0.2b still hung (SMU 100.7.0). Not a guarantee; vendor rollouts lag. |
 | Hold `pp_dpm_fclk` at top | Works on some hosts; **fails on others** (hang with FCLK held, 3 s at 140 W). |
 | Higher GPU clocks | Makes it **worse**. |
 | **Strict serialization — no GPU/NPU overlap** | Only field-proven software mitigation. 5 h clean where FCLK-hold failed. |
@@ -88,7 +93,7 @@ or blast radius:
   `run.wait()`, and watch `journalctl -kf | grep -i "hardware error"` plus
   `dmesg | grep "Previous system reset reason"` — `[0x08000800]` is the
   DF sync-flood signature.
-- Re-enable only behind a BIOS/AGESA ≥ 1.0.0.2b check, plus the soak and
+- Re-enable only with serialization or a verified-clean soak on the target host (AGESA ≥ 1.0.0.2b alone is not sufficient), plus the soak and
   fallback gates already written in `docs/NPU_RESEARCH.md`.
 
 ## References
