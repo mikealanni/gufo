@@ -58,14 +58,24 @@ text, with greedy chat requests to `gufo serve`. NPU numbers need the setup in
 
 | Decode, tok/s | plain | MTP | DFlash2 |
 | --- | --- | --- | --- |
-| code | 36.6 | 76.5 | **102.4** |
-| prose | 36.5 | **47.2** | 45.2 |
-| JSON | 36.7 | 99.8 | **118.3** |
+| code | 36.6 | 76.5 | **109.6** |
+| prose | 36.5 | 47.2 | **51.8** |
+| JSON | 36.7 | 99.8 | **118.7** |
 
-The DFlash2 column comes from a different set of greedy chat prompts than the first
-two; MTP on that set measured 83.5 / 46.0 / 106.9 tok/s. Prose is a tie within
-run-to-run noise (about 3 to 5%); DFlash2 also skips the MTP head's prompt
-priming, which is why its prefill is about 3% faster.
+The DFlash2 column was re-measured with the confidence cut described under
+speculative decoding (greedy, the project's probe prompts: 4 code, 6 prose and the
+JSON request). The plain and MTP columns come from an earlier prompt set, so read
+differences under about 5% as noise. DFlash2 also skips the MTP head's prompt
+priming, which is why its prefill is about 3% faster. Math prompts decode at
+about 95 tok/s and copy-heavy prompts at about 127 tok/s.
+
+Grammar-constrained turns (tool calls) decode at 90 to 93 tok/s, up from 59 to 61
+before their draft verification stayed on the GPU.
+
+Prompt passes of 1,024 to 4,095 tokens (short prompts and the tail of a long one)
+also run on the NPU, through the runtime-M program: prefill is +1% to +5% from
+about 3,000 tokens upward and unchanged below, and the text matches the previous
+build on 27 of 28 regression prompts (the other is a paraphrase at a near tie).
 
 `gufo bench -n 96`: 35.9 tok/s plain, 54.2 tok/s with MTP (on the benchmark's
 own repetitive context, where drafts are accepted easily).
@@ -164,7 +174,9 @@ reads the NPU result directly. One runtime-K program serves every reduction leng
   stay on the GPU, which runs them as grouped F16 matrix-core GEMMs. The router
   runs in fp32 accuracy through one split-bf16 GEMM.
 - **Qwen3.8 Flash-Next:** whole `ssm_in`/`attn_qkv` projections and the shared
-  expert, in two banks of 8192 tokens that run layer by layer in lock-step.
+  expert, in two banks of 8192 tokens that run layer by layer in lock-step;
+  passes of 1,024 to 4,095 tokens run in groups of their own size through the
+  runtime-M program in `tools/npu/runtime_mk`.
 - **GLM-5.3 Flash:** the KDA q/k/v projections and the shared expert gate/up, in
   two 4096-token banks that run layer by layer in lock-step; the runtime-K program
   in `tools/npu/runtime_k` serves them.
@@ -184,6 +196,11 @@ Flash-Next defaults to DFlash2 (`--speculative dflash2 --dflash-model <Qwen3.8-F
 which drafts a block of up to seven tokens in one pass and needs no MTP priming of the prompt; MTP
 (`--speculative mtp --mtp-model <shared Q8_0 sidecar>`) remains available. The DFlash2 head covers the
 first 163,840 vocabulary rows plus the special tokens (`GUFO_DFLASH_VOCAB=0` reads the whole vocabulary).
+For greedy requests the drafter always drafts the full block and the target verifies
+only the prefix whose running product of selector confidences stays at or above 0.7
+(at least one token): +8% to +9% on prose and math against the adaptive length
+alone, with identical output. Verifying all seven every round without the cut is slower (prose about 38 tok/s).
+Sampled requests keep the adaptive length.
 
 GLM-5.3 Flash uses a DFlash2 drafter (`--speculative dflash2 --dflash-model <GLM-5.3-Flash-DFlash2 GGUF>`)
 plus lossless prompt-lookup drafts from the context; the checkpoint has no MTP head.
