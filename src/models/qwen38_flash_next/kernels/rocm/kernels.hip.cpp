@@ -2912,7 +2912,9 @@ __global__ void SelectScoreKernel(const float* q, const __half* blocks,
   const auto t0 = blockIdx.x;
   const auto complete = (*start_pos + first_token + t0 + 1) / ratio;
   const auto b = blockIdx.y * blockDim.x + threadIdx.x;
-  if (t0 >= n_tokens || complete <= budget || b >= complete)
+  // The position comes from the device, the row size from the host: a block
+  // past max_blocks has no score slot in this row.
+  if (t0 >= n_tokens || complete <= budget || b >= complete || b >= max_blocks)
     return;
   // Load both stored halves together. Unpacking preserves their exact F32
   // values while avoiding a separate narrow memory load for each component.
@@ -2985,7 +2987,7 @@ __global__ __launch_bounds__(kThreads) void SelectScoreTiledKernel(
   }
   for (std::uint32_t t0 = first; t0 <= last; ++t0) {
     const auto complete = (*start_pos + first_token + t0 + 1) / ratio;
-    if (complete <= budget || b >= complete)
+    if (complete <= budget || b >= complete || b >= max_blocks)
       continue;
     float total = 0.0F;
 #pragma unroll
@@ -3086,7 +3088,7 @@ __global__ __launch_bounds__(kThreads) void SelectScoreWmmaKernel(
       if (t > last)
         continue;
       const std::uint32_t complete = (*start_pos + first_token + t + 1) / ratio;
-      if (b < complete)
+      if (b < complete && b < max_blocks)
         scores[std::size_t{t} * max_blocks + b] = total[i];
     }
   }
@@ -3196,7 +3198,8 @@ __global__ __launch_bounds__(kThreads) void SelectMarkKernel(
   __shared__ std::uint32_t row_max_bits;
   const std::uint32_t t = blockIdx.x;
   const std::uint32_t pos = *start_pos + first_token + t;
-  const std::uint32_t complete = (pos + 1) / ratio;
+  // Only max_blocks scores exist per row (see SelectScoreKernel).
+  const std::uint32_t complete = min((pos + 1) / ratio, max_blocks);
   std::uint32_t* words = mask + static_cast<std::size_t>(t) * mask_words;
   for (std::uint32_t w = threadIdx.x; w < mask_words; w += blockDim.x) {
     words[w] = complete <= budget ? 0xFFFFFFFFu : 0u;
@@ -3643,7 +3646,9 @@ __global__ void AttentionKernel(
       std::uint32_t flags = 0;
       std::uint32_t count = 0;
       const std::uint32_t b0 = w0 + (i * 4);
-      const std::uint32_t word = b0 < n_complete ? words[b0 / 32] : 0u;
+      // Blocks past the mask row are unselected.
+      const std::uint32_t word =
+          b0 < n_complete && b0 / 32 < mask_words ? words[b0 / 32] : 0u;
       for (std::uint32_t k = 0; k < 4; ++k) {
         const std::uint32_t b = b0 + k;
         const bool set = b < n_complete && ((word >> (b % 32)) & 1u);
