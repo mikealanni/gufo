@@ -1126,6 +1126,8 @@ const SuffixSettings& Suffix() {
   return settings;
 }
 
+constexpr float kDflashChainP = 0.7F;
+
 MtpProposal PointMassProposal(std::int32_t token) {
   MtpProposal proposal;
   proposal.size = 1;
@@ -1293,7 +1295,9 @@ bool Session::PrepareDecode(const DecodeRequest& request,
                            (sampled && sampler.config().temperature > 0.0F);
     if (can_chain) {
       const auto base = static_cast<std::uint32_t>(tokens_.size());
-      const auto want = static_cast<std::uint32_t>(width - 1);
+      const bool full_block = !sampled && !batch_drafts;
+      const auto want = full_block ? static_cast<std::uint32_t>(cap - 1)
+                                   : static_cast<std::uint32_t>(width - 1);
       const auto selector =
           model_->dflash_model_->GetDFlashConfig().selector_top_k;
       std::uint64_t draft_rng = 0;
@@ -1308,10 +1312,12 @@ bool Session::PrepareDecode(const DecodeRequest& request,
           uniforms.push_back(sampling::Uniform(&draft_rng));
         }
       }
+      std::vector<float> confidences;
       try {
         drafted = dflash_->executor->ForwardBlock(
             anchor, base, want, sampled ? sampler.config().temperature : 0.0F,
-            uniforms, nullptr, sampled ? &candidate_ids : nullptr,
+            uniforms, full_block ? &confidences : nullptr,
+            sampled ? &candidate_ids : nullptr,
             sampled ? &candidate_probabilities : nullptr);
       } catch (const std::exception&) {
         drafted.clear();
@@ -1335,6 +1341,20 @@ bool Session::PrepareDecode(const DecodeRequest& request,
             proposals.push_back(proposal);
           }
         }
+      }
+      if (complete && full_block && confidences.size() == drafted.size()) {
+        std::size_t kept = 0;
+        float product = 1.0F;
+        while (kept < drafted.size()) {
+          product *= confidences[kept];
+          if (product < kDflashChainP)
+            break;
+          ++kept;
+        }
+        kept = std::max<std::size_t>(1, kept);
+        drafted.resize(kept);
+        if (sampled)
+          proposals.resize(kept);
       }
       if (complete) {
         const bool gpu_greedy =

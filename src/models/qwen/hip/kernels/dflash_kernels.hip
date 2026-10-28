@@ -689,7 +689,11 @@ __device__ __forceinline__ void FinalizeSelector(
         candidate_probabilities[index] = index == best_index ? 1.0F : 0.0F;
     }
     if (output_confidence != nullptr) {
-      *output_confidence = 1.0F;
+      float denominator = 0.0F;
+      for (uint32_t index = 0; index < selector_top_k; ++index) {
+        denominator += expf(path_scores[index] - best_score);
+      }
+      *output_confidence = 1.0F / fmaxf(denominator, 1e-30F);
     }
   }
 }
