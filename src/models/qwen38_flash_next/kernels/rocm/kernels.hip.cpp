@@ -2150,6 +2150,11 @@ constexpr int kNpuTileK = 64;
 constexpr int kNpuTileN = 128;
 constexpr int kNpuTileRowsC = 4 * kNpuTileM;
 
+__host__ __device__ constexpr std::uint32_t NpuPaddedRows(
+    std::uint32_t tokens) {
+  return (tokens + kNpuTileRowsC - 1) / kNpuTileRowsC * kNpuTileRowsC;
+}
+
 /// One value of a 1024-column C stream: token `tl` of its group, column `cc`.
 __device__ inline float NpuStreamValue(const std::uint8_t* stream,
                                        std::uint32_t tl, std::uint32_t cc) {
@@ -8374,7 +8379,8 @@ __global__ void __launch_bounds__(256)
     NpuEncodeActivationsKernel(const __half* __restrict__ x,
                                std::uint8_t* __restrict__ out,
                                std::uint32_t k_slice, std::uint32_t k_offset,
-                               std::uint32_t k_valid, std::size_t ldx) {
+                               std::uint32_t k_valid, std::size_t ldx,
+                               std::uint32_t valid_rows) {
   __shared__ __align__(16) __half tile[kNpuTileM * kNpuTileK];
   __shared__ __align__(16) std::uint8_t staged[kNpuTileM * kNpuTileK / 8 * 9];
   const std::uint32_t tiles_k = k_slice / kNpuTileK;
@@ -8387,10 +8393,9 @@ __global__ void __launch_bounds__(256)
     const std::uint32_t vec = t & 7;
     const std::uint32_t col = tile_col * kNpuTileK + vec * 8;
     uint4 raw = make_uint4(0, 0, 0, 0);
-    if (k_offset + col + 8 <= k_valid) {
-      raw = *reinterpret_cast<const uint4*>(
-          &x[(static_cast<std::size_t>(tile_row) * kNpuTileM + row) * ldx +
-             k_offset + col]);
+    const std::size_t abs_row = std::size_t{tile_row} * kNpuTileM + row;
+    if (abs_row < valid_rows && k_offset + col + 8 <= k_valid) {
+      raw = *reinterpret_cast<const uint4*>(&x[abs_row * ldx + k_offset + col]);
     }
     *reinterpret_cast<uint4*>(&tile[row * kNpuTileK + vec * 8]) = raw;
   }
@@ -8551,7 +8556,7 @@ __global__ void NpuDecodeOutputKernel(const std::uint8_t* __restrict__ in,
                                       bool accumulate,
                                       std::uint32_t valid_cols) {
   const std::size_t g = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
-  if (g >= std::size_t{tokens} * cols / 8) {
+  if (g >= std::size_t{NpuPaddedRows(tokens)} * cols / 8) {
     return;
   }
   constexpr std::uint32_t kGroupsPerTile = kNpuTileRowsC * kNpuTileN / 8;
@@ -8568,7 +8573,7 @@ __global__ void NpuDecodeOutputKernel(const std::uint8_t* __restrict__ in,
   const std::size_t row =
       std::size_t{tile_row} * kNpuTileRowsC + (sr * 2 + br) * 8 + rib;
   const std::uint32_t col = tile_col * kNpuTileN + (sc * 2 + bc) * 8;
-  if (valid_cols != 0 && col >= valid_cols) {
+  if (row >= tokens || (valid_cols != 0 && col >= valid_cols)) {
     return;
   }
   const std::uint8_t* p = in + g * 9;
@@ -8613,7 +8618,7 @@ __global__ void NpuSwigluKernel(const std::uint8_t* __restrict__ gate_in,
                                 std::uint32_t cols, std::uint32_t valid_cols,
                                 std::size_t out_pitch, std::uint32_t out_col0) {
   const std::size_t g = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
-  if (g >= std::size_t{tokens} * cols / 8) {
+  if (g >= std::size_t{NpuPaddedRows(tokens)} * cols / 8) {
     return;
   }
   constexpr std::uint32_t kGroupsPerTile = kNpuTileRowsC * kNpuTileN / 8;
@@ -8630,7 +8635,7 @@ __global__ void NpuSwigluKernel(const std::uint8_t* __restrict__ gate_in,
   const std::size_t row =
       std::size_t{tile_row} * kNpuTileRowsC + (sr * 2 + br) * 8 + rib;
   const std::uint32_t col = tile_col * kNpuTileN + (sc * 2 + bc) * 8;
-  if (col >= valid_cols) {
+  if (row >= tokens || col >= valid_cols) {
     return;
   }
   const std::uint8_t* pg = gate_in + g * 9;
@@ -8665,7 +8670,7 @@ void NpuSwiglu(const void* gate, const void* up, const void* gate_lo,
                const void* up_lo, __half* out, std::uint32_t tokens,
                std::uint32_t cols, std::uint32_t valid_cols, hipStream_t stream,
                std::size_t out_pitch, std::uint32_t out_col0) {
-  const std::size_t groups = std::size_t{tokens} * cols / 8;
+  const std::size_t groups = std::size_t{NpuPaddedRows(tokens)} * cols / 8;
   hipLaunchKernelGGL(NpuSwigluKernel, dim3(Blocks(groups)), dim3(kThreads), 0,
                      stream, static_cast<const std::uint8_t*>(gate),
                      static_cast<const std::uint8_t*>(up),
@@ -8678,16 +8683,17 @@ void NpuEncodeActivations(const __half* x, std::size_t ldx,
                           std::uint32_t tokens, std::uint32_t k_slice,
                           std::uint32_t k_offset, std::uint32_t k_valid,
                           void* dst, hipStream_t stream, bool residual) {
-  const dim3 grid((tokens / kNpuTileM) * (k_slice / kNpuTileK));
+  const dim3 grid(((tokens + kNpuTileM - 1) / kNpuTileM) *
+                  (k_slice / kNpuTileK));
   if (residual) {
     hipLaunchKernelGGL(NpuEncodeActivationsKernel<true>, grid, dim3(256), 0,
                        stream, x, static_cast<std::uint8_t*>(dst), k_slice,
-                       k_offset, k_valid, ldx);
+                       k_offset, k_valid, ldx, tokens);
     return;
   }
   hipLaunchKernelGGL(NpuEncodeActivationsKernel<false>, grid, dim3(256), 0,
                      stream, x, static_cast<std::uint8_t*>(dst), k_slice,
-                     k_offset, k_valid, ldx);
+                     k_offset, k_valid, ldx, tokens);
 }
 
 void NpuEncodeWeights(const void* q8, std::uint32_t k_total, std::uint32_t row0,
@@ -8729,7 +8735,7 @@ void NpuDecodeOutput(const void* src, float* out, std::uint32_t tokens,
                      std::uint32_t cols, std::size_t out_pitch,
                      std::uint32_t col0, bool accumulate, hipStream_t stream,
                      std::uint32_t valid_cols) {
-  const std::size_t groups = std::size_t{tokens} * cols / 8;
+  const std::size_t groups = std::size_t{NpuPaddedRows(tokens)} * cols / 8;
   hipLaunchKernelGGL(NpuDecodeOutputKernel, dim3(Blocks(groups)),
                      dim3(kThreads), 0, stream,
                      static_cast<const std::uint8_t*>(src), out, tokens, cols,
