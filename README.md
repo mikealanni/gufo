@@ -55,6 +55,8 @@ text, with greedy chat requests to `gufo serve`. NPU numbers need the setup in
 | `-p 8192` | 1,814 | **2,128** (+17.3%) |
 | `-p 16384` | 1,786 | **2,142** (+19.9%) |
 | `-p 32768` | 1,760 | **2,109** (+19.8%) |
+| `-p 65536` | not measured | **2,046** |
+| `-p 131072` | not measured | **1,990** |
 
 | Decode, tok/s | plain | MTP | DFlash2 |
 | --- | --- | --- | --- |
