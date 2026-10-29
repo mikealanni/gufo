@@ -602,6 +602,31 @@ void CheckChunks(std::uint32_t n, std::uint32_t split) {
     throw std::runtime_error("attention depends on prefill chunk boundary");
 }
 
+void CheckWmmaLiveExtent() {
+  HipBuffer<float> qv(kQWidth), gate(kQWidth), out(kQWidth);
+  HipBuffer<__half> k(kKvWidth), v(kKvWidth);
+  HipBuffer<std::uint32_t> mask(3200);
+  // Both cases are refused before any launch, so the small buffers are safe.
+  const auto accepts = [&](std::uint32_t n, std::uint32_t start,
+                           std::uint32_t words) {
+    return q::WmmaCausalAttention(qv.get(), gate.get(), k.get(), v.get(),
+                                  mask.get(), words, out.get(), n, start,
+                                  kHeads, kKvHeads, kDim, kRatio, nullptr);
+  };
+  // A row stride narrower than the live extent is a caller error.
+  if (accepts(4, 131069, 1024))
+    throw std::runtime_error("WMMA accepted a stride below the live extent");
+  // Compact entries hold 28-bit block indices: 2^30 visible tokens at most.
+  const std::uint32_t limit =
+      q::WmmaCausalAttentionContextLimit(kHeads, kKvHeads, kDim, kRatio);
+  if (limit != (1U << 30))
+    throw std::runtime_error("WMMA context limit is not 2^30 tokens");
+  if (accepts(4, limit - 3, (1U << 23) + 1))
+    throw std::runtime_error("WMMA accepted an extent past 2^28 blocks");
+  std::cout << "WMMA live extent: limit " << limit
+            << " tokens, narrow stride refused\n";
+}
+
 }  // namespace
 
 int main() {
@@ -713,6 +738,29 @@ int main() {
       // The reference accumulates FP32 probabilities; the WMMA route rounds
       // Q and P to FP16, so the contract is a small absolute envelope on
       // values of order one.
+      ok = ok && worst < 2e-2;
+    }
+    // A capacity wider than 262,144 (3,200 words at 409,600). Up to 2,048
+    // live words the union mask is built in one pass; past it (2,049 words
+    // at 262,141 + 4, then up to 3,200 at 409,600) in several. Budgeted rows
+    // compact their union; one-in-sixteen random rows overflow the list and
+    // walk the union words, in LDS up to 2,052 words and recomputed from
+    // the rows' masks beyond.
+    struct Wide {
+      std::uint32_t n_tokens;
+      std::uint32_t start_pos;
+      bool bounded;
+    };
+    for (const Wide& c :
+         {Wide{5, 131069, true}, Wide{4, 262140, true}, Wide{4, 262141, true},
+          Wide{4, 262141, false}, Wide{7, 262141, true}, Wide{4, 397688, true},
+          Wide{7, 397688, true}, Wide{5, 409595, true},
+          Wide{5, 409595, false}}) {
+      const double worst =
+          Compare(c.n_tokens, c.start_pos, true, seed++, true, c.bounded, 3200);
+      std::cout << "WMMA attention n=" << c.n_tokens << " start=" << c.start_pos
+                << " stride=3200 " << (c.bounded ? "budgeted" : "sparse")
+                << " worst absolute error " << worst << '\n';
       ok = ok && worst < 2e-2;
     }
     return ok ? 0 : 1;
