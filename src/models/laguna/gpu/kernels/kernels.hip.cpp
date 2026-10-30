@@ -1149,6 +1149,24 @@ bool AttentionWmma(const __half* q, const __half* k_cache,
       return false;
   }
   return true;
+
+__global__ void CaptureTapKernel(float* dst, const float* x, std::uint32_t rows,
+                                 std::uint32_t hidden, std::size_t stride,
+                                 std::size_t tap_offset) {
+  const std::uint32_t r = blockIdx.y;
+  const float* src = x + static_cast<std::size_t>(r) * hidden;
+  float* out = dst + r * stride + tap_offset;
+  for (std::uint32_t i = threadIdx.x; i < hidden; i += blockDim.x)
+    out[i] = src[i];
+}
+
+void CaptureTap(float* dst, const float* x, std::uint32_t n_rows,
+                std::uint32_t hidden, std::size_t stride,
+                std::size_t tap_offset, hipStream_t stream) {
+  if (n_rows == 0)
+    return;
+  CaptureTapKernel<<<dim3(1, n_rows), hidden, 0, stream>>>(
+      dst, x, n_rows, hidden, stride, tap_offset);
 }
 
 }  // namespace gufo::models::laguna::gpu::rocm

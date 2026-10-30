@@ -15,6 +15,8 @@
 #include "src/models/laguna/gpu/kernels/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
+#include "src/models/qwen/hip/dflash.hpp"
+#include "src/models/qwen/state.hpp"
 
 namespace gufo::models::laguna::gpu {
 namespace {
@@ -36,6 +38,14 @@ constexpr std::uint32_t kWarmTokens = 64;
 constexpr float kRoutedActScale = 64.0F;
 
 using core::GgmlType;
+
+models::QwenTensorRef TensorRef(const DeviceTensor& t) {
+  models::QwenTensorRef ref;
+  ref.data = t.data;
+  ref.type = t.type;
+  ref.num_elements = static_cast<std::size_t>(t.cols) * t.rows;
+  return ref;
+}
 
 bool Fail(std::string* error_msg, const std::string& message) {
   if (error_msg != nullptr)
@@ -119,6 +129,11 @@ struct ModelState {
   std::shared_ptr<core::GgufReader> reader;
   Config config;
   std::unique_ptr<DeviceModel> device;
+  std::shared_ptr<const hip::QwenDFlashGpuModel> dflash_model;
+  std::vector<std::uint32_t> dflash_taps;
+  std::uint32_t dflash_window{0};
+  std::uint32_t drafter_block{0};
+  bool keep_reader{false};
 };
 
 struct Session::Impl {
@@ -138,6 +153,12 @@ struct Session::Impl {
 
   std::vector<DeviceBuffer<__half>> k_cache, v_cache;
   std::vector<std::uint32_t> ring;
+  std::unique_ptr<hip::QwenDFlashGpuExecutor> dflash;
+  DeviceBuffer<float> tap_capture;
+  std::uint32_t tap_capture_rows{0};
+  std::uint32_t tap_capture_pos{0};
+  std::uint32_t tap_pending{0}, tap_pending_pos{0}, tap_pending_first{0};
+  bool inject_taps{true};
   DeviceBuffer<std::int32_t> tokens;
   DeviceBuffer<std::uint32_t> pos;
   DeviceBuffer<float> x, xn, q, k, v, gate, attn, o, router;
@@ -185,7 +206,8 @@ struct Session::Impl {
   bool RoutedExperts(const DeviceLayer& layer, std::uint32_t n, bool* scaled,
                      std::string* error_msg);
   bool Forward(std::span<const std::int32_t> tokens, bool all_rows,
-               std::string* error_msg);
+               std::uint32_t prefix_end, std::string* error_msg);
+  bool DflashInject(std::uint32_t rows, std::string* error_msg);
 };
 
 bool Session::Impl::Init(std::uint32_t max_context, std::string* error_msg) {
@@ -585,6 +607,7 @@ bool Session::Impl::Moe(const DeviceLayer& layer, std::uint32_t n,
 }
 
 bool Session::Impl::Forward(std::span<const std::int32_t> input, bool all_rows,
+                            std::uint32_t prefix_end,
                             std::string* error_msg) {
   const Config& c = model->config;
   const DeviceModel& dm = *model->device;
@@ -598,6 +621,17 @@ bool Session::Impl::Forward(std::span<const std::int32_t> input, bool all_rows,
                             hipMemcpyHostToDevice, stream));
   rocm::EmbedQ8(dm.token_embd().data, tokens.get(), x.get(), n, c.hidden_size,
                 stream);
+  std::uint32_t tap_rows = 0, tap_first = 0;
+  if (dflash != nullptr) {
+    // Only the drafter's sliding window matters: capture the rows ending the
+    // session prefix and skip forwards that finish far before it.
+    const std::uint32_t end = position + n;
+    if (end + model->dflash_window >= prefix_end) {
+      tap_first = end > model->dflash_window ? end - model->dflash_window : 0;
+      tap_rows = end - tap_first;
+      tap_capture_pos = position + tap_first;
+    }
+  }
   for (std::uint32_t il = 0; il < c.num_layers; ++il) {
     const DeviceLayer& L = dm.layers()[il];
     rocm::RmsNormRows(x.get(), static_cast<const float*>(L.attn_norm.data),
@@ -608,7 +642,22 @@ bool Session::Impl::Forward(std::span<const std::int32_t> input, bool all_rows,
                       xn.get(), n, c.hidden_size, 1, c.rms_eps, stream);
     if (!(L.is_moe ? Moe(L, n, error_msg) : DenseFfn(L, n, error_msg)))
       return false;
+    if (tap_rows != 0 &&
+        std::find(model->dflash_taps.begin(), model->dflash_taps.end(),
+                  il + 1) != model->dflash_taps.end()) {
+      const auto tap = static_cast<std::size_t>(
+          std::find(model->dflash_taps.begin(), model->dflash_taps.end(),
+                    il + 1) -
+          model->dflash_taps.begin());
+      rocm::CaptureTap(
+          tap_capture.get(), x.get() + static_cast<std::size_t>(tap_first) *
+                                        c.hidden_size,
+          tap_rows, c.hidden_size,
+          static_cast<std::size_t>(model->dflash_taps.size()) * c.hidden_size,
+          tap * c.hidden_size, stream);
+    }
   }
+  tap_capture_rows = tap_rows;
   const std::uint32_t head_rows = all_rows ? n : 1;
   const float* head_in =
       x.get() + (all_rows ? 0 : std::size_t{n - 1} * c.hidden_size);
@@ -622,6 +671,14 @@ bool Session::Impl::Forward(std::span<const std::int32_t> input, bool all_rows,
                      hipMemcpyDeviceToHost, stream));
   LAGUNA_HIP(hipStreamSynchronize(stream));
   position += n;
+  if (tap_capture_rows != 0) {
+    tap_pending = tap_capture_rows;
+    tap_pending_pos = tap_capture_pos;
+    tap_pending_first = 0;
+    tap_capture_rows = 0;
+    if (inject_taps && !DflashInject(tap_pending, error_msg))
+      return false;
+  }
   return true;
 }
 
@@ -635,10 +692,12 @@ bool Session::Append(std::span<const std::int32_t> tokens,
   if (impl_->position + tokens.size() > impl_->capacity) {
     return Fail(error_msg, "Laguna: context capacity exceeded");
   }
+  const std::uint32_t prefix_end = impl_->position +
+                                   static_cast<std::uint32_t>(tokens.size());
   for (std::size_t off = 0; off < tokens.size();) {
     const std::size_t n =
         std::min<std::size_t>(tokens.size() - off, impl_->tile);
-    if (!impl_->Forward(tokens.subspan(off, n), false, error_msg))
+    if (!impl_->Forward(tokens.subspan(off, n), false, prefix_end, error_msg))
       return false;
     off += n;
   }
@@ -653,7 +712,13 @@ bool Session::AppendAll(std::span<const std::int32_t> tokens,
   if (impl_->position + tokens.size() > impl_->capacity) {
     return Fail(error_msg, "Laguna: context capacity exceeded");
   }
-  return impl_->Forward(tokens, true, error_msg);
+  impl_->inject_taps = false;
+  const bool ok =
+      impl_->Forward(tokens, true,
+                     impl_->position + static_cast<std::uint32_t>(tokens.size()),
+                     error_msg);
+  impl_->inject_taps = true;
+  return ok;
 }
 
 void Session::Rewind(std::uint32_t position) noexcept {
@@ -681,6 +746,40 @@ std::uint32_t Session::Capacity() const noexcept {
 
 void Session::Reset() noexcept {
   impl_->position = 0;
+  if (impl_->dflash != nullptr)
+    impl_->dflash->Reset();
+}
+
+hip::QwenDFlashGpuExecutor* Session::DflashExecutor() const noexcept {
+  return impl_->dflash.get();
+}
+
+bool Session::DflashInject(std::uint32_t rows, std::string* error_msg) {
+  return impl_->DflashInject(rows, error_msg);
+}
+
+bool Session::Impl::DflashInject(std::uint32_t rows, std::string* error_msg) {
+  if (dflash == nullptr)
+    return true;
+  if (rows > tap_pending) {
+    tap_pending = 0;
+    return Fail(error_msg, "Laguna: drafter capture out of range");
+  }
+  if (rows == 0)
+    return true;
+  if (!dflash->InjectTargetContextDevice(tap_capture.get() +
+                                            static_cast<std::size_t>(
+                                                tap_pending_first) *
+                                                model->dflash_taps.size() *
+                                                model->config.hidden_size,
+                                        tap_pending_pos, rows)) {
+    tap_pending = 0;
+    return Fail(error_msg, "Laguna: drafter context injection failed");
+  }
+  tap_pending -= rows;
+  tap_pending_pos += rows;
+  tap_pending_first += rows;
+  return true;
 }
 
 std::size_t Session::AllocatedBytes() const noexcept {
@@ -712,14 +811,48 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     return nullptr;
   }
   impl->config = *config;
+  if (!options.dflash_model_path.empty())
+    impl->keep_reader = true;
   impl->device = DeviceModel::Upload(*impl->reader, impl->config, &err);
   if (!impl->device) {
     Fail(error_msg, "failed to upload Laguna weights: " + err);
     return nullptr;
   }
+  if (!options.dflash_model_path.empty()) {
+    auto dflash_reader =
+        core::GgufReader::OpenFile(options.dflash_model_path, &err);
+    if (!dflash_reader) {
+      Fail(error_msg, "failed to open the drafter: " + err);
+      return nullptr;
+    }
+    std::string dflash_err;
+    impl->dflash_model = hip::QwenDFlashGpuModel::Create(
+        std::move(dflash_reader), impl->config.hidden_size,
+        impl->config.vocab_size, impl->config.num_layers,
+        TensorRef(impl->device->token_embd()),
+        TensorRef(impl->device->output()), &dflash_err);
+    if (!impl->dflash_model) {
+      Fail(error_msg, "failed to load the drafter: " + dflash_err);
+      return nullptr;
+    }
+    const auto& dcfg = impl->dflash_model->GetDFlashConfig();
+    impl->dflash_taps = dcfg.target_layer_ids;
+    impl->drafter_block =
+        std::min<std::uint32_t>(dcfg.block_size, Session::kMaxVerifyRows);
+    impl->dflash_window = dcfg.sliding_window == 0
+                              ? options.max_context
+                              : std::min<std::uint32_t>(
+                                    dcfg.sliding_window, options.max_context);
+    if (!impl->dflash_taps.empty() &&
+        impl->dflash_taps.back() >= impl->config.num_layers) {
+      Fail(error_msg, "the drafter taps exceed the Laguna layer count");
+      return nullptr;
+    }
+  }
   // Release the GGUF mmap now that all weights are on the device: keeping it
   // alive pins ~model-size host pages and trips the SVM/resident-memory limit.
-  impl->reader.reset();
+  if (!impl->keep_reader)
+    impl->reader.reset();
   model->state_ = std::move(impl);
   return model;
 }
@@ -730,20 +863,53 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
   session->impl_->model = state_;
   if (!session->impl_->Init(max_context, error_msg))
     return nullptr;
+  if (HasDflash()) {
+    session->impl_->dflash = hip::QwenDFlashGpuExecutor::Create(
+        state_->dflash_model,
+        std::min<std::uint32_t>(max_context, state_->options.max_context),
+        error_msg);
+    if (!session->impl_->dflash) {
+      Fail(error_msg, "Laguna: drafter executor creation failed");
+      return nullptr;
+    }
+    const std::size_t taps = state_->dflash_taps.size();
+    if (taps != 0 &&
+        !session->impl_->tap_capture.Allocate(std::size_t{state_->dflash_window +
+                                                         Session::kMaxVerifyRows} *
+                                              taps * state_->config.hidden_size)) {
+      Fail(error_msg, "Laguna: drafter capture allocation failed");
+      return nullptr;
+    }
+  }
   const std::int32_t warm[kWarmTokens] = {};
   for (const std::uint32_t width : {1U, kWarmTokens}) {
     if (width > max_context)
       break;
-    if (!session->impl_->Forward({warm, width}, false, error_msg)) {
+    if (!session->impl_->Forward({warm, width}, false, width, error_msg)) {
       return nullptr;
     }
     session->impl_->position = 0;
+    if (session->impl_->dflash != nullptr) {
+      session->impl_->dflash->Reset();
+      session->impl_->tap_pending = 0;
+      session->impl_->tap_pending_pos = 0;
+      session->impl_->tap_pending_first = 0;
+      session->impl_->tap_capture_rows = 0;
+    }
   }
   return session;
 }
 
 const Config& Model::config() const noexcept {
   return state_->config;
+}
+
+bool Model::HasDflash() const noexcept {
+  return state_->dflash_model != nullptr;
+}
+
+std::uint32_t Model::DrafterBlockSize() const noexcept {
+  return state_->drafter_block;
 }
 
 std::size_t Model::ResidentBytes() const noexcept {

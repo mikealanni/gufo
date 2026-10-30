@@ -8,11 +8,20 @@
 
 #include "src/models/laguna/runtime/config.hpp"
 
+namespace gufo::hip {
+class QwenDFlashGpuExecutor;
+class QwenDFlashGpuModel;
+}  // namespace gufo::hip
+
 namespace gufo::models::laguna::gpu {
 
 struct EngineOptions {
   /// Tokens one prefill pass processes.
   std::uint32_t prefill_tile{4096};
+  /// Optional DFlash-2 drafter; its trunk taps bind to this model.
+  std::string dflash_model_path;
+  /// Upper bound for session contexts; bounds the drafter's context.
+  std::uint32_t max_context{65536};
 };
 
 class Model;
@@ -37,6 +46,14 @@ public:
 
   /// Drops cache rows past `position`; later appends overwrite them.
   void Rewind(std::uint32_t position) noexcept;
+
+  /// DFlash-2 executor bound to this session, or null when no drafter was
+  /// loaded. Multi-row AppendAll leaves the drafter un-injected; the caller
+  /// commits the accepted prefix with DflashInject after verification.
+  [[nodiscard]] hip::QwenDFlashGpuExecutor* DflashExecutor() const noexcept;
+  /// Injects the first `rows` captured rows of the last forward into the
+  /// drafter and returns true when its context covers `Position()`.
+  bool DflashInject(std::uint32_t rows, std::string* error_msg);
 
   [[nodiscard]] std::span<const float> Logits() const noexcept;
   /// Row `row` of the last AppendAll (or Append of up to kMaxVerifyRows).
@@ -73,6 +90,9 @@ public:
 
   [[nodiscard]] const Config& config() const noexcept;
   [[nodiscard]] std::size_t ResidentBytes() const noexcept;
+  [[nodiscard]] bool HasDflash() const noexcept;
+  /// Tokens the drafter proposes and one verification pass holds at most.
+  [[nodiscard]] std::uint32_t DrafterBlockSize() const noexcept;
 
 private:
   Model() = default;

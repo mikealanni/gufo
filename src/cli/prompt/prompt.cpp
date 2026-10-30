@@ -604,7 +604,23 @@ int RunLagunaPromptGPU(const PromptOptions& opt, const core::GgufReader& reader,
     std::cerr << "Laguna tokenizer failed: " << err << '\n';
     return 1;
   }
-  auto model = models::laguna::gpu::Model::Load(opt.model_path, {}, &err);
+  models::laguna::gpu::EngineOptions engine_options;
+  const bool dflash = opt.speculative_backend == "dflash2";
+  if (!opt.speculative_backend.empty() && !dflash) {
+    std::cerr << "Laguna supports only --speculative dflash2\n";
+    return 2;
+  }
+  if (dflash &&
+      (opt.dflash_model_path.empty() || opt.draft_tokens < 1 ||
+       opt.draft_tokens > 15)) {
+    std::cerr << "Laguna DFlash2 requires --dflash-model and 1..15 draft "
+                 "tokens\n";
+    return 2;
+  }
+  if (dflash)
+    engine_options.dflash_model_path = opt.dflash_model_path;
+  auto model =
+      models::laguna::gpu::Model::Load(opt.model_path, engine_options, &err);
   if (!model) {
     std::cerr << "Laguna GPU load failed: " << err << '\n';
     PrintModelLoadTime(load_start, false);
@@ -651,19 +667,90 @@ int RunLagunaPromptGPU(const PromptOptions& opt, const core::GgufReader& reader,
   const auto prefill_end = std::chrono::steady_clock::now();
 
   std::size_t generated = 0;
-  auto token = sampler.Sample(session->Logits());
-  while (generated < opt.max_tokens && !is_stop(token)) {
-    sampler.Accept(token);
+  std::size_t drafted = 0;
+  std::size_t accepted_drafts = 0;
+  const bool use_dflash = model->HasDflash() && !opt.speculative_off;
+  const std::uint32_t max_draft =
+      dflash ? std::min<std::uint32_t>(opt.draft_tokens,
+                                       model->DrafterBlockSize() - 1)
+             : 0;
+  const auto emit = [&](tokenization::TokenId token) {
     std::cout << tokenizer->DecodeToken(token) << std::flush;
+  };
+  auto token = sampler.Sample(session->Logits());
+  bool stopped = false;
+  while (!stopped && generated < opt.max_tokens) {
+    if (is_stop(token))
+      break;
+    sampler.Accept(token);
+    emit(token);
     ++generated;
     if (generated >= opt.max_tokens)
       break;
-    const std::int32_t feed[1] = {static_cast<std::int32_t>(token)};
-    if (!session->Append(feed, &err)) {
-      std::cerr << "\nLaguna GPU decode failed: " << err << '\n';
+
+    std::vector<std::int32_t> feed{static_cast<std::int32_t>(token)};
+    if (use_dflash &&
+        session->DflashExecutor()->GetInjectedContextLength() ==
+            session->Position()) {
+      const auto drafts = session->DflashExecutor()->ForwardBlock(
+          token, session->Position(), max_draft,
+          opt.sampling.uses_random_sampling() ? opt.sampling.temperature
+                                              : 0.0F);
+      feed.insert(feed.end(), drafts.begin(), drafts.end());
+    }
+    if (feed.size() == 1) {
+      if (!session->Append(feed, &err)) {
+        std::cerr << "\nLaguna GPU decode failed: " << err << '\n';
+        return 1;
+      }
+      token = sampler.Sample(session->Logits());
+      continue;
+    }
+    drafted += feed.size() - 1;
+    if (!session->AppendAll(feed, &err)) {
+      std::cerr << "\nLaguna GPU verify failed: " << err << '\n';
       return 1;
     }
-    token = sampler.Sample(session->Logits());
+    // Row i holds the distribution after feed[i]; draft feed[i + 1] is tested
+    // against it, and only the accepted rows are committed to the drafter.
+    std::uint32_t kept = 0;
+    for (std::uint32_t row = 0;; ++row) {
+      const auto logits = session->Logits(row);
+      if (row + 1 >= feed.size()) {
+        token = sampler.Sample(logits);
+        break;
+      }
+      const auto guess = static_cast<tokenization::TokenId>(feed[row + 1]);
+      tokenization::TokenId next;
+      bool hit;
+      if (opt.sampling.uses_random_sampling()) {
+        const double p = sampler.Distribution(logits).probability(guess);
+        hit = sampler.Uniform() < p;
+        if (!hit) {
+          const float one = 1.0F;
+          next = sampler.SampleResidual(logits, {&guess, 1}, {&one, 1});
+        }
+      } else {
+        next = sampler.Sample(logits);
+        hit = next == guess;
+      }
+      if (!hit) {
+        token = next;
+        break;
+      }
+      emit(guess);
+      ++kept;
+      ++accepted_drafts;
+      if (is_stop(guess)) {
+        stopped = true;
+        break;
+      }
+    }
+    generated += kept;
+    if (!session->DflashInject(kept + 1, &err)) {
+      std::cerr << "\nLaguna drafter commit failed: " << err << '\n';
+      return 1;
+    }
   }
   std::cout << '\n';
   if (opt.verbose) {
@@ -677,7 +764,11 @@ int RunLagunaPromptGPU(const PromptOptions& opt, const core::GgufReader& reader,
               << " tok/s), generated=" << generated << " tok in "
               << seconds(prefill_end, end) << " s ("
               << generated / std::max(seconds(prefill_end, end), 1e-9)
-              << " tok/s)\n";
+              << " tok/s)";
+    if (drafted != 0)
+      std::cerr << ", drafted=" << drafted
+                << " accepted=" << accepted_drafts << '/' << drafted;
+    std::cerr << '\n';
   }
   return 0;
 }

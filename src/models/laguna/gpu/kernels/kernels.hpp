@@ -106,6 +106,12 @@ void NarrowRows(const float* in, __half* out, std::uint32_t n_rows,
 void AddInPlace(float* x, const float* y, std::size_t count,
                 hipStream_t stream);
 
+/// dst[r][tap * hidden + i] = x[first_row + r][i]; the drafter reads rows at
+/// `stride` with the tapped hidden states concatenated per row.
+void CaptureTap(float* dst, const float* x, std::uint32_t n_rows,
+                std::uint32_t hidden, std::size_t stride,
+                std::size_t tap_offset, hipStream_t stream);
+
 }  // namespace gufo::models::laguna::gpu::rocm
 
 #endif  // GUFO_MODELS_LAGUNA_GPU_KERNELS_KERNELS_HPP_
