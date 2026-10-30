@@ -98,8 +98,7 @@ __global__ __launch_bounds__(256) void RmsNormGroupsKernel(
     for (std::uint32_t i = lane; i < width; i += warpSize)
       sum += src[i] * src[i];
     sum = WaveSum(sum);
-    const float inv =
-        1.0F / sqrtf(sum / static_cast<float>(width) + eps);
+    const float inv = 1.0F / sqrtf(sum / static_cast<float>(width) + eps);
     for (std::uint32_t i = lane; i < width; i += warpSize)
       dst[i] = src[i] * inv * (gamma != nullptr ? gamma[i] : 1.0F);
   }
@@ -619,7 +618,8 @@ void RouterF32(const float* w, const float* x, float* out,
   }
   RouterGemmKernel<<<dim3(Blocks(n_experts, kRouteExpTile),
                           Blocks(n_tokens, kRouteTokTile)),
-                     kRouteThreads, 0, stream>>>(w, x, out, n_experts, k, n_tokens);
+                     kRouteThreads, 0, stream>>>(w, x, out, n_experts, k,
+                                                 n_tokens);
 }
 
 void SigmoidBiasTopK(const float* logits, const float* bias, std::int32_t* ids,
@@ -715,7 +715,7 @@ constexpr std::uint32_t kSparseList = 512;
 // group-6 layers, 9 for group-9). The 16 WMMA output columns hold
 // kTokensPerWave tokens x kHeadsPerKv heads, so a group with a higher
 // ratio simply fits fewer tokens per wave (9 has to drop to one).
-template <int kHeadsPerKv>
+template<int kHeadsPerKv>
 __global__ __launch_bounds__(kWmmaThreads) void AttentionWmmaKernelLaguna(
     const __half* __restrict__ q, const __half* __restrict__ k_cache,
     const __half* __restrict__ v_cache, const float* __restrict__ sinks,
@@ -1149,6 +1149,7 @@ bool AttentionWmma(const __half* q, const __half* k_cache,
       return false;
   }
   return true;
+}
 
 __global__ void CaptureTapKernel(float* dst, const float* x, std::uint32_t rows,
                                  std::uint32_t hidden, std::size_t stride,

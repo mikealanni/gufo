@@ -610,9 +610,8 @@ int RunLagunaPromptGPU(const PromptOptions& opt, const core::GgufReader& reader,
     std::cerr << "Laguna supports only --speculative dflash2\n";
     return 2;
   }
-  if (dflash &&
-      (opt.dflash_model_path.empty() || opt.draft_tokens < 1 ||
-       opt.draft_tokens > 15)) {
+  if (dflash && (opt.dflash_model_path.empty() || opt.draft_tokens < 1 ||
+                 opt.draft_tokens > 15)) {
     std::cerr << "Laguna DFlash2 requires --dflash-model and 1..15 draft "
                  "tokens\n";
     return 2;
@@ -689,9 +688,8 @@ int RunLagunaPromptGPU(const PromptOptions& opt, const core::GgufReader& reader,
       break;
 
     std::vector<std::int32_t> feed{static_cast<std::int32_t>(token)};
-    if (use_dflash &&
-        session->DflashExecutor()->GetInjectedContextLength() ==
-            session->Position()) {
+    if (use_dflash && session->DflashExecutor()->GetInjectedContextLength() ==
+                          session->Position()) {
       const auto drafts = session->DflashExecutor()->ForwardBlock(
           token, session->Position(), max_draft,
           opt.sampling.uses_random_sampling() ? opt.sampling.temperature
@@ -766,8 +764,8 @@ int RunLagunaPromptGPU(const PromptOptions& opt, const core::GgufReader& reader,
               << generated / std::max(seconds(prefill_end, end), 1e-9)
               << " tok/s)";
     if (drafted != 0)
-      std::cerr << ", drafted=" << drafted
-                << " accepted=" << accepted_drafts << '/' << drafted;
+      std::cerr << ", drafted=" << drafted << " accepted=" << accepted_drafts
+                << '/' << drafted;
     std::cerr << '\n';
   }
   return 0;

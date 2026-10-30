@@ -38,6 +38,10 @@ struct QwenDFlashConfig {
 
   /// Number of transformer blocks in the draft model.
   std::uint32_t num_layers{0};
+
+  /// True when this is a standard DFlash v1 model (no dynamic convs or
+  /// selector).
+  bool is_v1{false};
 };
 
 /// DFlash-2 transformer weights plus the layer-local dynamic convolutions.

@@ -315,18 +315,22 @@ void QwenDFlashGpuExecutor::Allocate() {
   // Scratch buffers for block drafting (size = block_size)
   allocate_scratch(d_block_hidden_, block_size * hidden_size);
   allocate_scratch(d_conv_hidden_, block_size * hidden_size);
-  allocate_scratch(d_dynamic_coefficients_, block_size * dynamic_size);
+  if (!df_cfg.is_v1) {
+    allocate_scratch(d_dynamic_coefficients_, block_size * dynamic_size);
+  }
   allocate_scratch(d_q_, block_size * q_dim);
   allocate_scratch(d_attn_out_, block_size * q_dim);
   const auto selector_scratch_elements =
-      kernels::DFlashSelectorScratchElements(cfg.vocab_size);
+      df_cfg.is_v1 ? 0 : kernels::DFlashSelectorScratchElements(cfg.vocab_size);
   const auto ffn_scratch_width =
       std::max(intermediate_size, selector_scratch_elements);
   allocate_scratch(d_ffn_gate_, block_size * ffn_scratch_width);
   allocate_scratch(d_ffn_up_, block_size * ffn_scratch_width);
   allocate_scratch(d_ffn_down_, block_size * hidden_size);
   allocate_scratch(d_logits_, block_size * cfg.vocab_size);
-  allocate_scratch(d_selector_hidden_, block_size * df_cfg.selector_rank);
+  if (!df_cfg.is_v1) {
+    allocate_scratch(d_selector_hidden_, block_size * df_cfg.selector_rank);
+  }
   allocate_scratch(d_selector_candidate_ids_,
                    block_size * df_cfg.selector_top_k);
   allocate_scratch(d_selector_candidate_probabilities_,
@@ -401,8 +405,10 @@ void QwenDFlashGpuExecutor::PrewarmBlockGemms() {
 
   for (std::size_t draft_count = 1; draft_count < df_cfg.block_size;
        ++draft_count) {
-    prewarm(weights.selector_hidden, d_block_normed_, d_selector_hidden_,
-            draft_count, df_cfg.selector_rank, hidden_size);
+    if (!df_cfg.is_v1) {
+      prewarm(weights.selector_hidden, d_block_normed_, d_selector_hidden_,
+              draft_count, df_cfg.selector_rank, hidden_size);
+    }
     prewarm(weights.output, d_block_normed_, d_logits_, draft_count,
             cfg.vocab_size, hidden_size);
   }
@@ -1126,21 +1132,24 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
         d_block_normed_, nullptr, block_count, hidden_size, 1e-6F, stream_);
     emit("attn_norm", d_block_normed_, hidden_size);
 
-    RunBlockGemm(dflash_layer.attention_conv_projection, d_block_normed_,
-                 d_dynamic_coefficients_, block_count, dynamic_size,
-                 hidden_size);
-    kernels::LaunchDFlashGroupedDynamicConv(
-        d_block_normed_, d_dynamic_coefficients_,
-        static_cast<const float*>(dflash_layer.attention_conv_base.data),
-        d_conv_hidden_, block_count, hidden_size, df_cfg.conv_kernel_size,
-        df_cfg.conv_group_size, 0, stream_);
-    emit("attn_conv_in", d_conv_hidden_, hidden_size);
+    const float* attn_in = d_block_normed_;
+    if (!df_cfg.is_v1) {
+      RunBlockGemm(dflash_layer.attention_conv_projection, d_block_normed_,
+                   d_dynamic_coefficients_, block_count, dynamic_size,
+                   hidden_size);
+      kernels::LaunchDFlashGroupedDynamicConv(
+          d_block_normed_, d_dynamic_coefficients_,
+          static_cast<const float*>(dflash_layer.attention_conv_base.data),
+          d_conv_hidden_, block_count, hidden_size, df_cfg.conv_kernel_size,
+          df_cfg.conv_group_size, 0, stream_);
+      emit("attn_conv_in", d_conv_hidden_, hidden_size);
+      attn_in = d_conv_hidden_;
+    }
 
-    RunBlockGemm(layer.attn_q, d_conv_hidden_, d_q_, block_count, q_dim,
+    RunBlockGemm(layer.attn_q, attn_in, d_q_, block_count, q_dim, hidden_size);
+    RunBlockGemm(layer.attn_k, attn_in, d_k_block_, block_count, kv_dim,
                  hidden_size);
-    RunBlockGemm(layer.attn_k, d_conv_hidden_, d_k_block_, block_count, kv_dim,
-                 hidden_size);
-    RunBlockGemm(layer.attn_v, d_conv_hidden_, d_v_block_, block_count, kv_dim,
+    RunBlockGemm(layer.attn_v, attn_in, d_v_block_, block_count, kv_dim,
                  hidden_size);
 
     NormalizeAndRotateQK(d_q_, d_k_block_,
@@ -1164,14 +1173,18 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
     RunBlockGemm(layer.attn_output, d_attn_out_, d_fused_features_, block_count,
                  hidden_size, q_dim);
     emit("attn_output", d_fused_features_, hidden_size);
-    kernels::LaunchDFlashGroupedDynamicConv(
-        d_fused_features_, d_dynamic_coefficients_,
-        static_cast<const float*>(dflash_layer.attention_conv_base.data),
-        d_conv_hidden_, block_count, hidden_size, df_cfg.conv_kernel_size,
-        df_cfg.conv_group_size, 1, stream_);
-    emit("attn_conv_out", d_conv_hidden_, hidden_size);
+    const float* attn_res = d_fused_features_;
+    if (!df_cfg.is_v1) {
+      kernels::LaunchDFlashGroupedDynamicConv(
+          d_fused_features_, d_dynamic_coefficients_,
+          static_cast<const float*>(dflash_layer.attention_conv_base.data),
+          d_conv_hidden_, block_count, hidden_size, df_cfg.conv_kernel_size,
+          df_cfg.conv_group_size, 1, stream_);
+      emit("attn_conv_out", d_conv_hidden_, hidden_size);
+      attn_res = d_conv_hidden_;
+    }
 
-    LaunchBatchedResidualAdd(d_block_hidden_, d_conv_hidden_, d_block_hidden_,
+    LaunchBatchedResidualAdd(d_block_hidden_, attn_res, d_block_hidden_,
                              block_count, hidden_size, stream_);
     emit("attn_residual", d_block_hidden_, hidden_size);
 
@@ -1180,19 +1193,23 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
         d_block_normed_, nullptr, block_count, hidden_size, 1e-6F, stream_);
     emit("ffn_norm", d_block_normed_, hidden_size);
 
-    RunBlockGemm(dflash_layer.ffn_conv_projection, d_block_normed_,
-                 d_dynamic_coefficients_, block_count, dynamic_size,
-                 hidden_size);
-    kernels::LaunchDFlashGroupedDynamicConv(
-        d_block_normed_, d_dynamic_coefficients_,
-        static_cast<const float*>(dflash_layer.ffn_conv_base.data),
-        d_conv_hidden_, block_count, hidden_size, df_cfg.conv_kernel_size,
-        df_cfg.conv_group_size, 0, stream_);
-    emit("ffn_conv_in", d_conv_hidden_, hidden_size);
+    const float* ffn_in = d_block_normed_;
+    if (!df_cfg.is_v1) {
+      RunBlockGemm(dflash_layer.ffn_conv_projection, d_block_normed_,
+                   d_dynamic_coefficients_, block_count, dynamic_size,
+                   hidden_size);
+      kernels::LaunchDFlashGroupedDynamicConv(
+          d_block_normed_, d_dynamic_coefficients_,
+          static_cast<const float*>(dflash_layer.ffn_conv_base.data),
+          d_conv_hidden_, block_count, hidden_size, df_cfg.conv_kernel_size,
+          df_cfg.conv_group_size, 0, stream_);
+      emit("ffn_conv_in", d_conv_hidden_, hidden_size);
+      ffn_in = d_conv_hidden_;
+    }
 
-    RunBlockGemm(layer.ffn_gate, d_conv_hidden_, d_ffn_gate_, block_count,
+    RunBlockGemm(layer.ffn_gate, ffn_in, d_ffn_gate_, block_count,
                  intermediate_size, hidden_size);
-    RunBlockGemm(layer.ffn_up, d_conv_hidden_, d_ffn_up_, block_count,
+    RunBlockGemm(layer.ffn_up, ffn_in, d_ffn_up_, block_count,
                  intermediate_size, hidden_size);
     kernels::LaunchDFlashSiLUMul(d_ffn_gate_, d_ffn_up_,
                                  block_count * intermediate_size, stream_);
@@ -1200,14 +1217,18 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
                  hidden_size, intermediate_size);
     emit("ffn_down", d_ffn_down_, hidden_size);
 
-    kernels::LaunchDFlashGroupedDynamicConv(
-        d_ffn_down_, d_dynamic_coefficients_,
-        static_cast<const float*>(dflash_layer.ffn_conv_base.data),
-        d_conv_hidden_, block_count, hidden_size, df_cfg.conv_kernel_size,
-        df_cfg.conv_group_size, 1, stream_);
-    emit("ffn_conv_out", d_conv_hidden_, hidden_size);
+    const float* ffn_res = d_ffn_down_;
+    if (!df_cfg.is_v1) {
+      kernels::LaunchDFlashGroupedDynamicConv(
+          d_ffn_down_, d_dynamic_coefficients_,
+          static_cast<const float*>(dflash_layer.ffn_conv_base.data),
+          d_conv_hidden_, block_count, hidden_size, df_cfg.conv_kernel_size,
+          df_cfg.conv_group_size, 1, stream_);
+      emit("ffn_conv_out", d_conv_hidden_, hidden_size);
+      ffn_res = d_conv_hidden_;
+    }
 
-    LaunchBatchedResidualAdd(d_block_hidden_, d_conv_hidden_, d_block_hidden_,
+    LaunchBatchedResidualAdd(d_block_hidden_, ffn_res, d_block_hidden_,
                              block_count, hidden_size, stream_);
     emit("output", d_block_hidden_, hidden_size);
   }
@@ -1219,11 +1240,13 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
               stream_);
 
   std::vector<tokenization::TokenId> tokens(draft_count, 0);
-  RunBlockGemm(weights.selector_hidden, d_block_normed_ + hidden_size,
-               d_selector_hidden_, draft_count, df_cfg.selector_rank,
-               hidden_size);
-  TraceTensor(trace, "selector_hidden", d_selector_hidden_,
-              draft_count * df_cfg.selector_rank, stream_);
+  if (!df_cfg.is_v1) {
+    RunBlockGemm(weights.selector_hidden, d_block_normed_ + hidden_size,
+                 d_selector_hidden_, draft_count, df_cfg.selector_rank,
+                 hidden_size);
+    TraceTensor(trace, "selector_hidden", d_selector_hidden_,
+                draft_count * df_cfg.selector_rank, stream_);
+  }
 
   const float* head_logits = d_logits_;
   const float* tail_logits = nullptr;
@@ -1268,29 +1291,43 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
       throw std::runtime_error("DFlash GPU sampling upload failed");
     }
   }
-  // The FFN is finished. Its buffers hold all independent top-k partials;
-  // one selector launch then walks this request's predecessor chain.
-  const std::array sequences{
-      kernels::DFlashSelectorSequence{draft_count, temperature}};
-  kernels::LaunchDFlashSelectorBatch(
-      head_logits, d_selector_hidden_, weights.selector_predecessor.data,
-      weights.selector_successor.data, d_out_token_, d_confidences_,
-      d_ffn_gate_, reinterpret_cast<std::uint32_t*>(d_ffn_up_),
-      temperature > 0.0F ? d_selector_uniforms_ : nullptr,
-      out_candidate_ids != nullptr ? d_selector_candidate_ids_ : nullptr,
-      out_candidate_probabilities != nullptr
-          ? d_selector_candidate_probabilities_
-          : nullptr,
-      sequences, vocab_size, df_cfg.selector_rank, df_cfg.selector_top_k,
-      stream_, tail_logits, draft_head_rows_, draft_tail_rows_,
-      draft_tail_base_);
+  if (df_cfg.is_v1) {
+    for (std::uint32_t i = 0; i < draft_count; ++i) {
+      LaunchGPUArgmax(d_logits_ + i * vocab_size, d_out_token_ + 1U + i,
+                      vocab_size, stream_);
+    }
+    const auto token_copy =
+        hipMemcpyAsync(tokens.data(), d_out_token_ + 1U,
+                       draft_count * sizeof(tokenization::TokenId),
+                       hipMemcpyDeviceToHost, stream_);
+    if (token_copy != hipSuccess) {
+      throw std::runtime_error("DFlash GPU token download failed");
+    }
+  } else {
+    // The FFN is finished. Its buffers hold all independent top-k partials;
+    // one selector launch then walks this request's predecessor chain.
+    const std::array sequences{
+        kernels::DFlashSelectorSequence{draft_count, temperature}};
+    kernels::LaunchDFlashSelectorBatch(
+        head_logits, d_selector_hidden_, weights.selector_predecessor.data,
+        weights.selector_successor.data, d_out_token_, d_confidences_,
+        d_ffn_gate_, reinterpret_cast<std::uint32_t*>(d_ffn_up_),
+        temperature > 0.0F ? d_selector_uniforms_ : nullptr,
+        out_candidate_ids != nullptr ? d_selector_candidate_ids_ : nullptr,
+        out_candidate_probabilities != nullptr
+            ? d_selector_candidate_probabilities_
+            : nullptr,
+        sequences, vocab_size, df_cfg.selector_rank, df_cfg.selector_top_k,
+        stream_, tail_logits, draft_head_rows_, draft_tail_rows_,
+        draft_tail_base_);
 
-  const auto token_copy =
-      hipMemcpyAsync(tokens.data(), d_out_token_ + 1U,
-                     draft_count * sizeof(tokenization::TokenId),
-                     hipMemcpyDeviceToHost, stream_);
-  if (token_copy != hipSuccess) {
-    throw std::runtime_error("DFlash GPU selector download failed");
+    const auto token_copy =
+        hipMemcpyAsync(tokens.data(), d_out_token_ + 1U,
+                       draft_count * sizeof(tokenization::TokenId),
+                       hipMemcpyDeviceToHost, stream_);
+    if (token_copy != hipSuccess) {
+      throw std::runtime_error("DFlash GPU selector download failed");
+    }
   }
 
   if (out_confidences != nullptr) {
