@@ -149,7 +149,7 @@ struct Session::Impl {
   DeviceBuffer<std::uint32_t> counts;
   DeviceBuffer<std::int32_t> route_bounds, route_cursors, rows_token, rows_slot;
   DeviceBuffer<std::int32_t> tiles_pair, tiles_down;
-  DeviceBuffer<__half> act_half;
+  DeviceBuffer<__half> act_half, qh;
 
   ~Impl() {
     if (stream != nullptr) {
@@ -224,6 +224,7 @@ bool Session::Impl::Init(std::uint32_t max_context, std::string* error_msg) {
        x.Allocate(std::size_t{tile} * c.hidden_size) &&
        xn.Allocate(std::size_t{tile} * c.hidden_size) &&
        q.Allocate(std::size_t{tile} * q_row) &&
+       qh.Allocate(std::size_t{tile} * q_row) &&
        k.Allocate(std::size_t{tile} * kv_row) &&
        v.Allocate(std::size_t{tile} * kv_row) &&
        gate.Allocate(std::size_t{tile} * max_heads) &&
@@ -349,9 +350,70 @@ bool Session::Impl::Attention(std::uint32_t il, std::uint32_t n,
                   rope.mscale, pos.get(), stream);
   rocm::StoreKv(k.get(), v.get(), k_cache[il].get(), v_cache[il].get(), n,
                 kv_row, pos.get(), ring[il], stream);
-  rocm::Attention(q.get(), k_cache[il].get(), v_cache[il].get(), gate.get(),
-                  attn.get(), n, pos.get(), heads, c.num_kv, c.head_dim,
-                  swa ? c.sliding_window : 0, ring[il], stream);
+  rocm::ToHalf(q.get(), qh.get(), std::size_t{n} * heads * c.head_dim, stream);
+  // Four real bugs found and fixed in AttentionWmma/AttentionWmmaKernelLaguna
+  // (shape guard; token stride missing *2; missing softplus(gate) multiply
+  // the scalar reference applies but WMMA silently dropped; head address
+  // using the tile width (kWmmaGroup=8) instead of the real per-kv_head
+  // stride (heads/kv_heads=6) as the memory stride, which only worked by
+  // coincidence for kv_head==0). Verified via `gufo bench
+  // --validate-prefill` and a per-layer scalar-vs-WMMA trace
+  // (LAGUNA_WMMA_DEBUG=1): every group-6 layer now matches scalar to
+  // fp16-precision-level noise only. See laguna-port-state.md for the full
+  // debugging trail, including why n=16 alone still fails top1_match (a
+  // pre-existing near-tie numeric sensitivity, not a WMMA bug -- confirmed
+  // by reproducing the same divergence with WMMA fully disabled).
+  constexpr bool kWmmaAttentionEnabled = true;
+  const bool use_wmma =
+      kWmmaAttentionEnabled &&
+      rocm::AttentionWmma(qh.get(), k_cache[il].get(), v_cache[il].get(),
+                          gate.get(), attn.get(), n, pos.get(), heads, c.num_kv,
+                          c.head_dim, swa ? c.sliding_window : 0, ring[il],
+                          stream);
+  if (!use_wmma) {
+    rocm::Attention(q.get(), k_cache[il].get(), v_cache[il].get(), gate.get(),
+                    attn.get(), n, pos.get(), heads, c.num_kv, c.head_dim,
+                    swa ? c.sliding_window : 0, ring[il], stream);
+  }
+  if (use_wmma && std::getenv("LAGUNA_WMMA_DEBUG") != nullptr) {
+    DeviceBuffer<float> scalar_attn;
+    scalar_attn.Allocate(std::size_t{n} * heads * c.head_dim);
+    rocm::Attention(q.get(), k_cache[il].get(), v_cache[il].get(), gate.get(),
+                    scalar_attn.get(), n, pos.get(), heads, c.num_kv,
+                    c.head_dim, swa ? c.sliding_window : 0, ring[il], stream);
+    LAGUNA_HIP(hipStreamSynchronize(stream));
+    std::vector<float> wmma_host(std::size_t{n} * heads * c.head_dim);
+    std::vector<float> scalar_host(wmma_host.size());
+    LAGUNA_HIP(hipMemcpy(wmma_host.data(), attn.get(),
+                         wmma_host.size() * sizeof(float),
+                         hipMemcpyDeviceToHost));
+    LAGUNA_HIP(hipMemcpy(scalar_host.data(), scalar_attn.get(),
+                         scalar_host.size() * sizeof(float),
+                         hipMemcpyDeviceToHost));
+    for (std::uint32_t t = 0; t < n; ++t) {
+      for (std::uint32_t h = 0; h < heads; ++h) {
+        double max_abs = 0.0;
+        double sum_abs_scalar = 0.0;
+        const std::size_t base = (std::size_t{t} * heads + h) * c.head_dim;
+        for (std::uint32_t d = 0; d < c.head_dim; ++d) {
+          const double diff =
+              std::fabs(wmma_host[base + d] - scalar_host[base + d]);
+          max_abs = std::max(max_abs, diff);
+          sum_abs_scalar += std::fabs(scalar_host[base + d]);
+        }
+        std::fprintf(stderr,
+                     "[LAGUNA_WMMA_DEBUG] layer=%u token=%u head=%u "
+                     "max_abs_diff=%.6f scalar_sum_abs=%.6f "
+                     "wmma[0..3]=%.4f,%.4f,%.4f,%.4f "
+                     "scalar[0..3]=%.4f,%.4f,%.4f,%.4f\n",
+                     il, t, h, max_abs, sum_abs_scalar, wmma_host[base + 0],
+                     wmma_host[base + 1], wmma_host[base + 2],
+                     wmma_host[base + 3], scalar_host[base + 0],
+                     scalar_host[base + 1], scalar_host[base + 2],
+                     scalar_host[base + 3]);
+      }
+    }
+  }
   if (!Dense(L.attn_output, attn.get(), o.get(), n, error_msg))
     return false;
   rocm::AddInPlace(x.get(), o.get(), std::size_t{n} * c.hidden_size, stream);

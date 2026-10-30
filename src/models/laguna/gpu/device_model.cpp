@@ -195,9 +195,18 @@ private:
         std::max<std::uint64_t>(1, kCopyChunk / dst_row);
     const std::size_t src_row_bytes = t.size_bytes / n_rows;
     std::vector<char> host(rows_per_chunk * dst_row);
-    const unsigned workers = std::max(1U, std::thread::hardware_concurrency());
+    const unsigned max_workers = std::thread::hardware_concurrency();
+    const unsigned workers = std::min(8U, std::max(1U, max_workers));
+    const bool log_progress = std::getenv("LAGUNA_LOAD_LOG") != nullptr;
     for (std::uint64_t r0 = 0; r0 < n_rows; r0 += rows_per_chunk) {
       const std::uint64_t n = std::min(rows_per_chunk, n_rows - r0);
+      if (log_progress) {
+        std::fprintf(stderr,
+                     "[laguna] reencode %.*s: %llu/%llu rows (%u workers)\n",
+                     static_cast<int>(t.name.size()), t.name.data(),
+                     static_cast<unsigned long long>(r0),
+                     static_cast<unsigned long long>(n_rows), workers);
+      }
       std::vector<std::thread> pool;
       for (unsigned w = 0; w < workers; ++w) {
         pool.emplace_back([&, w] {
@@ -227,6 +236,14 @@ private:
       }
       for (auto& th : pool)
         th.join();
+      if (log_progress) {
+        std::fprintf(stderr,
+                     "[laguna] reencode %.*s: chunk %llu-%llu done (%.1f GB)\n",
+                     static_cast<int>(t.name.size()), t.name.data(),
+                     static_cast<unsigned long long>(r0),
+                     static_cast<unsigned long long>(r0 + n),
+                     static_cast<double>(*bytes_) / 1e9);
+      }
       if (hipMemcpy(static_cast<char*>(out->data) + r0 * dst_row, host.data(),
                     n * dst_row, hipMemcpyHostToDevice) != hipSuccess) {
         SetError(error_, "device copy failed");

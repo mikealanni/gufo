@@ -41,6 +41,26 @@ void StoreKv(const float* k, const float* v, __half* k_cache, __half* v_cache,
              const std::uint32_t* start_pos, std::uint32_t ring,
              hipStream_t stream);
 
+void ToHalf(const float* src, __half* dst, std::size_t count,
+            hipStream_t stream);
+
+bool AttentionWmma(const __half* q, const __half* k_cache,
+                   const __half* v_cache, const float* gate, float* out,
+                   std::uint32_t n_tokens, const std::uint32_t* start_pos,
+                   std::uint32_t heads, std::uint32_t kv_heads,
+                   std::uint32_t head_dim, std::uint32_t window,
+                   std::uint32_t ring, hipStream_t stream);
+
+void ToHalf(const float* src, __half* dst, std::size_t count,
+            hipStream_t stream);
+
+bool AttentionWmma(const __half* q, const __half* k_cache,
+                   const __half* v_cache, const float* gate, float* out,
+                   std::uint32_t n_tokens, const std::uint32_t* start_pos,
+                   std::uint32_t heads, std::uint32_t kv_heads,
+                   std::uint32_t head_dim, std::uint32_t window,
+                   std::uint32_t ring, hipStream_t stream);
+
 /// Causal attention multiplied by softplus(gate[t][head]). `window` > 0
 /// limits each query to its last `window` keys; `ring` > 0 wraps cache rows.
 void Attention(const float* q, const __half* k_cache, const __half* v_cache,
