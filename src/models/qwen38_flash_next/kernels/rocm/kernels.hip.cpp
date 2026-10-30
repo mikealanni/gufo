@@ -586,13 +586,21 @@ __global__ void HcMixEpilogueF16Kernel(const __half* xn, const float* gate,
   }
 #pragma unroll
   for (std::uint32_t o = 0; o < kStreams; ++o) {
-    float dot = 0.0F;
+    // HcInjectPart's order, pinned: one product, then FMAs in stream and
+    // component order. A plain `dot +=` chain is contracted and reassociated
+    // differently per instantiation under fast-math, so a short prefill
+    // pass (this epilogue) and a wide one (the combine's fused partials)
+    // gave the same token different inject logits in the last bit.
+    float dot = __fmul_rn(wq[o][0].x, v[0].x);
+    dot = __fmaf_rn(wq[o][0].y, v[0].y, dot);
+    dot = __fmaf_rn(wq[o][0].z, v[0].z, dot);
+    dot = __fmaf_rn(wq[o][0].w, v[0].w, dot);
 #pragma unroll
-    for (std::uint32_t s = 0; s < kStreams; ++s) {
-      dot += wq[o][s].x * v[s].x;
-      dot += wq[o][s].y * v[s].y;
-      dot += wq[o][s].z * v[s].z;
-      dot += wq[o][s].w * v[s].w;
+    for (std::uint32_t s = 1; s < kStreams; ++s) {
+      dot = __fmaf_rn(wq[o][s].x, v[s].x, dot);
+      dot = __fmaf_rn(wq[o][s].y, v[s].y, dot);
+      dot = __fmaf_rn(wq[o][s].z, v[s].z, dot);
+      dot = __fmaf_rn(wq[o][s].w, v[s].w, dot);
     }
     dot = WaveSum(dot);
     if (lane == 0) {
@@ -604,7 +612,7 @@ __global__ void HcMixEpilogueF16Kernel(const __half* xn, const float* gate,
   if (threadIdx.x < kStreams) {
     float total = 0.0F;
     for (std::uint32_t w = 0; w < kThreads / 32; ++w) {
-      total += partial[threadIdx.x][w];
+      total = __fadd_rn(total, partial[threadIdx.x][w]);
     }
     inject[(static_cast<std::size_t>(t) * kStreams + threadIdx.x) * gridDim.x +
            part] = total;
@@ -799,6 +807,63 @@ __device__ __forceinline__ void StoreResRow(__half* p, float4 v) {
       __floats2half2_rn(SaturateHalf(v.z), SaturateHalf(v.w));
 }
 
+/// Writes inject partial `part` of token t (HcMixEpilogueF16Kernel<false>'s
+/// grid (part, t)): `xh` holds this thread's four F16-rounded norm streams
+/// at element (part * kThreads + threadIdx.x) * 4, zero past the row.
+/// Reuses `shared` behind a barrier.
+__device__ __forceinline__ void HcInjectPart(
+    const float4 (&xh)[4], const float* inject_w, float* inject,
+    float (*shared)[8], std::uint32_t t, std::uint32_t part,
+    std::uint32_t parts, std::uint32_t hidden) {
+  constexpr std::uint32_t kStreams = 4;
+  const std::size_t hc_dim = static_cast<std::size_t>(kStreams) * hidden;
+  const std::uint32_t i = (part * kThreads + threadIdx.x) * 4;
+  const bool live = i < hidden;
+  const std::uint32_t lane = threadIdx.x & 31u;
+  const std::uint32_t wave = threadIdx.x >> 5u;
+  float dots[kStreams];
+#pragma unroll
+  for (std::uint32_t o = 0; o < kStreams; ++o) {
+    float4 wq[kStreams];
+#pragma unroll
+    for (std::uint32_t s = 0; s < kStreams; ++s) {
+      wq[s] = live ? *reinterpret_cast<const float4*>(
+                         inject_w + (static_cast<std::size_t>(o) * hc_dim) +
+                         (static_cast<std::size_t>(s) * hidden) + i)
+                   : float4{0.0F, 0.0F, 0.0F, 0.0F};
+    }
+    // The separate kernel's sum from zero: one product, then FMAs in stream
+    // and component order.
+    float dot = __fmul_rn(wq[0].x, xh[0].x);
+    dot = __fmaf_rn(wq[0].y, xh[0].y, dot);
+    dot = __fmaf_rn(wq[0].z, xh[0].z, dot);
+    dot = __fmaf_rn(wq[0].w, xh[0].w, dot);
+#pragma unroll
+    for (std::uint32_t s = 1; s < kStreams; ++s) {
+      dot = __fmaf_rn(wq[s].x, xh[s].x, dot);
+      dot = __fmaf_rn(wq[s].y, xh[s].y, dot);
+      dot = __fmaf_rn(wq[s].z, xh[s].z, dot);
+      dot = __fmaf_rn(wq[s].w, xh[s].w, dot);
+    }
+    dots[o] = WaveSum(dot);
+  }
+  __syncthreads();  // earlier readers of `shared`
+  if (lane == 0) {
+#pragma unroll
+    for (std::uint32_t o = 0; o < kStreams; ++o)
+      shared[o][wave] = dots[o];
+  }
+  __syncthreads();
+  if (threadIdx.x < kStreams) {
+    float total = 0.0F;
+    for (std::uint32_t q = 0; q < kThreads / 32; ++q) {
+      total = __fadd_rn(total, shared[threadIdx.x][q]);
+    }
+    inject[(static_cast<std::size_t>(t) * kStreams + threadIdx.x) * parts +
+           part] = total;
+  }
+}
+
 /// HcCombineKernel over one token's whole hyper-connection row (all streams,
 /// float4 lanes): a block owns streams * hidden elements in up to
 /// kMaxChunks float4 per thread, keeps the updated residual in registers
@@ -824,11 +889,15 @@ __global__ void HcCombineVec4Kernel(ResT* res, const float* block_out,
   float w[kStreams];
 #pragma unroll
   for (std::uint32_t s = 0; s < kStreams; ++s) {
+    // The partials in order from zero, pinned like InjectParts::Sum: every
+    // instantiation (deferring, inject-writing, MoE-fused) must give a token
+    // the same stream weights whichever pass route computes it.
     float logit = 0.0f;
     for (std::uint32_t p = 0; p < inject_parts; ++p) {
-      logit +=
+      logit = __fadd_rn(
+          logit,
           inject[(static_cast<std::size_t>(t) * kStreams + s) * inject_parts +
-                 p];
+                 p]);
     }
     w[s] = 2.0f * SigmoidF(logit / static_cast<float>(kStreams));
   }
@@ -1025,11 +1094,15 @@ __global__ void HcCombineMoeF16Kernel(
   float w[kStreams];
 #pragma unroll
   for (std::uint32_t s = 0; s < kStreams; ++s) {
+    // The partials in order from zero, pinned like InjectParts::Sum: every
+    // instantiation (deferring, inject-writing, MoE-fused) must give a token
+    // the same stream weights whichever pass route computes it.
     float logit = 0.0f;
     for (std::uint32_t p = 0; p < inject_parts; ++p) {
-      logit +=
+      logit = __fadd_rn(
+          logit,
           inject[(static_cast<std::size_t>(t) * kStreams + s) * inject_parts +
-                 p];
+                 p]);
     }
     w[s] = 2.0f * SigmoidF(logit / static_cast<float>(kStreams));
   }
@@ -2353,6 +2426,19 @@ __global__ void SsmConvKernel(const float* qkv, std::uint32_t qkv_stride,
 /// loads. Lanes run along channels, so every access is a contiguous row.
 constexpr std::uint32_t kSsmConvTaps = 4;
 constexpr std::uint32_t kSsmConvTokensPerThread = 8;
+/// The four-tap convolution of one channel, SiLU applied, in one pinned
+/// F32 order. Every route uses it: a prefill pass of eight rows or fewer
+/// (SsmConv4Kernel<true, ...>), a wider one (SsmConv4Kernel<false, ...>) and
+/// the fused projection over its LDS tile, so a token's convolution does not
+/// depend on the pass width.
+__device__ __forceinline__ float SsmConv4Value(float4 w, float x0, float x1,
+                                               float x2, float x3) {
+  float acc = __fmaf_rn(w.x, x0, __fmul_rn(w.y, x1));
+  acc = __fmaf_rn(w.z, x2, acc);
+  acc = __fmaf_rn(w.w, x3, acc);
+  return SiluF(acc);
+}
+
 template<bool kSaveHistory, bool kBatch>
 __global__ void SsmConv4Kernel(const float* qkv, std::uint32_t qkv_stride,
                                const float* w, float* conv_state, float* out,
@@ -2395,9 +2481,8 @@ __global__ void SsmConv4Kernel(const float* qkv, std::uint32_t qkv_stride,
       break;
     }
     const float v = qkv[static_cast<std::size_t>(t) * qkv_stride + c];
-    const float acc = taps.x * window[0] + taps.y * window[1] +
-                      taps.z * window[2] + taps.w * v;
-    out[static_cast<std::size_t>(t) * channels + c] = SiluF(acc);
+    out[static_cast<std::size_t>(t) * channels + c] =
+        SsmConv4Value(taps, window[0], window[1], window[2], v);
     window[0] = window[1];
     window[1] = window[2];
     window[2] = v;
@@ -7999,16 +8084,6 @@ bool RoutedGatedF16Gemm(const void* gate, const void* up, WeightType type,
          LaunchRoutedGatedF16<64>(gate, up, type, x, tiles, n_tiles, pad_bounds,
                                   rows_in, rows_out, out, m, k, stream,
                                   out_scale);
-}
-
-// Keep the separate four-tap convolution's F32 rounding order when its
-// inputs come from the projection's LDS tile.
-__device__ __forceinline__ float SsmConv4Value(float4 w, float x0, float x1,
-                                               float x2, float x3) {
-  float acc = __fmaf_rn(w.x, x0, __fmul_rn(w.y, x1));
-  acc = __fmaf_rn(w.z, x2, acc);
-  acc = __fmaf_rn(w.w, x3, acc);
-  return SiluF(acc);
 }
 
 constexpr unsigned kSsmProjectionTileTokens = 32;

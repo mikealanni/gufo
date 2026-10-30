@@ -175,7 +175,10 @@ bool BlasLt::Gemm(const void* weights, const void* input, float* out,
   // Library edge tiles change the accumulation order when the same token
   // moves within a batch. Router and recurrent-gate errors then amplify across
   // layers. Keep one K reduction for every row and prefill chunk size.
-  if (type == HIP_R_16F && k == 2560 && (m == 96 || m == 513)) {
+  // Every F16 projection of the hidden row (router, GDN alpha/beta at any
+  // expert count): library plans are chosen per token count, so a row's
+  // logits would depend on its pass width.
+  if (type == HIP_R_16F && k == 2560) {
     return UnquantizedF16Gemm(weights, static_cast<const __half*>(input), out,
                               n, m, k, stream_);
   }
