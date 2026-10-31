@@ -3803,8 +3803,12 @@ public:
 
   [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
       const ChatRequest& request) const override {
+    // Laguna has no tool-call rendering yet. Reject only when the caller
+    // actually requires a tool call (we cannot satisfy that); clients that
+    // merely attach a tool list with tool_choice=auto (opencode does this
+    // on every request) proceed with tools silently ignored.
     if (!request.tools.empty() &&
-        request.tool_choice != ChatRequest::ToolChoice::kNone) {
+        request.tool_choice == ChatRequest::ToolChoice::kRequired) {
       throw std::invalid_argument("Laguna does not support tools yet");
     }
     std::vector<models::laguna::ChatMessage> messages;
