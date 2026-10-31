@@ -1530,8 +1530,16 @@ int RunLagunaBenchmark(const BenchOptions& options,
         const double seconds = std::chrono::duration<double>(
                                    std::chrono::steady_clock::now() - start)
                                    .count();
-        if (repetition > 0 || options.repetitions == 0)
-          runs.push_back(static_cast<double>(generation_length) / seconds);
+        // Discarding repetition 0 here (as the PP loop above correctly does,
+        // since IT has no separate warm-up) emptied `runs` whenever
+        // `options.repetitions` is 1 (the default): the loop condition is
+        // `repetition < options.repetitions`, so repetition 0 is the ONLY
+        // iteration, and this check always skipped it - `ComputeStats` on an
+        // empty vector then silently printed 0.00 for every `tgN @ dD` row.
+        // This loop already has its own 2-step warm-up above (unlike the PP
+        // loop), so no additional discard is needed - push every measured
+        // repetition, matching DeepSeek/DSpark's TG loop above.
+        runs.push_back(static_cast<double>(generation_length) / seconds);
       }
       print_result(MakeTestName("tg", generation_length, depth),
                    ComputeStats(runs));

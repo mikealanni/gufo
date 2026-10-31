@@ -4,6 +4,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -251,7 +253,9 @@ void QwenDFlashGpuExecutor::Allocate() {
   const std::size_t num_layers = df_cfg.num_layers;
   const std::size_t enc_in_dim = df_cfg.target_layer_ids.size() * hidden_size;
   const std::size_t dynamic_size =
-      2U * df_cfg.conv_kernel_size * (hidden_size / df_cfg.conv_group_size);
+      df_cfg.is_v1 ? 0
+                   : 2U * df_cfg.conv_kernel_size *
+                         (hidden_size / df_cfg.conv_group_size);
 
   const char* dflash_vocab = std::getenv("GUFO_DFLASH_VOCAB");
   if (dflash_vocab == nullptr) {
@@ -320,6 +324,35 @@ void QwenDFlashGpuExecutor::Allocate() {
   }
   allocate_scratch(d_q_, block_size * q_dim);
   allocate_scratch(d_attn_out_, block_size * q_dim);
+  allocate_scratch(d_attn_gate_, block_size * static_cast<std::size_t>(
+                                                  cfg.num_attention_heads));
+  // attn_gate.weight must be staged to real VRAM, not read from the
+  // GGUF-mmap'd host pointer directly: that faulted (hipErrorIllegalAddress)
+  // every time it was read from a GPU kernel, confirmed via the HIP
+  // driver's own fault report, even though the pointer's computed file
+  // offset is provably correct and a CPU-side read of the same bytes
+  // succeeds. Every other per-layer tensor is read from the same kind of
+  // host pointer without faulting, so this is specific to this tensor (or
+  // this access pattern) - staging it to VRAM is the confirmed fix, not a
+  // guess. See laguna-port-state.md for the full investigation.
+  if (df_cfg.is_v1) {
+    const auto& weights = model_->GetWeights();
+    d_attn_gate_weight_.resize(weights.layers.size(), nullptr);
+    for (std::size_t li = 0; li < weights.layers.size(); ++li) {
+      const auto& ref = weights.layers[li].transformer.attn_gate;
+      const std::size_t bytes = ref.num_elements * 2;  // BF16
+      void* dst = nullptr;
+      HIP_CHECK(hipMalloc(&dst, bytes));
+      HIP_CHECK(hipMemcpy(dst, ref.data, bytes, hipMemcpyHostToDevice));
+      d_attn_gate_weight_[li] = dst;
+    }
+    if (weights.aux_norm.data != nullptr) {
+      const std::size_t bytes = weights.aux_norm.num_elements * sizeof(float);
+      HIP_CHECK(hipMalloc(&d_aux_norm_, bytes));
+      HIP_CHECK(hipMemcpy(d_aux_norm_, weights.aux_norm.data, bytes,
+                          hipMemcpyHostToDevice));
+    }
+  }
   const auto selector_scratch_elements =
       df_cfg.is_v1 ? 0 : kernels::DFlashSelectorScratchElements(cfg.vocab_size);
   const auto ffn_scratch_width =
@@ -363,7 +396,9 @@ void QwenDFlashGpuExecutor::PrewarmBlockGemms() {
   const std::size_t kv_dim =
       static_cast<std::size_t>(cfg.num_key_value_heads) * cfg.head_dim;
   const std::size_t dynamic_size =
-      2U * df_cfg.conv_kernel_size * (hidden_size / df_cfg.conv_group_size);
+      df_cfg.is_v1 ? 0
+                   : 2U * df_cfg.conv_kernel_size *
+                         (hidden_size / df_cfg.conv_group_size);
 
   HIP_CHECK(hipMemsetAsync(d_block_normed_, 0,
                            df_cfg.block_size * hidden_size * sizeof(float),
@@ -565,6 +600,13 @@ void QwenDFlashGpuExecutor::Free() noexcept {
     (void)hipFree(d_v_block_);
   if (d_attn_out_ != nullptr)
     (void)hipFree(d_attn_out_);
+  if (d_attn_gate_ != nullptr)
+    (void)hipFree(d_attn_gate_);
+  for (void* p : d_attn_gate_weight_)
+    if (p != nullptr)
+      (void)hipFree(p);
+  if (d_aux_norm_ != nullptr)
+    (void)hipFree(d_aux_norm_);
   if (d_ffn_gate_ != nullptr)
     (void)hipFree(d_ffn_gate_);
   if (d_ffn_up_ != nullptr)
@@ -633,7 +675,9 @@ QwenGpuMemoryUsage QwenDFlashGpuExecutor::EstimateMemoryUsage(
   const std::size_t injection = std::min(max_context, std::uint32_t{256});
   const std::size_t shared = std::max(injection, block);
   const std::size_t dynamic =
-      2U * draft.conv_kernel_size * (hidden / draft.conv_group_size);
+      draft.is_v1
+          ? 0
+          : 2U * draft.conv_kernel_size * (hidden / draft.conv_group_size);
   const auto ffn_scratch_width = std::max<std::size_t>(
       config.intermediate_size,
       kernels::DFlashSelectorScratchElements(config.vocab_size));
@@ -872,6 +916,13 @@ bool QwenDFlashGpuExecutor::InjectTargetContextDevice(
   }
   if (target_features == nullptr || position < injected_context_len_ ||
       position > max_context_ || num_tokens > max_context_ - position) {
+    if (std::getenv("LAGUNA_DFLASH_DEBUG") != nullptr) {
+      std::fprintf(stderr,
+                   "[LAGUNA_DFLASH_DEBUG] inject reject: tf=%p position=%u "
+                   "num_tokens=%u injected_context_len_=%u max_context_=%u\n",
+                   static_cast<const void*>(target_features), position,
+                   num_tokens, injected_context_len_, max_context_);
+    }
     return false;
   }
   // The target may have advanced without a single-session capture (batched
@@ -879,6 +930,10 @@ bool QwenDFlashGpuExecutor::InjectTargetContextDevice(
   // so lookbacks inside the window read padding instead of stale KV.
   if (position > injected_context_len_ &&
       !ZeroTargetContextGap(position, num_tokens)) {
+    if (std::getenv("LAGUNA_DFLASH_DEBUG") != nullptr) {
+      std::fprintf(stderr,
+                   "[LAGUNA_DFLASH_DEBUG] ZeroTargetContextGap failed\n");
+    }
     return false;
   }
   // Only the final attention window is read back, so rows before it may be
@@ -886,12 +941,20 @@ bool QwenDFlashGpuExecutor::InjectTargetContextDevice(
   const auto expired =
       num_tokens > history_capacity_ ? num_tokens - history_capacity_ : 0U;
   const auto first_chunk =
-      (expired / injection_capacity_) * injection_capacity_;
+      injection_capacity_ == 0
+          ? 0U
+          : (expired / injection_capacity_) * injection_capacity_;
   for (std::uint32_t offset = first_chunk; offset < num_tokens;) {
     const auto count = std::min(injection_capacity_, num_tokens - offset);
     if (!InjectTargetContextDeviceChunk(
             target_features + static_cast<std::size_t>(offset) * width,
             position + offset, count, trace)) {
+      if (std::getenv("LAGUNA_DFLASH_DEBUG") != nullptr) {
+        std::fprintf(stderr,
+                     "[LAGUNA_DFLASH_DEBUG] InjectTargetContextDeviceChunk "
+                     "failed offset=%u count=%u\n",
+                     offset, count);
+      }
       return false;
     }
     offset += count;
@@ -979,10 +1042,23 @@ bool QwenDFlashGpuExecutor::InjectTargetContextRows(std::uint32_t position,
                                                     const DFlashTrace& trace) {
   const auto& weights = model_->GetWeights();
   const auto& cfg = model_->GetConfig();
+  const auto& df_cfg = model_->GetDFlashConfig();
   const std::size_t hidden_size = cfg.hidden_size;
   const std::size_t enc_in_dim = GetTargetFeaturesSize();
   const std::size_t kv_dim =
       static_cast<std::size_t>(cfg.num_key_value_heads) * cfg.head_dim;
+
+  // Per-tap pre-norm applied to each captured target hidden state before
+  // concatenation + fc_projection. d_aux_norm_ is a VRAM-staged copy of
+  // enc.aux_norm.weight - reading the GGUF-mmap'd host pointer directly
+  // from a GPU kernel faults, same root cause as attn_gate.weight (see
+  // Allocate() and laguna-port-state.md).
+  if (d_aux_norm_ != nullptr) {
+    kernels::LaunchDFlashTapRMSNorm(
+        d_target_features_, d_aux_norm_, d_target_features_, num_tokens,
+        static_cast<std::uint32_t>(df_cfg.target_layer_ids.size()),
+        static_cast<std::uint32_t>(hidden_size), 1e-6F, stream_);
+  }
 
   // FC Projection & Norm
   RunInjectGemm(weights.fc_projection, d_target_features_, d_fused_features_,
@@ -1043,7 +1119,12 @@ bool QwenDFlashGpuExecutor::InjectTargetContextRows(std::uint32_t position,
 
   injected_context_len_ =
       std::max(injected_context_len_, position + num_tokens);
-  (void)hipStreamSynchronize(stream_);
+  // No host-side sync needed here: injected_context_len_ is a plain host
+  // integer (nothing reads GPU data after this point), and every kernel
+  // this enqueued is on `stream_`, which the next call (ForwardBlock, same
+  // stream) will correctly wait behind via ordinary stream ordering - an
+  // explicit hipStreamSynchronize here only blocks the host thread with no
+  // correctness benefit, once per decode step.
   return true;
 }
 
@@ -1066,12 +1147,22 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
   const std::size_t vocab_size = cfg.vocab_size;
   const float scale = 1.0F / std::sqrt(static_cast<float>(head_dim));
   const std::size_t dynamic_size =
-      2U * df_cfg.conv_kernel_size * (hidden_size / df_cfg.conv_group_size);
+      df_cfg.is_v1 ? 0
+                   : 2U * df_cfg.conv_kernel_size *
+                         (hidden_size / df_cfg.conv_group_size);
 
   draft_count = std::min(draft_count,
                          df_cfg.block_size > 0 ? df_cfg.block_size - 1U : 0U);
   if (anchor_token >= vocab_size || df_cfg.mask_token_id >= vocab_size ||
       current_pos != injected_context_len_ || current_pos >= max_context_) {
+    if (std::getenv("LAGUNA_DFLASH_DEBUG") != nullptr) {
+      std::fprintf(stderr,
+                   "[LAGUNA_DFLASH_DEBUG] ForwardBlock reject: "
+                   "anchor_token=%u vocab_size=%zu mask_token_id=%u "
+                   "current_pos=%u injected_context_len_=%u max_context_=%u\n",
+                   anchor_token, vocab_size, df_cfg.mask_token_id, current_pos,
+                   injected_context_len_, max_context_);
+    }
     throw std::invalid_argument(
         "DFlash block token or committed position is invalid");
   }
@@ -1169,6 +1260,30 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
         static_cast<std::uint32_t>(head_dim), scale, stream_,
         history_capacity_);
     emit("attention", d_attn_out_, q_dim);
+
+    // Per-head output gate: out *= softplus(gate), gate = attn_in @
+    // attn_gate.weight. Only Laguna's v1 (block-diffusion) drafter has this
+    // tensor/mechanism (same as its own scalar AttentionKernel) - v2
+    // (gated-delta-net) drafters, e.g. 27B/35B/GLM's, have neither the
+    // weight nor the mechanism. Calling this unconditionally for v2 reads
+    // `d_attn_gate_weight_[i]`, a 0-byte VRAM allocation since the tensor
+    // is correctly left unbound for v2 (see dflash_weights.cpp) - a GPU
+    // memory fault, found via this session's regression check against
+    // ~/gufo. attn_gate.weight is read from d_attn_gate_weight_ (staged to
+    // VRAM in Allocate()), not the GGUF-mmap'd host pointer directly - the
+    // host pointer faults when read from this kernel (see Allocate()'s
+    // comment and laguna-port-state.md for the investigation).
+    if (df_cfg.is_v1) {
+      kernels::LaunchDFlashAttnGateProjection(
+          d_attn_gate_weight_[i], attn_in, d_attn_gate_,
+          static_cast<std::uint32_t>(block_count),
+          static_cast<std::uint32_t>(num_q_heads),
+          static_cast<std::uint32_t>(hidden_size), stream_);
+      kernels::LaunchDFlashAttnGateMul(
+          d_attn_out_, d_attn_gate_, static_cast<std::uint32_t>(block_count),
+          static_cast<std::uint32_t>(num_q_heads),
+          static_cast<std::uint32_t>(head_dim), stream_);
+    }
 
     RunBlockGemm(layer.attn_output, d_attn_out_, d_fused_features_, block_count,
                  hidden_size, q_dim);

@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -67,6 +68,11 @@ struct QwenDFlashWeights {
       fc_projection;  // [n_target_layers * hidden_size, draft_hidden_size]
   models::QwenTensorRef fc_norm;  // [draft_hidden_size] RMSNorm
 
+  // Per-tap RMSNorm applied to each captured target hidden state before
+  // concatenation and fc_projection - [hidden_size, n_target_layers], one
+  // gamma column per tap. Optional: absent on exports that skip it.
+  models::QwenTensorRef aux_norm;
+
   // Shared / tied target embeddings and LM head
   models::QwenTensorRef token_embedding;
   models::QwenTensorRef output_norm;
@@ -79,6 +85,15 @@ struct QwenDFlashWeights {
   models::QwenTensorRef selector_predecessor;  // [selector_rank, vocab_size]
   models::QwenTensorRef selector_successor;    // [selector_rank, vocab_size]
   models::QwenTensorRef selector_hidden;       // [hidden_size, selector_rank]
+
+  // Backing storage for any tensor re-encoded at load time (e.g. BF16 ->
+  // Q8_0, to let the drafter's forward pass use the smaller/faster Q8_0
+  // dense path instead of reading full BF16 weights every call).
+  // shared_ptr, not a plain buffer, so copying this struct (it is copied
+  // by value at least once while loading) keeps every QwenTensorRef::data
+  // pointing at valid memory - a plain owned std::vector would reallocate
+  // on copy and leave those pointers dangling.
+  std::vector<std::shared_ptr<std::vector<char>>> owned_reencoded_storage;
 
   [[nodiscard]] static std::optional<QwenDFlashWeights> LoadFromGguf(
       const core::GgufReader& reader, std::string* error_msg = nullptr);

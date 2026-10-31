@@ -267,6 +267,13 @@ private:
   float* d_k_block_{nullptr};
   float* d_v_block_{nullptr};
   float* d_attn_out_{nullptr};
+  float* d_attn_gate_{nullptr};
+  // DEBUG: per-layer device-resident copy of attn_gate.weight, to test
+  // whether the host/GGUF-mmap pointer is the problem (see
+  // laguna-port-state.md).
+  std::vector<void*> d_attn_gate_weight_;
+  // VRAM-staged copy of enc.aux_norm.weight, same reason as above.
+  float* d_aux_norm_{nullptr};
   float* d_ffn_gate_{nullptr};
   float* d_ffn_up_{nullptr};
   float* d_ffn_down_{nullptr};

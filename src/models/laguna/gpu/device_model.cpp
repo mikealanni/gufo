@@ -13,6 +13,8 @@
 
 #include "src/core/hip/weight_upload.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
+#include "src/models/laguna/gpu/kernels/kernels.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
 namespace gufo::models::laguna::gpu {
 namespace {
@@ -313,6 +315,37 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(const core::GgufReader& reader,
                                                  std::string* error_msg) {
   std::unique_ptr<DeviceModel> model(new DeviceModel());
   model->config_ = config;
+  // Wake the NPU before any heavy GPU work: resuming it re-initializes the
+  // SMU and PSP, which the GPU shares. Fixed M=4096 (no runtime-M sweep,
+  // unlike Flint) - see laguna-port-state.md for the scoping rationale.
+  // K=3072 (Laguna's hidden_size) has no pre-built xclbin program; this
+  // session built the instruction file for it (see
+  // tools/npu/runtime_mk/README.md's "Adding a shape" section - the XCLBIN
+  // itself is generic across K, only a small instruction file is new).
+  if (const char* dir = std::getenv("GUFO_NPU_DIR");
+      dir != nullptr && dir[0] != '\0') {
+    qwen38_flash_next::rocm::NpuGemm::Config cfg;
+    const std::string root = dir;
+    // M must match LAGUNA_PREFILL_TILE (engine.cpp reads the same env var
+    // for `tile`) - the instruction file name encodes M, the XCLBIN itself
+    // is generic across M and K (tools/npu/runtime_mk/README.md).
+    std::uint32_t npu_m = 4096;
+    if (const char* t = std::getenv("LAGUNA_PREFILL_TILE")) {
+      const int v = std::atoi(t);
+      if (v > 0)
+        npu_m = static_cast<std::uint32_t>(v);
+    }
+    cfg.xclbin = root + "/runtime_mk/final_4096xKx1024_128x64x128.xclbin";
+    cfg.insts = root + "/runtime_mk/insts_" + std::to_string(npu_m) +
+                "x3072x1024_128x64x128.txt";
+    cfg.tokens = npu_m;
+    cfg.k = config.hidden_size;
+    std::string npu_error;
+    model->npu_ = qwen38_flash_next::rocm::NpuGemm::Create(cfg, &npu_error);
+    if (model->npu_ == nullptr) {
+      std::fprintf(stderr, "NPU off: %s\n", npu_error.c_str());
+    }
+  }
   const auto mapped = reader.GetMappedRegions();
   const std::vector<core::GgufMappedRegion> shards(mapped.begin(),
                                                    mapped.end());
@@ -391,7 +424,105 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(const core::GgufReader& reader,
   }
   if (!up.Finish())
     return nullptr;
+  if (model->npu_ != nullptr && !model->StageNpuWeights()) {
+    std::fprintf(stderr, "NPU shared-expert weights unavailable\n");
+  }
   return model;
+}
+
+bool DeviceModel::StageNpuWeights() {
+  namespace rocm = qwen38_flash_next::rocm;
+  rocm::NpuGemm* npu = npu_.get();
+  std::string error;
+  std::uint32_t staged = 0;
+  // Encodes `w` (rows a multiple of npu->n()=1024, cols<=npu->k()) as one
+  // weight buffer per 1024-row chunk. Returns an empty vector (not an
+  // error) when the shape doesn't fit, so the caller degrades to the GPU
+  // path instead of corrupting output.
+  const auto stage_chunked = [&](const DeviceTensor& w) -> std::vector<int> {
+    if (w.data == nullptr || w.cols > npu->k() || w.rows % npu->n() != 0 ||
+        w.rows / npu->n() > gufo::models::laguna::gpu::rocm::kNpuMaxSlices) {
+      return {};
+    }
+    std::vector<int> ids;
+    for (std::uint32_t r0 = 0; r0 < w.rows; r0 += npu->n()) {
+      const int id = npu->NewBuffer(npu->BBytes(), &error);
+      if (id < 0)
+        return {};
+      if (w.type == core::GgmlType::kQ8_0) {
+        rocm::NpuEncodeWeights(w.data, w.cols, r0, npu->n(), npu->k(), 0,
+                               w.cols, npu->Device(id), nullptr);
+      } else {
+        rocm::NpuEncodeWeightsQuant(w.data, static_cast<std::uint32_t>(w.type),
+                                    w.cols, r0, npu->n(), npu->k(), 0, w.cols,
+                                    npu->Device(id), nullptr);
+      }
+      ids.push_back(id);
+    }
+    if (hipDeviceSynchronize() != hipSuccess)
+      return {};
+    for (const int id : ids)
+      npu->FinalizeWeights(id);
+    return ids;
+  };
+  std::uint32_t qkv_staged = 0;
+  for (auto& L : layers_) {
+    auto q = stage_chunked(L.attn_q);
+    auto k = stage_chunked(L.attn_k);
+    auto v = stage_chunked(L.attn_v);
+    if (!q.empty() && !k.empty() && !v.empty()) {
+      L.npu_q = std::move(q);
+      L.npu_k = std::move(k);
+      L.npu_v = std::move(v);
+      ++qkv_staged;
+    }
+  }
+  if (qkv_staged != 0)
+    std::fprintf(stderr, "NPU: QKV of %u layers\n", qkv_staged);
+  for (auto& L : layers_) {
+    if (!L.is_moe)
+      continue;
+    const DeviceTensor* parts[2] = {&L.gate_shexp, &L.up_shexp};
+    // npu->n()=1024 must already match shared_ff exactly (single buffer per
+    // tensor, no chunking) - true for Laguna's UD-Q4_K_M quant (shared_ff =
+    // 1024), but checked rather than assumed so a future quant with a
+    // different shared_ff degrades to the GPU path instead of corrupting
+    // output.
+    if (parts[0]->data == nullptr || parts[1]->data == nullptr ||
+        parts[0]->cols > npu->k() || parts[0]->rows != npu->n() ||
+        parts[0]->rows != parts[1]->rows || parts[0]->cols != parts[1]->cols) {
+      continue;
+    }
+    std::vector<int> ids;
+    bool ok = true;
+    for (const DeviceTensor* w : parts) {
+      const int id = npu->NewBuffer(npu->BBytes(), &error);
+      if (id < 0) {
+        ok = false;
+        break;
+      }
+      if (w->type == core::GgmlType::kQ8_0) {
+        rocm::NpuEncodeWeights(w->data, w->cols, 0, w->rows, npu->k(), 0,
+                               w->cols, npu->Device(id), nullptr);
+      } else {
+        rocm::NpuEncodeWeightsQuant(
+            w->data, static_cast<std::uint32_t>(w->type), w->cols, 0, w->rows,
+            npu->k(), 0, w->cols, npu->Device(id), nullptr);
+      }
+      ids.push_back(id);
+    }
+    if (!ok)
+      return false;
+    if (hipDeviceSynchronize() != hipSuccess)
+      return false;
+    for (const int id : ids)
+      npu->FinalizeWeights(id);
+    L.npu_shexp = std::move(ids);
+    ++staged;
+  }
+  if (staged != 0)
+    std::fprintf(stderr, "NPU: shared expert of %u layers\n", staged);
+  return true;
 }
 
 }  // namespace gufo::models::laguna::gpu

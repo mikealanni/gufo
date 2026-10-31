@@ -773,6 +773,107 @@ void LaunchDFlashSiLUMul(float* gate, const float* up,
   dflash_silu_mul_kernel<<<blocks, 256, 0, stream>>>(gate, up, total_elements);
 }
 
+__global__ void dflash_attn_gate_mul_kernel(float* __restrict__ attn_out,
+                                            const float* __restrict__ gate,
+                                            std::uint32_t num_heads,
+                                            std::uint32_t head_dim) {
+  const std::size_t row = blockIdx.y;
+  const std::uint32_t head = blockIdx.x;
+  const float g = gate[row * num_heads + head];
+  const float softplus = g > 20.0F ? g : log1pf(expf(g));
+  float* out = attn_out + (row * num_heads + head) * head_dim;
+  for (std::uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x)
+    out[i] *= softplus;
+}
+
+void LaunchDFlashAttnGateMul(float* attn_out, const float* gate,
+                             std::uint32_t num_rows, std::uint32_t num_heads,
+                             std::uint32_t head_dim, hipStream_t stream) {
+  const dim3 grid(num_heads, num_rows);
+  const std::uint32_t threads = head_dim < 256U ? head_dim : 256U;
+  dflash_attn_gate_mul_kernel<<<grid, threads, 0, stream>>>(
+      attn_out, gate, num_heads, head_dim);
+}
+
+__global__ void dflash_attn_gate_proj_kernel(
+    const hip_bfloat16* __restrict__ weight, const float* __restrict__ x,
+    float* __restrict__ out, std::uint32_t m, std::uint32_t k) {
+  const std::size_t row = blockIdx.y;
+  const std::uint32_t mi = blockIdx.x;
+  const float* xr = x + row * k;
+  const hip_bfloat16* wr = weight + static_cast<std::size_t>(mi) * k;
+  float sum = 0.0F;
+  for (std::uint32_t i = threadIdx.x; i < k; i += blockDim.x)
+    sum += static_cast<float>(wr[i]) * xr[i];
+  __shared__ float s[256];
+  s[threadIdx.x] = sum;
+  __syncthreads();
+  for (std::uint32_t stride = blockDim.x / 2; stride > 0; stride /= 2) {
+    if (threadIdx.x < stride)
+      s[threadIdx.x] += s[threadIdx.x + stride];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0)
+    out[row * m + mi] = s[0];
+}
+
+void LaunchDFlashAttnGateProjection(const void* bf16_weight, const float* x,
+                                    float* out, std::uint32_t num_rows,
+                                    std::uint32_t m, std::uint32_t k,
+                                    hipStream_t stream) {
+  const dim3 grid(m, num_rows);
+  dflash_attn_gate_proj_kernel<<<grid, 256, 0, stream>>>(
+      static_cast<const hip_bfloat16*>(bf16_weight), x, out, m, k);
+}
+
+__global__ void dflash_tap_rmsnorm_kernel(const float* __restrict__ x,
+                                          const float* __restrict__ weight,
+                                          float* __restrict__ out,
+                                          std::uint32_t num_taps,
+                                          std::uint32_t hidden_size,
+                                          float eps) {
+  const std::size_t row = blockIdx.y;
+  const std::uint32_t tap = blockIdx.x;
+  if (tap >= num_taps)
+    return;
+  const std::size_t row_total =
+      static_cast<std::size_t>(num_taps) * hidden_size;
+  const float* x_tap =
+      x + row * row_total + static_cast<std::size_t>(tap) * hidden_size;
+  float* out_tap =
+      out + row * row_total + static_cast<std::size_t>(tap) * hidden_size;
+  const float* w_tap = weight + static_cast<std::size_t>(tap) * hidden_size;
+
+  const std::uint32_t tid = threadIdx.x;
+  float sum_sq = 0.0F;
+  for (std::uint32_t i = tid; i < hidden_size; i += blockDim.x) {
+    const float v = x_tap[i];
+    sum_sq += v * v;
+  }
+  __shared__ float s_sum[256];
+  s_sum[tid] = sum_sq;
+  __syncthreads();
+  for (std::uint32_t stride = blockDim.x / 2; stride > 0; stride /= 2) {
+    if (tid < stride)
+      s_sum[tid] += s_sum[tid + stride];
+    __syncthreads();
+  }
+  const float inv_rms =
+      rsqrtf(s_sum[0] / static_cast<float>(hidden_size) + eps);
+  for (std::uint32_t i = tid; i < hidden_size; i += blockDim.x) {
+    out_tap[i] = x_tap[i] * inv_rms * w_tap[i];
+  }
+}
+
+void LaunchDFlashTapRMSNorm(const float* x, const float* weight, float* out,
+                            std::uint32_t num_rows, std::uint32_t num_taps,
+                            std::uint32_t hidden_size, float eps,
+                            hipStream_t stream) {
+  const dim3 grid(num_taps, num_rows);
+  dflash_tap_rmsnorm_kernel<<<grid, 256, 0, stream>>>(x, weight, out, num_taps,
+                                                      hidden_size, eps);
+}
+
 namespace {
 
 /// Shared launch geometry for both non-causal attention routes: one workgroup

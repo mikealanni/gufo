@@ -44,22 +44,24 @@ void StoreKv(const float* k, const float* v, __half* k_cache, __half* v_cache,
 void ToHalf(const float* src, __half* dst, std::size_t count,
             hipStream_t stream);
 
+/// WMMA causal attention multiplied by softplus(gate[t][head]); `window` > 0
+/// limits each query to its last `window` keys and `ring` > 0 wraps cache
+/// rows. Returns false when the shapes are unsupported so the caller can fall
+/// back to the scalar `Attention`.
+///
+/// When `partials` is non-null the key range is split round-robin over
+/// `splits` blocks (grid.z), each writing a partial online-softmax state
+/// `(m, l, acc[head_dim])` into `partials[n_tokens][heads][splits][head_dim +
+/// 2]`; a merge kernel combines them. This is the decode-depth lever: without
+/// it one block sweeps the whole KV range per (head, token) and TG falls off
+/// with context. `partials` must be nulled for prefill.
 bool AttentionWmma(const __half* q, const __half* k_cache,
                    const __half* v_cache, const float* gate, float* out,
-                   std::uint32_t n_tokens, const std::uint32_t* start_pos,
-                   std::uint32_t heads, std::uint32_t kv_heads,
-                   std::uint32_t head_dim, std::uint32_t window,
-                   std::uint32_t ring, hipStream_t stream);
-
-void ToHalf(const float* src, __half* dst, std::size_t count,
-            hipStream_t stream);
-
-bool AttentionWmma(const __half* q, const __half* k_cache,
-                   const __half* v_cache, const float* gate, float* out,
-                   std::uint32_t n_tokens, const std::uint32_t* start_pos,
-                   std::uint32_t heads, std::uint32_t kv_heads,
-                   std::uint32_t head_dim, std::uint32_t window,
-                   std::uint32_t ring, hipStream_t stream);
+                   const std::uint32_t* start_pos, std::uint32_t heads,
+                   std::uint32_t kv_heads, std::uint32_t head_dim,
+                   std::uint32_t window, std::uint32_t ring,
+                   std::uint32_t n_tokens, float* partials,
+                   std::uint32_t splits, hipStream_t stream);
 
 /// Causal attention multiplied by softplus(gate[t][head]). `window` > 0
 /// limits each query to its last `window` keys; `ring` > 0 wraps cache rows.
@@ -111,6 +113,36 @@ void AddInPlace(float* x, const float* y, std::size_t count,
 void CaptureTap(float* dst, const float* x, std::uint32_t n_rows,
                 std::uint32_t hidden, std::size_t stride,
                 std::size_t tap_offset, hipStream_t stream);
+
+/// NPU staging: encodes `tokens` (a multiple of 128) rows of `x` (pitch ldx,
+/// k_slice columns) into block-float `hi` and residual `lo` buffers for the
+/// shared-expert GEMM. See kernels.hip.cpp's 2026-10-31 NPU comment - this is
+/// a straight copy of Flint's NpuEncodeBoth, not Laguna-specific math.
+void NpuEncodeBoth(const float* x, std::size_t ldx, std::uint32_t tokens,
+                   std::uint32_t k_slice, void* hi, void* lo,
+                   hipStream_t stream);
+
+/// silu(gate) * up from the NPU GEMM's hi+residual C streams (gate and up,
+/// each split into its own hi/lo pair), written as F32 rows of valid_cols.
+void NpuSwigluCombine(const void* gate_hi, const void* up_hi,
+                      const void* gate_lo, const void* up_lo, float* out,
+                      std::uint32_t tokens, std::uint32_t cols,
+                      std::uint32_t valid_cols, hipStream_t stream);
+
+/// Staged C streams of an NPU GEMM: the high pass and the low (residual)
+/// pass of up to kNpuMaxSlices 1024-column slices.
+inline constexpr std::uint32_t kNpuMaxSlices = 9;
+struct NpuStreams {
+  const std::uint8_t* hi[kNpuMaxSlices];
+  const std::uint8_t* lo[kNpuMaxSlices];
+};
+
+/// QKV projections (no activation): dequantizes hi+lo and sums, writing each
+/// of `slices` 1024-wide chunks at its own offset into a `pitch`-wide output
+/// row - `pitch` is the full Q, K or V row width.
+void NpuDecodeFused(const NpuStreams& streams, std::uint32_t slices, float* out,
+                    std::uint32_t tokens, std::uint32_t cols, std::size_t pitch,
+                    hipStream_t stream);
 
 }  // namespace gufo::models::laguna::gpu::rocm
 

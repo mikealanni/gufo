@@ -236,6 +236,34 @@ __global__ void AttentionKernel(const float* q, const __half* k_cache,
       acc / l * softplus;
 }
 
+// Merge the `splits` partial online-softmax states written by the split-K
+// WMMA attention path. The WMMA kernel keeps scores/maxima in log2 units
+// (`exp2f`), so the merge must reweight with exp2 as well. One block per
+// (head, token), thread d owns output dimension d.
+__global__ void AttentionMergeKernel(const float* partial, const float* gate,
+                                     float* out, std::uint32_t heads,
+                                     std::uint32_t d, std::uint32_t splits) {
+  const std::uint32_t head = blockIdx.x;
+  const std::uint32_t tid = threadIdx.x;
+  const float* src =
+      partial +
+      (static_cast<std::size_t>(blockIdx.y) * heads + head) * splits * (d + 2);
+  float m_final = -3.0e38F;
+  for (std::uint32_t s = 0; s < splits; ++s)
+    m_final = fmaxf(m_final, src[s * (d + 2) + d]);
+  float l_final = 0.0F;
+  float acc_final = 0.0F;
+  for (std::uint32_t s = 0; s < splits; ++s) {
+    const float w = __builtin_amdgcn_exp2f(src[s * (d + 2) + d] - m_final);
+    l_final += src[s * (d + 2) + d + 1] * w;
+    acc_final += src[s * (d + 2) + tid] * w;
+  }
+  const float g = gate[static_cast<std::size_t>(blockIdx.y) * heads + head];
+  const float softplus = g > 20.0F ? g : log1pf(expf(g));
+  out[(static_cast<std::size_t>(blockIdx.y) * heads + head) * d + tid] =
+      acc_final / l_final * softplus;
+}
+
 // One wave per (token, expert); 8 experts per block.
 __global__ void RouterF32Kernel(const float* w, const float* x, float* out,
                                 std::uint32_t n_experts, std::uint32_t k) {
@@ -609,8 +637,13 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
 void RouterF32(const float* w, const float* x, float* out,
                std::uint32_t n_tokens, std::uint32_t n_experts, std::uint32_t k,
                hipStream_t stream) {
-  // Tiny batches (single-token decode) are cheaper on the wave-per-expert
-  // kernel: the tiled kernel would stage a 64x16 shared tile for one row.
+  // Tried lowering this to n_tokens<2 on the theory that the tiled kernel's
+  // single weight-matrix read would beat this kernel's redundant per-token
+  // re-read for small DFlash verify batches (n=2..7) - measured WORSE
+  // (36.9 -> 28.8 tok/s at -d 2): the tiled kernel's shared-memory staging
+  // for a 64-token tile dominates at this scale, outweighing the read
+  // savings. Confirmed by reverting back to <8 and re-measuring - do not
+  // retry this without a genuinely different (not just lower) threshold.
   if (n_tokens < 8) {
     RouterF32Kernel<<<dim3(Blocks(n_experts, kBlock / 32), n_tokens), kBlock, 0,
                       stream>>>(w, x, out, n_experts, k);
@@ -721,9 +754,10 @@ __global__ __launch_bounds__(kWmmaThreads) void AttentionWmmaKernelLaguna(
     const __half* __restrict__ v_cache, const float* __restrict__ sinks,
     float* __restrict__ out, std::uint32_t n_tokens,
     const std::uint32_t* __restrict__ start_pos, std::uint32_t heads,
-    std::uint32_t kv_heads, std::uint32_t window,
+    std::uint32_t kv_heads, std::uint32_t window, std::uint32_t ring,
     const __half* __restrict__ kmm, std::uint32_t nblk,
-    std::uint32_t top_blocks) {
+    std::uint32_t top_blocks, float* __restrict__ partials,
+    std::uint32_t splits) {
   // K tile and V^T tile; the block scores of the sparse prologue reuse them.
   constexpr int kKBytes = kWmmaKeys * kWmmaKStride * 2;
   constexpr int kVBytes = kWmmaHeadDim * kWmmaVtStride * 2;
@@ -745,6 +779,9 @@ __global__ __launch_bounds__(kWmmaThreads) void AttentionWmmaKernelLaguna(
   constexpr std::uint32_t kBlockTokens = kWmmaWaves * kTokensPerWave;
   const std::uint32_t kv_head = blockIdx.x;
   const std::uint32_t t0 = blockIdx.y * kBlockTokens;
+  // Round-robin key tiles across grid.z blocks (split-K decode): each split
+  // produces a partial (m, l, acc[d]) merged by AttentionMergeKernel.
+  const std::uint32_t split = blockIdx.z;
   const std::uint32_t start = *start_pos;
   const std::size_t kv_row = static_cast<std::size_t>(kv_heads) * kWmmaHeadDim;
   constexpr float kLog2e = 1.4426950408889634F;
@@ -963,8 +1000,18 @@ __global__ __launch_bounds__(kWmmaThreads) void AttentionWmmaKernelLaguna(
       kpre[u] = make_uint4(0, 0, 0, 0);
       vpre[u] = make_uint4(0, 0, 0, 0);
       if (kt + key <= pos_max) {
-        const std::size_t src =
-            (kt + key) * kv_row + kv_head * kWmmaHeadDim + c * 8;
+        // k_cache/v_cache are ring buffers for SWA layers (ring != 0):
+        // StoreKvKernel writes row = absolute_position % ring, so reads
+        // must map the same absolute position back to that physical row -
+        // using the absolute position directly reads far past the
+        // buffer's actual allocated extent once position exceeds ring,
+        // which only happens beyond the sliding window's own capacity
+        // (unexercised below ~ring tokens of context, hence invisible
+        // until deep-context testing).
+        const std::uint32_t abs_row = kt + key;
+        const std::uint32_t row = ring != 0 ? abs_row % ring : abs_row;
+        const std::size_t src = static_cast<std::size_t>(row) * kv_row +
+                                kv_head * kWmmaHeadDim + c * 8;
         kpre[u] = *reinterpret_cast<const uint4*>(k_cache + src);
         vpre[u] = *reinterpret_cast<const uint4*>(v_cache + src);
       }
@@ -996,13 +1043,15 @@ __global__ __launch_bounds__(kWmmaThreads) void AttentionWmmaKernelLaguna(
       }
     }
   };
-  fetch(tile_key(0));
-  for (std::uint32_t j = 0; j < n_tiles; ++j) {
+  if (split < n_tiles)
+    fetch(tile_key(split));
+  for (std::uint32_t j = split; j < n_tiles; j += splits) {
     const std::uint32_t kt = tile_key(j);
     stage();
     __syncthreads();
-    if (j + 1 < n_tiles)
-      fetch(tile_key(j + 1));
+    const std::uint32_t jn = j + splits;
+    if (jn < n_tiles)
+      fetch(tile_key(jn));
 
     // S^T blocks: rows are keys, columns are this wave's queries.
     v8f s_acc[kNb];
@@ -1087,6 +1136,28 @@ __global__ __launch_bounds__(kWmmaThreads) void AttentionWmmaKernelLaguna(
   if (!live)
     return;
   const float total = run_sum + __shfl_xor(run_sum, 16);
+  if (partials != nullptr) {
+    // Split path: store the unnormalized partial state, merged (and gated)
+    // by AttentionMergeKernel. run_max is in log2 units.
+    if (!head_live)
+      return;
+    float* dst =
+        partials +
+        ((static_cast<std::size_t>(token) * heads + head) * splits + split) *
+            (kWmmaHeadDim + 2);
+#pragma unroll
+    for (int t = 0; t < 8; ++t) {
+#pragma unroll
+      for (int i = 0; i < 8; ++i)
+        dst[t * 16 + 2 * i + half_id] = o_acc[t][i];
+    }
+    const float m_final = fmaxf(run_max, __shfl_xor(run_max, 16));
+    if (half_id == 0) {
+      dst[kWmmaHeadDim] = m_final;
+      dst[kWmmaHeadDim + 1] = total;
+    }
+    return;
+  }
   // Scalar's AttentionKernel multiplies by softplus(gate[token][head]) at
   // the very end (log1pf(expf(g)), guarded for large g) -- `sinks` here is
   // that same per-token-per-head gate buffer (passed as `gate.get()` by the
@@ -1109,10 +1180,11 @@ __global__ __launch_bounds__(kWmmaThreads) void AttentionWmmaKernelLaguna(
 
 bool AttentionWmma(const __half* q, const __half* k_cache,
                    const __half* v_cache, const float* gate, float* out,
-                   std::uint32_t n_tokens, const std::uint32_t* start_pos,
-                   std::uint32_t heads, std::uint32_t kv_heads,
-                   std::uint32_t head_dim, std::uint32_t window,
-                   std::uint32_t ring, hipStream_t stream) {
+                   const std::uint32_t* start_pos, std::uint32_t heads,
+                   std::uint32_t kv_heads, std::uint32_t head_dim,
+                   std::uint32_t window, std::uint32_t ring,
+                   std::uint32_t n_tokens, float* partials,
+                   std::uint32_t splits, hipStream_t stream) {
   if (head_dim != kWmmaHeadDim)
     return false;
   // The kernel's `head_live` mask already handles any ratio up to
@@ -1127,15 +1199,17 @@ bool AttentionWmma(const __half* q, const __half* k_cache,
   const std::uint32_t heads_per_kv = heads / kv_heads;
   if (heads_per_kv < 1 || heads_per_kv > kWmmaColumns)
     return false;
+  const std::uint32_t split_count = partials != nullptr ? splits : 1;
   const auto launch = [&](auto tag) {
     constexpr int kHeadsPerKv = decltype(tag)::value;
     constexpr int kTokensPerWave = kWmmaColumns / kHeadsPerKv;
     constexpr int kBlockTokens = kWmmaWaves * kTokensPerWave;
     AttentionWmmaKernelLaguna<kHeadsPerKv>
-        <<<dim3(kv_heads, (n_tokens + kBlockTokens - 1) / kBlockTokens),
+        <<<dim3(kv_heads, (n_tokens + kBlockTokens - 1) / kBlockTokens,
+                split_count),
            kWmmaThreads, 0, stream>>>(q, k_cache, v_cache, gate, out, n_tokens,
-                                      start_pos, heads, kv_heads, window,
-                                      nullptr, 0, 0);
+                                      start_pos, heads, kv_heads, window, ring,
+                                      nullptr, 0, 0, partials, split_count);
   };
   using std::integral_constant;
   switch (heads_per_kv) {
@@ -1148,6 +1222,9 @@ bool AttentionWmma(const __half* q, const __half* k_cache,
     default:
       return false;
   }
+  if (partials != nullptr && split_count > 1)
+    AttentionMergeKernel<<<dim3(heads, n_tokens), kAttnBlock, 0, stream>>>(
+        partials, gate, out, heads, head_dim, split_count);
   return true;
 }
 
@@ -1166,8 +1243,241 @@ void CaptureTap(float* dst, const float* x, std::uint32_t n_rows,
                 std::size_t tap_offset, hipStream_t stream) {
   if (n_rows == 0)
     return;
-  CaptureTapKernel<<<dim3(1, n_rows), hidden, 0, stream>>>(
+  // `hidden` (3072 for Laguna) exceeds the 1024-thread-per-block hardware
+  // limit; the kernel body already strides by blockDim.x, so any bounded
+  // block size works.
+  constexpr std::uint32_t kThreads = 256;
+  CaptureTapKernel<<<dim3(1, n_rows), kThreads, 0, stream>>>(
       dst, x, n_rows, hidden, stride, tap_offset);
+}
+
+// 2026-10-31: NPU shared-expert gate/up offload for prefill. The encode (A
+// operand, "hi" block-float plus "lo" residual for accuracy recovery) and
+// decode (C stream) math below is a straight copy of Flint's
+// NpuEncodeBothKernel/NpuSwigluScaledKernel (src/models/flint/gpu/kernels/
+// kernels.hip.cpp) - it is genuinely model-agnostic (parametrized by k_slice/
+// ldx/cols/valid_cols, fixed only by the xclbin's own 128x64x128 tile and
+// N=1024 slice, which is shared across every (M,K) build per
+// tools/npu/runtime_mk/README.md), not duplicated because of any Laguna-
+// specific math - just because it lives in Flint's own namespace and this
+// port did not refactor it into the shared qwen38_flash_next NPU kernels.
+// A future port (or this one, revisited) should move these into
+// qwen38_flash_next::rocm so Flint and Laguna (and any future model) share
+// one copy instead of three. The combine kernel here differs from Flint's
+// only in writing float directly (Laguna's Dense()/Swiglu path is F32 end to
+// end, so there is no need for Flint's F16-range scale-folding trick).
+constexpr int kNpuTileM = 128;
+constexpr int kNpuTileK = 64;
+constexpr int kNpuGroupBytes = 9;
+
+__device__ inline void NpuEncodeGroup(const float* v, std::uint8_t* out) {
+  unsigned max_exp = 0;
+#pragma unroll
+  for (int i = 0; i < 8; ++i)
+    max_exp = max(max_exp, (__float_as_uint(v[i]) >> 23) & 0xFFU);
+  const float inv = __uint_as_float(max_exp >= 7 ? (260U - max_exp) << 23 : 0U);
+  out[0] = static_cast<std::uint8_t>(max_exp);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const float q = fminf(127.0F, fmaxf(-128.0F, rintf(v[i] * inv)));
+    out[1 + i] = static_cast<std::uint8_t>(static_cast<std::int8_t>(q));
+  }
+}
+
+// The part of the group the high encoding cannot hold, encoded alone.
+__device__ inline void NpuEncodeResidual(const float* v, std::uint8_t* out) {
+  unsigned max_exp = 0;
+#pragma unroll
+  for (int i = 0; i < 8; ++i)
+    max_exp = max(max_exp, (__float_as_uint(v[i]) >> 23) & 0xFFU);
+  const float inv = __uint_as_float(max_exp >= 7 ? (260U - max_exp) << 23 : 0U);
+  const float unit = __uint_as_float(max_exp >= 7 ? (max_exp - 6U) << 23 : 0U);
+  float r[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const float q = fminf(127.0F, fmaxf(-128.0F, rintf(v[i] * inv)));
+    r[i] = v[i] - q * unit;
+  }
+  NpuEncodeGroup(r, out);
+}
+
+// A tiles (128 x 64) of the float activations, both the high and the
+// residual stream in one pass, in the layout of the GEMM's L1 tiles.
+__global__ void __launch_bounds__(256)
+    NpuEncodeBothKernel(const float* __restrict__ x,
+                        std::uint8_t* __restrict__ hi,
+                        std::uint8_t* __restrict__ lo, std::uint32_t k_slice,
+                        std::size_t ldx) {
+  __shared__ __align__(16) float tile[kNpuTileM * kNpuTileK];
+  __shared__ __align__(16)
+      std::uint8_t staged_hi[kNpuTileM * kNpuTileK / 8 * kNpuGroupBytes];
+  __shared__ __align__(16)
+      std::uint8_t staged_lo[kNpuTileM * kNpuTileK / 8 * kNpuGroupBytes];
+  const std::uint32_t tiles_k = k_slice / kNpuTileK;
+  const std::uint32_t tile_row = blockIdx.x / tiles_k;
+  const std::uint32_t tile_col = blockIdx.x % tiles_k;
+  const std::uint32_t t = threadIdx.x;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const std::uint32_t row = (t >> 3) + 32 * j;
+    const std::uint32_t vec = t & 7;
+    const float* src = x + (std::size_t{tile_row} * kNpuTileM + row) * ldx +
+                       tile_col * kNpuTileK + vec * 8;
+    float4* dst = reinterpret_cast<float4*>(&tile[row * kNpuTileK + vec * 8]);
+    dst[0] = *reinterpret_cast<const float4*>(src);
+    dst[1] = *reinterpret_cast<const float4*>(src + 4);
+  }
+  __syncthreads();
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const std::uint32_t gi = t + 256 * j;
+    const std::uint32_t rib = gi & 7;
+    const std::uint32_t block = (gi >> 3) & 1;
+    const std::uint32_t sc = (gi >> 4) & 7;
+    const std::uint32_t sr = gi >> 7;
+    const std::uint32_t row = sr * 16 + block * 8 + rib;
+    float v[8];
+    const float4* g =
+        reinterpret_cast<const float4*>(&tile[row * kNpuTileK + sc * 8]);
+    *reinterpret_cast<float4*>(v) = g[0];
+    *reinterpret_cast<float4*>(v + 4) = g[1];
+    NpuEncodeGroup(v, staged_hi + gi * kNpuGroupBytes);
+    NpuEncodeResidual(v, staged_lo + gi * kNpuGroupBytes);
+  }
+  __syncthreads();
+  constexpr std::uint32_t kTileBytes =
+      kNpuTileM * kNpuTileK / 8 * kNpuGroupBytes;
+  const std::size_t base = std::size_t{blockIdx.x} * kTileBytes;
+  for (std::uint32_t i = t; i < kTileBytes / 16; i += 256) {
+    reinterpret_cast<uint4*>(hi + base)[i] =
+        reinterpret_cast<const uint4*>(staged_hi)[i];
+    reinterpret_cast<uint4*>(lo + base)[i] =
+        reinterpret_cast<const uint4*>(staged_lo)[i];
+  }
+}
+
+void NpuEncodeBoth(const float* x, std::size_t ldx, std::uint32_t tokens,
+                   std::uint32_t k_slice, void* hi, void* lo,
+                   hipStream_t stream) {
+  NpuEncodeBothKernel<<<(tokens / kNpuTileM) * (k_slice / kNpuTileK), 256, 0,
+                        stream>>>(x, static_cast<std::uint8_t*>(hi),
+                                  static_cast<std::uint8_t*>(lo), k_slice, ldx);
+}
+
+// Block-float C streams of the NPU GEMM: 8 values share one exponent byte
+// (9 bytes per group), laid out in 512 x 128 tiles - fixed by the xclbin's
+// own tiling, not model-specific.
+constexpr std::uint32_t kNpuTileRowsC = 512;
+constexpr std::uint32_t kNpuTileN = 128;
+
+// silu(gate) * up straight from the high and residual C streams of the
+// shared expert's gate and up GEMMs, written as F32 rows of valid_cols
+// (Laguna's Dense()/Swiglu path is F32 end to end already, unlike Flint's,
+// so no scale-folding trick is needed here).
+__global__ void NpuSwigluCombineKernel(const std::uint8_t* __restrict__ gate_hi,
+                                       const std::uint8_t* __restrict__ up_hi,
+                                       const std::uint8_t* __restrict__ gate_lo,
+                                       const std::uint8_t* __restrict__ up_lo,
+                                       float* __restrict__ out,
+                                       std::uint32_t tokens, std::uint32_t cols,
+                                       std::uint32_t valid_cols) {
+  const std::size_t g = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
+  if (g >= std::size_t{tokens} * cols / 8)
+    return;
+  constexpr std::uint32_t kGroupsPerTile = kNpuTileRowsC * kNpuTileN / 8;
+  const std::size_t tile = g / kGroupsPerTile;
+  const std::uint32_t gi = static_cast<std::uint32_t>(g % kGroupsPerTile);
+  const std::uint32_t tiles_n = cols / kNpuTileN;
+  const std::uint32_t tile_row = static_cast<std::uint32_t>(tile / tiles_n);
+  const std::uint32_t tile_col = static_cast<std::uint32_t>(tile % tiles_n);
+  const std::uint32_t rib = gi & 7;
+  const std::uint32_t bc = (gi >> 3) & 1;
+  const std::uint32_t br = (gi >> 4) & 1;
+  const std::uint32_t sc = (gi >> 5) & 7;
+  const std::uint32_t sr = gi >> 8;
+  const std::size_t row =
+      std::size_t{tile_row} * kNpuTileRowsC + (sr * 2 + br) * 8 + rib;
+  const std::uint32_t col = tile_col * kNpuTileN + (sc * 2 + bc) * 8;
+  if (col >= valid_cols)
+    return;
+  const std::uint8_t* pg = gate_hi + g * 9;
+  const std::uint8_t* pu = up_hi + g * 9;
+  const std::uint8_t* pgl = gate_lo + g * 9;
+  const std::uint8_t* pul = up_lo + g * 9;
+  const float mg = ldexpf(1.0F, static_cast<int>(pg[0]) - 127) / 64.0F;
+  const float mu = ldexpf(1.0F, static_cast<int>(pu[0]) - 127) / 64.0F;
+  const float mgl = ldexpf(1.0F, static_cast<int>(pgl[0]) - 127) / 64.0F;
+  const float mul = ldexpf(1.0F, static_cast<int>(pul[0]) - 127) / 64.0F;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const float gv =
+        static_cast<float>(static_cast<std::int8_t>(pg[1 + i])) * mg +
+        static_cast<float>(static_cast<std::int8_t>(pgl[1 + i])) * mgl;
+    const float uv =
+        static_cast<float>(static_cast<std::int8_t>(pu[1 + i])) * mu +
+        static_cast<float>(static_cast<std::int8_t>(pul[1 + i])) * mul;
+    const float v = gv / (1.0F + expf(-gv)) * uv;
+    out[row * valid_cols + col + i] = v;
+  }
+}
+
+void NpuSwigluCombine(const void* gate_hi, const void* up_hi,
+                      const void* gate_lo, const void* up_lo, float* out,
+                      std::uint32_t tokens, std::uint32_t cols,
+                      std::uint32_t valid_cols, hipStream_t stream) {
+  const std::size_t groups = std::size_t{tokens} * cols / 8;
+  const std::uint32_t blocks = static_cast<std::uint32_t>((groups + 255) / 256);
+  NpuSwigluCombineKernel<<<blocks, 256, 0, stream>>>(
+      static_cast<const std::uint8_t*>(gate_hi),
+      static_cast<const std::uint8_t*>(up_hi),
+      static_cast<const std::uint8_t*>(gate_lo),
+      static_cast<const std::uint8_t*>(up_lo), out, tokens, cols, valid_cols);
+}
+
+// QKV projections have no activation to fuse - just dequantize hi+lo and sum,
+// writing each of `slices` 1024-wide chunks at its own column offset into a
+// `pitch`-wide output row (`pitch` is the full Q, K or V row width; `slices`
+// chunks cover [0, slices*1024) of it). Copy of Flint's NpuDecodeFused, same
+// genericity note as NpuEncodeBoth/NpuSwigluCombine above.
+__global__ void NpuDecodeFusedKernel(NpuStreams s, float* __restrict__ out,
+                                     std::uint32_t tokens, std::uint32_t cols,
+                                     std::size_t pitch) {
+  const std::size_t g = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
+  if (g >= std::size_t{tokens} * cols / 8)
+    return;
+  constexpr std::uint32_t kGroupsPerTile = kNpuTileRowsC * kNpuTileN / 8;
+  const std::size_t tile = g / kGroupsPerTile;
+  const std::uint32_t gi = static_cast<std::uint32_t>(g % kGroupsPerTile);
+  const std::uint32_t tiles_n = cols / kNpuTileN;
+  const std::uint32_t tile_row = static_cast<std::uint32_t>(tile / tiles_n);
+  const std::uint32_t tile_col = static_cast<std::uint32_t>(tile % tiles_n);
+  const std::uint32_t rib = gi & 7;
+  const std::uint32_t bc = (gi >> 3) & 1;
+  const std::uint32_t br = (gi >> 4) & 1;
+  const std::uint32_t sc = (gi >> 5) & 7;
+  const std::uint32_t sr = gi >> 8;
+  const std::size_t row =
+      std::size_t{tile_row} * kNpuTileRowsC + (sr * 2 + br) * 8 + rib;
+  const std::uint32_t col = tile_col * kNpuTileN + (sc * 2 + bc) * 8;
+  const std::uint8_t* hi = s.hi[blockIdx.y] + g * 9;
+  const std::uint8_t* lo = s.lo[blockIdx.y] + g * 9;
+  const float mult_hi = ldexpf(1.0F, static_cast<int>(hi[0]) - 127) / 64.0F;
+  const float mult_lo = ldexpf(1.0F, static_cast<int>(lo[0]) - 127) / 64.0F;
+  float* dst = out + row * pitch + blockIdx.y * cols + col;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    dst[i] = static_cast<float>(static_cast<std::int8_t>(hi[1 + i])) * mult_hi +
+             static_cast<float>(static_cast<std::int8_t>(lo[1 + i])) * mult_lo;
+  }
+}
+
+void NpuDecodeFused(const NpuStreams& streams, std::uint32_t slices, float* out,
+                    std::uint32_t tokens, std::uint32_t cols, std::size_t pitch,
+                    hipStream_t stream) {
+  const std::size_t groups = std::size_t{tokens} * cols / 8;
+  const std::uint32_t blocks = static_cast<std::uint32_t>((groups + 255) / 256);
+  NpuDecodeFusedKernel<<<dim3(blocks, slices), 256, 0, stream>>>(
+      streams, out, tokens, cols, pitch);
 }
 
 }  // namespace gufo::models::laguna::gpu::rocm

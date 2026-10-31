@@ -9,6 +9,7 @@
 
 #include "src/core/gguf_reader.hpp"
 #include "src/models/laguna/runtime/config.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/npu_gemm.hpp"
 
 namespace gufo::models::laguna::gpu {
 
@@ -31,6 +32,15 @@ struct DeviceLayer {
   DeviceTensor router, router_bias;
   DeviceTensor gate_exps, up_exps, down_exps;
   DeviceTensor gate_shexp, up_shexp, down_shexp;
+  // Shared-expert gate/up weights staged on the NPU (block-float, one buffer
+  // each - npu->n()=1024 already matches shared_ff exactly, no chunking
+  // needed). Empty when NPU offload is unavailable or this layer's shapes
+  // don't fit.
+  std::vector<int> npu_shexp;
+  // QKV staged on the NPU: attn_q chunked into npu->n()=1024-row blocks (up
+  // to kNpuMaxSlices for the widest, 72-head layers), attn_k/attn_v each a
+  // single block (their row count, num_kv*head_dim, is already 1024).
+  std::vector<int> npu_q, npu_k, npu_v;
 };
 
 /// Per-layer-type rope: effective inverse frequencies of the rotated pairs.
@@ -61,9 +71,15 @@ public:
     return swa ? rope_swa_ : rope_full_;
   }
   std::size_t resident_bytes() const noexcept { return bytes_; }
+  // NPU shared-expert offload (prefill only; fixed M=4096, no runtime-M
+  // sweep - see laguna-port-state.md for why this is scoped down from
+  // Flint's full runtime-M/ping-pong-bank version). nullptr when
+  // GUFO_NPU_DIR is unset or the K=3072 program failed to load.
+  qwen38_flash_next::rocm::NpuGemm* npu() const noexcept { return npu_.get(); }
 
 private:
   DeviceModel() = default;
+  bool StageNpuWeights();
 
   Config config_;
   DeviceTensor token_embd_, output_, output_norm_;
@@ -71,6 +87,7 @@ private:
   RopeTables rope_full_, rope_swa_;
   std::vector<void*> allocations_;
   std::size_t bytes_{0};
+  std::unique_ptr<qwen38_flash_next::rocm::NpuGemm> npu_;
 };
 
 }  // namespace gufo::models::laguna::gpu

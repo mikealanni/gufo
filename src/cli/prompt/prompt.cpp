@@ -4,6 +4,7 @@
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
@@ -687,6 +688,13 @@ int RunLagunaPromptGPU(const PromptOptions& opt, const core::GgufReader& reader,
     if (generated >= opt.max_tokens)
       break;
 
+    static const bool kTimingDebug =
+        std::getenv("LAGUNA_TIMING_DEBUG") != nullptr;
+    static double t_forward_block = 0.0, t_append_all = 0.0,
+                  t_accept_reject = 0.0, t_rewind_inject = 0.0;
+    static std::uint32_t t_steps = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+
     std::vector<std::int32_t> feed{static_cast<std::int32_t>(token)};
     if (use_dflash && session->DflashExecutor()->GetInjectedContextLength() ==
                           session->Position()) {
@@ -695,7 +703,16 @@ int RunLagunaPromptGPU(const PromptOptions& opt, const core::GgufReader& reader,
           opt.sampling.uses_random_sampling() ? opt.sampling.temperature
                                               : 0.0F);
       feed.insert(feed.end(), drafts.begin(), drafts.end());
+      if (std::getenv("LAGUNA_DFLASH_DEBUG") != nullptr) {
+        std::fprintf(stderr,
+                     "[LAGUNA_VERIFY_DEBUG] position=%u anchor=%d feed=[",
+                     session->Position(), static_cast<int>(token));
+        for (const auto t : feed)
+          std::fprintf(stderr, "%d,", t);
+        std::fprintf(stderr, "]\n");
+      }
     }
+    const auto t1 = std::chrono::steady_clock::now();
     if (feed.size() == 1) {
       if (!session->Append(feed, &err)) {
         std::cerr << "\nLaguna GPU decode failed: " << err << '\n';
@@ -705,10 +722,12 @@ int RunLagunaPromptGPU(const PromptOptions& opt, const core::GgufReader& reader,
       continue;
     }
     drafted += feed.size() - 1;
+    const std::uint32_t base = session->Position();
     if (!session->AppendAll(feed, &err)) {
       std::cerr << "\nLaguna GPU verify failed: " << err << '\n';
       return 1;
     }
+    const auto t2 = std::chrono::steady_clock::now();
     // Row i holds the distribution after feed[i]; draft feed[i + 1] is tested
     // against it, and only the accepted rows are committed to the drafter.
     std::uint32_t kept = 0;
@@ -732,6 +751,13 @@ int RunLagunaPromptGPU(const PromptOptions& opt, const core::GgufReader& reader,
         next = sampler.Sample(logits);
         hit = next == guess;
       }
+      if (std::getenv("LAGUNA_DFLASH_DEBUG") != nullptr) {
+        std::fprintf(stderr,
+                     "[LAGUNA_VERIFY_DEBUG] row=%u base=%u guess=%d next=%d "
+                     "hit=%d\n",
+                     row, base, static_cast<int>(guess),
+                     static_cast<int>(hit ? guess : next), hit ? 1 : 0);
+      }
       if (!hit) {
         token = next;
         break;
@@ -745,9 +771,35 @@ int RunLagunaPromptGPU(const PromptOptions& opt, const core::GgufReader& reader,
       }
     }
     generated += kept;
+    const auto t3 = std::chrono::steady_clock::now();
+    // AppendAll advanced the KV cache and position by the whole verified
+    // batch (anchor + every drafted token); only the accepted prefix
+    // (anchor + kept drafts) should stick - discard the rest the same way
+    // Flint's speculative loop does, or full-attention layers permanently
+    // keep rejected drafts' key/value state at positions nothing will ever
+    // overwrite.
+    session->Rewind(base + 1 + kept);
     if (!session->DflashInject(kept + 1, &err)) {
       std::cerr << "\nLaguna drafter commit failed: " << err << '\n';
       return 1;
+    }
+    if (kTimingDebug) {
+      const auto t4 = std::chrono::steady_clock::now();
+      const auto us = [](auto a, auto b) {
+        return std::chrono::duration<double, std::micro>(b - a).count();
+      };
+      t_forward_block += us(t0, t1);
+      t_append_all += us(t1, t2);
+      t_accept_reject += us(t2, t3);
+      t_rewind_inject += us(t3, t4);
+      if (++t_steps % 20 == 0) {
+        std::fprintf(stderr,
+                     "[LAGUNA_TIMING_DEBUG] steps=%u forward_block=%.1fms "
+                     "append_all=%.1fms accept_reject=%.1fms "
+                     "rewind_inject=%.1fms\n",
+                     t_steps, t_forward_block / 1000.0, t_append_all / 1000.0,
+                     t_accept_reject / 1000.0, t_rewind_inject / 1000.0);
+      }
     }
   }
   std::cout << '\n';
