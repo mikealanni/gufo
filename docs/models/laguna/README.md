@@ -76,7 +76,13 @@ file if `GUFO_NPU_DIR` is set and N != 4,096 |
 Prefill and decode verified against greedy text and `--validate-prefill`.
 DFlash v1 drafter working (coherent generation, real acceptance rate). NPU
 shared-expert offload on by default; QKV offload built but off by default
-(see Speed section). Not done: a CPU-reference regression script, model
-tests under `tests/`, and the standard cross-model regression run for the
-shared `dflash_weights.cpp`/`qfn_mmq.hip.cpp` edits (done manually this
-session against Flash-Next/27B/35B/GLM, not yet automated).
+(see Speed section). `gufo serve llm` works (smoke-tested: load, warm-up,
+a real `/v1/chat/completions` request) but has no snapshot/disk-cache
+reuse yet (the engine's `Session` has no save/restore) and rejects
+`--speculative` (DFlash v1 is `gufo prompt`/`gufo bench`-only for now). No
+block-sparse attention path (unlike Flint/27B/35B); relies only on its
+always-on sliding-window attention. Not done: a CPU-reference regression
+script, model tests under `tests/`, and the standard cross-model
+regression run for the shared `dflash_weights.cpp`/`qfn_mmq.hip.cpp` edits
+(done manually this session against Flash-Next/27B/35B/GLM, not yet
+automated).

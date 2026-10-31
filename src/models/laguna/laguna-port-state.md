@@ -1911,3 +1911,55 @@ buffer instead of a previously-required-but-functionally-unused one).
 Any `is_v1`/`is_v2`-gated tensor needs its CONSUMERS checked for the same
 gate, not just its binding - grep every kernel/launch site that touches
 the tensor, not only the loader.
+
+## `gufo serve` had no Laguna dispatch at all (2026-10-31)
+
+The AGENTS.md port workflow's "Serve" step (add a `general.architecture ==
+"<model>"` case to `src/cli/serve/inference_backend.cpp`) had never been
+done for Laguna - confirmed by the user's own `GUFO_KIND=laguna
+~/run-gufo.sh` run failing with `Unexpected Qwen layer kind at blk.0:
+expected Gated DeltaNet`: any GGUF with `general.architecture == "laguna"`
+fell through to the Qwen38/Flash-Next engine's own loader, which rejects
+Laguna's per-layer tensor layout outright. `gufo prompt`/`gufo bench`
+worked the whole time because they dispatch on the CLI's own model flag,
+not on `inference_backend.cpp`'s architecture switch - a working `gufo
+prompt` run is not evidence `gufo serve` works for a new model.
+
+Fixed by adding a `LagunaTextRunner`/`LagunaTextRunnerState` pair (modeled
+closely on Flint's, the simplest existing runner - no speculative decoding,
+no vision) plus an `InferenceBackend::load(shared_ptr<laguna::gpu::Model>,
+...)` overload and the `"laguna"` dispatch block, following the exact
+pattern of the existing `flint`/`glm5next`/`deepseek4`/`qwen4exp` blocks.
+
+Two things the Laguna GPU engine does NOT have that Flint's does, both
+left out of scope for now (serve works without them, just without
+snapshot/disk-cache reuse across requests):
+- No `SnapshotBytes`/`SaveSnapshot`/`RestoreSnapshot` on `Session` - the
+  runner declares `.snapshot = false, .fork = false` in its capabilities,
+  so prompt-cache-across-requests and the HTTP disk cache don't apply to
+  Laguna yet. Would need the same `SnapshotBytes`/`SaveSnapshot`/
+  `RestoreSnapshot` triplet Flint's `Session` has, covering KV cache +
+  the two-bank residual copies (`x2`/`xn2`) + the shexp/QKV NPU in-flight
+  state if a snapshot can land mid-submit (likely needs to drain pending
+  NPU work before capturing, same as any other quiesce point).
+- No `Model::SessionBytes(max_context)` closed-form estimate (KV cache
+  size depends on SWA ring buffers + two-bank NPU scratch, not a flat
+  per-token constant) - `ResourceClaim()`'s `per_request_state_bytes` is
+  filled by creating one throwaway full-size session at runner
+  construction and reading its `AllocatedBytes()` (`MeasureSessionBytes()`
+  in the runner), not a formula. Admission without this measured value
+  failed hard: `"text runner measured state exceeds its resource claim"`
+  the first time this was tried with `per_request_state_bytes = 0`.
+
+DFlash v1 speculative decoding is NOT wired into `gufo serve` either -
+the dispatch block rejects any `--speculative` flag for Laguna
+(`speculative_config.backend != kDisabled` is an error). `gufo serve` only
+serves the plain autoregressive path for now; DFlash stays `gufo
+prompt`/`gufo bench`-only until someone wires `QwenFlashNextTextRunner`'s
+speculative machinery through for Laguna's DFlash v1 (a separate,
+non-trivial task - Flash-Next's MTP/DFlash runner code is ~750 lines by
+itself).
+
+Smoke-tested end to end: `gufo serve llm -m <laguna.gguf> -c 16384` loads,
+warms up, and answers a real `/v1/chat/completions` request correctly
+(chat-templated prompt, coherent "OK." completion, correct stop handling).
