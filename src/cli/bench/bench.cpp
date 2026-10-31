@@ -25,6 +25,7 @@
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
 #include "src/models/flint/gpu/engine.hpp"
+#include "src/models/laguna/gpu/engine.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
 #include "src/testing/compare/logit_comparator.hpp"
@@ -1317,6 +1318,237 @@ int RunQwen38FlashNextBenchmark(
   return 0;
 }
 
+bool IsLaguna(const core::GgufReader& reader) {
+  return reader.GetMetadataString("general.architecture") == "laguna";
+}
+
+// Compares logits from one multi-token Append (exercises whatever
+// per-layer attention path the token count selects, e.g. WMMA) against
+// the same tokens appended one at a time (always n=1 per call), on a
+// fresh session each. A mismatch means a token-count-dependent attention
+// bug, not just noise -- see laguna-port-state.md group-6/group-9 WMMA
+// history.
+bool ValidateLagunaPrefill(models::laguna::gpu::Model& model,
+                           std::span<const std::int32_t> tokens,
+                           std::string* error_msg) {
+  auto batched = model.CreateSession(
+      static_cast<std::uint32_t>(tokens.size() + 1), error_msg);
+  if (!batched || !batched->Append(tokens, error_msg))
+    return false;
+  const std::vector<float> batched_logits(batched->Logits().begin(),
+                                          batched->Logits().end());
+
+  auto sequential = model.CreateSession(
+      static_cast<std::uint32_t>(tokens.size() + 1), error_msg);
+  if (!sequential)
+    return false;
+  for (const std::int32_t token : tokens) {
+    if (!sequential->Append(std::span(&token, 1), error_msg))
+      return false;
+  }
+  const auto sequential_logits = sequential->Logits();
+
+  const auto comparison = testing::CompareLogits(
+      std::vector<float>(sequential_logits.begin(), sequential_logits.end()),
+      batched_logits);
+  std::cout << "[Laguna Prefill Validation] tokens=" << tokens.size()
+            << " top1_match=" << (comparison.top1_match ? "yes" : "no")
+            << " finite=" << (comparison.finite ? "yes" : "no") << '\n'
+            << "  max_abs_diff=" << comparison.max_abs_diff
+            << " mean_abs_diff=" << comparison.mean_abs_diff
+            << " rmse=" << comparison.root_mean_square_error
+            << " cosine_similarity=" << comparison.cosine_similarity << '\n';
+  if (!comparison.top1_match) {
+    const float ref_top1 = sequential_logits[comparison.reference_argmax];
+    const float cand_top1 = batched_logits[comparison.candidate_argmax];
+    const float ref_at_cand = sequential_logits[comparison.candidate_argmax];
+    const float cand_at_ref = batched_logits[comparison.reference_argmax];
+    std::cout << "  reference_argmax=" << comparison.reference_argmax
+              << " (logit=" << ref_top1 << ")"
+              << " candidate_argmax=" << comparison.candidate_argmax
+              << " (logit=" << cand_top1 << ")\n"
+              << "  reference's logit at candidate's token=" << ref_at_cand
+              << " (margin=" << (ref_top1 - ref_at_cand) << ")"
+              << " candidate's logit at reference's token=" << cand_at_ref
+              << " (margin=" << (cand_top1 - cand_at_ref) << ")\n";
+  }
+  return comparison.finite && comparison.top1_match;
+}
+
+int RunLagunaBenchmark(const BenchOptions& options,
+                       const std::shared_ptr<const core::GgufReader>& reader,
+                       std::chrono::steady_clock::time_point model_load_start) {
+  namespace laguna = models::laguna::gpu;
+  if (options.concurrency != std::vector<std::size_t>{1}) {
+    std::cerr << "Error: Laguna bench supports C1 only\n";
+    return 1;
+  }
+  const auto max_or_zero = [](const std::vector<std::size_t>& values) {
+    return values.empty() ? std::size_t{0}
+                          : *std::max_element(values.begin(), values.end());
+  };
+  const std::size_t max_depth = max_or_zero(options.n_depths);
+  const std::size_t max_prompt = max_or_zero(options.n_prompts);
+  const std::size_t max_generation = max_or_zero(options.n_gens);
+  const std::size_t required_context =
+      std::max({std::size_t{4096}, max_depth + max_prompt + 1,
+                std::max<std::size_t>(max_depth, 16) + max_generation + 1,
+                options.validate_prefill_tokens + 1});
+
+  std::string error;
+  auto tokenizer = tokenization::QwenTokenizer::CreateFromGguf(*reader, &error);
+  if (!tokenizer) {
+    std::cerr << "Laguna tokenizer failed: " << error << '\n';
+    return 1;
+  }
+  auto model = laguna::Model::Load(options.model_path, {}, &error);
+  if (!model) {
+    std::cerr << "Error creating Laguna model: " << error << '\n';
+    PrintModelLoadTime(model_load_start, false);
+    return 1;
+  }
+  PrintModelLoadTime(model_load_start);
+
+  std::vector<std::int32_t> tokens;
+  {
+    const auto pattern = tokenizer->Encode(
+        "The quick brown fox jumps over the lazy dog. "
+        "Strix Halo executes this deterministic benchmark sequence. ",
+        tokenization::TokenizerOptions{});
+    if (pattern.empty()) {
+      std::cerr << "Error: benchmark token pattern is empty\n";
+      return 1;
+    }
+    tokens.resize(required_context);
+    for (std::size_t i = 0; i < tokens.size(); ++i)
+      tokens[i] = static_cast<std::int32_t>(pattern[i % pattern.size()]);
+  }
+
+  if (options.validate_prefill_tokens != 0) {
+    const std::size_t width =
+        std::min(options.validate_prefill_tokens, tokens.size());
+    if (!ValidateLagunaPrefill(*model, std::span(tokens).first(width),
+                               &error)) {
+      std::cerr << "Laguna prefill validation FAILED: " << error << '\n';
+      return 1;
+    }
+  }
+
+  const double size_gib =
+      static_cast<double>(reader->GetSize()) / (1024.0 * 1024.0 * 1024.0);
+  std::cout << "| " << std::left << std::setw(32) << "model"
+            << " | " << std::right << std::setw(10) << "size"
+            << " | " << std::left << std::setw(10) << "backend"
+            << " | " << std::right << std::setw(18) << "test"
+            << " | " << std::right << std::setw(21) << "t/s"
+            << " |\n"
+            << "| " << std::string(32, '-') << " | " << std::string(10, '-')
+            << " | " << std::string(10, '-') << " | " << std::string(18, '-')
+            << " | " << std::string(21, '-') << " |\n";
+  std::ostringstream size_text;
+  size_text << std::fixed << std::setprecision(2) << size_gib << " GiB";
+  const auto print_result = [&](std::string_view test_name,
+                                const BenchStats& stats) {
+    std::ostringstream throughput;
+    throughput << std::fixed << std::setprecision(2) << stats.mean << " ± "
+               << stats.stddev;
+    std::cout << "| " << std::left << std::setw(32) << "Laguna" << " | "
+              << std::right << std::setw(10) << size_text.str() << " | "
+              << std::left << std::setw(10) << "ROCm (HIP)"
+              << " | " << std::right << std::setw(18) << test_name << " | "
+              << std::right << std::setw(21) << throughput.str() << " |\n"
+              << std::flush;
+  };
+
+  for (const std::size_t depth : options.n_depths) {
+    for (const std::size_t prompt_length : options.n_prompts) {
+      if (depth + prompt_length >= required_context) {
+        std::cerr << "Error: prompt benchmark exceeds context\n";
+        return 1;
+      }
+      std::vector<double> runs;
+      for (std::size_t repetition = 0; repetition <= options.repetitions;
+           ++repetition) {
+        auto session = model->CreateSession(
+            static_cast<std::uint32_t>(required_context), &error);
+        if (!session ||
+            (depth > 0 &&
+             !session->Append(std::span(tokens).first(depth), &error))) {
+          std::cerr << "Error preparing depth: " << error << '\n';
+          return 1;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        if (!session->Append(std::span(tokens).subspan(depth, prompt_length),
+                             &error)) {
+          std::cerr << "Error running prefill: " << error << '\n';
+          return 1;
+        }
+        const double seconds = std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() - start)
+                                   .count();
+        if (repetition > 0)
+          runs.push_back(static_cast<double>(prompt_length) / seconds);
+      }
+      print_result(MakeTestName("pp", prompt_length, depth),
+                   ComputeStats(runs));
+    }
+
+    for (const std::size_t generation_length : options.n_gens) {
+      const std::size_t prefix_length = depth > 0 ? depth : 16;
+      if (prefix_length + generation_length >= required_context) {
+        std::cerr << "Error: generation benchmark exceeds context\n";
+        return 1;
+      }
+      std::vector<double> runs;
+      for (std::size_t repetition = 0; repetition < options.repetitions;
+           ++repetition) {
+        auto session = model->CreateSession(
+            static_cast<std::uint32_t>(required_context), &error);
+        if (!session ||
+            !session->Append(std::span(tokens).first(prefix_length), &error)) {
+          std::cerr << "Error preparing generation: " << error << '\n';
+          return 1;
+        }
+        std::int32_t next = tokens[prefix_length % tokens.size()];
+        for (int warm = 0; warm < 2; ++warm) {
+          const std::int32_t token = next;
+          if (!session->Append(std::span(&token, 1), &error)) {
+            std::cerr << "Error running Laguna decode: " << error << '\n';
+            return 1;
+          }
+          next = tokens[(prefix_length + warm + 1) % tokens.size()];
+        }
+        const auto start = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < generation_length; ++i) {
+          const std::int32_t token = next;
+          if (!session->Append(std::span(&token, 1), &error)) {
+            std::cerr << "Error running Laguna decode: " << error << '\n';
+            return 1;
+          }
+          next = tokens[(prefix_length + i + 3) % tokens.size()];
+        }
+        const double seconds = std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() - start)
+                                   .count();
+        // Discarding repetition 0 here (as the PP loop above correctly does,
+        // since IT has no separate warm-up) emptied `runs` whenever
+        // `options.repetitions` is 1 (the default): the loop condition is
+        // `repetition < options.repetitions`, so repetition 0 is the ONLY
+        // iteration, and this check always skipped it - `ComputeStats` on an
+        // empty vector then silently printed 0.00 for every `tgN @ dD` row.
+        // This loop already has its own 2-step warm-up above (unlike the PP
+        // loop), so no additional discard is needed - push every measured
+        // repetition, matching DeepSeek/DSpark's TG loop above.
+        runs.push_back(static_cast<double>(generation_length) / seconds);
+      }
+      print_result(MakeTestName("tg", generation_length, depth),
+                   ComputeStats(runs));
+    }
+  }
+  std::cout << '\n';
+  return 0;
+}
+
 bool IsGlm53Flash(const core::GgufReader& reader) {
   const auto architecture = reader.GetMetadataString("general.architecture");
   return architecture == "glm5next" || architecture == "glm5-next";
@@ -1721,6 +1953,9 @@ int RunBench(std::span<const char* const> args) {
   }
   if (IsFlint(*reader)) {
     return RunFlintBenchmark(opt, reader, model_load_start);
+  }
+  if (IsLaguna(*reader)) {
+    return RunLagunaBenchmark(opt, reader, model_load_start);
   }
   if (IsGlm53Flash(*reader)) {
     return RunGlm53Benchmark(opt, reader, model_load_start);

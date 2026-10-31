@@ -83,18 +83,55 @@ ggml_backend_hip_context * get_ctx_for_device(int device) {
     return cached[device].get();
 }
 
+// MMQ-tile-layout quantize size/quantize/GEMM split out of qfn_mmq_dense_impl
+// so a caller issuing several dense projections against the same X_f32 (e.g.
+// Laguna's Q/K/V or gate/up pair, which all share one row-normed activation)
+// can quantize once and reuse the buffer across calls instead of paying the
+// quantize_mmq_q8_1_hip cost per projection.
+size_t qfn_mmq_q8_1_mmq_bytes_impl(int N, int K) {
+    const int dev = ggml_hip_get_device();
+    const int cc  = ggml_hip_info().devices[dev].cc;
+    const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    const size_t y_block_size = sizeof(block_q8_1_mmq);
+    const size_t y_values_per_block = 4 * QK8_1;
+    return (size_t)N * ne10_padded * y_block_size / y_values_per_block +
+           get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
+}
+
+int qfn_mmq_quantize_q8_1_mmq_impl(
+        const float * X_f32, void * X_q8_1_mmq, int N, int K,
+        hipStream_t stream) {
+    if (!X_f32 || !X_q8_1_mmq || N <= 0 || K <= 0 || K % 32 != 0) {
+        fprintf(stderr, "qfn_mmq_quantize_q8_1_mmq: bad arguments N=%d K=%d\n",
+                N, K);
+        return -1;
+    }
+    const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    quantize_mmq_q8_1_hip(
+        X_f32, nullptr, X_q8_1_mmq,
+        GGML_TYPE_Q8_0, K, (int64_t)K, 0, 0,
+        ne10_padded, (int64_t)N, 1, 1,
+        stream);
+    const hipError_t qerr = hipGetLastError();
+    if (qerr != hipSuccess) {
+        fprintf(stderr, "qfn_mmq_quantize_q8_1_mmq: hip error %d (%s)\n",
+                (int)qerr, hipGetErrorString(qerr));
+        return -2;
+    }
+    return 0;
+}
+
 template <ggml_type type>
-int qfn_mmq_dense_impl(
+int qfn_mmq_dense_gemm_preq_impl(
         const char  * tag,
         const void  * W,
-        const float * X_f32,
+        const void  * src1_q8_1,
         float       * out_f32,
         int           M,
         int           N,
         int           K,
         hipStream_t  stream) {
-
-    if (!W || !X_f32 || !out_f32) {
+    if (!W || !src1_q8_1 || !out_f32) {
         fprintf(stderr, "%s: null pointer\n", tag);
         return -1;
     }
@@ -103,14 +140,11 @@ int qfn_mmq_dense_impl(
         return -1;
     }
     if (K % 32 != 0) {
-
         fprintf(stderr, "%s: K=%d must be a multiple of 32\n", tag, K);
         return -1;
     }
 
     const int dev = ggml_hip_get_device();
-    const int cc  = ggml_hip_info().devices[dev].cc;
-
     ggml_backend_hip_context * ctx = get_ctx_for_device(dev);
     if (!ctx) {
         fprintf(stderr, "%s: failed to get HIP context for device %d\n", tag, dev);
@@ -122,28 +156,8 @@ int qfn_mmq_dense_impl(
     const int64_t ne11         = N;
     const int64_t ne12         = 1;
     const int64_t ne13         = 1;
-
     const size_t y_block_size = sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = 4 * QK8_1;
-    const size_t nbytes_src1_q8_1 =
-        ne13 * ne12 * ne11 * ne10_padded * y_block_size /
-            y_values_per_block +
-        get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
-
-    ggml_hip_pool_alloc<char> src1_q8_1_pool(ctx->pool(), nbytes_src1_q8_1);
-    char *src1_q8_1 = src1_q8_1_pool.get();
-
-        quantize_mmq_q8_1_hip(
-            X_f32, nullptr, (void *)src1_q8_1,
-            type, K, (int64_t)K, 0, 0,
-            ne10_padded, ne11, ne12, ne13,
-            stream);
-
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess) {
-        fprintf(stderr, "%s: quantize failed: %s\n", tag, hipGetErrorString(err));
-        return -2;
-    }
 
     const int64_t blck   = ggml_blck_size(type);
     const int64_t s01    = (int64_t)K / blck;
@@ -176,7 +190,7 @@ int qfn_mmq_dense_impl(
 
     mul_mat_q_case<type>(*ctx, args, stream);
 
-    err = hipGetLastError();
+    hipError_t err = hipGetLastError();
     if (err != hipSuccess) {
         fprintf(stderr, "%s: mul_mat_q_case launch failed: %s\n", tag, hipGetErrorString(err));
         return -3;
@@ -187,10 +201,63 @@ int qfn_mmq_dense_impl(
     return 0;
 }
 
+template <ggml_type type>
+int qfn_mmq_dense_impl(
+        const char  * tag,
+        const void  * W,
+        const float * X_f32,
+        float       * out_f32,
+        int           M,
+        int           N,
+        int           K,
+        hipStream_t  stream) {
+    if (!X_f32) {
+        fprintf(stderr, "%s: null pointer\n", tag);
+        return -1;
+    }
+    if (K <= 0 || N <= 0) {
+        fprintf(stderr, "%s: bad shape M=%d N=%d K=%d\n", tag, M, N, K);
+        return -1;
+    }
+
+    const int dev = ggml_hip_get_device();
+    ggml_backend_hip_context * ctx = get_ctx_for_device(dev);
+    if (!ctx) {
+        fprintf(stderr, "%s: failed to get HIP context for device %d\n", tag, dev);
+        return -1;
+    }
+    const size_t nbytes_src1_q8_1 = qfn_mmq_q8_1_mmq_bytes_impl(N, K);
+    ggml_hip_pool_alloc<char> src1_q8_1_pool(ctx->pool(), nbytes_src1_q8_1);
+    char *src1_q8_1 = src1_q8_1_pool.get();
+
+    if (qfn_mmq_quantize_q8_1_mmq_impl(X_f32, src1_q8_1, N, K, stream) != 0)
+        return -2;
+
+    return qfn_mmq_dense_gemm_preq_impl<type>(tag, W, src1_q8_1, out_f32, M, N,
+                                              K, stream);
+}
+
 extern "C" int qfn_mmq_q8_0_dense(
         const void * W, const float * X, float * out,
         int M, int N, int K, hipStream_t stream) {
     return qfn_mmq_dense_impl<GGML_TYPE_Q8_0>("qfn_mmq_q8_0_dense", W, X, out, M, N, K, stream);
+}
+
+extern "C" size_t qfn_mmq_q8_1_mmq_bytes(int N, int K) {
+    return qfn_mmq_q8_1_mmq_bytes_impl(N, K);
+}
+
+extern "C" int qfn_mmq_quantize_q8_1_mmq(
+        const float * X_f32, void * X_q8_1_mmq, int N, int K,
+        hipStream_t stream) {
+    return qfn_mmq_quantize_q8_1_mmq_impl(X_f32, X_q8_1_mmq, N, K, stream);
+}
+
+extern "C" int qfn_mmq_q8_0_dense_gemm_preq(
+        const void * W, const void * X_q8_1_mmq, float * out,
+        int M, int N, int K, hipStream_t stream) {
+    return qfn_mmq_dense_gemm_preq_impl<GGML_TYPE_Q8_0>(
+        "qfn_mmq_q8_0_dense_gemm_preq", W, X_q8_1_mmq, out, M, N, K, stream);
 }
 
 template <ggml_type type>

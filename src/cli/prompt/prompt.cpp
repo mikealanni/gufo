@@ -4,6 +4,7 @@
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
@@ -25,6 +26,8 @@
 #include "src/models/flint/reference.hpp"
 #include "src/models/glm53_flash/chat_template.hpp"
 #include "src/models/glm53_flash/reference.hpp"
+#include "src/models/laguna/chat_template.hpp"
+#include "src/models/laguna/reference.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/generator.hpp"
 #include "src/models/qwen/tokenizer.hpp"
@@ -36,6 +39,7 @@
 #include "src/core/speculative/speculative_verifier.hpp"
 #include "src/models/flint/gpu/engine.hpp"
 #include "src/models/glm53_flash/engine.hpp"
+#include "src/models/laguna/gpu/engine.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
@@ -258,6 +262,17 @@ void PrintModelLoadTime(std::chrono::steady_clock::time_point start,
 bool IsDeepSeekV4Flash(const core::GgufReader& reader) {
   return reader.GetMetadataString("general.architecture") == "deepseek4";
 }
+
+bool IsLaguna(const core::GgufReader& reader) {
+  return reader.GetMetadataString("general.architecture") == "laguna";
+}
+
+int RunLagunaPromptCPU(const PromptOptions& opt, const core::GgufReader& reader,
+                       std::chrono::steady_clock::time_point load_start);
+#ifdef ENGINE_ENABLE_HIP
+int RunLagunaPromptGPU(const PromptOptions& opt, const core::GgufReader& reader,
+                       std::chrono::steady_clock::time_point load_start);
+#endif
 
 bool IsFlint(const core::GgufReader& reader) {
   return reader.GetMetadataString("general.architecture") == "flint";
@@ -505,6 +520,310 @@ int RunFlintPromptCPU(const PromptOptions& opt, const core::GgufReader& reader,
   }
   return 0;
 }
+
+// ── Laguna CPU reference ─────────────────────────────────────────────
+
+int RunLagunaPromptCPU(const PromptOptions& opt, const core::GgufReader& reader,
+                       std::chrono::steady_clock::time_point load_start) {
+  std::string err;
+  auto tokenizer = tokenization::QwenTokenizer::CreateFromGguf(reader, &err);
+  if (!tokenizer) {
+    std::cerr << "Laguna tokenizer failed: " << err << '\n';
+    return 1;
+  }
+  auto model = models::laguna::ReferenceModel::Open(opt.model_path, &err);
+  if (!model) {
+    std::cerr << "Laguna load failed: " << err << '\n';
+    PrintModelLoadTime(load_start, false);
+    return 1;
+  }
+  PrintModelLoadTime(load_start, true);
+
+  const auto reasoning = PromptReasoningOptions(opt);
+  models::laguna::ChatTemplateOptions chat_options;
+  chat_options.enable_thinking = reasoning.enabled.value_or(false);
+  const std::string rendered =
+      opt.use_chat_template
+          ? models::laguna::RenderPrompt(opt.system_prompt, opt.prompt_text,
+                                         chat_options)
+          : opt.prompt_text;
+  tokenization::TokenizerOptions encode_options;
+  encode_options.parse_special_tokens = true;
+  const auto prompt = tokenizer->Encode(rendered, encode_options);
+  if (prompt.empty()) {
+    std::cerr << "Laguna prompt produced no tokens\n";
+    return 1;
+  }
+
+  const auto stop_tokens = FlintStopTokens(reader);
+  const auto is_stop = [&](tokenization::TokenId token) {
+    return std::find(stop_tokens.begin(), stop_tokens.end(), token) !=
+           stop_tokens.end();
+  };
+
+  auto session = model->CreateSession();
+  sampling::SamplerState sampler(opt.sampling, prompt);
+  const auto start = std::chrono::steady_clock::now();
+  const std::vector<float>* logits = nullptr;
+  for (const auto token : prompt) {
+    logits = &model->Evaluate(*session, static_cast<std::int32_t>(token));
+  }
+  const auto prefill_end = std::chrono::steady_clock::now();
+
+  std::size_t generated = 0;
+  for (; generated < opt.max_tokens; ++generated) {
+    const auto token = sampler.Sample(*logits);
+    if (is_stop(token)) {
+      break;
+    }
+    sampler.Accept(token);
+    std::cout << tokenizer->DecodeToken(token) << std::flush;
+    if (generated + 1 < opt.max_tokens) {
+      logits = &model->Evaluate(*session, static_cast<std::int32_t>(token));
+    }
+  }
+  std::cout << '\n';
+  if (opt.verbose) {
+    const auto seconds = [](auto a, auto b) {
+      return std::chrono::duration<double>(b - a).count();
+    };
+    const auto end = std::chrono::steady_clock::now();
+    std::cerr << "[Laguna CPU reference] prompt=" << prompt.size() << " tok in "
+              << seconds(start, prefill_end) << " s, generated=" << generated
+              << " tok in " << seconds(prefill_end, end) << " s\n";
+  }
+  return 0;
+}
+
+#ifdef ENGINE_ENABLE_HIP
+
+int RunLagunaPromptGPU(const PromptOptions& opt, const core::GgufReader& reader,
+                       std::chrono::steady_clock::time_point load_start) {
+  std::string err;
+  auto tokenizer = tokenization::QwenTokenizer::CreateFromGguf(reader, &err);
+  if (!tokenizer) {
+    std::cerr << "Laguna tokenizer failed: " << err << '\n';
+    return 1;
+  }
+  models::laguna::gpu::EngineOptions engine_options;
+  const bool dflash = opt.speculative_backend == "dflash2";
+  if (!opt.speculative_backend.empty() && !dflash) {
+    std::cerr << "Laguna supports only --speculative dflash2\n";
+    return 2;
+  }
+  if (dflash && (opt.dflash_model_path.empty() || opt.draft_tokens < 1 ||
+                 opt.draft_tokens > 15)) {
+    std::cerr << "Laguna DFlash2 requires --dflash-model and 1..15 draft "
+                 "tokens\n";
+    return 2;
+  }
+  if (dflash)
+    engine_options.dflash_model_path = opt.dflash_model_path;
+  auto model =
+      models::laguna::gpu::Model::Load(opt.model_path, engine_options, &err);
+  if (!model) {
+    std::cerr << "Laguna GPU load failed: " << err << '\n';
+    PrintModelLoadTime(load_start, false);
+    return 1;
+  }
+  PrintModelLoadTime(load_start, true);
+
+  const auto reasoning = PromptReasoningOptions(opt);
+  models::laguna::ChatTemplateOptions chat_options;
+  chat_options.enable_thinking = reasoning.enabled.value_or(false);
+  const std::string rendered =
+      opt.use_chat_template
+          ? models::laguna::RenderPrompt(opt.system_prompt, opt.prompt_text,
+                                         chat_options)
+          : opt.prompt_text;
+  tokenization::TokenizerOptions encode_options;
+  encode_options.parse_special_tokens = true;
+  const auto prompt = tokenizer->Encode(rendered, encode_options);
+  if (prompt.empty()) {
+    std::cerr << "Laguna prompt produced no tokens\n";
+    return 1;
+  }
+
+  const auto session = model->CreateSession(
+      static_cast<std::uint32_t>(prompt.size() + opt.max_tokens + 1 +
+                                 models::laguna::gpu::Session::kMaxVerifyRows),
+      &err);
+  if (!session) {
+    std::cerr << "Laguna GPU session creation failed: " << err << '\n';
+    return 1;
+  }
+  const auto stop_tokens = FlintStopTokens(reader);
+  const auto is_stop = [&](tokenization::TokenId token) {
+    return std::find(stop_tokens.begin(), stop_tokens.end(), token) !=
+           stop_tokens.end();
+  };
+  sampling::SamplerState sampler(opt.sampling, prompt);
+  std::vector<std::int32_t> input(prompt.begin(), prompt.end());
+  const auto start = std::chrono::steady_clock::now();
+  if (!session->Append(input, &err)) {
+    std::cerr << "Laguna GPU prefill failed: " << err << '\n';
+    return 1;
+  }
+  const auto prefill_end = std::chrono::steady_clock::now();
+
+  std::size_t generated = 0;
+  std::size_t drafted = 0;
+  std::size_t accepted_drafts = 0;
+  const bool use_dflash = model->HasDflash() && !opt.speculative_off;
+  const std::uint32_t max_draft =
+      dflash ? std::min<std::uint32_t>(opt.draft_tokens,
+                                       model->DrafterBlockSize() - 1)
+             : 0;
+  const auto emit = [&](tokenization::TokenId token) {
+    std::cout << tokenizer->DecodeToken(token) << std::flush;
+  };
+  auto token = sampler.Sample(session->Logits());
+  bool stopped = false;
+  while (!stopped && generated < opt.max_tokens) {
+    if (is_stop(token))
+      break;
+    sampler.Accept(token);
+    emit(token);
+    ++generated;
+    if (generated >= opt.max_tokens)
+      break;
+
+    static const bool kTimingDebug =
+        std::getenv("LAGUNA_TIMING_DEBUG") != nullptr;
+    static double t_forward_block = 0.0, t_append_all = 0.0,
+                  t_accept_reject = 0.0, t_rewind_inject = 0.0;
+    static std::uint32_t t_steps = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+
+    std::vector<std::int32_t> feed{static_cast<std::int32_t>(token)};
+    if (use_dflash && session->DflashExecutor()->GetInjectedContextLength() ==
+                          session->Position()) {
+      const auto drafts = session->DflashExecutor()->ForwardBlock(
+          token, session->Position(), max_draft,
+          opt.sampling.uses_random_sampling() ? opt.sampling.temperature
+                                              : 0.0F);
+      feed.insert(feed.end(), drafts.begin(), drafts.end());
+      if (std::getenv("LAGUNA_DFLASH_DEBUG") != nullptr) {
+        std::fprintf(stderr,
+                     "[LAGUNA_VERIFY_DEBUG] position=%u anchor=%d feed=[",
+                     session->Position(), static_cast<int>(token));
+        for (const auto t : feed)
+          std::fprintf(stderr, "%d,", t);
+        std::fprintf(stderr, "]\n");
+      }
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    if (feed.size() == 1) {
+      if (!session->Append(feed, &err)) {
+        std::cerr << "\nLaguna GPU decode failed: " << err << '\n';
+        return 1;
+      }
+      token = sampler.Sample(session->Logits());
+      continue;
+    }
+    drafted += feed.size() - 1;
+    const std::uint32_t base = session->Position();
+    if (!session->AppendAll(feed, &err)) {
+      std::cerr << "\nLaguna GPU verify failed: " << err << '\n';
+      return 1;
+    }
+    const auto t2 = std::chrono::steady_clock::now();
+    // Row i holds the distribution after feed[i]; draft feed[i + 1] is tested
+    // against it, and only the accepted rows are committed to the drafter.
+    std::uint32_t kept = 0;
+    for (std::uint32_t row = 0;; ++row) {
+      const auto logits = session->Logits(row);
+      if (row + 1 >= feed.size()) {
+        token = sampler.Sample(logits);
+        break;
+      }
+      const auto guess = static_cast<tokenization::TokenId>(feed[row + 1]);
+      tokenization::TokenId next;
+      bool hit;
+      if (opt.sampling.uses_random_sampling()) {
+        const double p = sampler.Distribution(logits).probability(guess);
+        hit = sampler.Uniform() < p;
+        if (!hit) {
+          const float one = 1.0F;
+          next = sampler.SampleResidual(logits, {&guess, 1}, {&one, 1});
+        }
+      } else {
+        next = sampler.Sample(logits);
+        hit = next == guess;
+      }
+      if (std::getenv("LAGUNA_DFLASH_DEBUG") != nullptr) {
+        std::fprintf(stderr,
+                     "[LAGUNA_VERIFY_DEBUG] row=%u base=%u guess=%d next=%d "
+                     "hit=%d\n",
+                     row, base, static_cast<int>(guess),
+                     static_cast<int>(hit ? guess : next), hit ? 1 : 0);
+      }
+      if (!hit) {
+        token = next;
+        break;
+      }
+      emit(guess);
+      ++kept;
+      ++accepted_drafts;
+      if (is_stop(guess)) {
+        stopped = true;
+        break;
+      }
+    }
+    generated += kept;
+    const auto t3 = std::chrono::steady_clock::now();
+    // AppendAll advanced the KV cache and position by the whole verified
+    // batch (anchor + every drafted token); only the accepted prefix
+    // (anchor + kept drafts) should stick - discard the rest the same way
+    // Flint's speculative loop does, or full-attention layers permanently
+    // keep rejected drafts' key/value state at positions nothing will ever
+    // overwrite.
+    session->Rewind(base + 1 + kept);
+    if (!session->DflashInject(kept + 1, &err)) {
+      std::cerr << "\nLaguna drafter commit failed: " << err << '\n';
+      return 1;
+    }
+    if (kTimingDebug) {
+      const auto t4 = std::chrono::steady_clock::now();
+      const auto us = [](auto a, auto b) {
+        return std::chrono::duration<double, std::micro>(b - a).count();
+      };
+      t_forward_block += us(t0, t1);
+      t_append_all += us(t1, t2);
+      t_accept_reject += us(t2, t3);
+      t_rewind_inject += us(t3, t4);
+      if (++t_steps % 20 == 0) {
+        std::fprintf(stderr,
+                     "[LAGUNA_TIMING_DEBUG] steps=%u forward_block=%.1fms "
+                     "append_all=%.1fms accept_reject=%.1fms "
+                     "rewind_inject=%.1fms\n",
+                     t_steps, t_forward_block / 1000.0, t_append_all / 1000.0,
+                     t_accept_reject / 1000.0, t_rewind_inject / 1000.0);
+      }
+    }
+  }
+  std::cout << '\n';
+  if (opt.verbose) {
+    const auto seconds = [](auto a, auto b) {
+      return std::chrono::duration<double>(b - a).count();
+    };
+    const auto end = std::chrono::steady_clock::now();
+    std::cerr << "[Laguna GPU] prompt=" << prompt.size() << " tok in "
+              << seconds(start, prefill_end) << " s ("
+              << prompt.size() / seconds(start, prefill_end)
+              << " tok/s), generated=" << generated << " tok in "
+              << seconds(prefill_end, end) << " s ("
+              << generated / std::max(seconds(prefill_end, end), 1e-9)
+              << " tok/s)";
+    if (drafted != 0)
+      std::cerr << ", drafted=" << drafted << " accepted=" << accepted_drafts
+                << '/' << drafted;
+    std::cerr << '\n';
+  }
+  return 0;
+}
+
+#endif  // ENGINE_ENABLE_HIP
 
 #ifdef ENGINE_ENABLE_HIP
 
@@ -1608,6 +1927,18 @@ int RunPrompt(std::span<const char* const> args) {
   }
 #endif
 
+  if (IsLaguna(*reader)) {
+    if (!opt.image_paths.empty() || !opt.vision_model_path.empty()) {
+      std::cerr << "Laguna does not support image input\n";
+      return 2;
+    }
+#ifdef ENGINE_ENABLE_HIP
+    if (!opt.force_cpu) {
+      return RunLagunaPromptGPU(opt, *reader, model_load_start);
+    }
+#endif
+    return RunLagunaPromptCPU(opt, *reader, model_load_start);
+  }
   if (IsFlint(*reader)) {
     if (!opt.image_paths.empty() || !opt.vision_model_path.empty()) {
       std::cerr << "Flint does not support image input\n";

@@ -43,6 +43,26 @@ from dataclasses import dataclass, field
 
 # Kernel-name substring -> pipeline stage. First match wins, so order matters.
 STAGE_MAPS: dict[str, list[tuple[str, str]]] = {
+    "laguna": [
+        ("AttentionKernel", "attention"),
+        ("StoreKvKernel", "attention"),
+        ("RopeTableKernel", "norm/rope"),
+        ("group_moe", "experts: dispatch"),
+        ("mul_mat_vec_moe", "experts"),
+        ("mul_mat_q8_decode_batch", "projections: q8 decode"),
+        ("mul_mat_q", "projections: gemm"),
+        ("mul_mat", "projections: vec"),
+        ("quantize", "quantize"),
+        ("Q8RowsKernel", "quantize"),
+        ("Swiglu", "activation"),
+        ("MoeCombineKernel", "moe combine"),
+        ("RouterF32Kernel", "router"),
+        ("SigmoidBiasTopKKernel", "router"),
+        ("RmsNormKernel", "normalization"),
+        ("EmbedQ8Kernel", "embedding"),
+        ("AddKernel", "residual"),
+        ("NarrowRowsKernel", "other"),
+    ],
     "h3": [
         ("WmmaAttention", "attention"),
         ("ShortAttention", "attention"),

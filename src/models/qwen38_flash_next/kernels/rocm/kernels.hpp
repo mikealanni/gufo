@@ -448,6 +448,18 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
                    const float* swiglu_gate, float* out, __half* out_half,
                    std::size_t m, std::size_t k, hipStream_t stream);
 
+/// Experimental 128-row-per-tile variant of RoutedF16Gemm for Q8_0 only,
+/// bypassing the tile_rows<=64 limit RoutedF16Gemm enforces for that type.
+/// Laguna-only for now; promote into RoutedF16Gemm's dispatch if it proves
+/// out, since other Q8_0 MoE models (Flash-Next) may benefit too.
+bool RoutedF16GemmQ8Wide(const void* w, const __half* x,
+                         const std::int32_t* tiles, std::uint32_t n_tiles,
+                         const std::int32_t* pad_bounds,
+                         const std::int32_t* rows_in,
+                         const std::int32_t* rows_out, const float* swiglu_gate,
+                         float* out, __half* out_half, std::size_t m,
+                         std::size_t k, hipStream_t stream);
+
 /// Paired Q4_K/Q5_K gate/up GEMM with SwiGLU and F16 output. Uses the same
 /// routing layout as RoutedF16Gemm, with 64 or 128 token rows per tile. The two
 /// projections share one launch and never materialize the gate output.

@@ -7118,6 +7118,35 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
   }
 }
 
+// Additive experiment: RoutedF16GEMMKernel<kQ8_0, 128, 128, 2> directly,
+// bypassing LaunchRoutedF16's `if constexpr (BN > 64) return false` guard
+// for Q8_0. That guard reflects a limit measured on Flash-Next's shapes;
+// Laguna's token/expert mix differs (~80 tokens/expert at typical prefill
+// widths), so it is worth testing here without touching the existing
+// dispatch or its callers. Report back to LEARNINGS.md either way: if this
+// helps Laguna, Flash-Next may also benefit from a wider Q8_0 tile.
+bool RoutedF16GemmQ8Wide(const void* w, const __half* x,
+                         const std::int32_t* tiles, std::uint32_t n_tiles,
+                         const std::int32_t* pad_bounds,
+                         const std::int32_t* rows_in,
+                         const std::int32_t* rows_out, const float* swiglu_gate,
+                         float* out, __half* out_half, std::size_t m,
+                         std::size_t k, hipStream_t stream) {
+  constexpr int kBM = 128;
+  constexpr int kBN = 128;
+  constexpr int kBK = 2;
+  if (m == 0 || k == 0 || k % 64 != 0 || n_tiles == 0 ||
+      (out_half == nullptr) == (out == nullptr)) {
+    return false;
+  }
+  const dim3 grid(static_cast<unsigned int>((m + kBM - 1) / kBM), n_tiles);
+  hipLaunchKernelGGL((RoutedF16GEMMKernel<WeightType::kQ8_0, kBM, kBN, kBK>),
+                     grid, dim3(kThreads), 0, stream, w, x, tiles, pad_bounds,
+                     rows_in, rows_out, swiglu_gate, out, out_half, m, k,
+                     nullptr);
+  return true;
+}
+
 template<int BN>
 bool LaunchRoutedGatedF16(const void* gate, const void* up, WeightType type,
                           const __half* x, const std::int32_t* tiles,

@@ -72,6 +72,7 @@ endif()
 
 # Flint — model-private CPU reference (GPU/NPU follows after correctness).
 add_subdirectory(src/models/flint)
+add_subdirectory(src/models/laguna)
 
 # Qwen3.8-Flash-Next — model-private CPU reference plus ROCm runtime.
 add_subdirectory(src/models/qwen38_flash_next)
@@ -219,7 +220,7 @@ endif()
 add_library(gufo_llm_cli STATIC
   src/cli/bench/bench.cpp
   src/cli/prompt/prompt.cpp)
-target_link_libraries(gufo_llm_cli PUBLIC gufo_core gufo_flint gufo_glm53_flash)
+target_link_libraries(gufo_llm_cli PUBLIC gufo_core gufo_flint gufo_laguna gufo_glm53_flash)
 if(ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_llm_cli PUBLIC gufo_deepseek_v4_flash
     gufo_qwen38_flash_next gufo_glm53_flash_engine)

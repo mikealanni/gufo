@@ -231,15 +231,17 @@ void PackDFlashWeights(speculative::QwenDFlashWeights& weights,
       CopyVectorF32(weights.output_norm, hidden, allocations, packed_bytes);
 
   // Candidate selector.
-  weights.selector_predecessor =
-      PackMatrixBf16(weights.selector_predecessor, cfg.vocab_size,
-                     df_cfg.selector_rank, allocations, packed_bytes);
-  weights.selector_successor =
-      PackMatrixBf16(weights.selector_successor, cfg.vocab_size,
-                     df_cfg.selector_rank, allocations, packed_bytes);
-  weights.selector_hidden =
-      PackBlockMatrix(weights.selector_hidden, df_cfg.selector_rank, hidden,
-                      allocations, packed_bytes);
+  if (!df_cfg.is_v1) {
+    weights.selector_predecessor =
+        PackMatrixBf16(weights.selector_predecessor, cfg.vocab_size,
+                       df_cfg.selector_rank, allocations, packed_bytes);
+    weights.selector_successor =
+        PackMatrixBf16(weights.selector_successor, cfg.vocab_size,
+                       df_cfg.selector_rank, allocations, packed_bytes);
+    weights.selector_hidden =
+        PackBlockMatrix(weights.selector_hidden, df_cfg.selector_rank, hidden,
+                        allocations, packed_bytes);
+  }
 
   // Draft Transformer Layers
   for (std::size_t i = 0; i < weights.layers.size(); ++i) {
@@ -271,20 +273,22 @@ void PackDFlashWeights(speculative::QwenDFlashWeights& weights,
     transformer.ffn_down = PackBlockMatrix(
         transformer.ffn_down, hidden, intermediate, allocations, packed_bytes);
 
-    const std::size_t groups = hidden / df_cfg.conv_group_size;
-    const std::size_t dynamic_size = 2U * df_cfg.conv_kernel_size * groups;
-    layer.attention_conv_base = CopyVectorF32(
-        layer.attention_conv_base, hidden * df_cfg.conv_kernel_size * 2U,
-        allocations, packed_bytes);
-    layer.ffn_conv_base = CopyVectorF32(layer.ffn_conv_base,
-                                        hidden * df_cfg.conv_kernel_size * 2U,
-                                        allocations, packed_bytes);
-    layer.attention_conv_projection =
-        PackBlockMatrix(layer.attention_conv_projection, dynamic_size, hidden,
-                        allocations, packed_bytes);
-    layer.ffn_conv_projection =
-        PackBlockMatrix(layer.ffn_conv_projection, dynamic_size, hidden,
-                        allocations, packed_bytes);
+    if (!df_cfg.is_v1) {
+      const std::size_t groups = hidden / df_cfg.conv_group_size;
+      const std::size_t dynamic_size = 2U * df_cfg.conv_kernel_size * groups;
+      layer.attention_conv_base = CopyVectorF32(
+          layer.attention_conv_base, hidden * df_cfg.conv_kernel_size * 2U,
+          allocations, packed_bytes);
+      layer.ffn_conv_base = CopyVectorF32(layer.ffn_conv_base,
+                                          hidden * df_cfg.conv_kernel_size * 2U,
+                                          allocations, packed_bytes);
+      layer.attention_conv_projection =
+          PackBlockMatrix(layer.attention_conv_projection, dynamic_size, hidden,
+                          allocations, packed_bytes);
+      layer.ffn_conv_projection =
+          PackBlockMatrix(layer.ffn_conv_projection, dynamic_size, hidden,
+                          allocations, packed_bytes);
+    }
   }
 }
 
@@ -363,12 +367,15 @@ std::shared_ptr<const QwenDFlashGpuModel> QwenDFlashGpuModel::CreateImpl(
     return nullptr;
   }
 
+  if (raw_weights->dflash_config.is_v1) {
+    raw_weights->config.vocab_size = target_vocab_size;
+  }
   const auto& draft_config = raw_weights->config;
   if (target_hidden_size != draft_config.hidden_size ||
       target_vocab_size != draft_config.vocab_size) {
     if (error_msg != nullptr) {
       *error_msg =
-          "DFlash-2 target hidden/vocabulary dimensions do not match the "
+          "DFlash target hidden/vocabulary dimensions do not match the "
           "draft";
     }
     return nullptr;

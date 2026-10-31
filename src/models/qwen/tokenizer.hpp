@@ -98,6 +98,7 @@ private:
     kNone,
     kQwen35,
     kGlm4,
+    kLaguna,
   };
 
   struct PairHash {
@@ -123,6 +124,10 @@ private:
   /// GLM-4/GLM-5 split regex plus whole-piece vocabulary lookup
   /// (`tokenizer.ggml.ignore_merges`) before BPE.
   std::vector<TokenId> Glm4EncodeText(std::string_view text) const;
+  std::vector<TokenId> LagunaEncodeText(std::string_view text) const;
+  std::vector<TokenId> RegexEncodeText(std::string_view text,
+                                       const char* pattern,
+                                       bool ignore_merges) const;
 
   std::vector<std::string> id_to_token_;
   std::vector<std::string> id_to_decoded_token_;

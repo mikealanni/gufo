@@ -386,6 +386,17 @@ std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromGguf(
     }
   }
 
+  if (const auto pre = reader.GetMetadataString("tokenizer.ggml.pre");
+      pre && *pre == "laguna") {
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+      const auto& t = tokens[i];
+      if (t == "<assistant>" || t == "</assistant>" ||
+          t == "\u3008|EOS|\u3009") {
+        special_tokens[t] = static_cast<TokenId>(i);
+      }
+    }
+  }
+
   auto tokenizer =
       CreateFromVocabulary(tokens, merges, special_tokens, error_msg);
   if (tokenizer == nullptr) {
@@ -396,6 +407,8 @@ std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromGguf(
       tokenizer->pre_tokenizer_ = PreTokenizer::kQwen35;
     } else if (*pre == "glm4" || *pre == "glm5") {
       tokenizer->pre_tokenizer_ = PreTokenizer::kGlm4;
+    } else if (*pre == "laguna") {
+      tokenizer->pre_tokenizer_ = PreTokenizer::kLaguna;
     }
   }
 
@@ -649,8 +662,36 @@ std::vector<TokenId> QwenTokenizer::Glm4EncodeText(
   // llama.cpp `LLAMA_VOCAB_PRE_TYPE_CHATGLM4`.
   static constexpr char kPattern[] =
       R"((?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
+  return RegexEncodeText(text, kPattern, true);
+}
+
+std::vector<TokenId> QwenTokenizer::LagunaEncodeText(
+    std::string_view text) const {
+  // llama.cpp `LLAMA_VOCAB_PRE_TYPE_LAGUNA`: split on newline runs, then the
+  // main pattern inside each piece.
+  static constexpr char kPattern[] =
+      R"((?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
+  std::vector<TokenId> tokens;
+  std::size_t offset = 0;
+  while (offset < text.size()) {
+    const bool newline = text[offset] == '\n';
+    std::size_t end = offset;
+    while (end < text.size() && (text[end] == '\n') == newline) {
+      ++end;
+    }
+    const auto part =
+        RegexEncodeText(text.substr(offset, end - offset), kPattern, false);
+    tokens.insert(tokens.end(), part.begin(), part.end());
+    offset = end;
+  }
+  return tokens;
+}
+
+std::vector<TokenId> QwenTokenizer::RegexEncodeText(std::string_view text,
+                                                    const char* pattern,
+                                                    bool ignore_merges) const {
   UErrorCode status = U_ZERO_ERROR;
-  icu::RegexMatcher matcher(icu::UnicodeString::fromUTF8(kPattern), 0, status);
+  icu::RegexMatcher matcher(icu::UnicodeString::fromUTF8(pattern), 0, status);
   if (U_FAILURE(status)) {
     throw std::runtime_error("could not compile the GLM pre-tokenizer regex");
   }
@@ -674,7 +715,8 @@ std::vector<TokenId> QwenTokenizer::Glm4EncodeText(
     }
     // `ignore_merges`: a split piece that is itself a vocabulary token is
     // encoded as that single token without running merge ranks over it.
-    if (const auto whole = token_to_id_.find(escaped);
+    if (const auto whole =
+            ignore_merges ? token_to_id_.find(escaped) : token_to_id_.end();
         whole != token_to_id_.end()) {
       tokens.push_back(whole->second);
       return;
@@ -715,6 +757,9 @@ std::vector<TokenId> QwenTokenizer::Glm4EncodeText(
 std::vector<TokenId> QwenTokenizer::BpeEncodeText(std::string_view text) const {
   if (pre_tokenizer_ == PreTokenizer::kGlm4) {
     return Glm4EncodeText(text);
+  }
+  if (pre_tokenizer_ == PreTokenizer::kLaguna) {
+    return LagunaEncodeText(text);
   }
   if (pre_tokenizer_ != PreTokenizer::kQwen35) {
     return BpeMergeChunk(text);
