@@ -22,14 +22,32 @@ binary named `gufo*`.
 
 ## Speed (GPU, interleaved runs, one machine)
 
-| | Prefill | Decode |
+| Prefill, tok/s | GPU only | GPU + NPU |
 | --- | --- | --- |
-| 2,048-token prompt | 1,275 tok/s (1,277 with NPU) | 26.0 (plain), 36.2 (DFlash `-d 3`) |
-| 4,096 tokens | 1,249 (1,272 with NPU) | |
-| 8,192 tokens | 1,198 (1,224 with NPU) | |
-| 13,305 tokens | | 24.0 (plain, split-K attention) |
-| 47,280 tokens | | 20.3 (plain, split-K attention) |
-| 133,284 tokens | | 14.8 (plain, split-K attention) |
+| `-p 2048` | 1,145 | **1,277** (+11.5%) |
+| `-p 4096` | 1,241 | **1,253** (+1.0%) |
+| `-p 8192` | 1,193 | **1,204** (+0.9%) |
+
+| Decode, tok/s | plain | DFlash v1 |
+| --- | --- | --- |
+| code | 25.9 | **44.5** (211/267 drafts accepted, 79%) |
+| prose | 25.9 | 27.9 (153/441 accepted, 35%) |
+| JSON | 25.9 | **45.4** (90/111 accepted, 81%) |
+
+| Decode at depth, tok/s | plain (split-K attention) |
+| --- | --- |
+| 13,305 tokens | 24.0 |
+| 47,280 tokens | 20.3 |
+| 133,284 tokens | 14.8 |
+
+DFlash v1's gain is sharply content-dependent, same pattern every other
+model in this project shows: 79% of drafts accepted on code (44.5 tok/s),
+35% on prose (27.9 tok/s), and a short/trivial prompt can land BELOW plain
+decode (25% accepted, 24.0 tok/s on a "why is the sky blue" filler prompt)
+- measure on real target text, not a filler prompt, before trusting a
+single decode number. Measured via `gufo prompt`
+(`--speculative dflash2 --dflash-model ... -d 3`); `gufo serve` doesn't
+support `--speculative` for Laguna yet (see Status).
 
 NPU gain is +0.2% to +2.4% depending on depth - shared-expert gate/up is a
 small fraction of total per-layer FLOPs for this model's shape (72 query
@@ -114,7 +132,8 @@ reuse yet (the engine's `Session` has no save/restore) and rejects
 Block-sparse attention built and verified (needle-in-haystack at three
 depths, two-bank+NPU interaction, decode graph-capture boundary) but off
 by default (`LAGUNA_SPARSE_ATTN=1` opts in; see Block-sparse attention
-above). Not done: a CPU-reference regression
+above). Fast HumanEval check (`--limit 20`) with sparse attention on:
+20/20, pass@1 = 1.0. Not done: a CPU-reference regression
 script, model tests under `tests/`, and the standard cross-model
 regression run for the shared `dflash_weights.cpp`/`qfn_mmq.hip.cpp` edits
 (done manually this session against Flash-Next/27B/35B/GLM, not yet

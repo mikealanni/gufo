@@ -11,6 +11,7 @@ speculative decoding on top, for Qwen, Flint and GLM-5.3 Flash models. Fork of [
 | Qwen3.8 Flash-Next | UD-IQ4_XS | whole projections, two-bank lock-step | DFlash2 (default), MTP |
 | Flint | UD-Q4_K_XL | shared expert and QKV, two-bank pipeline | prompt lookup (no draft model) |
 | GLM-5.3 Flash | AJ-IQ2_XXS | KDA q/k/v and shared expert, two-bank lock-step | DFlash2 with prompt-lookup drafts |
+| Laguna S 2.1 | UD-Q4_K_M | shared expert, two-bank pipeline | DFlash v1 (block-diffusion) |
 
 ## Speed
 
@@ -125,6 +126,37 @@ Greedy chat requests to `gufo serve`, 256 tokens. `gufo bench -n 128` plain deco
 shared-expert projections, so plain decode is bandwidth-bound; drafting helps when
 the next tokens are predictable. Serving uses a 131,072-token context and one
 session at a time. Start it with `GUFO_KIND=glm scripts/run-gufo.sh`.
+
+### Laguna S 2.1
+
+A 118B-ish mixture-of-experts model (48 layers, 256 experts with 10 routed
+plus a shared expert, sliding-window attention on 3 of every 4 layers) in
+the 68 GiB UD-Q4_K_M quantization.
+
+| Prefill, tok/s | GPU only | GPU + NPU |
+| --- | --- | --- |
+| `-p 2048` | 1,145 | **1,277** (+11.5%) |
+| `-p 4096` | 1,241 | **1,253** (+1.0%) |
+| `-p 8192` | 1,193 | **1,204** (+0.9%) |
+
+| Decode, tok/s | plain | DFlash v1 |
+| --- | --- | --- |
+| code | 25.9 | **44.5** (79% accepted) |
+| prose | 25.9 | 27.9 (35% accepted) |
+| JSON | 25.9 | **45.4** (81% accepted) |
+
+`gufo bench -n 128` plain decode: 25.9 tok/s. DFlash v1's gain is sharply
+content-dependent - a short/trivial prompt can land below plain decode
+(25% accepted, 24.0 tok/s on a filler prompt); measure on real target
+text, not a filler prompt. Measured via `gufo prompt`
+(`--speculative dflash2 --dflash-model ...`); `gufo serve` doesn't support
+`--speculative` for Laguna yet. Block-sparse attention
+(`LAGUNA_SPARSE_ATTN=1`) gives a depth-growing prefill win -
++6.6%/+16.5%/+37.9% at 41k/61k/100k tokens, needle-in-haystack-verified
+correct at every depth tested. Fast HumanEval check (20/20, pass@1 = 1.0)
+with sparse attention on. Details, every bug found turning sparse
+attention on, and the full numbers are in
+[docs/models/laguna](docs/models/laguna/README.md).
 
 ## Quality
 
