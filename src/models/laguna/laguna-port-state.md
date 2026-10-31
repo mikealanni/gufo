@@ -1963,3 +1963,132 @@ itself).
 Smoke-tested end to end: `gufo serve llm -m <laguna.gguf> -c 16384` loads,
 warms up, and answers a real `/v1/chat/completions` request correctly
 (chat-templated prompt, coherent "OK." completion, correct stop handling).
+
+## Block-sparse attention (2026-10-31)
+
+Laguna had no block-sparse attention (unlike Flint/27B/35B's
+`GUFO_SPARSE`/`GUFO_QWEN_SPARSE_ATTN`) - the user asked directly why, and
+once it was clear the mechanism gives a real, depth-growing speed gain on
+decode AND prefill elsewhere (27B/35B: 893->2,112 pp4096, 24.4->43.2 tg at
+128k), asked for it to be built for Laguna too.
+
+**The groundwork already existed, dormant.** `AttentionWmmaKernelLaguna`
+in `kernels.hip.cpp` already contained a full Quest-bound block-selection
+implementation (sink blocks + local window + top-K-scored older blocks,
+carried over from Flint's port) behind two literal `if (false)` guards -
+never wired to real pooled-key data, never turned on. Scoped to the 12
+full-attention (`il%4==0`, 48 query heads / 8 KV heads = GQA 6 - the
+advisor corrected an initial head-count mistake here; it's the SWA layers
+that are 72/8=GQA 9) layers only; the 36 SWA layers already cap their own
+cost via `sliding_window=512` and never touch this.
+
+Built: `UpdatePooledKeysLaguna` (per-64-key-block channel min/max pooling,
+one new kernel), wired the dormant selection code live via `kmm`/`nblk`/
+`top_blocks` parameters threaded through `AttentionWmma`, gated behind
+`LAGUNA_SPARSE_ATTN=1` (off by default), `LAGUNA_SPARSE_TOPK` to override
+the default 256-block budget.
+
+**Three real bugs found in the "dormant" code once it was turned on** (all
+via `advisor`, not guesswork - the first NIAH run *looked* like evidence
+the whole mechanism was just poorly tuned, which was the wrong read):
+1. The exact/"take all" branch (candidates <= top_blocks) wrote block
+   indices into `blist` (a 512-entry `__shared__` array) WITHOUT checking
+   it fit - fine at the depths manual testing happened to hit, a real
+   overflow (corrupting `blist`/`scan_tmp`, both `__shared__`) the moment
+   `LAGUNA_SPARSE_TOPK` was raised past ~476 to chase better recall. Fixed
+   by capping top_blocks to what `blist` can hold, AND by never touching
+   `blist` at all in the take-all case - it now falls through to the
+   ordinary dense contiguous `tile_key()`, which is exact by construction
+   and can't overflow regardless of depth.
+2. The actual scoring loop (`for (t = wave; t*16 < cand_count; t +=
+   kWmmaWaves)`) stranded each candidate tile's Quest score on ONE wave's
+   own query (2 tokens x 6 heads), not a value comparable across the
+   whole tile - different waves scored disjoint candidate subsets using
+   different, unrelated queries. For decode (n=1, only wave 0's token
+   live) this left 7 of 8 waves scoring their candidates from an
+   all-zero query, an almost coin-flip eviction of whatever block the
+   needle happened to live in. Fixed: every wave now scores every
+   candidate tile (`for (t = 0; ...; ++t)`), ~8x more work, atomicMax
+   combining each block's real max score over every live column.
+3. Lanes past `kHeadsPerKv * kTokensPerWave` (zero-padded, not a real
+   (token, head) pair) weren't excluded from the atomicMax write, flooring
+   those blocks' scores at +0.0 and producing mass ties that could push a
+   real candidate out.
+After all three: the 54k/93k-token needle-in-a-haystack failures that
+first surfaced this (dense retrieved the passphrase, sparse at the
+default top_blocks=256 returned plausible-looking garbage) were
+re-verified passing with the SAME default settings, not a raised
+top_blocks - confirming these were real logic bugs, not an inherent
+precision limit requiring a bigger budget.
+
+**A fourth, separate bug: pooled-key updates were being captured into
+Laguna's decode HIP graph.** `Session::Impl::Forward`'s decode path
+captures the whole per-step kernel sequence once (past `kSplitAttnMinDepth`
+tokens) and replays it via `hipGraphLaunch` for every later step at that
+width. `UpdatePooledKeysLaguna`'s grid size and `from_pos`/`end_pos` were
+plain `std::uint32_t` kernel-launch arguments, not something read from a
+device pointer at replay time - so once captured, every replay would
+re-pool only the ONE block range that existed at capture time, forever.
+New block boundaries crossed by later decode steps would read whatever
+garbage `hipMalloc` happened to leave in that never-pooled memory.
+Invisible on any short generation (the capture itself only happens past
+`kSplitAttnMinDepth`=2048 tokens of DEPTH, and the bug only bites once
+decode has produced enough NEW tokens to push a once-local block out of
+the 2048-token local window - two different, easy-to-conflate thresholds,
+which is exactly why two earlier verification attempts in this session
+gave false negatives: a 2600-token generation from a short prompt never
+left the "exact, no pooling needed at all" depth regime, and a second
+attempt at depth hit a natural EOS at under 2048 generated tokens before
+the bug's window even opened). Fixed by moving ALL pooled-key maintenance
+out of the capturable `Attention()` and into two call sites that are
+never part of a captured graph: `Forward()`'s pre-pass (runs live, every
+call, before the capture/replay/non-graphed dispatch decision) and
+`EnqueueBanked`'s own per-bank call right after `Attention()` returns
+(EnqueueBanked never uses graph capture at all). `AttentionWmmaKernelLaguna`
+itself still just reads `kmm` through a pointer, which replays correctly
+regardless, since only the pointer's TARGET content needed to stay live,
+not the launch arguments of the kernel that updates it.
+
+**Verification** (all via `gufo prompt`, one load at a time - this binary
+can't hold two 68GB models' worth of GTT-pinned RAM at once):
+- Exact match, dense vs sparse, at 54 tokens and 4,862 tokens (both well
+  under the sink+local+top_blocks exact-selection boundary, ~18.5k tokens
+  at the default settings) - byte-for-byte identical output and timing
+  within noise.
+- Needle-in-a-haystack (a unique passphrase buried mid-document, asked
+  for at the end) at three real depths, default `top_blocks=256`:
+
+  | Depth | Dense | Sparse | Gain |
+  | --- | --- | --- | --- |
+  | 41,327 tok | 937.6 tok/s, correct | 999.5 tok/s, correct | +6.6% |
+  | 61,108 tok | 835.3 tok/s, correct | 973.2 tok/s, correct | +16.5% |
+  | 100,616 tok | 694.6 tok/s, correct | 958.0 tok/s, correct | +37.9% |
+
+  Gain grows with depth, as expected - the candidate pool sparse has to
+  prune grows roughly linearly with position, so the relative saving
+  grows with it.
+- Two-bank + NPU + sparse together (`GUFO_NPU_DIR` set, `fclk` held,
+  default banking on): needle still retrieved correctly at 61,108 tokens,
+  995.7 tok/s - no corruption from combining all three, consistent with
+  the single-shared-`valid_end`-per-layer reasoning (EnqueueBanked runs
+  bank 0's whole `Attention()` before bank 1's on the same stream, so
+  there's no cross-bank race the way `MoeRoute`/`MoeFinish` had).
+- Graph-capture fix, empirically (not just by code reading): a "count 1
+  to 3000 in English words" generation at 32,476-token depth, 2,600
+  tokens generated (crossing well past the 2,048-token capture boundary),
+  dense vs sparse - byte-for-byte identical output throughout, including
+  the exact same mid-word truncation at the `-n` limit. No corruption,
+  repetition collapse, or numeric derailment anywhere past the graph
+  boundary. (Two earlier attempts at this specific check were false
+  negatives for the reasons explained above - worth remembering for any
+  future graph-capture-adjacent fix: confirm the bug's ACTUAL trigger
+  window empirically before trusting a clean-looking generation as
+  verification.)
+
+Not yet done: a true long free-form generation (not short-answer NIAH, not
+a mechanical counting task) at depth, verifying prose quality doesn't
+degrade past the exact-selection boundary beyond the expected
+accepted-divergence class; a documented `GUFO_SPARSE`-style min-context
+knob (currently always-on past whatever depth the sink+local+top_blocks
+math naturally reaches); automated regression coverage (everything above
+was manual `gufo prompt` runs, not a script).

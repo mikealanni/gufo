@@ -848,28 +848,70 @@ __global__ __launch_bounds__(kWmmaThreads) void AttentionWmmaKernelLaguna(
   // best-scoring older blocks and the local window, each 64 keys.
   std::uint32_t n_tiles = (pos_max - first_key) / kWmmaKeys + 1;
   std::uint32_t list_count = 0;
-  if (false) {
+  // blist holds 2 sink + up to top_blocks selected + up to kSparseLocal+1
+  // local entries; cap top_blocks so that sum can never exceed kSparseList,
+  // regardless of what LAGUNA_SPARSE_TOPK was set to on the host.
+  const std::uint32_t capped_top_blocks =
+      min(top_blocks, kSparseList - kSparseSink - (kSparseLocal + 1));
+  const bool sparse = kmm != nullptr && window == 0;
+  // Set only once selection actually prunes something (the cand_count <=
+  // top_blocks case below is dense attention in every way that matters -
+  // it must NOT go through blist, which was never sized for the full
+  // candidate range and silently corrupted scan_tmp/the K/V tile smem
+  // whenever it was asked to).
+  bool use_list = false;
+  if (sparse) {
     const std::uint32_t local_last = pos_max / kSparseBlock;
     const std::uint32_t pmin_block = pos_min / kSparseBlock;
     const std::uint32_t local_first =
         pmin_block >= kSparseLocal ? pmin_block - kSparseLocal : 0;
-    const std::uint32_t cand_first = kSparseSink;
+    // `scores` below reuses the K/V tile's shared memory (nothing else
+    // needs it until the tile-loading loop starts, after selection is
+    // done) as scratch for one std::uint32_t per candidate block. Below
+    // kSparseMaxCandidates candidates (about 305k tokens of context with
+    // the current kSparseSink/kSparseLocal/kKBytes+kVBytes sizes) every
+    // candidate fits; past that, writing scores[b] for b beyond the
+    // buffer's capacity would silently corrupt `blist`/`scan_tmp` (also
+    // __shared__, laid out right after `smem`), not just degrade the
+    // approximation - so cand_first is pulled forward to keep only the
+    // most recent kSparseMaxCandidates candidates instead, which can
+    // never overflow regardless of context length. Past that depth, the
+    // dropped oldest candidates (between the sink and the new cand_first)
+    // are simply not attended at all - a wider approximation gap than
+    // normal, but safe, and still far beyond the ~256k context this
+    // model has actually been run at.
+    constexpr std::uint32_t kSparseMaxCandidates =
+        (kKBytes + kVBytes) / sizeof(std::uint32_t);
     const std::uint32_t cand_end = local_first;
+    const std::uint32_t cand_first =
+        cand_end > kSparseSink + kSparseMaxCandidates
+            ? cand_end - kSparseMaxCandidates
+            : kSparseSink;
     const std::uint32_t cand_count =
         cand_end > cand_first ? cand_end - cand_first : 0;
     auto* scores = reinterpret_cast<std::uint32_t*>(smem);
-    if (cand_count <= top_blocks) {
-      for (std::uint32_t b = tid; b <= local_last; b += kWmmaThreads)
-        blist[b] = b;
-      list_count = local_last + 1;
-    } else {
+    if (cand_count > capped_top_blocks) {
+      use_list = true;
       for (std::uint32_t b = tid; b < cand_count; b += kWmmaThreads)
         scores[b] = 0;
       __syncthreads();
       // Quest bound per block and query: q+ . kmax + q- . kmin, as two WMMA
-      // chains with the pooled rows as the A operand.
+      // chains with the pooled rows as the A operand. Every wave scores
+      // EVERY candidate tile (not strided by wave) and atomicMax-combines
+      // into one shared score per block: a block's score must be the max
+      // Quest bound over every live (token, head) column in this CUDA
+      // block, not just the one column the striding happened to assign to
+      // a given wave - the original `t = wave; t += kWmmaWaves` striding
+      // let each wave score a DIFFERENT, disjoint subset of candidates
+      // using only its own (2 tokens x 6 heads) query, so a block's final
+      // "score" came from whichever one wave happened to touch it, not a
+      // real comparison across the whole tile - for decode (n=1, only wave
+      // 0's tokens live) this left 7 of 8 waves' candidate tiles scored
+      // from an all-zero query, at a near-guaranteed tie, essentially
+      // random eviction. This is ~kWmmaWaves(8)x more scoring work; get it
+      // correct before trying to claw that back.
       const v16h zero16 = v16h{};
-      for (std::uint32_t t = wave; t * 16 < cand_count; t += kWmmaWaves) {
+      for (std::uint32_t t = 0; t * 16 < cand_count; ++t) {
         std::uint32_t row = cand_first + t * 16 + sub;
         if (row >= cand_end)
           row = cand_end - 1;
@@ -885,7 +927,10 @@ __global__ __launch_bounds__(kWmmaThreads) void AttentionWmmaKernelLaguna(
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
           const std::uint32_t blk = cand_first + t * 16 + 2 * i + half_id;
-          if (live && blk < cand_end) {
+          // head_live excludes the zero-padded lanes (sub >= kHeadsPerKv *
+          // kTokensPerWave) that would otherwise floor every block's score
+          // at +0.0 from a zero query, producing mass ties.
+          if (live && head_live && blk < cand_end) {
             const std::uint32_t bits = __float_as_uint(acc[i]);
             const std::uint32_t key =
                 bits ^ ((bits >> 31) != 0 ? 0xFFFFFFFFU : 0x80000000U);
@@ -894,7 +939,8 @@ __global__ __launch_bounds__(kWmmaThreads) void AttentionWmmaKernelLaguna(
         }
       }
       __syncthreads();
-      // Largest threshold with at least top_blocks scores at or above it.
+      // Largest threshold with at least capped_top_blocks scores at or
+      // above it.
       std::uint32_t thr = 0;
       for (int bit = 31; bit >= 0; --bit) {
         const std::uint32_t trial = thr | (1U << bit);
@@ -910,7 +956,7 @@ __global__ __launch_bounds__(kWmmaThreads) void AttentionWmmaKernelLaguna(
         for (int w = 0; w < kWmmaWaves; ++w)
           total += scan_tmp[w];
         __syncthreads();
-        if (total >= top_blocks)
+        if (total >= capped_top_blocks)
           thr = trial;
       }
       // Ordered compaction: scores above the threshold, then ties by index.
@@ -949,7 +995,7 @@ __global__ __launch_bounds__(kWmmaThreads) void AttentionWmmaKernelLaguna(
       const std::uint32_t gt_off = block_scan(gt, &total_gt);
       const std::uint32_t eq_off = block_scan(eq, &total_eq);
       const std::uint32_t eq_take =
-          top_blocks > total_gt ? top_blocks - total_gt : 0;
+          capped_top_blocks > total_gt ? capped_top_blocks - total_gt : 0;
       const std::uint32_t my_eq =
           eq_off < eq_take ? min(eq, eq_take - eq_off) : 0;
       std::uint32_t sel_total = 0;
@@ -974,12 +1020,12 @@ __global__ __launch_bounds__(kWmmaThreads) void AttentionWmmaKernelLaguna(
            b += kWmmaThreads)
         blist[local_base + (b - local_first)] = b;
       list_count = local_base + (local_last - local_first + 1);
+      n_tiles = list_count * (kSparseBlock / kWmmaKeys);
     }
     __syncthreads();
-    n_tiles = list_count * (kSparseBlock / kWmmaKeys);
   }
   const auto tile_key = [&](std::uint32_t j) {
-    if (false) {
+    if (use_list) {
       return blist[j / (kSparseBlock / kWmmaKeys)] * kSparseBlock +
              (j % (kSparseBlock / kWmmaKeys)) * kWmmaKeys;
     } else {
@@ -1178,13 +1224,62 @@ __global__ __launch_bounds__(kWmmaThreads) void AttentionWmmaKernelLaguna(
   }
 }
 
+namespace {
+
+// One block per (new 64-key block, kv_head); one thread per channel. k_cache
+// is the full-attention layer's contiguous (ring=0) cache, row-major
+// [position][kv_head][head_dim]. Writes pooled[(kv_head*nblk+block)*256]:
+// 128 half-words of per-channel max, then 128 of per-channel min - the exact
+// layout AttentionWmmaKernelLaguna's sparse Quest bound reads.
+__global__ void UpdatePooledKeysLagunaKernel(
+    const __half* __restrict__ k_cache, __half* __restrict__ pooled,
+    std::uint32_t from_block, std::uint32_t end_pos, std::uint32_t kv_heads,
+    std::uint32_t head_dim, std::uint32_t nblk) {
+  const std::uint32_t block = from_block + blockIdx.x;
+  const std::uint32_t kv_head = blockIdx.y;
+  const std::uint32_t c = threadIdx.x;
+  const std::uint32_t row0 = block * kSparseBlock;
+  const std::uint32_t row1 = min(row0 + kSparseBlock, end_pos);
+  const std::size_t kv_row = static_cast<std::size_t>(kv_heads) * head_dim;
+  float v_max = -3.0e38F;
+  float v_min = 3.0e38F;
+  for (std::uint32_t r = row0; r < row1; ++r) {
+    const float v = __half2float(k_cache[r * kv_row + kv_head * head_dim + c]);
+    v_max = fmaxf(v_max, v);
+    v_min = fminf(v_min, v);
+  }
+  __half* dst = pooled + (std::size_t{kv_head} * nblk + block) * 256;
+  dst[c] = __float2half(v_max);
+  dst[128 + c] = __float2half(v_min);
+}
+
+}  // namespace
+
+void UpdatePooledKeysLaguna(const __half* k_cache, __half* pooled_keys,
+                            std::uint32_t from_pos, std::uint32_t end_pos,
+                            std::uint32_t kv_heads, std::uint32_t head_dim,
+                            std::uint32_t nblk, hipStream_t stream) {
+  if (end_pos == 0)
+    return;
+  const std::uint32_t from_block = from_pos / kSparseBlock;
+  const std::uint32_t to_block = (end_pos - 1) / kSparseBlock;
+  if (to_block < from_block)
+    return;
+  const std::uint32_t n_blocks = to_block - from_block + 1;
+  UpdatePooledKeysLagunaKernel<<<dim3(n_blocks, kv_heads), head_dim, 0,
+                                 stream>>>(k_cache, pooled_keys, from_block,
+                                           end_pos, kv_heads, head_dim, nblk);
+}
+
 bool AttentionWmma(const __half* q, const __half* k_cache,
                    const __half* v_cache, const float* gate, float* out,
                    const std::uint32_t* start_pos, std::uint32_t heads,
                    std::uint32_t kv_heads, std::uint32_t head_dim,
                    std::uint32_t window, std::uint32_t ring,
                    std::uint32_t n_tokens, float* partials,
-                   std::uint32_t splits, hipStream_t stream) {
+                   std::uint32_t splits, hipStream_t stream,
+                   const __half* pooled_keys, std::uint32_t nblk,
+                   std::uint32_t top_blocks) {
   if (head_dim != kWmmaHeadDim)
     return false;
   // The kernel's `head_live` mask already handles any ratio up to
@@ -1209,7 +1304,8 @@ bool AttentionWmma(const __half* q, const __half* k_cache,
                 split_count),
            kWmmaThreads, 0, stream>>>(q, k_cache, v_cache, gate, out, n_tokens,
                                       start_pos, heads, kv_heads, window, ring,
-                                      nullptr, 0, 0, partials, split_count);
+                                      pooled_keys, nblk, top_blocks, partials,
+                                      split_count);
   };
   using std::integral_constant;
   switch (heads_per_kv) {

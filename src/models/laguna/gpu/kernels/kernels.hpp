@@ -55,13 +55,35 @@ void ToHalf(const float* src, __half* dst, std::size_t count,
 /// 2]`; a merge kernel combines them. This is the decode-depth lever: without
 /// it one block sweeps the whole KV range per (head, token) and TG falls off
 /// with context. `partials` must be nulled for prefill.
+///
+/// When `pooled_keys` is non-null, block-sparse attention (LAGUNA_SPARSE_ATTN)
+/// replaces the full contiguous key sweep beyond the sink + local window with
+/// the `top_blocks` highest-scoring 64-key blocks (Quest bound against
+/// `pooled_keys`'s per-block min/max, laid out as UpdatePooledKeysLaguna
+/// writes it: `pooled_keys[(kv_head * nblk + block) * 256]`, 128 half-words of
+/// per-channel max then 128 of min). Exact (no blocks dropped) whenever the
+/// candidate block count is at most `top_blocks`; `window` must be 0 (sparse
+/// is for the full-attention layers only, not the sliding-window ones).
 bool AttentionWmma(const __half* q, const __half* k_cache,
                    const __half* v_cache, const float* gate, float* out,
                    const std::uint32_t* start_pos, std::uint32_t heads,
                    std::uint32_t kv_heads, std::uint32_t head_dim,
                    std::uint32_t window, std::uint32_t ring,
                    std::uint32_t n_tokens, float* partials,
-                   std::uint32_t splits, hipStream_t stream);
+                   std::uint32_t splits, hipStream_t stream,
+                   const __half* pooled_keys = nullptr, std::uint32_t nblk = 0,
+                   std::uint32_t top_blocks = 0);
+
+/// Updates the per-64-key-block channel min/max pooled keys used by
+/// AttentionWmma's sparse path, for blocks newly covered by
+/// [from_pos, end_pos) of `k_cache` (absolute positions; `k_cache` must be a
+/// contiguous, non-ring layer cache - sparse applies only to Laguna's
+/// full-attention layers, which never use the SWA ring buffer). Call once per
+/// (layer, bank) right after StoreKv, before AttentionWmma.
+void UpdatePooledKeysLaguna(const __half* k_cache, __half* pooled_keys,
+                            std::uint32_t from_pos, std::uint32_t end_pos,
+                            std::uint32_t kv_heads, std::uint32_t head_dim,
+                            std::uint32_t nblk, hipStream_t stream);
 
 /// Causal attention multiplied by softplus(gate[t][head]). `window` > 0
 /// limits each query to its last `window` keys; `ring` > 0 wraps cache rows.

@@ -55,6 +55,20 @@ constexpr std::uint32_t kWarmTokens = 64;
 // decode on the unchanged WMMA path, where the extra merge launch is pure cost.
 constexpr std::uint32_t kSplitAttnSplits = 64;
 constexpr std::uint32_t kSplitAttnMinDepth = 2048;
+// Block-sparse attention (LAGUNA_SPARSE_ATTN): candidate older blocks beyond
+// the sink + local window are kept exactly whenever there are at most this
+// many of them; above that, only the top-scoring ones (Quest bound) survive.
+// Same default as 27B/35B's GUFO_QWEN_SPARSE_TOPK; LAGUNA_SPARSE_TOPK
+// overrides it.
+constexpr std::uint32_t kSparseTopBlocksDefault = 256;
+std::uint32_t SparseTopBlocks() {
+  static const std::uint32_t value = [] {
+    if (const char* v = std::getenv("LAGUNA_SPARSE_TOPK"))
+      return static_cast<std::uint32_t>(std::strtoul(v, nullptr, 10));
+    return kSparseTopBlocksDefault;
+  }();
+  return value;
+}
 // Routed-expert activations are stored divided by this (F16 range); the
 // combine multiplies it back.
 constexpr float kRoutedActScale = 64.0F;
@@ -180,6 +194,16 @@ struct Session::Impl {
 
   std::vector<DeviceBuffer<__half>> k_cache, v_cache;
   std::vector<std::uint32_t> ring;
+  // Block-sparse attention (LAGUNA_SPARSE_ATTN): per-64-key-block channel
+  // min/max pooled keys, allocated only for the non-SWA (group-6,
+  // il%4==0) layers - the SWA layers are already bounded by their ring
+  // buffer and never use this. One shared buffer per layer (not banked:
+  // the underlying k_cache isn't banked either, and EnqueueBanked runs
+  // bank 0's full Attention() before bank 1's on the same stream, so a
+  // single valid_end tracked on the host is safe - see Attention()).
+  std::vector<DeviceBuffer<__half>> sparse_pooled;
+  std::vector<std::uint32_t> sparse_valid_end;
+  std::uint32_t sparse_max_blocks{0};
   std::unique_ptr<hip::QwenDFlashGpuExecutor> dflash;
   DeviceBuffer<float> tap_capture;
   std::uint32_t tap_pending{0}, tap_pending_pos{0}, tap_pending_first{0};
@@ -410,6 +434,18 @@ bool Session::Impl::Init(std::uint32_t max_context, std::string* error_msg) {
     }
     ok = ok && k_cache[il].Allocate(kv_row * rows) &&
          v_cache[il].Allocate(kv_row * rows);
+  }
+  const bool sparse_attn = std::getenv("LAGUNA_SPARSE_ATTN") != nullptr;
+  sparse_pooled.resize(c.num_layers);
+  sparse_valid_end.assign(c.num_layers, 0);
+  if (sparse_attn) {
+    sparse_max_blocks = (capacity + 63) / 64;
+    for (std::uint32_t il = 0; il < c.num_layers && ok; ++il) {
+      if (!c.IsSwa(il)) {
+        ok = sparse_pooled[il].Allocate(std::size_t{c.num_kv} *
+                                        sparse_max_blocks * 256);
+      }
+    }
   }
   ok = ok && tokens.Allocate(tile) && pos.Allocate(4) &&
        x.Allocate(std::size_t{tile} * c.hidden_size) &&
@@ -817,6 +853,19 @@ bool Session::Impl::Attention(std::uint32_t il, std::uint32_t n,
                   rope.mscale, pos.get() + cbank, stream);
   rocm::StoreKv(k.get(), v.get(), k_cache[il].get(), v_cache[il].get(), n,
                 kv_row, pos.get() + cbank, ring[il], stream);
+  // Block-sparse attention's pooled-key maintenance is the CALLER's job
+  // (Forward()'s live pre-pass, or EnqueueBanked's own per-bank call right
+  // after this returns), never Attention()'s own - a decode/verify HIP
+  // graph can capture this function, and UpdatePooledKeysLaguna's grid
+  // size and from_pos/end_pos would then be baked into the recorded graph
+  // as fixed launch arguments (not read from a device pointer at replay
+  // time), so every later replay would re-pool only the ONE block range
+  // that existed at capture time, forever - silently degrading sparse's
+  // accuracy the longer a captured decode run goes (invisible on a short
+  // needle-in-haystack generation, real on a long completion). See
+  // Forward()'s UpdateSparsePooling-equivalent pre-pass and the call
+  // EnqueueBanked makes right after this function returns.
+  const __half* sparse_kmm = sparse_pooled[il].get();
   rocm::ToHalf(q.get(), qh.get(), std::size_t{n} * heads * c.head_dim, stream);
   // Four real bugs found and fixed in AttentionWmma/AttentionWmmaKernelLaguna
   // (shape guard; token stride missing *2; missing softplus(gate) multiply
@@ -839,12 +888,13 @@ bool Session::Impl::Attention(std::uint32_t il, std::uint32_t n,
                           position + n >= kSplitAttnMinDepth;
   const bool use_wmma =
       kWmmaAttentionEnabled &&
-      rocm::AttentionWmma(qh.get(), k_cache[il].get(), v_cache[il].get(),
-                          gate.get(), attn.get(), pos.get() + cbank, heads,
-                          c.num_kv, c.head_dim, swa ? c.sliding_window : 0,
-                          ring[il], n,
-                          split_attn ? attn_partials.get() : nullptr,
-                          split_attn ? kSplitAttnSplits : 1, stream);
+      rocm::AttentionWmma(
+          qh.get(), k_cache[il].get(), v_cache[il].get(), gate.get(),
+          attn.get(), pos.get() + cbank, heads, c.num_kv, c.head_dim,
+          swa ? c.sliding_window : 0, ring[il], n,
+          split_attn ? attn_partials.get() : nullptr,
+          split_attn ? kSplitAttnSplits : 1, stream, sparse_kmm,
+          sparse_max_blocks, sparse_kmm != nullptr ? SparseTopBlocks() : 0);
   if (!use_wmma) {
     rocm::Attention(q.get(), k_cache[il].get(), v_cache[il].get(), gate.get(),
                     attn.get(), n, pos.get() + cbank, heads, c.num_kv,
@@ -1293,6 +1343,26 @@ bool Session::Impl::Forward(std::span<const std::int32_t> input, bool all_rows,
   h_pos[0] = position;
   logit_rows = all_rows ? n : 1;
 
+  // Block-sparse attention's pooled-key maintenance, run live every call
+  // (including ones a captured graph will replay) - see the long comment
+  // on the equivalent, capture-skipped call inside Attention() for why
+  // this can't just live there for the graphed decode path. k_cache is not
+  // banked, so bank 0's view of it here is the whole, current cache
+  // regardless of which bank API wrote it (EnqueueBanked handles its own
+  // pooling directly, inside Attention(), since it never captures a graph).
+  {
+    const Config& c = model->config;
+    const std::uint32_t end = position + n;
+    for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+      if (sparse_pooled[il].get() == nullptr)
+        continue;
+      rocm::UpdatePooledKeysLaguna(k_cache[il].get(), sparse_pooled[il].get(),
+                                   sparse_valid_end[il], end, c.num_kv,
+                                   c.head_dim, sparse_max_blocks, stream);
+      sparse_valid_end[il] = end;
+    }
+  }
+
   // Same tap-window math as Enqueue() (duplicated, not shared, since it must
   // run every call - including replayed ones, where Enqueue()'s body does
   // not re-execute - to decide graphability and drive DflashInject below).
@@ -1411,6 +1481,18 @@ bool Session::Impl::EnqueueBanked(std::span<const std::int32_t> input,
                         bn, c.hidden_size, 1, c.rms_eps, stream);
       if (!Attention(il, bn, error_msg))
         return false;
+      // Live pooled-key maintenance for sparse attention - see the long
+      // comment in Attention() for why this isn't done there. EnqueueBanked
+      // never uses graph capture, so it's always safe to do it right here,
+      // per bank, right after that bank's StoreKv (inside Attention()) has
+      // actually written the new rows.
+      if (sparse_pooled[il].get() != nullptr) {
+        const std::uint32_t end = h_pos[b] + bn;
+        rocm::UpdatePooledKeysLaguna(k_cache[il].get(), sparse_pooled[il].get(),
+                                     sparse_valid_end[il], end, c.num_kv,
+                                     c.head_dim, sparse_max_blocks, stream);
+        sparse_valid_end[il] = end;
+      }
       rocm::RmsNormRows(cx, static_cast<const float*>(L.ffn_norm.data), cxn, bn,
                         c.hidden_size, 1, c.rms_eps, stream);
     }
@@ -1543,8 +1625,16 @@ bool Session::AppendAll(std::span<const std::int32_t> tokens,
 }
 
 void Session::Rewind(std::uint32_t position) noexcept {
-  if (position < impl_->position)
+  if (position < impl_->position) {
     impl_->position = position;
+    // A pooled block covering rows past the rewound position is stale (it
+    // pooled KV that is about to be overwritten by a later Append) - drop
+    // back to the block boundary at or below `position` so the next
+    // UpdatePooledKeysLaguna call re-pools it from scratch instead of
+    // trusting a min/max computed from since-discarded rows.
+    for (auto& end : impl_->sparse_valid_end)
+      end = std::min(end, (position / 64) * 64);
+  }
 }
 
 std::span<const float> Session::Logits() const noexcept {
@@ -1567,6 +1657,7 @@ std::uint32_t Session::Capacity() const noexcept {
 
 void Session::Reset() noexcept {
   impl_->position = 0;
+  std::fill(impl_->sparse_valid_end.begin(), impl_->sparse_valid_end.end(), 0);
   if (impl_->dflash != nullptr)
     impl_->dflash->Reset();
 }

@@ -48,6 +48,35 @@ ported from Flash-Next/Flint's technique): 26 -> 19.8 -> 12.5 tok/s before,
 flat - SWA-layer and FFN/MoE kernel cost becomes a larger share of the step
 once the split non-SWA attention layers' own cost shrinks.
 
+## Block-sparse attention (opt-in)
+
+`LAGUNA_SPARSE_ATTN=1` replaces full attention beyond the sink + local
+window with block-sparse attention on the 12 full-attention layers only
+(the 36 sliding-window layers are already bounded by `sliding_window=512`
+and don't need it): each query reads 2 sink blocks, a 32-block local
+window, and the 256 best-scoring older 64-token blocks (Quest bound,
+per-block channel min/max). Exact below ~18.5k tokens of context (every
+candidate fits inside the 256-block budget); approximate above it, same
+accepted-divergence class as this port's other approximations.
+Needle-in-a-haystack (a unique fact buried mid-document) matches dense on
+every depth tested:
+
+| Depth | Dense | Sparse | Gain |
+| --- | --- | --- | --- |
+| 41,327 tok | 937.6 tok/s, correct | 999.5 tok/s, correct | +6.6% |
+| 61,108 tok | 835.3 tok/s, correct | 973.2 tok/s, correct | +16.5% |
+| 100,616 tok | 694.6 tok/s, correct | 958.0 tok/s, correct | +37.9% |
+
+Gain grows with depth (the candidate pool to prune grows with position).
+Verified stacking cleanly with the NPU and two-bank pipeline (995.7 tok/s
+at 61,108 tokens, all three on, no corruption) and across a 2,600-token
+generation past the decode HIP-graph capture boundary (a real, separate
+bug found and fixed this port - see
+[laguna-port-state.md](../../../src/models/laguna/laguna-port-state.md)
+for the full account, including three real selection bugs found when
+this was first turned on). Off by default; `LAGUNA_SPARSE_TOPK=N`
+overrides the 256-block budget.
+
 ## Options (environment)
 
 | Variable | Effect |
@@ -55,6 +84,8 @@ once the split non-SWA attention layers' own cost shrinks.
 | `GUFO_NPU_DIR=<repo>/tools/npu` | Use the NPU (shared-expert gate/up, banked by default) |
 | `LAGUNA_NPU_NO_BANK=1` | NPU without the two-bank pipeline (same-call overlap only) |
 | `LAGUNA_NPU_QKV=1` | Also offload QKV to the NPU - measured net loss, off by default |
+| `LAGUNA_SPARSE_ATTN=1` | Block-sparse attention on the 12 full-attention layers - off by default |
+| `LAGUNA_SPARSE_TOPK=N` | Candidate-block budget for sparse attention (default 256) |
 | `LAGUNA_PREFILL_TILE=N` | Prefill chunk size (default 4,096); needs a matching NPU instruction
 file if `GUFO_NPU_DIR` is set and N != 4,096 |
 
@@ -79,9 +110,11 @@ shared-expert offload on by default; QKV offload built but off by default
 (see Speed section). `gufo serve llm` works (smoke-tested: load, warm-up,
 a real `/v1/chat/completions` request) but has no snapshot/disk-cache
 reuse yet (the engine's `Session` has no save/restore) and rejects
-`--speculative` (DFlash v1 is `gufo prompt`/`gufo bench`-only for now). No
-block-sparse attention path (unlike Flint/27B/35B); relies only on its
-always-on sliding-window attention. Not done: a CPU-reference regression
+`--speculative` (DFlash v1 is `gufo prompt`/`gufo bench`-only for now).
+Block-sparse attention built and verified (needle-in-haystack at three
+depths, two-bank+NPU interaction, decode graph-capture boundary) but off
+by default (`LAGUNA_SPARSE_ATTN=1` opts in; see Block-sparse attention
+above). Not done: a CPU-reference regression
 script, model tests under `tests/`, and the standard cross-model
 regression run for the shared `dflash_weights.cpp`/`qfn_mmq.hip.cpp` edits
 (done manually this session against Flash-Next/27B/35B/GLM, not yet
