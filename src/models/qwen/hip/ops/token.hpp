@@ -163,7 +163,8 @@ void LaunchBatchedRoPE(float* q, float* k, std::size_t batch_size,
                        std::uint32_t head_dim, std::uint32_t rotary_dim,
                        std::uint32_t start_pos, float rope_theta,
                        hipStream_t stream = nullptr,
-                       const models::qwen::vision::DeviceRope* rope = nullptr);
+                       const models::qwen::vision::DeviceRope* rope = nullptr,
+                       const float* yarn = nullptr, float mscale = 1.0F);
 
 }  // namespace gufo::hip
 

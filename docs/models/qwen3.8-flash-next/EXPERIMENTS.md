@@ -140,3 +140,19 @@ objectives remain unmet; see [current benchmarks](BENCHMARKS.md).
 | Prefix checkpoint inside the prefill pass with the disk cache on | Retained: removes the second pass for short prompts (first token 269 → 188 ms); cold and restored outputs can differ at near-ties, which matched the earlier split-chunk behaviour only by construction. |
 | `--prefill-chunk` 4096 / 8192 / 16384 with two long prompts | Launcher default 8192: aggregate prefill 1,842 / 1,898 / 1,928 tok/s; larger chunks make a running decode wait longer for the next pass. |
 | Gate/up rows per wave 8 → 1 | Retained: bit-identical, width-1 cost −1.5%, no measurable end-to-end change. |
+
+
+
+## DSA selection capped at native context for long-context prefill (2026-11-01)
+
+Retained: DSA selection (`score_context`, `live`) is now capped at the native
+context length (`c.context_length`) so that `SelectMarkKernel` never writes past
+the native-sized mask stride (`mask_words_`, 2048 words / 65536 blocks) even for
+YaRN-extended sessions up to 1,048,576 tokens. Blocks beyond the native length
+are left unselected for DSA layers; the full-attention layers (every 4th) still
+attend to the whole context. This keeps long-context prefill fast (no
+512 MiB mask stride) while staying in-bounds. `CreateSession` now accepts the
+YaRN ceiling (`context_length * yarn_factor`) instead of the raw native length,
+so YaRN-extended sessions load. Sizing `mask_words_` for the full ceiling was
+tried and reverted: the 4x mask stride destroyed cache locality and halved
+prefill throughput.

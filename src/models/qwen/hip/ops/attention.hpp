@@ -104,7 +104,8 @@ void LaunchBatchedFusedQKNormRoPEKvWrite(
     std::uint32_t num_kv_heads, std::uint32_t head_dim,
     std::uint32_t rotary_dim, float rope_theta, float eps = 1e-6F,
     hipStream_t stream = nullptr,
-    const models::qwen::vision::DeviceRope* rope = nullptr);
+    const models::qwen::vision::DeviceRope* rope = nullptr,
+    const float* yarn = nullptr, float mscale = 1.0F);
 
 /// Qwen3.8-specific causal GQA tile for gfx1151. The kernel processes 16 query
 /// positions and two query heads per block while reusing one FP16 K/V tile.

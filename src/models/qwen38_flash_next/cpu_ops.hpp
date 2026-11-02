@@ -35,9 +35,12 @@ void L2Norm(std::span<float> x, float eps);
 /// NEOX-style partial rotary embedding on the first `rotary_dim` elements of
 /// each `head_dim` head: pair (i, i + rotary_dim/2) rotates by pos * theta_i.
 /// Text-only IMRoPE has equal positions on every section, so it is exactly
-/// this rotation.
+/// this rotation. `yarn` (when non-null) supplies YaRN-blended per-pair inverse
+/// frequencies in place of `theta^(-2i/rotary_dim)`, and `mscale` scales the
+/// resulting cos/sin; both default to the plain path (byte-identical).
 void Rope(float* x, std::uint32_t heads, std::uint32_t head_dim,
-          std::uint32_t rotary_dim, std::uint32_t pos, float theta);
+          std::uint32_t rotary_dim, std::uint32_t pos, float theta,
+          const float* yarn = nullptr, float mscale = 1.0F);
 
 }  // namespace gufo::models::qwen38_flash_next::cpu
 

@@ -29,7 +29,8 @@ __launch_bounds__(256, 4) __global__ void BatchedFusedQKNormRoPEKvWriteKernel(
     std::uint32_t start_pos, std::size_t batch_size, std::uint32_t max_context,
     std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t head_dim,
     std::uint32_t rotary_dim, float rope_theta, float eps,
-    const models::qwen::vision::DeviceRope* rope) {
+    const models::qwen::vision::DeviceRope* rope,
+    const float* __restrict__ yarn = nullptr, float mscale = 1.0F) {
   const std::size_t b = blockIdx.y;
   const std::uint32_t block = blockIdx.x;
   const std::size_t tid = threadIdx.x;
@@ -77,13 +78,16 @@ __launch_bounds__(256, 4) __global__ void BatchedFusedQKNormRoPEKvWriteKernel(
     for (std::size_t p = tid; p < half_rot; p += blockDim.x) {
       const float q0 = s_norm[p];
       const float q1 = s_norm[p + half_rot];
-      const float exponent =
-          static_cast<float>(2 * p) / static_cast<float>(rotary_dim);
-      const float inv_freq = 1.0F / powf(rope_theta, exponent);
+      const float inv_freq = yarn != nullptr
+                                  ? yarn[p]
+                                  : 1.0F / powf(rope_theta,
+                                               static_cast<float>(2 * p) /
+                                                   static_cast<float>(
+                                                       rotary_dim));
       const float angle =
           models::qwen::vision::RopePosition(rope, cur_pos, p) * inv_freq;
-      const float cos_val = cosf(angle);
-      const float sin_val = sinf(angle);
+      const float cos_val = cosf(angle) * mscale;
+      const float sin_val = sinf(angle) * mscale;
       q_out[head_base + p] = (q0 * cos_val) - (q1 * sin_val);
       q_out[head_base + p + half_rot] = (q0 * sin_val) + (q1 * cos_val);
     }
@@ -137,13 +141,16 @@ __launch_bounds__(256, 4) __global__ void BatchedFusedQKNormRoPEKvWriteKernel(
   for (std::size_t p = tid; p < half_rot; p += blockDim.x) {
     const float k0 = s_norm[p];
     const float k1 = s_norm[p + half_rot];
-    const float exponent =
-        static_cast<float>(2 * p) / static_cast<float>(rotary_dim);
-    const float inv_freq = 1.0F / powf(rope_theta, exponent);
+    const float inv_freq = yarn != nullptr
+                                ? yarn[p]
+                                : 1.0F / powf(rope_theta,
+                                             static_cast<float>(2 * p) /
+                                                 static_cast<float>(
+                                                     rotary_dim));
     const float angle =
         models::qwen::vision::RopePosition(rope, cur_pos, p) * inv_freq;
-    const float cos_val = cosf(angle);
-    const float sin_val = sinf(angle);
+    const float cos_val = cosf(angle) * mscale;
+    const float sin_val = sinf(angle) * mscale;
     const float k0_rot = (k0 * cos_val) - (k1 * sin_val);
     const float k1_rot = (k0 * sin_val) + (k1 * cos_val);
     k_out[head_base + p] = k0_rot;
@@ -187,21 +194,23 @@ void LaunchBatchedFusedQKNormRoPEKvWrite(
     std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t head_dim,
     std::uint32_t rotary_dim, float rope_theta, float eps, hipStream_t stream,
-    const models::qwen::vision::DeviceRope* rope) {
+    const models::qwen::vision::DeviceRope* rope, const float* yarn,
+    float mscale) {
   const dim3 grid(num_heads + num_kv_heads,
                   static_cast<unsigned int>(batch_size));
   BatchedFusedQKNormRoPEKvWriteKernel<<<grid, 256, 0, stream>>>(
       q, k, v, q_weight, k_weight, q_out, k_out, k_cache, v_cache,
       static_cast<__half*>(k_cache_f16), static_cast<__half*>(v_cache_f16),
       layer_idx, start_pos, batch_size, max_context, num_heads, num_kv_heads,
-      head_dim, rotary_dim, rope_theta, eps, rope);
+      head_dim, rotary_dim, rope_theta, eps, rope, yarn, mscale);
 }
 
 __global__ void BatchedRoPEKernel(
     float* __restrict__ q, float* __restrict__ k, std::size_t batch_size,
     std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t head_dim,
     std::uint32_t rotary_dim, std::uint32_t start_pos, float rope_theta,
-    const models::qwen::vision::DeviceRope* rope) {
+    const models::qwen::vision::DeviceRope* rope,
+    const float* __restrict__ yarn = nullptr, float mscale = 1.0F) {
   const std::size_t b = blockIdx.y;
   if (b >= batch_size)
     return;
@@ -214,12 +223,14 @@ __global__ void BatchedRoPEKernel(
     const std::size_t h = pair_idx / half_rot;
     const std::size_t i = pair_idx % half_rot;
     const float freq =
-        1.0F / powf(rope_theta,
-                    static_cast<float>(2 * i) / static_cast<float>(rotary_dim));
+        yarn != nullptr
+            ? yarn[i]
+            : 1.0F / powf(rope_theta, static_cast<float>(2 * i) /
+                                           static_cast<float>(rotary_dim));
     const float angle =
         models::qwen::vision::RopePosition(rope, cur_pos, i) * freq;
-    const float cos_val = cosf(angle);
-    const float sin_val = sinf(angle);
+    const float cos_val = cosf(angle) * mscale;
+    const float sin_val = sinf(angle) * mscale;
 
     const std::size_t q_stride = static_cast<std::size_t>(num_heads) * head_dim;
     float* q_head = q + (b * q_stride) + (h * head_dim);
@@ -233,12 +244,14 @@ __global__ void BatchedRoPEKernel(
     const std::size_t h = pair_idx / half_rot;
     const std::size_t i = pair_idx % half_rot;
     const float freq =
-        1.0F / powf(rope_theta,
-                    static_cast<float>(2 * i) / static_cast<float>(rotary_dim));
+        yarn != nullptr
+            ? yarn[i]
+            : 1.0F / powf(rope_theta, static_cast<float>(2 * i) /
+                                           static_cast<float>(rotary_dim));
     const float angle =
         models::qwen::vision::RopePosition(rope, cur_pos, i) * freq;
-    const float cos_val = cosf(angle);
-    const float sin_val = sinf(angle);
+    const float cos_val = cosf(angle) * mscale;
+    const float sin_val = sinf(angle) * mscale;
 
     const std::size_t k_stride =
         static_cast<std::size_t>(num_kv_heads) * head_dim;
@@ -255,7 +268,8 @@ void LaunchBatchedRoPE(float* q, float* k, std::size_t batch_size,
                        std::uint32_t head_dim, std::uint32_t rotary_dim,
                        std::uint32_t start_pos, float rope_theta,
                        hipStream_t stream,
-                       const models::qwen::vision::DeviceRope* rope) {
+                       const models::qwen::vision::DeviceRope* rope,
+                       const float* yarn, float mscale) {
   const std::size_t half_rot = rotary_dim / 2;
   const std::size_t total_pairs =
       std::max(static_cast<std::size_t>(num_heads) * half_rot,
@@ -266,7 +280,7 @@ void LaunchBatchedRoPE(float* q, float* k, std::size_t batch_size,
                   static_cast<unsigned int>(batch_size));
   BatchedRoPEKernel<<<grid, static_cast<unsigned int>(block_size), 0, stream>>>(
       q, k, batch_size, num_heads, num_kv_heads, head_dim, rotary_dim,
-      start_pos, rope_theta, rope);
+      start_pos, rope_theta, rope, yarn, mscale);
 }
 }  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

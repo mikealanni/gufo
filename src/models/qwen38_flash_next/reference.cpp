@@ -19,6 +19,15 @@ ReferenceModel::ReferenceModel(const ModelWeights& weights, NgramTable* ngram,
       storage_(storage),
       ngram_(ngram),
       max_context_(max_context) {
+  // Match the GPU: YaRN is active only above the native context length, so
+  // native-length reference runs keep the plain (byte-identical) frequencies.
+  const float yarn_factor =
+      (c_.context_length != 0 && max_context_ > c_.context_length)
+          ? static_cast<float>(max_context_) /
+                static_cast<float>(c_.context_length)
+          : 1.0F;
+  yarn_ = ComputeYarn(c_.rope_theta, c_.rotary_dim, yarn_factor,
+                      c_.context_length, c_.yarn_beta_fast, c_.yarn_beta_slow);
   linear_.resize(c_.num_layers);
   attention_.resize(c_.num_layers);
   Reset();
@@ -349,7 +358,8 @@ void ReferenceModel::Attention(const LayerWeights& l, AttentionState& s,
   const auto rope = [&](float* values, std::uint32_t heads, std::uint32_t dim,
                         std::uint32_t physical) {
     if (layout == nullptr) {
-      cpu::Rope(values, heads, dim, c_.rotary_dim, physical, c_.rope_theta);
+      cpu::Rope(values, heads, dim, c_.rotary_dim, physical, c_.rope_theta,
+                yarn_.enabled ? yarn_.inv_freq.data() : nullptr, yarn_.mscale);
       return;
     }
     const auto coordinates = layout->Position(physical);

@@ -21,6 +21,7 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
+#include "src/models/qwen38_flash_next/rope_yarn.hpp"
 #include "src/models/qwen38_flash_next/weights.hpp"
 
 namespace gufo::models::qwen38_flash_next {
@@ -86,6 +87,11 @@ std::uint64_t SessionSnapshotHostBytes(std::uint32_t token_count,
 /// one and matches the distribution the block drew from.
 // One block forward serves every slot, so a slot only adds its verification.
 constexpr float kDflashSlotScale = 0.5F;
+
+/// Largest YaRN frequency-scaling factor accepted for the trunk RoPE. The
+/// Flash-Next card validates factor 4.0, extending the native 262,144-token
+/// window to 1,048,576; requesting more than this ratio is rejected.
+constexpr float kMaxYarnFactor = 4.0F;
 
 MtpProposal MakeDflashProposal(std::span<const sampling::TokenId> ids,
                                std::span<const float> probabilities,
@@ -170,10 +176,32 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   }
   m->weights_ = std::make_unique<ModelWeights>(std::move(*weights));
   const Config& c = m->weights_->config;
-  if (options.max_context == 0 || options.max_context > c.context_length) {
-    AssignError(error_msg, "context exceeds the model's " +
-                               std::to_string(c.context_length) + " tokens");
+  // Native context is accepted verbatim. Beyond it, YaRN rescales the RoPE
+  // frequencies so the model generalises past its trained length; the
+  // Flash-Next card validates factor 4.0 (262,144 -> 1,048,576), so that is
+  // the ceiling. `yarn_factor` reaches Executor::Create through Options; a
+  // factor of 1 keeps the plain path byte-identical.
+  if (options.max_context == 0) {
+    AssignError(error_msg, "a non-zero max_context is required");
     return nullptr;
+  }
+  float yarn_factor = 1.0F;
+  if (options.max_context > c.context_length) {
+    if (c.context_length == 0) {
+      AssignError(error_msg, "model declares no native context length");
+      return nullptr;
+    }
+    yarn_factor = static_cast<float>(options.max_context) /
+                  static_cast<float>(c.context_length);
+    if (yarn_factor > kMaxYarnFactor) {
+      AssignError(error_msg, "context " + std::to_string(options.max_context) +
+                                 " exceeds YaRN's limit of " +
+                                 std::to_string(static_cast<std::uint32_t>(
+                                     static_cast<float>(c.context_length) *
+                                     kMaxYarnFactor)) +
+                                 " tokens");
+      return nullptr;
+    }
   }
   try {
     m->vision_ = qwen::vision::Encoder::Open(
@@ -236,6 +264,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     }
   }
   rocm::Executor::Options exec;
+  exec.yarn_factor = yarn_factor;
   exec.max_batch = m->PrefillThroughCapacity();
   const bool draft_capable = m->mtp_weights_ != nullptr || m->dflash_model_;
   exec.max_logit_rows =
@@ -367,6 +396,17 @@ bool Session::MtpLoaded() const noexcept {
 
 struct Session::DflashState {
   std::unique_ptr<hip::QwenDFlashGpuExecutor> executor;
+  // Owns the drafter's OWN YaRN table (computed from its own rope_theta,
+  // confirmed by reading its GGUF directly: 10,000, a 1000x different base
+  // from the trunk's 10,000,000 - reusing the trunk's table here is a
+  // confirmed, measured regression, see InitDflash). Null when YaRN is off
+  // for this session.
+  float* d_yarn_inv{nullptr};
+  ~DflashState() {
+    if (d_yarn_inv != nullptr) {
+      (void)hipFree(d_yarn_inv);
+    }
+  }
 };
 
 bool Session::InitDflash(std::string* error_msg) {
@@ -379,6 +419,39 @@ bool Session::InitDflash(std::string* error_msg) {
     return false;
   }
   dflash_ = std::make_unique<DflashState>();
+  // The drafter's own rope.freq_base (10,000) differs from the trunk's
+  // (10,000,000) - it needs its OWN YaRN table, computed from its own
+  // theta/rotary_dim/context_length, not the trunk's (an earlier version
+  // of this code reused the trunk's table directly, which measurably made
+  // DFlash2 worse: 25.3% -> 12.7% draft acceptance at 397k tokens, because
+  // it applied frequencies computed from the wrong base entirely). Same
+  // factor and beta_fast/beta_slow as the trunk resolved, since both share
+  // the same native 262,144-token context and the caller asked for one
+  // target depth, not two independent ones.
+  const auto& draft_cfg = executor->GetModel().GetConfig();
+  const std::uint32_t native = draft_cfg.context_length;
+  if (native != 0 && session_->max_context() > native) {
+    const float factor =
+        std::min(kMaxYarnFactor, static_cast<float>(session_->max_context()) /
+                                     static_cast<float>(native));
+    const RopeScaling yarn =
+        ComputeYarn(draft_cfg.rope_theta, draft_cfg.rotary_dim, factor, native,
+                    32.0F, 1.0F);
+    if (yarn.enabled) {
+      if (hipMalloc(&dflash_->d_yarn_inv,
+                    yarn.inv_freq.size() * sizeof(float)) != hipSuccess) {
+        AssignError(error_msg, "DFlash YaRN table allocation failed");
+        return false;
+      }
+      if (hipMemcpy(dflash_->d_yarn_inv, yarn.inv_freq.data(),
+                    yarn.inv_freq.size() * sizeof(float),
+                    hipMemcpyHostToDevice) != hipSuccess) {
+        AssignError(error_msg, "DFlash YaRN table upload failed");
+        return false;
+      }
+      executor->SetYarnScaling(dflash_->d_yarn_inv, yarn.mscale);
+    }
+  }
   dflash_->executor = std::move(executor);
   draft_length_.SetSlotScale(kDflashSlotScale);
   return true;

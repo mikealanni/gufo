@@ -249,6 +249,11 @@ public:
     /// Zero-based completed trunk layers whose residual mean is captured, in
     /// the drafter's feature order.
     std::vector<std::uint32_t> dflash_layers;
+    /// YaRN frequency-scaling factor for the trunk's RoPE. 1 disables YaRN
+    /// (plain theta, byte-identical to the pre-YaRN path); a caller that
+    /// requests a context above the model's native length passes
+    /// `requested_len / native_len`.
+    float yarn_factor{1.0F};
   };
 
   ~Executor();
@@ -436,6 +441,15 @@ public:
     return options_.max_speculative;
   }
   [[nodiscard]] bool has_mtp() const noexcept { return model_->has_mtp(); }
+  /// YaRN inverse-frequency device table and attention-score scale this
+  /// trunk session resolved at Create() - null/1.0 when YaRN is off. Lets
+  /// a DFlash drafter attached to this session keep its own RoPE aligned
+  /// with the trunk's scaled positions past native context (this worktree
+  /// only - see QwenDFlashGpuExecutor::SetYarnScaling).
+  [[nodiscard]] const float* yarn_inv_freq() const noexcept {
+    return d_yarn_inv_;
+  }
+  [[nodiscard]] float yarn_mscale() const noexcept { return yarn_mscale_; }
 
 private:
   Executor() = default;
@@ -498,6 +512,16 @@ private:
   /// Reads the routing of the current batch back and derives the tile
   /// hints for its expert GEMMs (tiled batches only).
   bool RouteHints(std::uint32_t n_tokens, std::string* error_msg) const;
+  bool NanProbe(const char* tag, const void* data, std::size_t count,
+                bool is_half, std::uint32_t n_tokens, std::uint32_t il,
+                std::string* error_msg) const;
+  void ProbeRouter(const char* tag, std::uint32_t n_tokens) const;
+  bool NanProbeRows(const char* tag, const float* data, std::uint32_t rows,
+                    std::uint32_t cols, std::uint32_t il,
+                    std::string* error_msg) const;
+  bool NanProbeRowsHalf(const char* tag, const void* data, std::size_t rows,
+                        std::size_t cols, std::uint32_t il,
+                        std::string* error_msg) const;
   /// Routed gate/up projections followed by SwiGLU.
   bool GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
                     const float* x, const std::int32_t* ids, float* out,
@@ -610,6 +634,12 @@ private:
   hipEvent_t counts_ready_{nullptr};
   hipblasHandle_t blas_{nullptr};
   std::unique_ptr<BlasLt> blaslt_;
+  /// Device YaRN inverse-frequency table (`rotary_dim/2` floats) and its
+  /// attention-score scale, uploaded once in Create. `d_yarn_inv_` is null when
+  /// YaRN is disabled, so every RoPE kernel falls back to plain theta math
+  /// (byte-identical to the pre-YaRN path).
+  float* d_yarn_inv_{nullptr};
+  float yarn_mscale_{1.0F};
 
   // Scratch, sized for max_batch tokens. Names follow reference.cpp.
   struct Scratch {
@@ -721,6 +751,27 @@ private:
   bool bank_b_allocated_{false};
   Session::Control* bank_b_control_host_{nullptr};
   std::int32_t* bank_b_tokens_host_{nullptr};
+  /// Bank B's half of the routed tile/counts staging. HIP does not order
+  /// copy-engine transfers against each other within one stream, so a
+  /// `hipEventSynchronize` on the counts event does not prove bank A's tile
+  /// map upload has drained; the two banks must not share the pinned source
+  /// buffers (see FIX-ple-prefetch-race.md). Selected by `route_bank_`.
+  std::uint32_t* bank_b_counts_host_{nullptr};
+  std::int32_t* bank_b_tiles_host_{nullptr};
+  hipEvent_t bank_b_counts_ready_{nullptr};
+  /// 0 while A/default staging is live, 1 while bank B's is; switched only by
+  /// `SetScratchHost`, which drains the stream first so no in-flight copy of
+  /// the outgoing bank's pinned buffers can read the new contents.
+  mutable std::uint32_t route_bank_{0};
+  std::uint32_t* RouteCountsHost() const {
+    return route_bank_ == 1 ? bank_b_counts_host_ : counts_host_;
+  }
+  std::int32_t* RouteTilesHost() const {
+    return route_bank_ == 1 ? bank_b_tiles_host_ : tiles_host_;
+  }
+  hipEvent_t RouteCountsReady() const {
+    return route_bank_ == 1 ? bank_b_counts_ready_ : counts_ready_;
+  }
   bool DenseBatch(const DeviceTensor& w, const float* x, float* out,
                   std::uint32_t rows, std::string* error_msg) const;
   bool GatedDenseBatch(const DeviceTensor& up, const DeviceTensor& gate,
@@ -840,12 +891,22 @@ private:
   /// NPU staging buffers (activation tiles and six output slices), -1 / empty
   /// when the NPU is not in use.
   /// One A buffer and kNpuSlicesMax C buffers per 4096-token group of a chunk.
-  std::vector<int> npu_a_;
-  std::vector<int> npu_a_lo_;
-  std::vector<int> npu_c_;
+  /// Banked by `route_bank_`: the two banks run their forward passes
+  /// concurrently and Submit writes results into these host slots
+  /// asynchronously, so a shared pool tears the other bank's outputs
+  /// (observed as dequant overflow Infs; see FIX-ple-prefetch-race.md).
+  std::array<std::vector<int>, 2> npu_a_{};
+  std::array<std::vector<int>, 2> npu_a_lo_{};
+  std::array<std::vector<int>, 2> npu_c_{};
   /// Device table of the C streams' GPU pointers, [group][kNpuSlicesMax]; the
   /// GDN epilogue reads z from them directly. Null when unavailable.
-  const std::uint8_t** npu_c_dev_{nullptr};
+  std::array<const std::uint8_t**, 2> npu_c_dev_{};
+  const std::vector<int>& NpuA() const { return npu_a_[route_bank_]; }
+  const std::vector<int>& NpuALo() const { return npu_a_lo_[route_bank_]; }
+  const std::vector<int>& NpuC() const { return npu_c_[route_bank_]; }
+  const std::uint8_t** NpuCDev() const {
+    return const_cast<const std::uint8_t**>(npu_c_dev_[route_bank_]);
+  }
   std::array<std::vector<int>, 2> npu_whole_a_{};
   std::array<std::vector<int>, 2> npu_whole_c_{};
   std::uint32_t npu_whole_groups_{0};
@@ -857,7 +918,10 @@ private:
   };
   /// Set while a whole-projection linear layer runs: its qkv/z values are read
   /// straight from the NPU streams (fused convolution, z in the epilogue).
-  mutable WholeStreams whole_streams_{};
+  /// Banked: the whole path's C buffers are per bank, so each bank needs its
+  /// own view of the table while its layer runs.
+  mutable std::array<WholeStreams, 2> whole_streams_{};
+  WholeStreams& Whole() const { return whole_streams_[route_bank_]; }
   mutable void* gdn_chunk_scratch_{nullptr};
   mutable std::size_t gdn_chunk_scratch_bytes_{0};
   mutable std::uint32_t q8t_rows_{0};

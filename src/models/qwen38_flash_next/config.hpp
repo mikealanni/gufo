@@ -39,6 +39,17 @@ struct Config {
   float rope_theta{0.0F};                    ///< 1e7
   std::array<std::uint32_t, 4> rope_sections{};
 
+  // YaRN long-context extension. Read from `rope.scaling.*` when the artifact
+  // carries them; the shipped Flash-Next GGUF does not, so these stay at the
+  // disabled default and the engine applies Qwen's documented YaRN settings
+  // (factor = requested_len / context_length, beta 32/1) only when a caller
+  // asks for a context above `context_length`. `yarn_attn_factor` (mscale) is
+  // derived as 1 + 0.1 ln(factor), matching models/laguna, and not stored.
+  float yarn_factor{1.0F};         ///< 1 => YaRN disabled (plain rope).
+  std::uint32_t yarn_orig_ctx{0};  ///< rope.scaling.original_context_length.
+  float yarn_beta_fast{32.0F};     ///< rope.scaling.yarn_beta_fast.
+  float yarn_beta_slow{1.0F};      ///< rope.scaling.yarn_beta_slow.
+
   // Qwen Sparse Attention indexer (block top-k selection).
   std::uint32_t indexer_heads{0};     ///< 4
   std::uint32_t indexer_head_dim{0};  ///< 128

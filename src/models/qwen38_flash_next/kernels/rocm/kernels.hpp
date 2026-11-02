@@ -135,6 +135,28 @@ void ResidualToFloat(const __half* src, float* dst, std::size_t count,
 void MeanStreams(const void* src, float* dst, std::uint32_t rows,
                  std::uint32_t hidden, std::uint32_t streams,
                  std::size_t dst_stride, bool src_half, hipStream_t stream);
+/// flags[0] += NaN, flags[1] += Inf element counts over `count` elements of
+/// F32 or F16 `data`. Debug builds only; caller zeroes flags and syncs.
+void NanScan(const void* data, std::size_t count, bool is_half, int* flags,
+             hipStream_t stream);
+/// flags += count of negative ids over `slots` entries. Debug only.
+void NegIdsCount(const int* ids, std::size_t slots, int* flags,
+                 hipStream_t stream);
+/// out[0] += rows containing NaN, out[1] = min row index with NaN. Debug only.
+void NanRowScan(const float* x, std::size_t rows, std::size_t cols, int* out,
+                hipStream_t stream);
+/// F16 variant of NanRowScan. Debug only.
+void NanRowScanHalf(const void* x, std::size_t rows, std::size_t cols, int* out,
+                    hipStream_t stream);
+/// Locates the first non-finite float: host_out packs the inverted element
+/// index in the high word and its raw bits in the low word. Debug only.
+void FirstBadFloat(const void* data, std::size_t count,
+                   unsigned long long* host_out, hipStream_t stream);
+void FillF32(float* p, float v, std::size_t n, hipStream_t stream);
+/// Collects (up to 16) elements equal to `magic` (host sync; debug only).
+/// host[0] = count, host[1] = filled, host[2+k] = index, host[34+k] = bits.
+bool StaleScan(const float* p, float magic, std::size_t n, unsigned host[50],
+               hipStream_t stream);
 /// HcCombineF16 with the MoE epilogue fused in: the block output is
 /// MoeEpilogueVec4F16's result over `expert_out` ([tokens][used][hidden]
 /// F16 rows), `weights`, the gated shared expert; it is formed in
@@ -302,7 +324,8 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope = nullptr,
                       bool half_weights = false,
-                      std::uint32_t skip_gate_heads = 0);
+                      std::uint32_t skip_gate_heads = 0,
+                      const float* yarn = nullptr, float mscale = 1.0f);
 
 /// Exact Q8_0 HC up projection and F16-input mixer for the Flash Next
 /// 2560-hidden, rank-320 geometry. Returns false below 96 tokens or for other
@@ -604,7 +627,8 @@ void PrepareQueryHeads(const float* packed, std::uint32_t stride,
                        std::uint32_t rotary_dim, const std::uint32_t* start_pos,
                        float theta, float eps, hipStream_t stream,
                        const qwen::vision::DeviceRope* rope,
-                       std::uint32_t q_heads);
+                       std::uint32_t q_heads, const float* yarn = nullptr,
+                       float mscale = 1.0f);
 /// The same, reading the packed rows straight from the NPU's C streams.
 /// Keys and values of the packed rows (heads query/gate pairs, then k, then v)
 /// into the caches: the kv heads' blocks of PrepareAttention only.
@@ -614,7 +638,8 @@ bool PrepareKvHeads(const float* packed, std::uint32_t stride,
                     std::uint32_t kv_heads, std::uint32_t d,
                     std::uint32_t rotary_dim, const std::uint32_t* start_pos,
                     float theta, float eps, hipStream_t stream,
-                    const qwen::vision::DeviceRope* rope);
+                    const qwen::vision::DeviceRope* rope,
+                    const float* yarn = nullptr, float mscale = 1.0f);
 void PrepareQueryHeadsStreams(
     const std::uint8_t* const* streams, std::uint32_t stream_stride,
     std::uint32_t stream_tokens, const float* q_gamma, float* q, float* gate,
@@ -622,7 +647,8 @@ void PrepareQueryHeadsStreams(
     std::uint32_t d, std::uint32_t rotary_dim, const std::uint32_t* start_pos,
     float theta, float eps, hipStream_t stream,
     const qwen::vision::DeviceRope* rope, std::uint32_t q_heads,
-    std::uint32_t first_token = 0);
+    std::uint32_t first_token = 0, const float* yarn = nullptr,
+    float mscale = 1.0f);
 bool PrepareAttention(const float* packed, std::uint32_t stride,
                       const float* q_gamma, const float* k_gamma, float* q,
                       float* gate, __half* k_cache, __half* v_cache,
@@ -631,7 +657,8 @@ bool PrepareAttention(const float* packed, std::uint32_t stride,
                       std::uint32_t rotary_dim, const std::uint32_t* start_pos,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope = nullptr,
-                      bool prefill = false);
+                      bool prefill = false, const float* yarn = nullptr,
+                      float mscale = 1.0f);
 
 /// NEOX partial rotary on x [t][heads][d] at positions start_pos + t.
 /// Positions are read from device memory (`start_pos` points at the
@@ -640,7 +667,8 @@ bool PrepareAttention(const float* packed, std::uint32_t stride,
 void Rope(float* x, std::uint32_t n_tokens, std::uint32_t heads,
           std::uint32_t d, std::uint32_t rotary_dim,
           const std::uint32_t* start_pos, float theta, hipStream_t stream,
-          const qwen::vision::DeviceRope* rope = nullptr);
+          const qwen::vision::DeviceRope* rope = nullptr,
+          const float* yarn = nullptr, float mscale = 1.0f);
 
 /// Stores f32 rows into the f16 cache at positions start_pos + t:
 /// cache[(start_pos + t)][row_dim].
@@ -664,7 +692,8 @@ void PoolIndexerBlocks(const float* raw_keys, const float* gamma,
                        std::uint32_t grid_blocks, std::uint32_t ratio,
                        std::uint32_t dim, std::uint32_t rotary_dim, float theta,
                        float eps, std::uint32_t capacity, hipStream_t stream,
-                       const qwen::vision::DeviceRope* rope = nullptr);
+                       const qwen::vision::DeviceRope* rope = nullptr,
+                       const float* yarn = nullptr, float mscale = 1.0f);
 
 /// Per query t (position *start_pos + first_token + t): scores every
 /// complete block below its own tail, keeps the `budget` highest, and

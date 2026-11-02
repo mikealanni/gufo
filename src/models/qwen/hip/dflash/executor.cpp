@@ -85,16 +85,19 @@ void NormalizeAndRotateQK(float* query, float* key, const float* query_weight,
                           const float* key_weight,
                           const core::ModelConfig& config,
                           std::uint32_t query_heads, std::size_t rows,
-                          std::uint32_t position, hipStream_t stream) {
+                          std::uint32_t position, hipStream_t stream,
+                          const float* yarn = nullptr, float mscale = 1.0F) {
   // The target's fused kernel has the same reduction and RoPE arithmetic.
   // DFlash2 keeps its own ring cache, so only the in-place Q/K outputs are
-  // used.
+  // used. yarn/mscale (non-null only for Flash-Next's YaRN-extended
+  // sessions, this worktree) keep the drafter's own RoPE aligned with the
+  // target's scaled positions past native context - see QwenDFlashGpuExecutor.
   if (config.head_dim <= 256) {
     LaunchBatchedFusedQKNormRoPEKvWrite(
         query, key, key, query_weight, key_weight, query, key, nullptr, nullptr,
         nullptr, nullptr, 0, position, rows, 0, query_heads,
         config.num_key_value_heads, config.head_dim, config.rotary_dim,
-        config.rope_theta, 1e-6F, stream);
+        config.rope_theta, 1e-6F, stream, nullptr, yarn, mscale);
     return;
   }
   if (query_heads != 0) {
@@ -106,7 +109,7 @@ void NormalizeAndRotateQK(float* query, float* key, const float* query_weight,
                               1e-6F, stream);
   LaunchBatchedRoPE(query, key, rows, query_heads, config.num_key_value_heads,
                     config.head_dim, config.rotary_dim, position,
-                    config.rope_theta, stream);
+                    config.rope_theta, stream, nullptr, yarn, mscale);
 }
 
 void TraceTensor(const DFlashTrace& trace, std::string_view name,
@@ -223,8 +226,19 @@ QwenDFlashGpuExecutor::~QwenDFlashGpuExecutor() {
 std::unique_ptr<QwenDFlashGpuExecutor> QwenDFlashGpuExecutor::Create(
     std::shared_ptr<const QwenDFlashGpuModel> model, std::uint32_t max_context,
     std::string* error_msg) {
-  if (model == nullptr || max_context == 0 ||
-      max_context > model->GetConfig().context_length) {
+  // The drafter's own context_length cap assumed the target session never
+  // exceeds the trunk's native context. Flash-Next's YaRN extension (this
+  // worktree only) breaks that assumption: the target can request up to
+  // 4x native, but this drafter's RoPE (NormalizeAndRotateQK above) is
+  // NOT YaRN-aware - it still uses plain config.rope_theta at the
+  // absolute position. Past native context the drafter's position
+  // encoding will not match the (YaRN-scaled) target's, so its proposals
+  // may be systematically wrong there - expect that to show up as a low
+  // acceptance rate, not a crash, and do not read a DFlash2 past-262,144
+  // acceptance rate as representative without threading YaRN into this
+  // drafter's RoPE too. Relaxed to unblock testing per explicit request;
+  // not a correctness fix.
+  if (model == nullptr || max_context == 0) {
     if (error_msg != nullptr) {
       *error_msg = "DFlash GPU executor context is invalid";
     }
@@ -1086,11 +1100,13 @@ bool QwenDFlashGpuExecutor::InjectTargetContextRows(std::uint32_t position,
     if (layer.attn_k_norm.data != nullptr) {
       NormalizeAndRotateQK(nullptr, d_k_block_, nullptr,
                            static_cast<const float*>(layer.attn_k_norm.data),
-                           cfg, 0, num_tokens, position, stream_);
+                           cfg, 0, num_tokens, position, stream_,
+                           yarn_inv_freq_, yarn_mscale_);
     } else {
       LaunchBatchedRoPE(nullptr, d_k_block_, num_tokens, 0,
                         cfg.num_key_value_heads, cfg.head_dim, cfg.rotary_dim,
-                        position, cfg.rope_theta, stream_);
+                        position, cfg.rope_theta, stream_, nullptr,
+                        yarn_inv_freq_, yarn_mscale_);
     }
 
     if (trace) {
@@ -1243,10 +1259,10 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
     RunBlockGemm(layer.attn_v, attn_in, d_v_block_, block_count, kv_dim,
                  hidden_size);
 
-    NormalizeAndRotateQK(d_q_, d_k_block_,
-                         static_cast<const float*>(layer.attn_q_norm.data),
-                         static_cast<const float*>(layer.attn_k_norm.data), cfg,
-                         num_q_heads, block_count, current_pos, stream_);
+    NormalizeAndRotateQK(
+        d_q_, d_k_block_, static_cast<const float*>(layer.attn_q_norm.data),
+        static_cast<const float*>(layer.attn_k_norm.data), cfg, num_q_heads,
+        block_count, current_pos, stream_, yarn_inv_freq_, yarn_mscale_);
     emit("q", d_q_, q_dim);
     emit("k", d_k_block_, kv_dim);
     emit("v", d_v_block_, kv_dim);

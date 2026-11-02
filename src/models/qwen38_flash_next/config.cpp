@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <optional>
 #include <string_view>
 #include <utility>
 #include <variant>
@@ -41,6 +42,24 @@ struct Reader {
     if (!value || !std::isfinite(*value))
       Fail("missing or invalid GGUF float " + std::string(key));
     return value.value_or(fallback);
+  }
+
+  /// Optional finite float: present keys are validated, absent keys are not an
+  /// error (used for the optional YaRN scaling block).
+  std::optional<float> F32Opt(std::string_view key) {
+    const auto value = gguf.GetMetadataFloat32(key);
+    if (value && std::isfinite(*value)) {
+      return value;
+    }
+    return std::nullopt;
+  }
+
+  std::optional<std::uint32_t> U32Opt(std::string_view key) {
+    const auto value = gguf.GetMetadataUint32(key);
+    if (value && *value != 0) {
+      return value;
+    }
+    return std::nullopt;
   }
 
   /// Integer arrays of any width; GGUF writers pick the narrowest type.
@@ -127,6 +146,21 @@ std::optional<Config> Config::FromGguf(const core::GgufReader& gguf,
       if (sum != c.rotary_dim / 2)
         r.Fail("mRoPE sections must sum to half the rotary dimension");
     }
+  }
+
+  // Optional YaRN scaling. The Flash-Next GGUF carries none of these; the
+  // engine layers Qwen's documented YaRN settings on top when extending past
+  // `context_length`, so absent keys here simply leave YaRN disabled.
+  if (gguf.GetMetadataString(key("rope.scaling.type")) == "yarn") {
+    c.yarn_factor = r.F32Opt(key("rope.scaling.factor")).value_or(1.0F);
+    if (const auto orig =
+            r.U32Opt(key("rope.scaling.original_context_length"))) {
+      c.yarn_orig_ctx = *orig;
+    }
+    c.yarn_beta_fast =
+        r.F32Opt(key("rope.scaling.yarn_beta_fast")).value_or(32.0F);
+    c.yarn_beta_slow =
+        r.F32Opt(key("rope.scaling.yarn_beta_slow")).value_or(1.0F);
   }
 
   c.indexer_heads = r.U32(key("attention.indexer.head_count"));

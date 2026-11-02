@@ -2661,7 +2661,8 @@ __global__ void PrepareAttentionKernel(
     std::uint32_t q_only_heads = 0,
     const std::uint8_t* const* streams = nullptr,
     std::uint32_t stream_stride = 0, std::uint32_t stream_tokens = 0,
-    std::uint32_t first_token = 0, std::uint32_t head_block0 = 0) {
+    std::uint32_t first_token = 0, std::uint32_t head_block0 = 0,
+    const float* yarn = nullptr, float mscale = 1.0f) {
   __shared__ float partial[kHeadsPerBlock][8];
   __shared__ float norm[kHeadsPerBlock][256];
   const std::uint32_t t = blockIdx.x + first_token,
@@ -2735,10 +2736,15 @@ __global__ void PrepareAttentionKernel(
   const std::uint32_t half = rotary / 2;
   float sine = 0.0f, cosine = 0.0f;
   if (tid < half) {
-    const float freq = powf(
-        theta, -2.0f * static_cast<float>(tid) / static_cast<float>(rotary));
+    const float freq = yarn ? yarn[tid]
+                            : powf(theta, -2.0f * static_cast<float>(tid) /
+                                              static_cast<float>(rotary));
     sincosf(qwen::vision::RopePosition(rope, *start_pos + t, tid) * freq, &sine,
             &cosine);
+    if (mscale != 1.0f) {
+      sine *= mscale;
+      cosine *= mscale;
+    }
   }
 #pragma unroll
   for (std::uint32_t j = 0; j < kHeadsPerBlock; ++j) {
@@ -2774,18 +2780,24 @@ __global__ void PrepareAttentionKernel(
 __global__ void RopeKernel(float* x, std::uint32_t heads, std::uint32_t d,
                            std::uint32_t rotary_dim,
                            const std::uint32_t* start_pos, float theta,
-                           const qwen::vision::DeviceRope* rope) {
+                           const qwen::vision::DeviceRope* rope,
+                           const float* yarn = nullptr, float mscale = 1.0f) {
   const std::uint32_t t = blockIdx.x;
   const std::uint32_t half = rotary_dim / 2;
   for (std::uint32_t idx = threadIdx.x; idx < heads * half; idx += blockDim.x) {
     const std::uint32_t h = idx / half;
     const std::uint32_t i = idx % half;
     float* v = x + (static_cast<std::size_t>(t) * heads + h) * d;
-    const float freq = powf(
-        theta, -2.0f * static_cast<float>(i) / static_cast<float>(rotary_dim));
+    const float freq = yarn ? yarn[i]
+                            : powf(theta, -2.0f * static_cast<float>(i) /
+                                              static_cast<float>(rotary_dim));
     float s = 0.0f;
     float c = 0.0f;
     sincosf(qwen::vision::RopePosition(rope, *start_pos + t, i) * freq, &s, &c);
+    if (mscale != 1.0f) {
+      s *= mscale;
+      c *= mscale;
+    }
     const float a = v[i];
     const float b = v[i + half];
     v[i] = a * c - b * s;
@@ -2818,14 +2830,13 @@ __global__ void StoreRowsKernel(const float* src, float* dst,
 /// grid: the most blocks a batch can complete. Block b pools raw keys
 /// [b*ratio, (b+1)*ratio) once every one of them is stored, i.e. for
 /// b in [*first_block, (*start_pos + n_tokens) / ratio).
-__global__ void PoolBlocksKernel(const float* raw, const float* gamma,
-                                 __half* blocks,
-                                 const std::uint32_t* first_block,
-                                 const std::uint32_t* start_pos,
-                                 std::uint32_t n_tokens, std::uint32_t ratio,
-                                 std::uint32_t dim, std::uint32_t rotary_dim,
-                                 float theta, float eps, std::uint32_t capacity,
-                                 const qwen::vision::DeviceRope* rope) {
+__global__ void PoolBlocksKernel(
+    const float* raw, const float* gamma, __half* blocks,
+    const std::uint32_t* first_block, const std::uint32_t* start_pos,
+    std::uint32_t n_tokens, std::uint32_t ratio, std::uint32_t dim,
+    std::uint32_t rotary_dim, float theta, float eps, std::uint32_t capacity,
+    const qwen::vision::DeviceRope* rope, const float* yarn = nullptr,
+    float mscale = 1.0f) {
   __shared__ float v[256];
   __shared__ float shared[32];
   const std::uint32_t b = *first_block + blockIdx.x;
@@ -2851,11 +2862,16 @@ __global__ void PoolBlocksKernel(const float* raw, const float* gamma,
   float outv = i < dim ? v[i] : 0.0f;
   if (i < rotary_dim) {
     const std::uint32_t p = i < half ? i : i - half;
-    const float freq = powf(
-        theta, -2.0f * static_cast<float>(p) / static_cast<float>(rotary_dim));
+    const float freq = yarn ? yarn[p]
+                            : powf(theta, -2.0f * static_cast<float>(p) /
+                                              static_cast<float>(rotary_dim));
     float s = 0.0f;
     float c = 0.0f;
     sincosf(qwen::vision::RopePosition(rope, b * ratio, p) * freq, &s, &c);
+    if (mscale != 1.0f) {
+      s *= mscale;
+      c *= mscale;
+    }
     const float a = v[p];
     const float bb = v[p + half];
     outv = i < half ? a * c - bb * s : a * s + bb * c;
@@ -3731,7 +3747,8 @@ __global__ void AttentionKernel(
   }
   if (splits == 1) {
     if (i < d) {
-      out[(static_cast<std::size_t>(t) * heads + h) * d + i] = total / l;
+      out[(static_cast<std::size_t>(t) * heads + h) * d + i] =
+          l == 0.0f ? 0.0f : total / l;
     }
     return;
   }
@@ -3773,7 +3790,8 @@ __global__ void AttentionMergeKernel(const float* partials, float* out,
     }
   }
   if (i < d) {
-    out[(static_cast<std::size_t>(t) * heads + h) * d + i] = acc / l;
+    out[(static_cast<std::size_t>(t) * heads + h) * d + i] =
+        l == 0.0f ? 0.0f : acc / l;
   }
 }
 
@@ -4233,6 +4251,13 @@ __device__ __forceinline__ __attribute__((convergent)) void SyncLds() {
 // the writes stay conflict-free. The optional block mask follows the model's
 // sparse selection: keys at or past the query's incomplete tail block are
 // always visible, earlier blocks only when their bit is set.
+__device__ __forceinline__ bool HalfInfWord(unsigned w) {
+  const auto inf = [](unsigned h) {
+    return (h & 0x7C00u) == 0x7C00u && (h & 0x03FFu) == 0u;
+  };
+  return inf(w & 0xFFFFu) || inf(w >> 16);
+}
+
 constexpr std::uint32_t kWmmaHeadDim = 256;
 constexpr std::uint32_t kWmmaQueryHeads = 24;
 constexpr std::uint32_t kWmmaKvHeads = 2;
@@ -4264,7 +4289,7 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
     const __half* __restrict__ k_cache, const __half* __restrict__ v_cache,
     const std::uint32_t* __restrict__ mask, std::uint32_t mask_words,
     float* __restrict__ out, std::uint32_t start_pos, std::uint32_t n_tokens,
-    std::uint32_t first_query_group = 0) {
+    std::uint32_t first_query_group = 0, int* __restrict__ dbg = nullptr) {
   // The launcher accepts only four-token selection blocks. Keep that
   // geometry constant throughout the key sweep.
   constexpr std::uint32_t ratio = kWmmaRatio;
@@ -4355,6 +4380,10 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
 #pragma unroll
       for (std::uint32_t v = 0; v < 4; ++v) {
         const float4 f = live ? qp[v] : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+        if (dbg && !(std::isfinite(f.x) && std::isfinite(f.y) &&
+                     std::isfinite(f.z) && std::isfinite(f.w))) {
+          atomicAdd(dbg + 0, 1);
+        }
         q_frag[ks][(v * 4) + 0] = static_cast<_Float16>(f.x * attention_scale);
         q_frag[ks][(v * 4) + 1] = static_cast<_Float16>(f.y * attention_scale);
         q_frag[ks][(v * 4) + 2] = static_cast<_Float16>(f.z * attention_scale);
@@ -4555,6 +4584,20 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
       dst[j] = live ? *reinterpret_cast<const uint4*>(src + (j * 8))
                     : make_uint4(0u, 0u, 0u, 0u);
     }
+    if (dbg && live) {
+      bool bad = false;
+#pragma unroll
+      for (std::uint32_t j = 0; j < kVRegs; ++j) {
+        const unsigned* w = reinterpret_cast<const unsigned*>(&dst[j]);
+#pragma unroll
+        for (std::uint32_t t = 0; t < 4; ++t)
+          bad |= HalfInfWord(w[t]);
+      }
+      if (bad) {
+        atomicAdd(dbg + 2, 1);
+        atomicExch(reinterpret_cast<unsigned*>(dbg + 3), key_position);
+      }
+    }
   };
   // Coalesced: a wave reads one key row's 512 contiguous bytes.
   const auto load_k = [&](const Tile& tile, uint4* dst) {
@@ -4570,6 +4613,14 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
                      (static_cast<std::size_t>(key_position) * kWmmaKvWidth) +
                      d8)
                : make_uint4(0u, 0u, 0u, 0u);
+      if (dbg && live) {
+        const unsigned* w = reinterpret_cast<const unsigned*>(&dst[n]);
+        if (HalfInfWord(w[0]) | HalfInfWord(w[1]) | HalfInfWord(w[2]) |
+            HalfInfWord(w[3])) {
+          atomicAdd(dbg + 1, 1);
+          atomicExch(reinterpret_cast<unsigned*>(dbg + 12), key_position);
+        }
+      }
     }
   };
 
@@ -4619,6 +4670,9 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
       // Each half writes its own slot; the reader sums them.
 #pragma unroll
       for (std::uint32_t i = 0; i < 8; ++i) {
+        if (dbg && !std::isfinite(s_acc[i])) {
+          atomicAdd(dbg + 4, 1);
+        }
         s_lds[s_kh][s_tile][(2 * i) + half_id][sub] = s_acc[i];
       }
     }
@@ -4681,6 +4735,10 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
           vals[m] = valid ? (s_lds[0][tile][row][col % 16] +
                              s_lds[1][tile][row][col % 16])
                           : -INFINITY;
+          if (dbg && !std::isfinite(vals[m])) {
+            atomicAdd(dbg + 5, 1);
+            vals[m] = -INFINITY;
+          }
           part_max = fmaxf(part_max, vals[m]);
         }
 #pragma unroll
@@ -4814,6 +4872,12 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
             (denominator > 0.0F) ? (o_acc[rb][t][i] / denominator) : 0.0F;
         if (gate != nullptr) {
           value *= SigmoidF(gate[offset]);
+        }
+        // The attention output is mathematically bounded by |v|max; any
+        // non-finite value here (e.g. a racing writer into the output
+        // buffer's tile) must never enter the residual stream.
+        if (!std::isfinite(value)) {
+          value = 0.0F;
         }
         out[offset] = value;
       }
@@ -7319,6 +7383,10 @@ struct AttentionProjectionOutput {
   const qwen::vision::DeviceRope* rope;
   /// Query and gate tiles of the first heads are computed elsewhere (the NPU).
   std::uint32_t skip_gate_heads;
+  /// YaRN inverse-frequency table (null) and attention-score scale (1) for the
+  /// inline rotary; null/1 reproduces plain theta math byte-for-byte.
+  const float* yarn = nullptr;
+  float mscale = 1.0f;
 };
 
 /// Dense F16 WMMA GEMM over Q8_0 or F16 weights: block = BM rows x BN tokens,
@@ -7683,13 +7751,20 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
               v[c] = v[c] * gamma[c * 32 + lane_id];
               asm volatile("" : "+v"(v[c]));
             }
-            const float freq = powf(
-                attention.theta, -2.0F * static_cast<float>(lane_id) / 64.0F);
+            const float freq =
+                attention.yarn
+                    ? attention.yarn[lane_id]
+                    : powf(attention.theta,
+                           -2.0F * static_cast<float>(lane_id) / 64.0F);
             float sn = 0.0F, cs = 0.0F;
             sincosf(qwen::vision::RopePosition(
                         attention.rope, *attention.position + tok, lane_id) *
                         freq,
                     &sn, &cs);
+            if (attention.mscale != 1.0F) {
+              sn *= attention.mscale;
+              cs *= attention.mscale;
+            }
             const float lo = __fmaf_rn(v[0], cs, -__fmul_rn(v[1], sn));
             const float hi = __fmaf_rn(v[0], sn, __fmul_rn(v[1], cs));
             v[0] = lo;
@@ -7927,15 +8002,16 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
                       std::uint32_t n_tokens, const std::uint32_t* position,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope, bool half_weights,
-                      std::uint32_t skip_gate_heads) {
+                      std::uint32_t skip_gate_heads, const float* yarn,
+                      float mscale) {
   if (n_tokens == 0 || weights == nullptr || input == nullptr ||
       q_gamma == nullptr || k_gamma == nullptr || query == nullptr ||
       gate == nullptr || keys == nullptr || values == nullptr ||
       position == nullptr)
     return false;
   const AttentionProjectionOutput output{
-      q_gamma,  k_gamma, query, gate, keys,           values,
-      position, theta,   eps,   rope, skip_gate_heads};
+      q_gamma, k_gamma, query,           gate, keys,  values, position, theta,
+      eps,     rope,    skip_gate_heads, yarn, mscale};
   if (half_weights) {
     hipLaunchKernelGGL((DenseF16GEMMKernel<256, 128, 2, 8, 1, 1, false, false,
                                            true, true, false>),
@@ -9815,7 +9891,8 @@ bool PrepareAttention(const float* packed, std::uint32_t stride,
                       std::uint32_t kv_heads, std::uint32_t d,
                       std::uint32_t rotary_dim, const std::uint32_t* start_pos,
                       float theta, float eps, hipStream_t stream,
-                      const qwen::vision::DeviceRope* rope, bool prefill) {
+                      const qwen::vision::DeviceRope* rope, bool prefill,
+                      const float* yarn, float mscale) {
   if (d == 0 || d > 256 || rotary_dim == 0 || rotary_dim > d ||
       rotary_dim % 2 != 0 || kv_heads == 0 ||
       stride < static_cast<std::size_t>(2) * (heads + kv_heads) * d) {
@@ -9824,17 +9901,17 @@ bool PrepareAttention(const float* packed, std::uint32_t stride,
   if (n_tokens == 0)
     return true;
   if (!prefill && n_tokens < 32) {
-    hipLaunchKernelGGL((PrepareAttentionKernel<1>),
-                       dim3(n_tokens, heads + kv_heads), dim3(kThreads), 0,
-                       stream, packed, stride, q_gamma, k_gamma, q, gate,
-                       k_cache, v_cache, heads, kv_heads, d, rotary_dim,
-                       start_pos, theta, eps, rope);
+    hipLaunchKernelGGL(
+        (PrepareAttentionKernel<1>), dim3(n_tokens, heads + kv_heads),
+        dim3(kThreads), 0, stream, packed, stride, q_gamma, k_gamma, q, gate,
+        k_cache, v_cache, heads, kv_heads, d, rotary_dim, start_pos, theta, eps,
+        rope, 0U, nullptr, 0U, 0U, 0U, 0U, yarn, mscale);
   } else {
-    hipLaunchKernelGGL((PrepareAttentionKernel<4>),
-                       dim3(n_tokens, (heads + kv_heads + 3) / 4),
-                       dim3(kThreads), 0, stream, packed, stride, q_gamma,
-                       k_gamma, q, gate, k_cache, v_cache, heads, kv_heads, d,
-                       rotary_dim, start_pos, theta, eps, rope);
+    hipLaunchKernelGGL(
+        (PrepareAttentionKernel<4>), dim3(n_tokens, (heads + kv_heads + 3) / 4),
+        dim3(kThreads), 0, stream, packed, stride, q_gamma, k_gamma, q, gate,
+        k_cache, v_cache, heads, kv_heads, d, rotary_dim, start_pos, theta, eps,
+        rope, 0U, nullptr, 0U, 0U, 0U, 0U, yarn, mscale);
   }
   return true;
 }
@@ -9846,12 +9923,13 @@ void PrepareQueryHeadsStreams(
     std::uint32_t d, std::uint32_t rotary_dim, const std::uint32_t* start_pos,
     float theta, float eps, hipStream_t stream,
     const qwen::vision::DeviceRope* rope, std::uint32_t q_heads,
-    std::uint32_t first_token) {
-  hipLaunchKernelGGL(
-      (PrepareAttentionKernel<4, true>), dim3(n_tokens, (q_heads + 3) / 4),
-      dim3(kThreads), 0, stream, nullptr, 0, q_gamma, nullptr, q, gate, nullptr,
-      nullptr, heads, kv_heads, d, rotary_dim, start_pos, theta, eps, rope,
-      q_heads, streams, stream_stride, stream_tokens, first_token);
+    std::uint32_t first_token, const float* yarn, float mscale) {
+  hipLaunchKernelGGL((PrepareAttentionKernel<4, true>),
+                     dim3(n_tokens, (q_heads + 3) / 4), dim3(kThreads), 0,
+                     stream, nullptr, 0, q_gamma, nullptr, q, gate, nullptr,
+                     nullptr, heads, kv_heads, d, rotary_dim, start_pos, theta,
+                     eps, rope, q_heads, streams, stream_stride, stream_tokens,
+                     first_token, 0U, yarn, mscale);
 }
 
 bool PrepareKvHeads(const float* packed, std::uint32_t stride,
@@ -9860,7 +9938,8 @@ bool PrepareKvHeads(const float* packed, std::uint32_t stride,
                     std::uint32_t kv_heads, std::uint32_t d,
                     std::uint32_t rotary_dim, const std::uint32_t* start_pos,
                     float theta, float eps, hipStream_t stream,
-                    const qwen::vision::DeviceRope* rope) {
+                    const qwen::vision::DeviceRope* rope, const float* yarn,
+                    float mscale) {
   if (d == 0 || d > 256 || rotary_dim == 0 || rotary_dim > d ||
       rotary_dim % 2 != 0 || kv_heads == 0 || heads % 4 != 0) {
     return false;
@@ -9869,7 +9948,7 @@ bool PrepareKvHeads(const float* packed, std::uint32_t stride,
       (PrepareAttentionKernel<4>), dim3(n_tokens, (kv_heads + 3) / 4),
       dim3(kThreads), 0, stream, packed, stride, nullptr, k_gamma, nullptr,
       nullptr, k_cache, v_cache, heads, kv_heads, d, rotary_dim, start_pos,
-      theta, eps, rope, 0U, nullptr, 0U, 0U, 0U, heads / 4);
+      theta, eps, rope, 0U, nullptr, 0U, 0U, 0U, heads / 4, yarn, mscale);
   return true;
 }
 
@@ -9880,20 +9959,22 @@ void PrepareQueryHeads(const float* packed, std::uint32_t stride,
                        std::uint32_t rotary_dim, const std::uint32_t* start_pos,
                        float theta, float eps, hipStream_t stream,
                        const qwen::vision::DeviceRope* rope,
-                       std::uint32_t q_heads) {
+                       std::uint32_t q_heads, const float* yarn, float mscale) {
   hipLaunchKernelGGL((PrepareAttentionKernel<4>),
                      dim3(n_tokens, (q_heads + 3) / 4), dim3(kThreads), 0,
                      stream, packed, stride, q_gamma, nullptr, q, gate, nullptr,
                      nullptr, heads, kv_heads, d, rotary_dim, start_pos, theta,
-                     eps, rope, q_heads);
+                     eps, rope, q_heads, nullptr, 0U, 0U, 0U, 0U, yarn, mscale);
 }
 
 void Rope(float* x, std::uint32_t n_tokens, std::uint32_t heads,
           std::uint32_t d, std::uint32_t rotary_dim,
           const std::uint32_t* start_pos, float theta, hipStream_t stream,
-          const qwen::vision::DeviceRope* rope) {
+          const qwen::vision::DeviceRope* rope, const float* yarn,
+          float mscale) {
   hipLaunchKernelGGL(RopeKernel, dim3(n_tokens), dim3(kThreads), 0, stream, x,
-                     heads, d, rotary_dim, start_pos, theta, rope);
+                     heads, d, rotary_dim, start_pos, theta, rope, yarn,
+                     mscale);
 }
 
 void StoreKv(const float* src, __half* cache, std::uint32_t n_tokens,
@@ -9916,14 +9997,15 @@ void PoolIndexerBlocks(const float* raw_keys, const float* gamma,
                        std::uint32_t grid_blocks, std::uint32_t ratio,
                        std::uint32_t dim, std::uint32_t rotary_dim, float theta,
                        float eps, std::uint32_t capacity, hipStream_t stream,
-                       const qwen::vision::DeviceRope* rope) {
+                       const qwen::vision::DeviceRope* rope, const float* yarn,
+                       float mscale) {
   if (grid_blocks == 0) {
     return;
   }
   hipLaunchKernelGGL(PoolBlocksKernel, dim3(grid_blocks), dim3(kThreads), 0,
                      stream, raw_keys, gamma, blocks, first_block, start_pos,
                      n_tokens, ratio, dim, rotary_dim, theta, eps, capacity,
-                     rope);
+                     rope, yarn, mscale);
 }
 
 // Debug aid (GUFO_SELECT_CHECK=1): compares the shipped masks and scores with
@@ -10148,6 +10230,23 @@ bool WmmaCausalAttention(const float* q, const float* gate,
       (mask != nullptr && mask_words > kWmmaMaxMaskWords)) {
     return false;
   }
+  static int* const dbg = [] {
+    const char* e = std::getenv("GUFO_ATTN_DBG");
+    if (e == nullptr || e[0] != '1') {
+      return static_cast<int*>(nullptr);
+    }
+    int* p = nullptr;
+    if (hipMalloc(&p, 32 * sizeof(int)) != hipSuccess) {
+      return static_cast<int*>(nullptr);
+    }
+    return p;
+  }();
+  hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+  (void)hipStreamIsCapturing(stream, &capture);
+  const bool dbg_live = dbg != nullptr && capture == hipStreamCaptureStatusNone;
+  if (dbg_live) {
+    (void)hipMemsetAsync(dbg, 0, 32 * sizeof(int), stream);
+  }
   if (mask != nullptr) {
     constexpr std::uint32_t kPackedQueries = 4;
     const std::uint32_t first_group =
@@ -10161,12 +10260,26 @@ bool WmmaCausalAttention(const float* q, const float* gate,
       hipLaunchKernelGGL(
           (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true, true>),
           grid, dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask,
-          mask_words, out, start_pos, n_tokens, first_group);
+          mask_words, out, start_pos, n_tokens, first_group, dbg);
     } else {
       hipLaunchKernelGGL(
           (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true>), grid,
           dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask,
-          mask_words, out, start_pos, n_tokens, first_group);
+          mask_words, out, start_pos, n_tokens, first_group, dbg);
+    }
+    if (dbg_live) {
+      int h[32] = {};
+      (void)hipMemcpyAsync(h, dbg, sizeof(h), hipMemcpyDeviceToHost, stream);
+      (void)hipStreamSynchronize(stream);
+      if (h[0] != 0 || h[1] != 0 || h[2] != 0 || h[4] != 0 || h[6] != 0 ||
+          h[13] != 0) {
+        std::fprintf(stderr,
+                     "[attn dbg] q=%d k=%d(kpos=%d) v=%d(vpos=%d) s=%d "
+                     "vsm=%d out=%d off=%d val=%08x den=%08x oacc=%08x "
+                     "gate=%d(%08x) sp=%u n=%u mask=1\n",
+                     h[0], h[1], h[12], h[2], h[3], h[4], h[5], h[6], h[7],
+                     h[8], h[9], h[10], h[13], h[14], start_pos, n_tokens);
+      }
     }
     return true;
   }
@@ -10180,6 +10293,55 @@ bool WmmaCausalAttention(const float* q, const float* gate,
       dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask, mask_words,
       out, start_pos, n_tokens, first_group);
   return true;
+}
+
+__global__ void FillF32Kernel(float* p, float v, std::size_t n) {
+  const std::size_t i =
+      blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+  if (i < n) {
+    p[i] = v;
+  }
+}
+
+void FillF32(float* p, float v, std::size_t n, hipStream_t stream) {
+  if (n == 0) {
+    return;
+  }
+  hipLaunchKernelGGL(FillF32Kernel, dim3(Blocks(n)), dim3(kThreads), 0, stream,
+                     p, v, n);
+}
+
+__global__ void StaleScanKernel(const float* __restrict__ p, float magic,
+                                std::size_t n, unsigned* __restrict__ out) {
+  const std::size_t i =
+      blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+  if (i < n && p[i] == magic) {
+    atomicAdd(out, 1u);
+    const unsigned k = atomicAdd(out + 1, 1u);
+    if (k < 16u) {
+      out[2 + k] = static_cast<unsigned>(i);
+      out[34 + k] = __float_as_uint(p[i]);
+    }
+  }
+}
+
+bool StaleScan(const float* p, float magic, std::size_t n, unsigned host[50],
+               hipStream_t stream) {
+  if (n == 0) {
+    return true;
+  }
+  unsigned* dev = nullptr;
+  if (hipMalloc(&dev, 50 * sizeof(unsigned)) != hipSuccess) {
+    return false;
+  }
+  (void)hipMemsetAsync(dev, 0, 50 * sizeof(unsigned), stream);
+  hipLaunchKernelGGL(StaleScanKernel, dim3(Blocks(n)), dim3(kThreads), 0,
+                     stream, p, magic, n, dev);
+  const bool ok = hipMemcpyAsync(host, dev, 50 * sizeof(unsigned),
+                                 hipMemcpyDeviceToHost, stream) == hipSuccess &&
+                  hipStreamSynchronize(stream) == hipSuccess;
+  (void)hipFree(dev);
+  return ok;
 }
 
 __global__ void ExpertCountsKernel(const std::int32_t* ids,
@@ -10211,6 +10373,184 @@ void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,
   const std::size_t slots = static_cast<std::size_t>(n_tokens) * k;
   hipLaunchKernelGGL(ExpertCountsKernel, dim3(Blocks(slots)), dim3(kThreads), 0,
                      stream, ids, counts, slots);
+}
+
+__global__ void NanScanKernel(const unsigned int* words, std::size_t count,
+                              int is_half, int* flags) {
+  const std::size_t units = is_half ? count / 2 : count;
+  const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  int nan = 0;
+  int inf = 0;
+  for (std::size_t i =
+           blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+       i < units; i += stride) {
+    const unsigned int w = words[i];
+    if (!is_half) {
+      const float f = __uint_as_float(w);
+      if (f != f) {
+        ++nan;
+      } else if (!isfinite(f)) {
+        ++inf;
+      }
+    } else {
+      const __half lo = __ushort_as_half(static_cast<unsigned short>(w));
+      const __half hi = __ushort_as_half(static_cast<unsigned short>(w >> 16));
+      nan += __hisnan(lo) + __hisnan(hi);
+      inf += (__hisinf(lo) != 0) + (__hisinf(hi) != 0);
+    }
+  }
+  if (nan != 0) {
+    atomicAdd(flags + 0, nan);
+  }
+  if (inf != 0) {
+    atomicAdd(flags + 1, inf);
+  }
+}
+
+void NanScan(const void* data, std::size_t count, bool is_half, int* flags,
+             hipStream_t stream) {
+  const std::size_t units = is_half ? count / 2 : count;
+  const std::size_t blocks = (units + kThreads - 1) / kThreads < 2048
+                                 ? (units + kThreads - 1) / kThreads
+                                 : 2048;
+  hipLaunchKernelGGL(NanScanKernel, dim3(static_cast<unsigned>(blocks)),
+                     dim3(kThreads), 0, stream,
+                     reinterpret_cast<const unsigned int*>(data), count,
+                     is_half ? 1 : 0, flags);
+}
+
+__global__ void FirstBadFloatKernel(const unsigned int* words,
+                                    std::size_t count,
+                                    unsigned long long* report) {
+  const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  for (std::size_t i =
+           blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+       i < count; i += stride) {
+    const float f = __uint_as_float(words[i]);
+    if (f != f || !isfinite(f)) {
+      const unsigned long long packed =
+          (static_cast<unsigned long long>(0xFFFFFFFFu -
+                                           static_cast<unsigned>(i))
+           << 32) |
+          static_cast<unsigned long long>(words[i]);
+      atomicMax(report, packed);
+    }
+  }
+}
+
+void FirstBadFloat(const void* data, std::size_t count,
+                   unsigned long long* host_out, hipStream_t stream) {
+  static unsigned long long* flags = nullptr;
+  static unsigned long long* host = nullptr;
+  if (flags == nullptr) {
+    if (hipMalloc(&flags, sizeof(unsigned long long)) != hipSuccess ||
+        hipHostMalloc(&host, sizeof(unsigned long long)) != hipSuccess) {
+      *host_out = 0;
+      return;
+    }
+  }
+  if (hipMemsetAsync(flags, 0, sizeof(unsigned long long), stream) !=
+      hipSuccess) {
+    *host_out = 0;
+    return;
+  }
+  const std::size_t blocks = (count + kThreads - 1) / kThreads < 2048
+                                 ? (count + kThreads - 1) / kThreads
+                                 : 2048;
+  hipLaunchKernelGGL(FirstBadFloatKernel, dim3(static_cast<unsigned>(blocks)),
+                     dim3(kThreads), 0, stream,
+                     reinterpret_cast<const unsigned int*>(data), count, flags);
+  if (hipMemcpyAsync(host, flags, sizeof(unsigned long long),
+                     hipMemcpyDeviceToHost, stream) != hipSuccess ||
+      hipStreamSynchronize(stream) != hipSuccess) {
+    *host_out = 0;
+    return;
+  }
+  *host_out = *host;
+}
+
+__global__ void NegIdsKernel(const int* ids, std::size_t slots, int* flags) {
+  const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  int neg = 0;
+  for (std::size_t i =
+           blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+       i < slots; i += stride) {
+    neg += ids[i] < 0;
+  }
+  if (neg != 0) {
+    atomicAdd(flags, neg);
+  }
+}
+
+void NegIdsCount(const int* ids, std::size_t slots, int* flags,
+                 hipStream_t stream) {
+  if (slots == 0) {
+    return;
+  }
+  const std::size_t blocks = (slots + kThreads - 1) / kThreads < 2048
+                                 ? (slots + kThreads - 1) / kThreads
+                                 : 2048;
+  hipLaunchKernelGGL(NegIdsKernel, dim3(static_cast<unsigned>(blocks)),
+                     dim3(kThreads), 0, stream, ids, slots, flags);
+}
+
+__global__ void NanRowScanKernel(const float* x, std::size_t cols, int* out) {
+  const float* p = x + static_cast<std::size_t>(blockIdx.x) * cols;
+  __shared__ int bad;
+  if (threadIdx.x == 0) {
+    bad = 0;
+  }
+  __syncthreads();
+  int mine = 0;
+  for (std::size_t i = threadIdx.x; i < cols; i += blockDim.x) {
+    const float f = p[i];
+    mine += f != f;
+  }
+  if (mine != 0) {
+    atomicOr(&bad, 1);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0 && bad != 0) {
+    atomicAdd(out + 0, 1);
+    atomicMin(out + 1, static_cast<int>(blockIdx.x));
+  }
+}
+
+void NanRowScan(const float* x, std::size_t rows, std::size_t cols, int* out,
+                hipStream_t stream) {
+  hipLaunchKernelGGL(NanRowScanKernel, dim3(static_cast<unsigned>(rows)),
+                     dim3(kThreads), 0, stream, x, cols, out);
+}
+
+__global__ void NanRowScanHalfKernel(const __half* x, std::size_t cols,
+                                     int* out) {
+  const __half* p = x + static_cast<std::size_t>(blockIdx.x) * cols;
+  __shared__ int bad;
+  if (threadIdx.x == 0) {
+    bad = 0;
+  }
+  __syncthreads();
+  int mine = 0;
+  for (std::size_t i = threadIdx.x; i < cols; i += blockDim.x) {
+    const float f = __half2float(p[i]);
+    mine +=
+        !(f > -3.40282346638528859812e38f && f < 3.40282346638528859812e38f);
+  }
+  if (mine != 0) {
+    atomicOr(&bad, 1);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0 && bad != 0) {
+    atomicAdd(out + 0, 1);
+    atomicMin(out + 1, static_cast<int>(blockIdx.x));
+  }
+}
+
+void NanRowScanHalf(const void* x, std::size_t rows, std::size_t cols, int* out,
+                    hipStream_t stream) {
+  hipLaunchKernelGGL(NanRowScanHalfKernel, dim3(static_cast<unsigned>(rows)),
+                     dim3(kThreads), 0, stream,
+                     reinterpret_cast<const __half*>(x), cols, out);
 }
 
 void MoeEpilogue(const float* expert_out, const float* weights,

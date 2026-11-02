@@ -9,6 +9,7 @@
 
 #include "src/models/qwen/vision/prompt.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
+#include "src/models/qwen38_flash_next/rope_yarn.hpp"
 #include "src/models/qwen38_flash_next/weights.hpp"
 
 namespace gufo::models::qwen38_flash_next {
@@ -87,6 +88,10 @@ private:
   Storage storage_;
   NgramTable* ngram_;
   std::uint32_t max_context_;
+  /// YaRN table matching the GPU trunk: enabled only when `max_context_`
+  /// exceeds the model's native length, so the CPU oracle reproduces the same
+  /// frequencies (disabled, and byte-identical, for native-length runs).
+  RopeScaling yarn_;
   std::uint32_t position_{0};
   std::vector<LinearState> linear_;
   std::vector<AttentionState> attention_;

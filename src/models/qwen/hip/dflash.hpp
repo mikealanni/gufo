@@ -215,9 +215,22 @@ public:
     return *model_;
   }
 
+  /// Keeps this drafter's own RoPE aligned with a YaRN-extended target
+  /// session (Flash-Next, this worktree only - see dflash/executor.cpp's
+  /// NormalizeAndRotateQK). `yarn_inv_freq` is a device pointer the caller
+  /// owns and must outlive this executor; null (the default) reproduces
+  /// the plain rope_theta math exactly. Set once, right after Create().
+  void SetYarnScaling(const float* yarn_inv_freq, float mscale) noexcept {
+    yarn_inv_freq_ = yarn_inv_freq;
+    yarn_mscale_ = mscale;
+  }
+
 private:
   QwenDFlashGpuExecutor(std::shared_ptr<const QwenDFlashGpuModel> model,
                         std::uint32_t max_context);
+
+  const float* yarn_inv_freq_{nullptr};
+  float yarn_mscale_{1.0F};
 
   bool InjectTargetContextChunk(std::span<const float> target_features,
                                 std::uint32_t position,
