@@ -58,6 +58,13 @@ text, with greedy chat requests to `gufo serve`. NPU numbers need the setup in
 | `-p 32768` | 1,760 | **2,109** (+19.8%) |
 | `-p 65536` | not measured | **2,046** |
 | `-p 131072` | not measured | **1,990** |
+| full 1,048,044-token prompt | not measured | **1,633** |
+
+A `-c` above the native 262,144 extends the model to a **1,048,576-token context**
+with YaRN automatically. That full-prompt row above is a real 1,048,044-token
+request served end to end in 641.7 s, decoding at 33.7 tok/s with DFlash2
+(46% draft acceptance). At cached depths, `gufo bench -d` decode reaches
+106.8 tok/s at 524,288 (`-n 512`) and 72.9 at 983,040 (`-n 1024`).
 
 | Decode, tok/s | plain | MTP | DFlash2 |
 | --- | --- | --- | --- |
