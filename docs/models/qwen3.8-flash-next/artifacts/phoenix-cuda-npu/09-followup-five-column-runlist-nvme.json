@@ -1,0 +1,136 @@
+{
+  "version": "1.1.0",
+  "title": "Phoenix XDNA1 NPU 20-Core Silicon Execution, Batched xrt::runlist, Configured Context (16K-262K), and NVMe Direct I/O Co-Optimization",
+  "hardware": {
+    "npu": "AMD Phoenix XDNA1 (AIE2) 5 columns x 4 rows = 20 compute tiles + 5 MemTiles",
+    "gpu": "NVIDIA GeForce RTX Laptop GPU (8 GiB GDDR6, 128-bit bus)",
+    "cpu": "AMD Ryzen 9 (Zen 4 with AVX-512)",
+    "ram": "64 GiB dual-channel DDR5",
+    "ssd": "4 TB PCIe Gen4 NVMe SSD"
+  },
+  "phase2_five_column_silicon_execution": {
+    "probe": {
+      "all_20_cores_passed": true,
+      "passed_tiles": 20,
+      "total_tiles": 20,
+      "dispatch_ms": 2.14,
+      "physical_columns": 5,
+      "physical_rows": 4
+    },
+    "gemm_throughput_comparison": {
+      "shape": [
+        1024,
+        2560,
+        1280
+      ],
+      "cores_16_peak_tflops": 1.92,
+      "comparison_scope": "The retained legacy 16-tile field corresponds to 1.9246 TFLOPS derived from an N=1024 median NPU-only interval of 2.7895 ms. The 20-tile result uses N=1280 and host start/wait timing. This is not a matched shape or timing-boundary comparison.",
+      "cores_20_peak_tflops": 1.04,
+      "cores_20_median_tflops": 0.81,
+      "architectural_finding": "The timings do not establish a DMA-stall percentage or the reason for the compiler's four-column constraint. The retained builder maps B/C streams for compute columns 0 and 1 to shim column 1, and compute columns 2, 3 and 4 to their corresponding shim columns. The earlier column-3-sharing and 25% stall explanation was unsupported and is withdrawn. These runs do not establish the cause of historical driver timeouts or general device stability."
+    }
+  },
+  "phase2_batched_runlist_and_tile_sentinel": {
+    "qualification": {
+      "passed": true,
+      "checked_values": 3056672768,
+      "max_abs_error": 0.120964,
+      "max_rel_rms": 0.001804,
+      "max_math_abs": 0.000103,
+      "negative_control_passed": true
+    },
+    "gufo_npu4_confirmation": {
+      "worker_ms_reduction_percent": 18.2,
+      "non_xrt_cpu_overhead_reduction_percent": 81.2,
+      "before_non_xrt_cpu_ms": 3185.1,
+      "after_non_xrt_cpu_ms": 598.5,
+      "host_wait_ms": 0.065,
+      "residual_scope": "Legacy non_xrt_cpu field names describe worker elapsed time minus XRT elapsed time, not CPU busy time. Median residuals were 3185.108 and 598.528 ms across 644 jobs, or 0.9294 ms/job after the change. The 0.64 ms/job value is from the separate same-binary screen."
+    },
+    "gufo_npu8_screen": {
+      "total_worker_ms_before": 26450.0,
+      "total_worker_ms_after": 20327.1,
+      "worker_saved_ms": 6122.9,
+      "worker_reduction_percent": 23.1,
+      "host_wait_ms_before": 241.38,
+      "host_wait_ms_after": 0.067,
+      "fresh_360_prefill_improved_ms": 1508.5
+    }
+  },
+  "phase3_long_context_and_nvme_coopt": {
+    "context_scope": "Configured capacities reach 262144 tokens. Document workloads were labeled 2048, 4096 and 8192 tokens, plus 16384 at the largest configured capacity. This does not qualify a 262144-token input request or quality at that length.",
+    "kv_cache_scaling": {
+      "ctx_16384": {
+        "mode": "vram_resident",
+        "pinned_host_ram_gib": 0.0
+      },
+      "ctx_32768": {
+        "mode": "streaming",
+        "pinned_host_ram_int8_gib": 0.39,
+        "pinned_host_ram_k8v4_gib": 0.3
+      },
+      "ctx_65536": {
+        "mode": "streaming",
+        "pinned_host_ram_int8_gib": 0.77,
+        "pinned_host_ram_k8v4_gib": 0.6
+      },
+      "ctx_131072": {
+        "mode": "streaming",
+        "pinned_host_ram_int8_gib": 1.55,
+        "pinned_host_ram_k8v4_gib": 1.2
+      },
+      "ctx_262144": {
+        "mode": "streaming",
+        "pinned_host_ram_int8_gib": 3.09,
+        "pinned_host_ram_k8v4_gib": 2.39
+      }
+    },
+    "nvme_direct_io": {
+      "ple_table_rows": 320001536,
+      "ple_table_disk_gib": 9.1,
+      "measured_read_rows_per_s": 234892,
+      "host_page_cache_thrashing": "Not measured. Read rows/s is a startup component probe, not request-averaged SSD throughput."
+    },
+    "coopt_262k_benchmarks": {
+      "configuration_scope": "Completed profile used k8v4, 586 expert-cache slots, 720 MiB reserve and requested 1024-token prefill. Startup reported automatic own-buffer allocation. Separate explicit no-prefill-borrow/auto-cache/300-MiB-reserve profiles at this capacity failed startup. Document labels exclude 24 additional processed prompt tokens.",
+      "prefill_tok_per_s": {
+        "doc_2048": 411.7,
+        "doc_4096": 443.9,
+        "doc_8192": 440.9,
+        "doc_16384": 442.3
+      },
+      "decode_median_tok_per_s": 36.1,
+      "decode_peak_tok_per_s": 52.2
+    },
+    "nvme_tiered_experts_28gib_ram_cap": {
+      "prefill_8k_tok_per_s": 278.1,
+      "decode_8k_tok_per_s": 42.27,
+      "nvme_streamed_blobs_per_query": 3324,
+      "nvme_streamed_mib_per_query": 6780.3,
+      "io_counter_scope": "The legacy per_query values above belong to the first short-chat request (34 processed prompt tokens, 128 generated tokens), not the 8K document. The 8K document processed 8216 prompt tokens and reported 225 file blobs / 480.8 MiB. Resident budget refers to engine expert storage, not total system RAM. Memory faults were not measured."
+    },
+    "same_binary_npu_vs_cuda_comparison": {
+      "binary": "gufo-build/strata.exe (0.1.50 engine)",
+      "context": 16384,
+      "chunk_tokens": 1024,
+      "npu4_prefill_tok_per_s": {
+        "doc_2048": 332.4,
+        "doc_4096": 423.5,
+        "doc_8192": 424.2
+      },
+      "cuda_ctl_prefill_tok_per_s": {
+        "doc_2048": 355.6,
+        "doc_4096": 431.8,
+        "doc_8192": 440.2
+      },
+      "gap_percent_at_8k": 3.65,
+      "npu_jobs": 644,
+      "npu_dispatches": 2576,
+      "npu_valid_rows": 659456,
+      "npu_xrt_ms": 8783.1,
+      "npu_worker_ms": 9198.5,
+      "npu_host_wait_ms": 0.043,
+      "non_xrt_cpu_overhead_ms_per_job": 0.64
+    }
+  }
+}
