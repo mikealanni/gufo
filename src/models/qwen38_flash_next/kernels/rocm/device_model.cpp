@@ -540,6 +540,10 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
                      npu_error.c_str());
       }
     }
+    if (early_npu != nullptr) {
+      std::fprintf(stderr, "NPU prefill offload: on (%s)\n",
+                   m->npu_m_runtime_ ? "runtime-M" : "fixed-M");
+    }
   }
 #endif
   const auto regions = reader.GetMappedRegions();
