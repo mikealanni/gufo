@@ -32,6 +32,7 @@
 #include "src/models/deepseek_v4_flash/chat_template.hpp"
 #include "src/models/deepseek_v4_flash/tool_calls.hpp"
 #include "src/models/qwen/chat_template.hpp"
+#include "src/models/qwen38_flash_next/jev_gate.hpp"
 
 namespace gufo::server {
 
@@ -764,6 +765,48 @@ std::optional<HttpResponse> ParseReasoningBudget(const json::Value& body,
   return {};
 }
 
+// Fills the reasoning default from the Flash-Next effort pre-gate. A caller
+// that named an effort or a thinking mode keeps it; the gate only replaces the
+// model-wide xhigh default, never a request's explicit choice.
+const char* JevEffortName(ReasoningEffort effort) {
+  switch (effort) {
+    case ReasoningEffort::kMinimal:
+      return "minimal";
+    case ReasoningEffort::kLow:
+      return "low";
+    case ReasoningEffort::kMedium:
+      return "medium";
+    case ReasoningEffort::kHigh:
+      return "high";
+    case ReasoningEffort::kXHigh:
+      return "xhigh";
+    case ReasoningEffort::kMax:
+      return "max";
+  }
+  return "unknown";
+}
+
+void ApplyJevGate(TextGenerationBackend& backend, ChatRequest* chat) {
+  if (!backend.jev_gate_enabled() || chat->reasoning.effort.has_value() ||
+      chat->reasoning.enabled.has_value()) {
+    return;
+  }
+  std::string_view prompt;
+  for (const auto& message : chat->messages) {
+    if (message.role == tokenization::ChatRole::kUser)
+      prompt = message.content;
+  }
+  const auto decision = models::qwen38_flash_next::ClassifyJevRequest(prompt);
+  chat->reasoning.effort = decision.effort;
+  chat->reasoning.enabled = decision.needs_thinking;
+  if (!decision.needs_thinking && !chat->reasoning.preserve_thinking)
+    chat->reasoning.preserve_thinking = false;
+  Logger::LogFormatted(
+      LogLevel::kDebug, "jev-gate", "effort=%s thinking=%d chars=%zu",
+      JevEffortName(decision.effort), static_cast<int>(decision.needs_thinking),
+      prompt.size());
+}
+
 std::optional<HttpResponse> ParseToolControls(const json::Value& body,
                                               ParsedChatRequest* output,
                                               bool nullable_parallel = false,
@@ -891,6 +934,7 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
       output->chat.add_vision_id = vision_id->as_bool();
     }
   }
+  ApplyJevGate(backend, &output->chat);
   const ReasoningOptions defaults = backend.reasoning_defaults();
   if (!output->chat.reasoning.enabled.has_value()) {
     output->chat.reasoning.enabled = defaults.enabled;

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <deque>
 #include <fstream>
 #include <future>
 #include <limits>
@@ -1215,6 +1216,7 @@ struct TextRunnerPool::Request::Impl {
   bool state_reusable{true};
   bool stopped{false};
   std::optional<TextDecodeSelection> pending_selection;
+  std::deque<TextRunnerToken> injected_tokens;
   sampling::SamplerState sampler;
   std::shared_ptr<const TextPromptContext> context;
   bool retain_fallback{false};
@@ -1536,6 +1538,22 @@ TextDecodeSelection TextRunnerPool::Request::SelectNext() {
     throw std::logic_error("text runner request already stopped");
   }
 
+  if (!impl_->injected_tokens.empty()) {
+    const TextRunnerToken token = impl_->injected_tokens.front();
+    impl_->injected_tokens.pop_front();
+    const std::string piece =
+        impl_->runner->Decode(std::span<const TextRunnerToken>(&token, 1));
+    TextDecodeSelection selection{
+        .stop = false, .token = token, .piece = piece};
+    impl_->state_reusable = false;
+    // still need to advance model state? Selection only; Advance handles model.
+    impl_->state_reusable = true;
+    impl_->sampler.Accept(selection.token);
+    impl_->generated.push_back(selection.token);
+    impl_->pending_selection = selection;
+    return selection;
+  }
+
   impl_->state_reusable = false;
   auto selection = impl_->runner->SelectNext(
       dynamic_cast<TextRunnerState&>(impl_->lease.state()), impl_->sampler);
@@ -1586,6 +1604,24 @@ TextDecodeStep TextRunnerPool::Request::DecodeStep(std::size_t max_tokens) {
         "text runner decode step budget must be at least one token");
   }
 
+  if (!impl_->injected_tokens.empty()) {
+    impl_->CapturePromptSnapshot();
+    impl_->state_reusable = false;
+    auto selection = SelectNext();
+    if (!selection.stop) {
+      impl_->runner->Advance(
+          dynamic_cast<TextRunnerState&>(impl_->lease.state()),
+          selection.token);
+      impl_->pending_selection.reset();
+    }
+    impl_->stopped = selection.stop;
+    impl_->state_reusable = true;
+    if (selection.stop) {
+      return {.selections = {}, .stop = true};
+    }
+    return {.selections = {std::move(selection)}};
+  }
+
   impl_->CapturePromptSnapshot();
   impl_->state_reusable = false;
   auto step = impl_->runner->DecodeStep(
@@ -1606,6 +1642,18 @@ TextDecodeStep TextRunnerPool::Request::DecodeStep(std::size_t max_tokens) {
   impl_->stopped = step.stop;
   impl_->state_reusable = true;
   return step;
+}
+
+void TextRunnerPool::Request::InjectTokens(
+    std::vector<TextRunnerToken> tokens) {
+  if (!*this)
+    return;
+  for (auto t : tokens)
+    impl_->injected_tokens.push_back(t);
+}
+
+bool TextRunnerPool::Request::HasInjectedTokens() const noexcept {
+  return *this && !impl_->injected_tokens.empty();
 }
 
 TextRunnerPool::Request::CommitMetrics TextRunnerPool::Request::Commit() {
