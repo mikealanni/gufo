@@ -2843,6 +2843,23 @@ public:
     qfn.session().ResetDraftPolicy();
   }
 
+  /// Tokens one prefill step takes from `offset`. A step the pass capacity
+  /// ends before the prompt stops on a selection block (the model's
+  /// compress_ratio), as the serving runner ends budget-limited ones, so the
+  /// next step continues the prompt exactly from an unaligned reused
+  /// frontier too.
+  [[nodiscard]] std::size_t StepTokens(std::size_t offset, std::size_t budget,
+                                       std::size_t remaining,
+                                       std::size_t capacity) const noexcept {
+    auto count = std::min({budget, remaining, capacity});
+    const std::size_t ratio =
+        std::max<std::uint32_t>(1, model_->config().compress_ratio);
+    if (const auto over = (offset + count) % ratio;
+        count < remaining && count > over)
+      count -= over;
+    return count;
+  }
+
   [[nodiscard]] TextPrefillStep Prefill(
       TextRunnerState& state, std::span<const TextRunnerToken> prompt,
       std::size_t offset, std::size_t max_input_tokens) const override {
@@ -2856,11 +2873,11 @@ public:
           "Qwen3.8-Flash-Next prefill has no remaining input");
     }
     const std::size_t remaining = prompt.size() - offset;
+    const std::size_t capacity = remaining <= model_->PrefillThroughCapacity()
+                                     ? model_->PrefillThroughCapacity()
+                                     : model_->PrefillCapacity();
     const std::size_t consumed =
-        std::min<std::size_t>({max_input_tokens, remaining,
-                               remaining <= model_->PrefillThroughCapacity()
-                                   ? model_->PrefillThroughCapacity()
-                                   : model_->PrefillCapacity()});
+        StepTokens(offset, max_input_tokens, remaining, capacity);
     const std::size_t next_position = offset + consumed;
     const auto prefix = QwenFlashNextEngineTokens(prompt.first(next_position));
     // The next step most likely takes the same budget; its n-gram rows are
@@ -2889,8 +2906,8 @@ public:
       std::size_t offset, std::size_t budget,
       std::size_t boundary) const override {
     const auto& qfn = RequireQwenFlashNextState(state);
-    const auto consumed = std::min<std::size_t>(
-        {budget, prompt.size() - offset, model_->PrefillThroughCapacity()});
+    const auto consumed = StepTokens(offset, budget, prompt.size() - offset,
+                                     model_->PrefillThroughCapacity());
     if (boundary <= offset + 1 || boundary >= offset + consumed ||
         offset + consumed - boundary > 8)
       return std::nullopt;
@@ -2907,8 +2924,8 @@ public:
     auto& qfn = RequireQwenFlashNextState(state);
     if (offset != qfn.position())
       throw std::logic_error("in-pass checkpoint offset does not match state");
-    const auto consumed = std::min<std::size_t>(
-        {budget, prompt.size() - offset, model_->PrefillThroughCapacity()});
+    const auto consumed = StepTokens(offset, budget, prompt.size() - offset,
+                                     model_->PrefillThroughCapacity());
     const auto next_position = offset + consumed;
     const auto prefix = QwenFlashNextEngineTokens(prompt.first(next_position));
     std::unique_ptr<models::qwen38_flash_next::SessionSnapshot> captured;
