@@ -544,6 +544,8 @@ public:
     [[nodiscard]] TextDecodeSelection SelectNext();
     void Advance();
     [[nodiscard]] TextDecodeStep DecodeStep(std::size_t max_tokens);
+    void InjectTokens(std::vector<TextRunnerToken> tokens);
+    [[nodiscard]] bool HasInjectedTokens() const noexcept;
 
     /// Publishes a reusable continuation boundary.
     ///

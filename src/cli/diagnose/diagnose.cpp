@@ -1,6 +1,8 @@
 #include "src/cli/diagnose/diagnose.h"
 
+#include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <span>
@@ -20,6 +22,9 @@
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
+#endif
+#if defined(ENGINE_ENABLE_NPU)
+#include "src/models/qwen38_flash_next/kernels/rocm/npu_gemm.hpp"
 #endif
 
 namespace gufo::cli {
@@ -491,6 +496,59 @@ int RunProbe(std::span<const char* const> args) {
 #endif
 
   std::printf("OK\n");
+
+#if defined(ENGINE_ENABLE_NPU)
+  // One-shot NPU GEMM timing for a jev-shaped matmul (M=1024, K=2048, N=1024).
+  {
+    std::string err;
+    gufo::models::qwen38_flash_next::rocm::NpuGemm::Config cfg;
+    cfg.xclbin =
+        std::string(std::getenv("GUFO_NPU_DIR") ? std::getenv("GUFO_NPU_DIR")
+                                                : "tools/npu") +
+        "/runtime_mk/final_4096xKx1024_128x64x128.xclbin";
+    cfg.insts =
+        std::string(std::getenv("GUFO_NPU_DIR") ? std::getenv("GUFO_NPU_DIR")
+                                                : "tools/npu") +
+        "/runtime_mk/insts_1024x2048x1024_128x64x128.txt";
+    cfg.tokens = 1024;
+    cfg.k = 2048;
+    cfg.n = 1024;
+    auto npu =
+        gufo::models::qwen38_flash_next::rocm::NpuGemm::Create(cfg, &err);
+    if (!npu) {
+      std::printf("NPU probe: Create failed: %s\n", err.c_str());
+    } else {
+      int a = npu->NewBuffer(npu->ABytes(), &err);
+      int b = npu->NewBuffer(npu->BBytes(), &err);
+      int c = npu->NewBuffer(npu->CBytes(), &err);
+      // zero-fill
+      std::memset(npu->Host(a), 0, npu->ABytes());
+      std::memset(npu->Host(b), 0, npu->BBytes());
+      npu->FinalizeWeights(b);
+      int prog = 0;
+      // warmup
+      int b_ids[1] = {b};
+      int c_ids[1] = {c};
+      npu->Submit(nullptr, a, b_ids, c_ids, 1, prog);
+      npu->Wait(nullptr);
+      // timed run
+      auto t0 = std::chrono::high_resolution_clock::now();
+      npu->Submit(nullptr, a, b_ids, c_ids, 1, prog);
+      npu->Wait(nullptr);
+      auto t1 = std::chrono::high_resolution_clock::now();
+      double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+      std::printf(
+          "NPU probe: M=1024 K=2048 N=1024 one GEMM wall time = %.3f ms (GEMM "
+          "only, no encode/decode)\n",
+          ms);
+      std::printf(
+          "NPU probe: 196 such GEMMs (28 layers x 7) = %.1f ms GEMM-only lower "
+          "bound\n",
+          ms * 196.0);
+    }
+  }
+#endif
+
   return 0;
 }
 

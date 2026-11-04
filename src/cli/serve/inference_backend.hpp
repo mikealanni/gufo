@@ -170,6 +170,8 @@ public:
   [[nodiscard]] std::uint32_t max_context() const override;
   [[nodiscard]] std::vector<SessionState> session_states() const override;
   [[nodiscard]] ReasoningOptions reasoning_defaults() const override;
+  [[nodiscard]] bool jev_gate_enabled() const override;
+  [[nodiscard]] bool jev_inline_enabled() const override;
   [[nodiscard]] InitialOutputState initial_output_state(
       const ChatRequest& request) const override;
   void set_model_id(const std::string& model_id);
@@ -180,6 +182,8 @@ public:
                              sampling::SamplingOverrides supplied =
                                  sampling::SamplingOverrides::All());
   void set_reasoning_defaults(const ReasoningOptions& reasoning);
+  void set_jev_gate_enabled(bool enabled);
+  void set_jev_inline_enabled(bool enabled);
 
   /// Plain text completion (no chat framing).
   Result complete(std::string_view prompt, std::size_t max_tokens,

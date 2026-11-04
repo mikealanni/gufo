@@ -50,6 +50,8 @@
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
+#include "src/models/qwen38_flash_next/jev_inline.hpp"
+#include "src/models/qwen38_flash_next/jev_model.hpp"
 #endif
 
 namespace gufo::server {
@@ -4540,6 +4542,14 @@ private:
 }  // namespace
 
 struct InferenceBackend::Impl {
+  // Written once during startup, before the first request is admitted.
+  bool jev_gate_option{false};
+  bool jev_inline_option{false};
+#if defined(ENGINE_ENABLE_HIP)
+  std::shared_ptr<models::qwen38_flash_next::JevModel> jev_model;
+#endif
+  std::mutex jev_mutex;
+
 #if defined(ENGINE_ENABLE_HIP)
   struct State {
     std::shared_ptr<TextGenerationScheduler> scheduler;
@@ -4610,7 +4620,10 @@ struct InferenceBackend::Impl {
       std::shared_ptr<const TextPromptContext> context = {},
       bool cache_prompt = true, std::size_t cache_prefix_tokens = 0,
       const std::vector<std::string>& stop_sequences = {},
-      InitialOutputState initial = InitialOutputState::kContent) const {
+      InitialOutputState initial = InitialOutputState::kContent,
+      std::function<
+          std::optional<std::vector<TextRunnerToken>>(const std::string&)>
+          jev_inline_fn = {}) const {
     Result result;
     result.prompt_tokens = prompt_tokens.size();
     result.client_id = client_id.empty() ? "anonymous" : client_id;
@@ -4633,6 +4646,7 @@ struct InferenceBackend::Impl {
             .cache_prompt = cache_prompt,
             .cache_prefix_tokens = cache_prefix_tokens,
             .stop_sequences = stop_sequences,
+            .jev_inline_fn = std::move(jev_inline_fn),
         });
     ScheduledGenerationRequest generation(std::move(current),
                                           std::move(request), initial);
@@ -5659,6 +5673,34 @@ ReasoningOptions InferenceBackend::reasoning_defaults() const {
 #endif
 }
 
+bool InferenceBackend::jev_gate_enabled() const {
+#if defined(ENGINE_ENABLE_HIP)
+  if (!impl_->jev_gate_option) {
+    return false;
+  }
+  const auto state = impl_->Snapshot();
+  return state != nullptr &&
+         state->scheduler->runner().Descriptor().state_abi ==
+             std::string(kQwenFlashNextStateAbi);
+#else
+  return false;
+#endif
+}
+
+bool InferenceBackend::jev_inline_enabled() const {
+#if defined(ENGINE_ENABLE_HIP)
+  if (!impl_->jev_inline_option) {
+    return false;
+  }
+  const auto state = impl_->Snapshot();
+  return state != nullptr &&
+         state->scheduler->runner().Descriptor().state_abi ==
+             std::string(kQwenFlashNextStateAbi);
+#else
+  return false;
+#endif
+}
+
 InferenceBackend::InitialOutputState InferenceBackend::initial_output_state(
     const ChatRequest& request) const {
 #if defined(ENGINE_ENABLE_HIP)
@@ -5760,6 +5802,14 @@ void InferenceBackend::set_reasoning_defaults(
 #endif
 }
 
+void InferenceBackend::set_jev_gate_enabled(bool enabled) {
+  impl_->jev_gate_option = enabled;
+}
+
+void InferenceBackend::set_jev_inline_enabled(bool enabled) {
+  impl_->jev_inline_option = enabled;
+}
+
 InferenceBackend::Result InferenceBackend::complete(
     std::string_view prompt, std::size_t max_tokens,
     const sampling::SamplingConfig& sampling_config,
@@ -5815,11 +5865,73 @@ InferenceBackend::Result InferenceBackend::chat(
     effective_sampling.reasoning_budget =
         state->scheduler->runner().BuildReasoningBudget(
             *request.reasoning.budget_tokens, prompt->tokens);
+
+  std::function<std::optional<std::vector<TextRunnerToken>>(const std::string&)>
+      jev_inline_fn;
+  if (impl_->jev_inline_option) {
+    std::shared_ptr<models::qwen38_flash_next::JevModel> jev_model;
+    {
+      std::lock_guard<std::mutex> lock(impl_->jev_mutex);
+      if (!impl_->jev_model) {
+        const char* env = std::getenv("GUFO_JEV_MODEL");
+        std::string path = env ? env
+                               : "/mnt/raid0/user_cache/huggingface/hub/"
+                                 "models--unsloth--Qwen3-0.6B-GGUF/snapshots/"
+                                 "50968a4468ef4233ed78cd7c3de230dd1d61a56b/"
+                                 "Qwen3-0.6B-Q4_0.gguf";
+        std::string err;
+        auto reader = core::GgufReader::OpenFile(path, &err);
+        if (reader) {
+          impl_->jev_model =
+              models::qwen38_flash_next::JevModel::LoadFromGguf(*reader, &err);
+        }
+      }
+      jev_model = impl_->jev_model;
+    }
+    if (jev_model) {
+      auto scanner =
+          std::make_shared<models::qwen38_flash_next::JevInlineScanner>();
+      auto ctx = std::make_shared<std::string>();
+      auto last_q = std::make_shared<std::string>();
+      auto disabled = std::make_shared<bool>(false);
+      const auto& runner_ref = state->scheduler->runner();
+      jev_inline_fn = [jev_model, scanner, ctx, last_q, disabled,
+                       &runner_ref](const std::string& piece)
+          -> std::optional<std::vector<TextRunnerToken>> {
+        *ctx += piece;
+        if (ctx->size() > 2048) {
+          ctx->erase(0, ctx->size() - 2048);
+        }
+        auto q = scanner->Push(piece);
+        if (!q || *disabled) {
+          return std::nullopt;
+        }
+        if (*q == *last_q) {
+          *disabled = true;
+          return std::nullopt;
+        }
+        std::string c = *ctx;
+        if (c.size() > 400) {
+          c = c.substr(c.size() - 400);
+        }
+        auto v = jev_model->Answer(*q, c);
+        float conf = std::max(v.yes, v.no);
+        if (conf < 0.6F) {
+          return std::nullopt;
+        }
+        std::string answer = (v.yes >= v.no) ? "Yes" : "No";
+        *last_q = *q;
+        return runner_ref.Tokenize(" " + answer + ".");
+      };
+    }
+  }
+
   return impl_->GenerateScheduled(
       state, std::move(prompt->tokens), request_start, max_tokens,
       effective_sampling, is_cancelled, on_token, request.client_id,
       std::move(prompt->context), request.cache_prompt,
-      prompt->cache_prefix_tokens, request.stop_sequences, initial);
+      prompt->cache_prefix_tokens, request.stop_sequences, initial,
+      std::move(jev_inline_fn));
 #else
   (void)request;
   (void)max_tokens;
@@ -5900,6 +6012,67 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
     effective_sampling.reasoning_budget =
         state->scheduler->runner().BuildReasoningBudget(
             *request.reasoning.budget_tokens, prompt->tokens);
+
+  std::function<std::optional<std::vector<TextRunnerToken>>(const std::string&)>
+      jev_inline_fn;
+  if (impl_->jev_inline_option) {
+    std::shared_ptr<models::qwen38_flash_next::JevModel> jev_model;
+    {
+      std::lock_guard<std::mutex> lock(impl_->jev_mutex);
+      if (!impl_->jev_model) {
+        const char* env = std::getenv("GUFO_JEV_MODEL");
+        std::string path = env ? env
+                               : "/mnt/raid0/user_cache/huggingface/hub/"
+                                 "models--unsloth--Qwen3-0.6B-GGUF/snapshots/"
+                                 "50968a4468ef4233ed78cd7c3de230dd1d61a56b/"
+                                 "Qwen3-0.6B-Q4_0.gguf";
+        std::string err;
+        auto reader = core::GgufReader::OpenFile(path, &err);
+        if (reader) {
+          impl_->jev_model =
+              models::qwen38_flash_next::JevModel::LoadFromGguf(*reader, &err);
+        }
+      }
+      jev_model = impl_->jev_model;
+    }
+    if (jev_model) {
+      auto scanner =
+          std::make_shared<models::qwen38_flash_next::JevInlineScanner>();
+      auto ctx = std::make_shared<std::string>();
+      auto last_q = std::make_shared<std::string>();
+      auto disabled = std::make_shared<bool>(false);
+      const auto& runner_ref = state->scheduler->runner();
+      jev_inline_fn = [jev_model, scanner, ctx, last_q, disabled,
+                       &runner_ref](const std::string& piece)
+          -> std::optional<std::vector<TextRunnerToken>> {
+        *ctx += piece;
+        if (ctx->size() > 2048) {
+          ctx->erase(0, ctx->size() - 2048);
+        }
+        auto q = scanner->Push(piece);
+        if (!q || *disabled) {
+          return std::nullopt;
+        }
+        if (*q == *last_q) {
+          *disabled = true;
+          return std::nullopt;
+        }
+        std::string c = *ctx;
+        if (c.size() > 400) {
+          c = c.substr(c.size() - 400);
+        }
+        auto v = jev_model->Answer(*q, c);
+        float conf = std::max(v.yes, v.no);
+        if (conf < 0.6F) {
+          return std::nullopt;
+        }
+        std::string answer = (v.yes >= v.no) ? "Yes" : "No";
+        *last_q = *q;
+        return runner_ref.Tokenize(" " + answer + ".");
+      };
+    }
+  }
+
   const std::string client_id =
       request.client_id.empty() ? "anonymous" : request.client_id;
   auto scheduled_request = state->scheduler->Submit(
@@ -5914,6 +6087,7 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
           .cache_prefix_tokens = prompt->cache_prefix_tokens,
           .stop_sequences = request.stop_sequences,
           .return_progress = request.return_progress,
+          .jev_inline_fn = std::move(jev_inline_fn),
       });
   return std::make_shared<Impl::ScheduledGenerationRequest>(
       state, std::move(scheduled_request), initial, tool_format);

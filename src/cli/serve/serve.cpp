@@ -588,6 +588,8 @@ void PrintServeHelp(std::string_view program_name,
     std::string reasoning_effort = "auto";
     std::string preserve_thinking = "auto";
     std::int64_t reasoning_budget = -1;
+    std::string jev_gate = "on";
+    std::string jev_inline = "off";
     std::string speculative_backend;
     std::string dflash_model_path;
     std::string draft_policy;
@@ -658,6 +660,13 @@ void PrintServeHelp(std::string_view program_name,
         "Reasoning tokens before </think> is forced: -1 unlimited, 0 none "
         "(default: -1)",
         "Reasoning Defaults", &reasoning_budget);
+    parser.AddOption("", "--jev-gate", "MODE",
+                     "Flash-Next reasoning pre-gate: on or off (default: on)",
+                     "Reasoning Defaults", &jev_gate);
+    parser.AddOption(
+        "", "--jev-inline", "MODE",
+        "Inline jev yes/no answering inside <think>: on or off (default: off)",
+        "Reasoning Defaults", &jev_inline);
 
     // Speculative & Hardware
     parser.AddOption("", "--speculative", "MODE",
@@ -1136,6 +1145,8 @@ int RunServe(std::span<const char* const> args) {
     std::string reasoning_effort = "auto";
     std::string preserve_thinking = "auto";
     std::int64_t reasoning_budget = -1;
+    std::string jev_gate = "on";
+    std::string jev_inline = "off";
     std::string speculative_backend;
     std::string dflash_model_path;
     std::string draft_policy;
@@ -1202,6 +1213,14 @@ int RunServe(std::span<const char* const> args) {
         "Reasoning tokens before </think> is forced: -1 unlimited, 0 none "
         "(default: -1)",
         "Reasoning Defaults", &reasoning_budget);
+    llm_parser.AddOption(
+        "", "--jev-gate", "MODE",
+        "Flash-Next reasoning pre-gate: on or off (default: on)",
+        "Reasoning Defaults", &jev_gate);
+    llm_parser.AddOption(
+        "", "--jev-inline", "MODE",
+        "Inline jev yes/no answering inside <think>: on or off (default: off)",
+        "Reasoning Defaults", &jev_inline);
     llm_parser.AddOption("", "--speculative", "MODE",
                          "HTTP draft backend: dspark, dflash2, mtp, or off",
                          "Speculative", &speculative_backend);
@@ -1356,6 +1375,14 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error: --reasoning-budget must be -1 or nonnegative\n";
       return 2;
     }
+    if (jev_gate != "on" && jev_gate != "off") {
+      std::cerr << "Error: --jev-gate must be on or off\n";
+      return 2;
+    }
+    if (jev_inline != "on" && jev_inline != "off") {
+      std::cerr << "Error: --jev-inline must be on or off\n";
+      return 2;
+    }
     if (reasoning_budget >= 0)
       reasoning_defaults->budget_tokens =
           static_cast<std::size_t>(reasoning_budget);
@@ -1464,6 +1491,8 @@ int RunServe(std::span<const char* const> args) {
         max_tokens < 0 ? 0 : static_cast<std::size_t>(max_tokens),
         sampling_config, SamplingOptionsSupplied(llm_parser));
     backend->set_reasoning_defaults(*reasoning_defaults);
+    backend->set_jev_gate_enabled(jev_gate == "on");
+    backend->set_jev_inline_enabled(jev_inline == "on");
     const auto effective_sampling =
         backend->sampling_defaults().Resolve(reasoning_defaults->enabled);
     server::ChatRequest default_request;

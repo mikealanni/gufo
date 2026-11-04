@@ -307,6 +307,11 @@ public:
   [[nodiscard]] virtual ReasoningOptions reasoning_defaults() const {
     return {};
   }
+  /// The Flash-Next reasoning pre-gate may fill the effort default of a
+  /// request that carries no explicit reasoning control. Only the model family
+  /// it was tuned for, with the server option enabled, returns true.
+  [[nodiscard]] virtual bool jev_gate_enabled() const { return false; }
+  [[nodiscard]] virtual bool jev_inline_enabled() const { return false; }
   /// The loaded tokenizer's control tokens, or null when it owns none. The
   /// parser treats a pipe-wrapped spelling as call framing only when this trie
   /// knows it; every other lookalike stays literal argument data (#383).
