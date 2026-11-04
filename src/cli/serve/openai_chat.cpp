@@ -802,7 +802,7 @@ void ApplyJevGate(TextGenerationBackend& backend, ChatRequest* chat) {
   if (!decision.needs_thinking && !chat->reasoning.preserve_thinking)
     chat->reasoning.preserve_thinking = false;
   Logger::LogFormatted(
-      LogLevel::kDebug, "jev-gate", "effort=%s thinking=%d chars=%zu",
+      LogLevel::kInfo, "jev-gate", "effort=%s thinking=%d chars=%zu",
       JevEffortName(decision.effort), static_cast<int>(decision.needs_thinking),
       prompt.size());
 }
