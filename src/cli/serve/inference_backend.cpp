@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -20,6 +21,7 @@
 #include <thread>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
@@ -4573,23 +4575,33 @@ struct InferenceBackend::Impl {
     if (want_npu) {
 #if defined(GUFO_NPU)
       if (!jev_npu_model) {
-        // The NPU judge is validated on Qwen3-1.7B-Q6_K (18/22 vs 14/22 for
-        // 0.6B on the known-answer battery; the CPU reference scores the
-        // same, so the judge is faithful). GUFO_JEV_MODEL overrides.
+        // Default judge: MiniCPM5-1B-SFT Q6_K (tokenizer-fixed GGUF). Replay
+        // on 73 real thinking traces: graded probabilities (0% of answers
+        // clear 0.9) where Qwen3-1.7B saturates at ~1.00 Yes, and 31-36 ms
+        // vs ~59 ms per batched question (battery 17/22 vs 18/22). Falls back
+        // to Qwen3-1.7B-Q6_K. GUFO_JEV_MODEL overrides.
         const char* env = std::getenv("GUFO_JEV_MODEL");
-        std::string path =
-            env ? env
-                : (std::getenv("HOME") ? std::string(std::getenv("HOME")) +
-                                             "/jev-model/Qwen3-1.7B-Q6_K.gguf"
-                                       : std::string());
+        const std::string home =
+            std::getenv("HOME") ? std::getenv("HOME") : std::string();
+        std::vector<std::string> paths;
+        if (env)
+          paths.emplace_back(env);
+        else if (!home.empty()) {
+          paths.push_back(home + "/jev-model/MiniCPM5-1B-SFT-Q6_K-fixed.gguf");
+          paths.push_back(home + "/jev-model/Qwen3-1.7B-Q6_K.gguf");
+        }
         std::string err;
-        auto reader = core::GgufReader::OpenFile(path, &err);
-        if (reader) {
+        for (const auto& path : paths) {
+          auto reader = core::GgufReader::OpenFile(path, &err);
+          if (!reader)
+            continue;
           jev_npu_reader = std::shared_ptr<core::GgufReader>(std::move(reader));
           jev_npu_model = models::qwen38_flash_next::JevNpuModel::LoadFromGguf(
               *jev_npu_reader, &err);
-          if (!jev_npu_model)
-            jev_npu_reader.reset();
+          if (jev_npu_model)
+            break;
+          std::fprintf(stderr, "jev: %s: %s\n", path.c_str(), err.c_str());
+          jev_npu_reader.reset();
         }
       }
       if (jev_npu_model) {
