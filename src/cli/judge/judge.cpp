@@ -1,6 +1,10 @@
 #include "src/cli/judge/judge.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -11,6 +15,7 @@
 
 #include "src/cli/arg_parser.hpp"
 #include "src/core/gguf_reader.hpp"
+#include "src/models/qwen38_flash_next/jev_inline.hpp"
 
 #if defined(GUFO_NPU)
 #include "src/models/qwen38_flash_next/jev_npu.hpp"
@@ -105,12 +110,94 @@ void print_battery_batched(const models::qwen38_flash_next::JevNpuModel& model,
 }
 #endif
 
+constexpr std::size_t kReplayPiece = 8;
+constexpr std::size_t kReplayWindow = 2048;
+constexpr std::size_t kReplayContext = 400;
+constexpr std::size_t kReplayNext = 200;
+constexpr float kReplayInlineCutoff = 0.6F;
+constexpr float kReplayStrictCutoff = 0.9F;
+
+std::string OneLine(std::string text) {
+  for (char& c : text)
+    if (c == '\n' || c == '\r')
+      c = ' ';
+  return text;
+}
+
+// Streams each trace through the inline scanner exactly as serve does and
+// scores every detected question with the same context handling.
+void ReplayTraces(const auto& model, const std::string& path) {
+  namespace fs = std::filesystem;
+  std::vector<fs::path> files;
+  if (fs::is_directory(path)) {
+    for (const auto& e : fs::directory_iterator(path))
+      if (e.is_regular_file())
+        files.push_back(e.path());
+    std::sort(files.begin(), files.end());
+  } else {
+    files.emplace_back(path);
+  }
+  std::size_t total = 0, inline_ok = 0, strict_ok = 0, yes = 0, repeats = 0;
+  for (const auto& file : files) {
+    std::ifstream in(file);
+    const std::string text((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+    models::qwen38_flash_next::JevInlineScanner scanner;
+    std::string ctx;
+    std::string last_q;
+    std::size_t found = 0;
+    for (std::size_t pos = 0; pos < text.size(); pos += kReplayPiece) {
+      const std::string piece = text.substr(pos, kReplayPiece);
+      ctx += piece;
+      if (ctx.size() > kReplayWindow)
+        ctx.erase(0, ctx.size() - kReplayWindow);
+      const auto q = scanner.Push(piece);
+      if (!q)
+        continue;
+      if (*q == last_q) {
+        ++repeats;
+        std::printf("STOP repeat  %s\n", q->c_str());
+        break;
+      }
+      std::string c = ctx;
+      if (c.size() > kReplayContext)
+        c = c.substr(c.size() - kReplayContext);
+      const auto v = model.Answer(*q, c);
+      const float conf = std::max(v.yes, v.no);
+      ++found;
+      ++total;
+      inline_ok += conf >= kReplayInlineCutoff;
+      strict_ok += conf >= kReplayStrictCutoff;
+      yes += v.yes >= v.no;
+      last_q = *q;
+      std::printf("%s yes=%.2f no=%.2f c60=%d c90=%d  Q: %s\n  next: %s\n",
+                  file.filename().string().c_str(), v.yes, v.no,
+                  conf >= kReplayInlineCutoff, conf >= kReplayStrictCutoff,
+                  q->c_str(),
+                  OneLine(text.substr(pos + kReplayPiece, kReplayNext))
+                      .c_str());
+    }
+    std::printf("TRACE %s detections=%zu\n", file.filename().string().c_str(),
+                found);
+  }
+  const auto pct = [&](std::size_t n) {
+    return total ? 100.0 * static_cast<double>(n) / static_cast<double>(total)
+                 : 0.0;
+  };
+  std::printf(
+      "REPLAY traces=%zu detections=%zu clear0.6=%.1f%% clear0.9=%.1f%% "
+      "yes=%.1f%% no=%.1f%% repeat_stops=%zu\n",
+      files.size(), total, pct(inline_ok), pct(strict_ok), pct(yes),
+      total ? 100.0 - pct(yes) : 0.0, repeats);
+}
+
 }  // namespace
 
 int RunJudge(std::span<const char* const> args) {
   std::string model_path;
   std::string question;
   std::string context;
+  std::string replay;
   int repeat = 5;
   bool battery = false;
   bool use_gpu = false;
@@ -132,6 +219,10 @@ int RunJudge(std::span<const char* const> args) {
                  "Battery", &battery);
   parser.AddFlag("", "--code", "Run the known-answer code battery", "Battery",
                  &code);
+  parser.AddOption("", "--replay", "PATH",
+                   "Replay thinking traces (file or dir) through the inline "
+                   "scanner and judge",
+                   "Battery", &replay);
   parser.AddFlag("", "--gpu", "Use the GPU judge instead of the NPU", "Model",
                  &use_gpu);
   parser.AddFlag(
@@ -145,7 +236,7 @@ int RunJudge(std::span<const char* const> args) {
     std::fprintf(stderr, "judge: --model is required\n");
     return 2;
   }
-  if (!battery && !code && question.empty()) {
+  if (!battery && !code && question.empty() && replay.empty()) {
     std::fprintf(stderr, "judge: --question, --battery or --code required\n");
     return 2;
   }
@@ -177,6 +268,8 @@ int RunJudge(std::span<const char* const> args) {
                     verdict.no, ms);
       }
     }
+    if (!replay.empty())
+      ReplayTraces(*model, replay);
     if (battery)
       batched ? print_battery_batched(*model, kTrivia, std::size(kTrivia))
               : print_battery(*model, kTrivia, std::size(kTrivia));

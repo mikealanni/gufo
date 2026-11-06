@@ -209,17 +209,22 @@ Done (builds clean, `MiniCPM5-2B-Q6_K.gguf` loads and runs end to end, no crash)
   `JevSplitQkvKernel` takes the padded row stride. No effect on models with
   an exact match.
 
-Result: 2B battery 6/10 trivia, 7/12 code, every answer ~0.96-0.97 Yes
-(saturated, same signature as Qwen3-1.7B). MiniCPM5-2B has `q_dim == hidden`
-(2048 == 2048), the only confirmed structural difference behind the Qwen3-1.7B
-failure (`JEV-1.7B-BUG.md`), so this is very likely the same unresolved
-engine bug, not a MiniCPM5 problem. Not CPU-verified.
+Result: 2B battery 6/10 trivia, 7/12 code, every answer 0.94-0.99 Yes; all
+"No" cases miss. Re-run after the Qwen3-1.7B fixes landed (see
+`JEV-1.7B-BUG.md` Resolution: broken weight encoding + softmax max
+reduction, NOT `q_dim == hidden` as first suspected) gave the same result,
+so the engine is no longer the prime suspect. Remaining suspects, none
+verified: (a) the model genuinely saturates to Yes on this bare framing (as
+Qwen3-0.6B does on CPU: `sep=NO`); (b) tokenizer mismatch (digit grouping,
+unverified vs HF); (c) the n_qkv 2560->4096 padding path (first model to use
+it). Next step is a CPU reference: download `openbmb/MiniCPM5-2B` (HF
+safetensors) and run it with `~/jev-ref/nothink_battery.py`-style framing
+(`<s>` + ChatML + no-think). If CPU also saturates, it is (a) and the model
+is a poor judge; if CPU separates, bisect (b) vs (c).
 
-Differentiator test, not yet run: MiniCPM5-1B has `hidden=1536`,
-`q_dim=2048` (unequal) so it should work if the hypothesis is right. It needs
-new instruction files for K=1536 base, qkv (n_qkv=2560, padded to 4096), o
-(K=2048,N=1536), gu (K=1536,N=9216), down (K=4608,N=1536); N=1536/9216 may hit
-the same `aiecc` crash. Resume after the 1.7B bug is fixed.
+MiniCPM5-1B (`hidden=1536`) still needs new instruction files (K=1536 base,
+qkv n_qkv=2560 padded to 4096, o K=2048/N=1536, gu K=1536/N=9216, down
+K=4608/N=1536); N=1536/9216 may hit the same `aiecc` crash.
 
 ## Status 2026-11-05b — batched AnswerBatch: ~2.2-2.6x throughput, verified bit-identical
 
@@ -934,3 +939,36 @@ scoping this, both verified against the current tree):
   invocation pattern already in `engine.cpp`/`weights.cpp`.
 - No model name mentions of competitor projects anywhere in this file or
   commits built from it.
+
+## 2026-11-06 Part B offline replay (`gufo judge --replay <file|dir>`)
+
+Streams thinking traces through `JevInlineScanner` in 8-char pieces with the
+server's 2048-char window / 400-char context, scores each detection with the
+NPU judge (Qwen3-1.7B-Q6_K). Traces: 73 (13 Flash-Next `reasoning_content`
+from `~/jev-gate-run/responses/gate_on`, 60 random long opencode reasoning
+parts), saved in `~/jev-replay/traces`, output in `~/jev-replay/out.txt`.
+
+Result: 40 detections in 19/73 traces; 95% clear 0.6, 85% clear 0.9; 90% Yes /
+10% No; 1 repeat-stop.
+
+Findings:
+- The confidence cutoffs do not discriminate: the judge saturates to Yes
+  (1.00) on most detections, so 0.6 vs 0.9 differs by 10 points only. Raising
+  the cutoff will not make injection safer. Treat Part B inline as unsafe to
+  enable by default.
+- Scanner misfires: ~8/39 detections are wh-questions ("What are the three
+  most likely causes...", "Where do I look...", "Why are there 100 dict
+  objects...") and ~11/39 are context-free ("Is that true?", "Is that
+  likely?", "Is that desired?"). Injecting "Yes." into these is meaningless
+  or wrong. Fix the scanner first: require a yes/no aux start (is/does/do/
+  should/can/are/would) and reject bare anaphora ("that/this/it" only).
+- Context is the last 400 chars of the model's own thinking; for anaphoric
+  questions it is often insufficient. Wide context is not an option on the
+  128-row slot (kJevSeqCap).
+- One case where the judge said No=1.00 and the trace itself concluded Yes
+  (cgroup memory.current includes kernel memory), i.e. high-confidence
+  disagreement with the main model's own conclusion.
+- Recommendation: keep the inline cutoff at 0.9 until the scanner is
+  tightened, then re-measure; kJevPreConfidence cannot be inferred from this
+  data (Part A needs the 3-arm run). Needs a ground-truth label set for real
+  precision numbers.
