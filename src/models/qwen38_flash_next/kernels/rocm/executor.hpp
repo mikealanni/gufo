@@ -550,6 +550,9 @@ private:
                bool res_half = false, const DeviceMixer* next = nullptr) const;
   [[nodiscard]] bool InjectFusable(const DeviceMixer& m,
                                    std::uint32_t n_tokens) const;
+  /// Whether HcMix runs a decode batch of `m` as one HcMixQ8Fused launch.
+  [[nodiscard]] bool FusedMixer(const DeviceMixer& m,
+                                std::uint32_t n_tokens) const;
   /// Hashes the batch's n-gram rows and starts reading them from disk, so
   /// the read overlaps the layers before the PLE one.
   bool PleFetch(Session& s, std::span<const std::int32_t> tokens,
@@ -946,6 +949,19 @@ private:
     std::uint32_t n{0};
     std::uint32_t k{0};
   };
+  /// A decode combine left to the next mixer's one-launch HcMixQ8Fused
+  /// (see Combine): HcCombineQ8_1's operands when Combine ran.
+  struct PendingCombine {
+    const DeviceMixer* mixer{nullptr};
+    float* res{nullptr};
+    const float* gamma{nullptr};
+    const float* block_out{nullptr};
+    const float* inject{nullptr};
+    std::uint32_t inject_parts{1};
+    float* xn{nullptr};
+    void* xn_q8{nullptr};
+    std::uint32_t n{0};
+  };
   struct BankCache {
     const float* half_src_{nullptr};
     std::uint32_t half_rows_{0};
@@ -958,6 +974,8 @@ private:
 
     ReadyRows xn_q8_ready_{};
     ReadyRows mixed_q8_ready_{};
+    /// See Combine: a decode combine handed to the next mixer's launch.
+    PendingCombine pending_combine_{};
 
     bool shexp_half_ready_{false};
     bool moe_pending_{false};
@@ -974,6 +992,9 @@ private:
   void LoadCache(const BankCache& cache) const;
   mutable ReadyRows xn_q8_ready_;
   mutable ReadyRows mixed_q8_ready_;
+  mutable PendingCombine pending_combine_;
+  /// HcMixQ8Fused's counters and intermediates (HcMixQ8FusedStateBytes).
+  void* hc_fused_state_{nullptr};
 };
 
 }  // namespace gufo::models::qwen38_flash_next::rocm

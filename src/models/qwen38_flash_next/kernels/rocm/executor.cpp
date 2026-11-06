@@ -1469,6 +1469,11 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   }
   if (!e->AllocateScratch(T, &e->s_, nullptr, error_msg))
     return nullptr;
+  e->hc_fused_state_ =
+      Alloc<std::uint8_t>(e->allocations_, HcMixQ8FusedStateBytes(), error_msg);
+  if (e->hc_fused_state_ == nullptr) {
+    return nullptr;
+  }
   const std::size_t slots = T * c.num_experts_used;
   {
     void* control = nullptr;
@@ -1896,6 +1901,7 @@ const void* Executor::ReadyQ8(const float* x, std::uint32_t n_tokens,
 void Executor::DropReadyQ8() const {
   xn_q8_ready_ = {};
   mixed_q8_ready_ = {};
+  pending_combine_ = {};  // a cancelled pass may have left one
 }
 
 bool Executor::Quantize(const float* x, std::uint32_t n_tokens, std::uint32_t k,
@@ -2730,6 +2736,18 @@ bool Executor::InjectFusable(const DeviceMixer& m,
          !m.inject.empty() && m.inject.type == GgmlType::kF32;
 }
 
+bool Executor::FusedMixer(const DeviceMixer& m, std::uint32_t n_tokens) const {
+  // Model geometry and Q8_0 projections only: a mixer in another format
+  // keeps the separate kernels.
+  const Config& c = config();
+  return hc_fused_state_ != nullptr && !MatrixRows(n_tokens) &&
+         n_tokens <= kVecBatch && c.hc_count == 4 && c.hidden_size == 2560 &&
+         c.hc_low_rank == 320 && m.down.type == GgmlType::kQ8_0 &&
+         m.down.rows == c.hc_low_rank && m.down.cols == c.HcDim() &&
+         m.up.type == GgmlType::kQ8_0 && m.up.rows == c.HcDim() &&
+         m.up.cols == c.hc_low_rank;
+}
+
 void Executor::Combine(void* res, const float* gamma, std::uint32_t n_tokens,
                        bool res_half, const DeviceMixer* next) const {
   const Config& c = config();
@@ -2776,7 +2794,15 @@ void Executor::Combine(void* res, const float* gamma, std::uint32_t n_tokens,
     return;
   }
   // A decode batch's next mixer quantizes xn for its down projection: the
-  // combine writes those rows as well. Decode keeps the F32 residual.
+  // combine writes those rows as well, or joins that mixer's single launch.
+  if (!res_half && next != nullptr && gamma != nullptr &&
+      FusedMixer(*next, n_tokens)) {
+    pending_combine_ = {next,         static_cast<float*>(res), gamma,
+                        s_.block_out, s_.inject,  inject_parts_,
+                        s_.xn,        s_.xn_q8_1, n_tokens};
+    xn_q8_ready_ = {s_.xn, s_.xn_q8_1, n_tokens, c.HcDim()};
+    return;
+  }
   if (!MatrixRows(n_tokens) && UnpaddedQ8(c.HcDim()) &&
       HcCombineQ8_1(static_cast<float*>(res), s_.block_out, s_.inject,
                     inject_parts_, gamma, s_.xn, s_.xn_q8_1, n_tokens,
@@ -2794,6 +2820,54 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
                      std::string* error_msg, bool half_only) const {
   const Config& c = config();
   mixed_q8_ready_ = {};  // `mixed` is rewritten below
+  if (pending_combine_.mixer != nullptr) {
+    const PendingCombine p = pending_combine_;
+    pending_combine_ = {};
+    const bool fused_inject = inject != nullptr && !m.inject.empty() &&
+                              m.inject.type == GgmlType::kF32;
+    if (normed && p.mixer == &m && p.res == res && p.n == n_tokens &&
+        !half_only) {
+      // The combine, both projections, SiLU and the epilogue in one launch,
+      // with the outputs and producer-written Q8_1 rows of the kernels below.
+      const HcFusedMix mix{
+          m.down.data,
+          m.up.data,
+          p.res,
+          p.block_out,
+          p.inject,
+          p.inject_parts,
+          p.gamma,
+          p.xn,
+          p.xn_q8,
+          s_.lo,
+          s_.lo_q8_1,
+          static_cast<std::uint32_t>(
+              qfn_mmq_q8_1_bytes(1, static_cast<int>(c.hc_low_rank)) / 36 * 32),
+          fused_inject ? m.inject.f32() : nullptr,
+          mixed,
+          s_.mixed_q8_1,
+          fused_inject ? inject : nullptr,
+          c.hidden_size,
+          c.hc_count,
+          c.hc_low_rank,
+          c.rms_eps,
+          1.0F / static_cast<float>(c.hc_count)};
+      if (!HcMixQ8Fused(hc_fused_state_, mix, n_tokens, stream_)) {
+        AssignError(error_msg, "fused HC mixer failed");
+        return false;
+      }
+      inject_fused_ = false;
+      q8t_src_ = nullptr;
+      half_src_ = nullptr;
+      mixed_q8_ready_ = {mixed, s_.mixed_q8_1, n_tokens, c.hidden_size};
+      inject_parts_ = fused_inject ? HcInjectParts(c.hidden_size) : 1;
+      return inject == nullptr || m.inject.empty() || fused_inject ||
+             Dense(m.inject, s_.xn, inject, n_tokens, error_msg);
+    }
+    // Another mixer follows after all: run the combine Combine left.
+    HcCombineQ8_1(p.res, p.block_out, p.inject, p.inject_parts, p.gamma, p.xn,
+                  p.xn_q8, p.n, c.hidden_size, c.hc_count, c.rms_eps, stream_);
+  }
   // Without `normed` this mixer's grouped norm of res is computed here (F32);
   // otherwise the previous combine produced it, as F16 plus tiled Q8 on the
   // wide route or as F32 in s_.xn (with its Q8_1 rows on a decode batch).
@@ -4498,6 +4572,7 @@ void Executor::SaveCache(BankCache* cache) const {
   cache->q8t_cols_ = q8t_cols_;
   cache->xn_q8_ready_ = xn_q8_ready_;
   cache->mixed_q8_ready_ = mixed_q8_ready_;
+  cache->pending_combine_ = pending_combine_;
   cache->shexp_half_ready_ = shexp_half_ready_;
   cache->moe_pending_ = moe_pending_;
   cache->xn_half_ = xn_half_;
@@ -4517,6 +4592,7 @@ void Executor::LoadCache(const BankCache& cache) const {
   q8t_cols_ = cache.q8t_cols_;
   xn_q8_ready_ = cache.xn_q8_ready_;
   mixed_q8_ready_ = cache.mixed_q8_ready_;
+  pending_combine_ = cache.pending_combine_;
   shexp_half_ready_ = cache.shexp_half_ready_;
   moe_pending_ = cache.moe_pending_;
   xn_half_ = cache.xn_half_;
@@ -6807,7 +6883,9 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
     if (!Dense(l.attn_out, s_.ctx, s_.block_out, tail_rows, error_msg))
       return false;
   }
-  Combine(s_.mtp_res, l.hc_ffn.norm.f32(), tail_rows);
+  // A trace reads the residual before the mixer.
+  Combine(s_.mtp_res, l.hc_ffn.norm.f32(), tail_rows, false,
+          trace == nullptr ? &l.hc_ffn : nullptr);
   if (trace && !copy_trace(s_.mtp_res + tail_last, trace->attention))
     return false;
   if (!session.CheckCancellation(error_msg))
