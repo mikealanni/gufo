@@ -257,6 +257,20 @@ SpeculativeVerifier::SpeculativeVerifier(
 }
 
 SpeculativeVerifier::SpeculativeVerifier(
+    hip::QwenGpuExecutor& target_executor, IDraftBackend& draft_backend,
+    SpeculativeOptions options)
+    : owned_target_executor_(
+          std::make_unique<QwenGpuSpeculativeTarget>(target_executor)),
+      target_executor_(owned_target_executor_.get()),
+      borrowed_draft_backend_(&draft_backend),
+      draft_backend_(nullptr),
+      options_(options),
+      current_draft_length_(options_.initial_draft_tokens),
+      use_batched_verification_(options_.use_batched_verification) {
+  ConfigureAdaptiveDraftPolicy();
+}
+
+SpeculativeVerifier::SpeculativeVerifier(
     ISpeculativeTargetExecutor& target_executor,
     std::unique_ptr<IDraftBackend> draft_backend, SpeculativeOptions options)
     : target_executor_(&target_executor),
@@ -270,16 +284,16 @@ SpeculativeVerifier::SpeculativeVerifier(
 void SpeculativeVerifier::Reset() noexcept {
   stats_ = {};
   ResetAdaptiveDraftLength();
-  if (draft_backend_ != nullptr) {
-    draft_backend_->Reset();
+  if (Draft() != nullptr) {
+    Draft()->Reset();
   }
 }
 
 void SpeculativeVerifier::BeginRequest() noexcept {
   stats_ = {};
   ResetAdaptiveDraftLength();
-  if (draft_backend_ != nullptr)
-    draft_backend_->BeginRequest();
+  if (Draft() != nullptr)
+    Draft()->BeginRequest();
 }
 
 void SpeculativeVerifier::ConfigureAdaptiveDraftPolicy() {
@@ -325,10 +339,10 @@ void SpeculativeVerifier::UpdateAdaptiveDraftLength(std::size_t accepted,
 tokenization::TokenId SpeculativeVerifier::AdvanceCommittedToken(
     tokenization::TokenId token, std::uint32_t position) {
   const auto next = target_executor_->ForwardToken(token, position);
-  if (draft_backend_ != nullptr &&
-      draft_backend_->RequiresTargetHiddenStates()) {
+  if (Draft() != nullptr &&
+      Draft()->RequiresTargetHiddenStates()) {
     const auto hidden = target_executor_->CopyLastHidden();
-    if (hidden.empty() || !draft_backend_->AppendTargetContext(
+    if (hidden.empty() || !Draft()->AppendTargetContext(
                               {.prompt_tokens = std::span(&token, 1),
                                .prompt_hidden_states = hidden,
                                .hidden_size = hidden.size(),
@@ -447,8 +461,8 @@ SpeculativeVerifier::PreparedStep SpeculativeVerifier::PrepareStep(
   if (prepared.sampled)
     prepared.working_sampler.emplace(request.sampler);
   prepared.max_draft_tokens =
-      request.max_emitted_tokens > 1 && draft_backend_ != nullptr &&
-              (!prepared.sampled || draft_backend_->SupportsSampledProposals())
+      request.max_emitted_tokens > 1 && Draft() != nullptr &&
+              (!prepared.sampled || Draft()->SupportsSampledProposals())
           ? std::min(current_draft_length_, request.max_emitted_tokens - 1)
           : 0;
   if (prepared.max_draft_tokens == 0) {
@@ -460,7 +474,7 @@ SpeculativeVerifier::PreparedStep SpeculativeVerifier::PrepareStep(
   auto& working_sampler =
       prepared.sampled ? *prepared.working_sampler : request.sampler;
   DraftProposalRequest draft_request;
-  draft_request.backend = draft_backend_.get();
+  draft_request.backend = Draft();
   draft_request.tokens = request.sequence;
   draft_request.position = request.position;
   draft_request.max_tokens = prepared.max_draft_tokens;
@@ -469,7 +483,7 @@ SpeculativeVerifier::PreparedStep SpeculativeVerifier::PrepareStep(
     draft_request.rng_state = working_sampler.mutable_rng_state();
   }
   draft_request.sampler = &working_sampler;
-  prepared.proposal = draft_backend_->ProposeForRequest(draft_request);
+  prepared.proposal = Draft()->ProposeForRequest(draft_request);
   PrepareProposalVerification(prepared, request, defer_target_only);
   return prepared;
 }
@@ -482,8 +496,8 @@ void SpeculativeVerifier::PrepareTargetOnlyStep(PreparedStep& prepared,
   if (defer_target_only) {
     prepared.target_only = true;
     prepared.inputs = {request.current_token};
-    prepared.capture_hidden = draft_backend_ != nullptr &&
-                              draft_backend_->RequiresTargetHiddenStates();
+    prepared.capture_hidden = Draft() != nullptr &&
+                              Draft()->RequiresTargetHiddenStates();
     prepared.capture_logits =
         (prepared.sampled || options_.retain_frontier_logits) &&
         !target_executor_->SupportsDeviceResidentSampling();
@@ -583,7 +597,7 @@ void SpeculativeVerifier::PrepareProposalVerification(
   prepared.inputs.push_back(request.current_token);
   prepared.inputs.insert(prepared.inputs.end(), proposal.tokens.begin(),
                          proposal.tokens.end());
-  prepared.capture_hidden = draft_backend_->RequiresTargetHiddenStates();
+  prepared.capture_hidden = Draft()->RequiresTargetHiddenStates();
   prepared.capture_logits =
       prepared.sampled && !target_executor_->SupportsDeviceResidentSampling();
   target_executor_->SaveState(request.position);
@@ -652,7 +666,7 @@ SpeculativeVerifier::ProcessVerificationChunk(
     target_executor_->FinishVerification();
     const auto prediction = verification.predictions.front();
     if (capture_target_hidden &&
-        !draft_backend_->AppendTargetContext(
+        !Draft()->AppendTargetContext(
             {.prompt_tokens = verification_inputs,
              .prompt_hidden_states = verification.hidden_states,
              .hidden_size = verification.hidden_width,
@@ -748,7 +762,7 @@ SpeculativeVerifier::ProcessVerificationChunk(
     // Only committed input rows reach the draft, in their original order.
     // Pending features remain private until this proposal receives feedback.
     for (std::size_t row = chunk_begin; row < committed_input_count; ++row) {
-      draft_backend_->UpdateTargetHidden(std::span<const float>(
+      Draft()->UpdateTargetHidden(std::span<const float>(
           verification.hidden_states.data() +
               ((row - chunk_begin) * verification.hidden_width),
           verification.hidden_width));
@@ -807,7 +821,7 @@ SpeculativeVerifier::ProcessVerificationChunk(
   UpdateAdaptiveDraftLength(accepted_count, num_draft);
   if (prepared.sampled)
     sampler.SetRngState(working_sampler.rng_state());
-  draft_backend_->AcceptFeedback(std::span<const tokenization::TokenId>(
+  Draft()->AcceptFeedback(std::span<const tokenization::TokenId>(
                                      proposal.tokens.data(), accepted_count),
                                  correction_token);
   return result;
@@ -859,7 +873,7 @@ std::vector<SpeculativeVerifier::StepResult> SpeculativeVerifier::VerifyBatch(
       auto& sampler = step.sampled ? *step.working_sampler : request.sampler;
       draft_indices.push_back(prepared.size() - 1);
       draft_requests.push_back(
-          {verifier.draft_backend_.get(), request.sequence, request.position,
+          {verifier.Draft(), request.sequence, request.position,
            step.max_draft_tokens,
            step.random_sampling ? request.sampler.config().temperature : 0.0F,
            step.random_sampling ? sampler.mutable_rng_state() : nullptr,
@@ -971,7 +985,7 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifySequentialStep(
   std::optional<speculative::DraftProposal> proposal_holder;
   {
     proposal_holder =
-        draft_backend_->Propose(current_sequence, cur_pos, max_draft_tokens);
+        Draft()->Propose(current_sequence, cur_pos, max_draft_tokens);
   }
   const auto proposal = std::move(*proposal_holder);
   if (proposal.tokens.empty()) {
@@ -994,7 +1008,7 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifySequentialStep(
 
   const std::size_t num_draft = proposal.tokens.size();
   const bool capture_target_hidden =
-      draft_backend_->RequiresTargetHiddenStates();
+      Draft()->RequiresTargetHiddenStates();
   std::size_t accepted_count = 0;
   tokenization::TokenId correction_token = 0;
   std::vector<float> correction_logits;
@@ -1082,7 +1096,7 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifySequentialStep(
     }
     for (std::size_t offset = 0; offset < committed_target_hidden.size();
          offset += target_hidden_width) {
-      draft_backend_->UpdateTargetHidden(std::span<const float>(
+      Draft()->UpdateTargetHidden(std::span<const float>(
           committed_target_hidden.data() + offset, target_hidden_width));
     }
   }
@@ -1117,7 +1131,7 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifySequentialStep(
 
   UpdateAdaptiveDraftLength(accepted_count, num_draft);
 
-  draft_backend_->AcceptFeedback(std::span<const tokenization::TokenId>(
+  Draft()->AcceptFeedback(std::span<const tokenization::TokenId>(
                                      proposal.tokens.data(), accepted_count),
                                  correction_token);
 
@@ -1204,7 +1218,7 @@ std::size_t SpeculativeVerifier::SnapshotPayloadBytes() const {
   if (draft_backend_ == nullptr) {
     throw std::logic_error("speculative verifier has no draft backend to size");
   }
-  std::size_t bytes = draft_backend_->SnapshotPayloadBytes();
+  std::size_t bytes = Draft()->SnapshotPayloadBytes();
   const auto checked_add = [&bytes](std::size_t value) {
     if (value > std::numeric_limits<std::size_t>::max() - bytes) {
       throw std::overflow_error("speculative snapshot size overflows");
@@ -1229,7 +1243,7 @@ std::unique_ptr<SpeculativeVerifierSnapshot> SpeculativeVerifier::Snapshot()
   }
   auto snapshot = std::unique_ptr<SpeculativeVerifierSnapshot>(
       new SpeculativeVerifierSnapshot());
-  snapshot->draft_snapshot_ = draft_backend_->Snapshot();
+  snapshot->draft_snapshot_ = Draft()->Snapshot();
   snapshot->stats_ = stats_;
   snapshot->current_draft_length_ = current_draft_length_;
   snapshot->rolling_acceptance_ = rolling_acceptance_;
@@ -1241,12 +1255,12 @@ void SpeculativeVerifier::RestoreSnapshot(
   if (draft_backend_ == nullptr || snapshot.draft_snapshot_ == nullptr) {
     throw std::invalid_argument("speculative verifier snapshot is incomplete");
   }
-  const bool capture_hidden = draft_backend_->RequiresTargetHiddenStates();
+  const bool capture_hidden = Draft()->RequiresTargetHiddenStates();
   const auto target_layer_ids = capture_hidden
-                                    ? draft_backend_->TargetHiddenLayerIds()
+                                    ? Draft()->TargetHiddenLayerIds()
                                     : std::span<const std::uint32_t>{};
   target_executor_->SetPromptHiddenCapture(capture_hidden, target_layer_ids);
-  draft_backend_->RestoreSnapshot(*snapshot.draft_snapshot_);
+  Draft()->RestoreSnapshot(*snapshot.draft_snapshot_);
   stats_ = snapshot.stats_;
   current_draft_length_ = snapshot.current_draft_length_;
   rolling_acceptance_ = snapshot.rolling_acceptance_;
@@ -1324,12 +1338,12 @@ void SpeculativeVerifier::RestorePersistentSnapshot(
     rolling_offset += sizeof(std::uint32_t);
   }
 
-  const bool capture_hidden = draft_backend_->RequiresTargetHiddenStates();
+  const bool capture_hidden = Draft()->RequiresTargetHiddenStates();
   const auto target_layer_ids = capture_hidden
-                                    ? draft_backend_->TargetHiddenLayerIds()
+                                    ? Draft()->TargetHiddenLayerIds()
                                     : std::span<const std::uint32_t>{};
   target_executor_->SetPromptHiddenCapture(capture_hidden, target_layer_ids);
-  draft_backend_->RestorePersistentSnapshot(
+  Draft()->RestorePersistentSnapshot(
       payload.subspan(draft_offset, draft_payload_bytes));
   stats_ = {
       .total_draft_tokens = static_cast<std::size_t>(total_draft_tokens),
@@ -1431,16 +1445,16 @@ tokenization::TokenId SpeculativeVerifier::ExtendPrompt(
         "prompt extension needs a nonempty retained prefix");
   }
   const bool capture =
-      draft_backend_ != nullptr && draft_backend_->RequiresTargetHiddenStates();
+      Draft() != nullptr && Draft()->RequiresTargetHiddenStates();
   target_executor_->SetPromptHiddenCapture(
-      capture, capture ? draft_backend_->TargetHiddenLayerIds()
+      capture, capture ? Draft()->TargetHiddenLayerIds()
                        : std::span<const std::uint32_t>{});
   const auto next =
       target_executor_->ForwardPromptSuffix(tokens, position, compute_logits);
   if (capture) {
     const auto hidden = target_executor_->GetPromptHiddenStates();
     if (hidden.empty() || hidden.size() % tokens.size() != 0 ||
-        !draft_backend_->AppendTargetContext(
+        !Draft()->AppendTargetContext(
             {.prompt_tokens = tokens,
              .prompt_hidden_states = hidden,
              .hidden_size = hidden.size() / tokens.size(),
@@ -1461,9 +1475,9 @@ tokenization::TokenId SpeculativeVerifier::Prime(
   target_executor_->Reset();
 
   const bool capture_hidden =
-      draft_backend_ != nullptr && draft_backend_->RequiresTargetHiddenStates();
+      Draft() != nullptr && Draft()->RequiresTargetHiddenStates();
   const auto target_layer_ids = capture_hidden
-                                    ? draft_backend_->TargetHiddenLayerIds()
+                                    ? Draft()->TargetHiddenLayerIds()
                                     : std::span<const std::uint32_t>{};
   target_executor_->SetPromptHiddenCapture(capture_hidden, target_layer_ids);
   const tokenization::TokenId first_token =
@@ -1481,7 +1495,7 @@ tokenization::TokenId SpeculativeVerifier::Prime(
         .hidden_size = prompt_hidden.size() / prompt_tokens.size(),
         .first_token = first_token,
     };
-    if (!draft_backend_->PrimeTargetContext(context)) {
+    if (!Draft()->PrimeTargetContext(context)) {
       throw std::runtime_error("draft backend failed to prime target context");
     }
   }

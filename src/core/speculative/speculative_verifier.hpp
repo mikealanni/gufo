@@ -269,6 +269,10 @@ public:
   SpeculativeVerifier(hip::QwenGpuExecutor& target_executor,
                       std::unique_ptr<IDraftBackend> draft_backend,
                       SpeculativeOptions options = {});
+  // Component-cache slots own both executors and outlive the bound runner.
+  SpeculativeVerifier(hip::QwenGpuExecutor& target_executor,
+                      IDraftBackend& draft_backend,
+                      SpeculativeOptions options = {});
   SpeculativeVerifier(ISpeculativeTargetExecutor& target_executor,
                       std::unique_ptr<IDraftBackend> draft_backend,
                       SpeculativeOptions options = {});
@@ -387,6 +391,12 @@ private:
   std::unique_ptr<ISpeculativeTargetExecutor> owned_target_executor_;
   ISpeculativeTargetExecutor* target_executor_;
   std::unique_ptr<IDraftBackend> draft_backend_;
+  /// A borrowed draft (see the IDraftBackend& constructors); owned elsewhere.
+  IDraftBackend* borrowed_draft_backend_{nullptr};
+  [[nodiscard]] IDraftBackend* Draft() const noexcept {
+    return draft_backend_ != nullptr ? draft_backend_.get()
+                                     : borrowed_draft_backend_;
+  }
   SpeculativeOptions options_;
   SpeculativeStats stats_;
   std::uint32_t current_draft_length_{3};
