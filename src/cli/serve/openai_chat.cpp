@@ -32,6 +32,7 @@
 #include "src/models/deepseek_v4_flash/chat_template.hpp"
 #include "src/models/deepseek_v4_flash/tool_calls.hpp"
 #include "src/models/qwen/chat_template.hpp"
+#include "src/models/qwen38_flash_next/jev_finish.hpp"
 #include "src/models/qwen38_flash_next/jev_gate.hpp"
 
 namespace gufo::server {
@@ -68,6 +69,7 @@ struct ParsedChatRequest {
   sampling::SamplingConfig sampling;
   bool stream{false};
   bool include_usage{false};
+  TextGenerationBackend::CancellationCheck is_cancelled;
 };
 
 struct ParsedToolCall {
@@ -2893,31 +2895,135 @@ private:
   bool unfinished_tool_{false};
 };
 
+/// Unfinished-turn continuation (--jev-finish). Silence is stock behavior: any
+/// uncertain case, every length stop and every tool-call turn ends normally.
+constexpr int kJevFinishMaxContinues = 2;
+constexpr std::size_t kJevFinishTailBytes = 200;
+
+struct JevFinishState {
+  int continues{0};
+  std::string last_reason;
+  std::string last_tail;
+};
+
+std::optional<ChatRequest> JevFinishContinuation(
+    const ChatRequest& chat, const TextGenerationBackend& backend,
+    const TextGenerationBackend::Result& result,
+    const ParsedGeneration& generated, JevFinishState& state) {
+  if (!backend.jev_finish_enabled() ||
+      result.finish_reason != TextGenerationBackend::FinishReason::kStop ||
+      !generated.tool_calls.empty() || chat.response_format ||
+      chat.constrained_tools || chat.messages.empty()) {
+    return std::nullopt;
+  }
+  std::string_view task;
+  for (auto it = chat.messages.rbegin(); it != chat.messages.rend(); ++it) {
+    if (it->role == tokenization::ChatRole::kUser) {
+      task = it->content;
+      break;
+    }
+  }
+  const auto verdict = models::qwen38_flash_next::JudgeFinish(
+      task, generated.text, false, "stop");
+  const std::string tail =
+      generated.text.size() > kJevFinishTailBytes
+          ? generated.text.substr(generated.text.size() - kJevFinishTailBytes)
+          : generated.text;
+  if (!verdict.unfinished) {
+    Logger::LogFormatted(
+        LogLevel::kInfo, "jev-finish", "decision=finished reason=%s score=%.2f",
+        verdict.reason.empty() ? "none" : verdict.reason.c_str(),
+        verdict.score);
+    return std::nullopt;
+  }
+  if (state.continues >= kJevFinishMaxContinues ||
+      (verdict.reason == state.last_reason && tail == state.last_tail)) {
+    Logger::LogFormatted(LogLevel::kInfo, "jev-finish",
+                         "decision=finished reason=%s score=%.2f guard=loop",
+                         verdict.reason.c_str(), verdict.score);
+    return std::nullopt;
+  }
+  ++state.continues;
+  state.last_reason = verdict.reason;
+  state.last_tail = tail;
+  Logger::LogFormatted(LogLevel::kInfo, "jev-finish",
+                       "decision=continue reason=%s score=%.2f round=%d",
+                       verdict.reason.c_str(), verdict.score, state.continues);
+  ChatRequest next = chat;
+  next.messages.emplace_back(tokenization::ChatRole::kAssistant,
+                             generated.text);
+  next.messages.emplace_back(
+      tokenization::ChatRole::kUser,
+      "Continue; the task is not complete. " + verdict.reason);
+  return next;
+}
+
+/// Adds a continuation round's counters to the first round's result. Prompt,
+/// cache and timing fields keep the latest round; token counts accumulate so
+/// usage covers everything generated for the client.
+void MergeContinuation(TextGenerationBackend::Result* total,
+                       const TextGenerationBackend::Result& round) {
+  const std::size_t completion =
+      total->completion_tokens + round.completion_tokens;
+  const std::size_t reasoning =
+      total->reasoning_tokens + round.reasoning_tokens;
+  const std::size_t prefill = total->prefill_tokens + round.prefill_tokens;
+  *total = round;
+  total->completion_tokens = completion;
+  total->reasoning_tokens = reasoning;
+  total->prefill_tokens = prefill;
+}
+
 HttpResponse NonStreamingResponse(
     const ParsedChatRequest& request, TextGenerationBackend& backend,
     const std::shared_ptr<TextGenerationBackend::GenerationRequest>& generation,
     TextGenerationBackend::InitialOutputState initial_output_state) {
-  const auto result = generation->Wait();
+  auto result = generation->Wait();
   const auto format = generation->ToolFormat();
   const auto markers = ToolMarkers(format);
   const auto closers = ToolClosers(format);
-  core::Utf8Decoder decoder;
-  const auto decoded = decoder.Push(result.text, true);
-  QuoteTracker quotes;
-  const ParsedGeneration generated =
-      request.chat.response_format || request.chat.constrained_tools
-          ? ParseStructuredGeneration(
-                decoded, initial_output_state, request.chat.tools,
-                request.chat.tool_choice,
-                result.finish_reason ==
-                    TextGenerationBackend::FinishReason::kStop,
-                request.chat.constrained_tools && !request.chat.response_format,
-                markers, closers, quotes)
-          : ParseGeneration(decoded, initial_output_state, request.chat.tools,
-                            request.chat.tool_choice,
-                            result.finish_reason ==
-                                TextGenerationBackend::FinishReason::kStop,
-                            markers, closers, quotes);
+  const auto parse = [&](const TextGenerationBackend::Result& round,
+                         const ChatRequest& chat,
+                         TextGenerationBackend::InitialOutputState state) {
+    core::Utf8Decoder decoder;
+    const auto decoded = decoder.Push(round.text, true);
+    QuoteTracker quotes;
+    const bool stopped =
+        round.finish_reason == TextGenerationBackend::FinishReason::kStop;
+    return chat.response_format || chat.constrained_tools
+               ? ParseStructuredGeneration(
+                     decoded, state, chat.tools, chat.tool_choice, stopped,
+                     chat.constrained_tools && !chat.response_format, markers,
+                     closers, quotes)
+               : ParseGeneration(decoded, state, chat.tools, chat.tool_choice,
+                                 stopped, markers, closers, quotes);
+  };
+  ParsedGeneration generated =
+      parse(result, request.chat, initial_output_state);
+  JevFinishState finish_state;
+  ChatRequest round_chat = request.chat;
+  ParsedGeneration latest = generated;
+  TextGenerationBackend::Result latest_result = result;
+  while (auto next = JevFinishContinuation(round_chat, backend, latest_result,
+                                           latest, finish_state)) {
+    try {
+      auto follow =
+          backend.start_chat(*next, request.max_tokens, request.sampling,
+                             request.is_cancelled, false);
+      const auto round = follow->Wait();
+      if (round.cancelled)
+        break;
+      latest = parse(round, *next, backend.initial_output_state(*next));
+      generated.text += "\n\n" + latest.text;
+      generated.reasoning_content += latest.reasoning_content;
+      generated.tool_calls = latest.tool_calls;
+      MergeContinuation(&result, round);
+      latest_result = round;
+      round_chat = std::move(*next);
+    } catch (const std::exception&) {
+      break;
+    }
+  }
 
   json::Value response = json::Value::object();
   response["id"] = RandomId("chatcmpl-");
@@ -2986,10 +3092,16 @@ HttpResponse StreamingResponse(
           },
       .streaming_body =
           [request, generation = std::move(generation), id, created, model,
-           initial_output_state, markers, closers,
-           stream_log](const HttpResponse::BodyWriter& writer) {
+           initial_output_state, markers, closers, stream_log,
+           &backend](const HttpResponse::BodyWriter& writer) {
             bool connected = true;
             bool started = false;
+            auto active_generation = generation;
+            auto round_state = initial_output_state;
+            ChatRequest round_chat = request.chat;
+            JevFinishState finish_state;
+            TextGenerationBackend::Result total_result;
+            bool first_round = true;
             const auto begin = [&] {
               if (!started) {
                 started = true;
@@ -3001,147 +3113,183 @@ HttpResponse StreamingResponse(
               return connected;
             };
             if (request.chat.return_progress && !begin()) {
-              generation->Cancel();
+              active_generation->Cancel();
               return;
             }
-            QuoteTracker quotes;
-            StreamingTextFilter filter(
-                initial_output_state,
-                [&](std::string_view text, bool is_reasoning) {
-                  if (text.empty()) {
-                    return true;
-                  }
-                  json::Value delta = json::Value::object();
-                  if (is_reasoning) {
-                    delta["reasoning_content"] = std::string(text);
-                  } else {
-                    delta["content"] = std::string(text);
-                  }
-                  connected = writer(
-                      Sse(ChoiceChunk(id, created, model, std::move(delta))));
-                  return connected;
-                },
-                request.chat.response_format != nullptr,
-                request.chat.constrained_tools && !request.chat.response_format,
-                !request.chat.tools.empty() &&
-                    request.chat.tool_choice != ChatRequest::ToolChoice::kNone,
-                markers, closers, request.chat.tools);
-            StreamingToolCalls tools([&](const ToolDelta& call) {
-              // Completion without additional arguments needs no Chat delta.
-              if (call.id.empty() && call.arguments.empty())
-                return connected;
-              auto item = json::Value::object();
-              item["index"] = call.index;
-              if (!call.id.empty()) {
-                item["id"] = call.id;
-                item["type"] = "function";
-                item["function"]["name"] = call.name;
-              }
-              item["function"]["arguments"] = call.arguments;
-              auto delta = json::Value::object();
-              delta["tool_calls"] = json::Value::array();
-              delta["tool_calls"].push_back(std::move(item));
-              connected = writer(
-                  Sse(ChoiceChunk(id, created, model, std::move(delta))));
-              return connected;
-            });
-
-            TextGenerationBackend::ProgressCallback on_progress;
-            if (request.chat.return_progress) {
-              on_progress =
-                  [&](const TextGenerationBackend::PromptProgress& progress) {
-                    auto chunk =
-                        ChoiceChunk(id, created, model, json::Value::object());
-                    chunk["prompt_progress"] = PromptProgressJson(progress);
-                    connected = begin() && writer(Sse(chunk));
+            for (;;) {
+              QuoteTracker quotes;
+              StreamingTextFilter filter(
+                  round_state,
+                  [&](std::string_view text, bool is_reasoning) {
+                    if (text.empty()) {
+                      return true;
+                    }
+                    json::Value delta = json::Value::object();
+                    if (is_reasoning) {
+                      delta["reasoning_content"] = std::string(text);
+                    } else {
+                      delta["content"] = std::string(text);
+                    }
+                    connected = writer(
+                        Sse(ChoiceChunk(id, created, model, std::move(delta))));
                     return connected;
-                  };
-            }
-
-            try {
-              const auto result = generation->Wait(
-                  [&](std::string_view piece) {
-                    if (!begin() || !filter.Push(piece))
-                      return false;
-                    return !filter.in_tools() || markers.size() > 2 ||
-                           tools.Update(StreamingGeneration(
-                                            filter, request.chat,
-                                            initial_output_state, markers,
-                                            closers, quotes, false, true)
-                                            .tool_calls);
                   },
-                  on_progress, begin);
-              stream_log->details = GenerationLogDetails(result);
-              RecordServerMetrics(result);
-              if (!connected || result.cancelled) {
-                return;
-              }
-              if (!begin())
-                return;
-              if (!filter.Push({}, true))
-                return;
+                  request.chat.response_format != nullptr,
+                  request.chat.constrained_tools &&
+                      !request.chat.response_format,
+                  !request.chat.tools.empty() &&
+                      request.chat.tool_choice !=
+                          ChatRequest::ToolChoice::kNone,
+                  markers, closers, request.chat.tools);
+              StreamingToolCalls tools([&](const ToolDelta& call) {
+                // Completion without additional arguments needs no Chat delta.
+                if (call.id.empty() && call.arguments.empty())
+                  return connected;
+                auto item = json::Value::object();
+                item["index"] = call.index;
+                if (!call.id.empty()) {
+                  item["id"] = call.id;
+                  item["type"] = "function";
+                  item["function"]["name"] = call.name;
+                }
+                item["function"]["arguments"] = call.arguments;
+                auto delta = json::Value::object();
+                delta["tool_calls"] = json::Value::array();
+                delta["tool_calls"].push_back(std::move(item));
+                connected = writer(
+                    Sse(ChoiceChunk(id, created, model, std::move(delta))));
+                return connected;
+              });
 
-              const bool interrupted =
-                  result.finish_reason !=
-                  TextGenerationBackend::FinishReason::kStop;
-              const auto generated = StreamingGeneration(
-                  filter, request.chat, initial_output_state, markers, closers,
-                  quotes, !interrupted);
-              if (!tools.Finish(generated.tool_calls, interrupted))
-                return;
-              if (!filter.Finish(generated.hide_tool_markup, generated.text,
-                                 generated.reasoning_content)) {
-                return;
+              TextGenerationBackend::ProgressCallback on_progress;
+              if (request.chat.return_progress) {
+                on_progress =
+                    [&](const TextGenerationBackend::PromptProgress& progress) {
+                      auto chunk = ChoiceChunk(id, created, model,
+                                               json::Value::object());
+                      chunk["prompt_progress"] = PromptProgressJson(progress);
+                      connected = begin() && writer(Sse(chunk));
+                      return connected;
+                    };
               }
-              json::Value terminal_delta = json::Value::object();
-              auto terminal_chunk = ChoiceChunk(
-                  id, created, model, std::move(terminal_delta),
-                  FinishReason(result, !generated.tool_calls.empty()));
-              // llama.cpp reports timings on the terminal choice regardless
-              // of the optional OpenAI usage chunk. Proxies need these even
-              // when a client does not request stream_options.include_usage.
-              terminal_chunk["timings"] = GenerationTimings(result);
-              if (!writer(Sse(terminal_chunk))) {
-                return;
-              }
-              if (request.include_usage) {
-                json::Value usage_chunk = BaseChunk(id, created, model);
-                usage_chunk["choices"] = json::Value::array();
-                usage_chunk["usage"] = Usage(result);
-                usage_chunk["timings"] = GenerationTimings(result);
-                if (!writer(Sse(usage_chunk))) {
+
+              try {
+                auto result = active_generation->Wait(
+                    [&](std::string_view piece) {
+                      if (!begin() || !filter.Push(piece))
+                        return false;
+                      return !filter.in_tools() || markers.size() > 2 ||
+                             tools.Update(StreamingGeneration(
+                                              filter, request.chat, round_state,
+                                              markers, closers, quotes, false,
+                                              true)
+                                              .tool_calls);
+                    },
+                    on_progress, begin);
+                stream_log->details = GenerationLogDetails(result);
+                RecordServerMetrics(result);
+                const auto round_result = result;
+                if (first_round) {
+                  total_result = result;
+                  first_round = false;
+                } else {
+                  MergeContinuation(&total_result, result);
+                  result = total_result;
+                }
+                if (!connected || result.cancelled) {
                   return;
                 }
+                if (!begin())
+                  return;
+                if (!filter.Push({}, true))
+                  return;
+
+                const bool interrupted =
+                    result.finish_reason !=
+                    TextGenerationBackend::FinishReason::kStop;
+                const auto generated =
+                    StreamingGeneration(filter, request.chat, round_state,
+                                        markers, closers, quotes, !interrupted);
+                if (!tools.Finish(generated.tool_calls, interrupted))
+                  return;
+                if (!filter.Finish(generated.hide_tool_markup, generated.text,
+                                   generated.reasoning_content)) {
+                  return;
+                }
+                if (auto next =
+                        JevFinishContinuation(round_chat, backend, round_result,
+                                              generated, finish_state)) {
+                  try {
+                    auto follow = backend.start_chat(
+                        *next, request.max_tokens, request.sampling,
+                        request.is_cancelled, true);
+                    json::Value gap = json::Value::object();
+                    gap["content"] = "\n\n";
+                    if (!writer(Sse(
+                            ChoiceChunk(id, created, model, std::move(gap))))) {
+                      follow->Cancel();
+                      return;
+                    }
+                    round_state = backend.initial_output_state(*next);
+                    round_chat = std::move(*next);
+                    active_generation = std::move(follow);
+                    continue;
+                  } catch (const std::exception&) {
+                    // Stock behavior: end the response as it stands.
+                  }
+                }
+                json::Value terminal_delta = json::Value::object();
+                auto terminal_chunk = ChoiceChunk(
+                    id, created, model, std::move(terminal_delta),
+                    FinishReason(result, !generated.tool_calls.empty()));
+                // llama.cpp reports timings on the terminal choice regardless
+                // of the optional OpenAI usage chunk. Proxies need these even
+                // when a client does not request stream_options.include_usage.
+                terminal_chunk["timings"] = GenerationTimings(result);
+                if (!writer(Sse(terminal_chunk))) {
+                  return;
+                }
+                if (request.include_usage) {
+                  json::Value usage_chunk = BaseChunk(id, created, model);
+                  usage_chunk["choices"] = json::Value::array();
+                  usage_chunk["usage"] = Usage(result);
+                  usage_chunk["timings"] = GenerationTimings(result);
+                  if (!writer(Sse(usage_chunk))) {
+                    return;
+                  }
+                }
+                (void)writer("data: [DONE]\n\n");
+                return;
+              } catch (const TextGenerationError& exception) {
+                if (!started)
+                  throw;
+                stream_log->error_code = exception.stable_code();
+                json::Value error = json::Value::object();
+                json::Value detail = json::Value::object();
+                detail["message"] = exception.what();
+                detail["type"] = "server_error";
+                detail["code"] = exception.stable_code();
+                error["error"] = std::move(detail);
+                stream_log->error_event_sent = writer(Sse(error));
+                (void)writer("data: [DONE]\n\n");
+              } catch (const std::exception& error) {
+                if (!started)
+                  throw;
+                // Retain the cause in logs alongside the client's stable code.
+                Logger::Error("chat", error.what());
+                stream_log->error_code = "generation_failed";
+                json::Value err = json::Value::object();
+                json::Value detail = json::Value::object();
+                const char* message = error.what();
+                detail["message"] =
+                    message && *message ? message : "generation failed";
+                detail["type"] = "server_error";
+                detail["code"] = "generation_failed";
+                err["error"] = std::move(detail);
+                stream_log->error_event_sent = writer(Sse(err));
+                (void)writer("data: [DONE]\n\n");
               }
-              (void)writer("data: [DONE]\n\n");
-            } catch (const TextGenerationError& exception) {
-              if (!started)
-                throw;
-              stream_log->error_code = exception.stable_code();
-              json::Value error = json::Value::object();
-              json::Value detail = json::Value::object();
-              detail["message"] = exception.what();
-              detail["type"] = "server_error";
-              detail["code"] = exception.stable_code();
-              error["error"] = std::move(detail);
-              stream_log->error_event_sent = writer(Sse(error));
-              (void)writer("data: [DONE]\n\n");
-            } catch (const std::exception& error) {
-              if (!started)
-                throw;
-              // Retain the cause in logs alongside the client's stable code.
-              Logger::Error("chat", error.what());
-              stream_log->error_code = "generation_failed";
-              json::Value err = json::Value::object();
-              json::Value detail = json::Value::object();
-              const char* message = error.what();
-              detail["message"] =
-                  message && *message ? message : "generation failed";
-              detail["type"] = "server_error";
-              detail["code"] = "generation_failed";
-              err["error"] = std::move(detail);
-              stream_log->error_event_sent = writer(Sse(err));
-              (void)writer("data: [DONE]\n\n");
+              return;
             }
           },
       .stream_log = std::move(stream_log),
@@ -4030,6 +4178,7 @@ HttpResponse HandleOpenAiChat(const HttpRequest& request,
   if (auto error = ParseRequest(request, backend, &parsed); error.has_value()) {
     return std::move(*error);
   }
+  parsed.is_cancelled = request.is_cancelled;
   if (auto pre = TryJevPreRoute(parsed, backend); pre.has_value())
     return std::move(*pre);
   try {
