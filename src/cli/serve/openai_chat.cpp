@@ -9,6 +9,7 @@
 #include <ctime>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <random>
@@ -788,7 +789,62 @@ const char* JevEffortName(ReasoningEffort effort) {
   return "unknown";
 }
 
+// Tool-loop turn policy: the pending turn is the trailing run of tool messages.
+// Routine results (reads, listings, inspection commands without failure
+// signals) lower the effort to low; the caller's effort or the server default
+// is never raised, and anything unclear keeps it.
+bool ApplyJevAgentGate(TextGenerationBackend& backend, ChatRequest* chat) {
+  if (!backend.jev_gate_agent_enabled() || chat->messages.empty() ||
+      chat->messages.back().role != tokenization::ChatRole::kTool) {
+    return false;
+  }
+  const ReasoningEffort in_effort = chat->reasoning.effort.value_or(
+      backend.reasoning_defaults().effort.value_or(ReasoningEffort::kMedium));
+  if (chat->reasoning.enabled == false || in_effort <= ReasoningEffort::kLow)
+    return true;
+  using models::qwen38_flash_next::JevToolResult;
+  std::vector<std::vector<JevToolResult>> turns;
+  std::map<std::string, std::pair<std::string_view, std::string_view>> calls;
+  for (const auto& message : chat->messages) {
+    if (message.role == tokenization::ChatRole::kUser) {
+      turns.clear();
+    } else if (message.role == tokenization::ChatRole::kAssistant &&
+               !message.tool_calls.empty()) {
+      turns.emplace_back();
+      for (const auto& call : message.tool_calls) {
+        std::string_view command;
+        for (const auto& argument : call.arguments) {
+          if (argument.name == "command")
+            command = argument.value;
+        }
+        calls[call.id] = {call.name, command};
+      }
+    } else if (message.role == tokenization::ChatRole::kTool &&
+               !turns.empty()) {
+      std::string_view tool = message.name;
+      std::string_view command;
+      if (const auto it = calls.find(message.tool_call_id); it != calls.end()) {
+        tool = it->second.first;
+        command = it->second.second;
+      }
+      turns.back().push_back({tool, command, message.content});
+    }
+  }
+  const auto decision = models::qwen38_flash_next::ClassifyJevAgentTurn(turns);
+  Logger::LogFormatted(
+      LogLevel::kInfo, "jev-gate",
+      "mode=agent role=tool turns=%zu effort_in=%s effort_out=%s reason=%.*s",
+      turns.size(), JevEffortName(in_effort),
+      JevEffortName(decision.lower ? ReasoningEffort::kLow : in_effort),
+      static_cast<int>(decision.reason.size()), decision.reason.data());
+  if (decision.lower)
+    chat->reasoning.effort = ReasoningEffort::kLow;
+  return true;
+}
+
 void ApplyJevGate(TextGenerationBackend& backend, ChatRequest* chat) {
+  if (ApplyJevAgentGate(backend, chat))
+    return;
   if (!backend.jev_gate_enabled() || chat->reasoning.effort.has_value() ||
       chat->reasoning.enabled.has_value()) {
     return;

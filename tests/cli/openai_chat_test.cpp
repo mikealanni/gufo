@@ -209,6 +209,10 @@ public:
   bool image_support{true};
   [[nodiscard]] bool jev_finish_enabled() const override { return jev_finish; }
   bool jev_finish{false};
+  [[nodiscard]] bool jev_gate_agent_enabled() const override {
+    return jev_gate_agent;
+  }
+  bool jev_gate_agent{false};
   std::vector<std::vector<std::string>> piece_sequence;
 
   bool WaitForFirstPiece() {
@@ -6358,7 +6362,49 @@ void TestJevFinishContinuesUnfinishedTurns() {
   }
 }
 
+void TestJevAgentGateLowersRoutineToolTurns() {
+  const auto build = [](const std::string& tool, const std::string& args,
+                        const std::string& result, const std::string& extra) {
+    return std::string(
+               R"({"model":"test-model","tools":[{"type":"function","function":{"name":")") +
+           tool +
+           R"(","parameters":{"type":"object","properties":{}}}}],"messages":[{"role":"user","content":"Fix the build."},{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":")" +
+           tool + R"(","arguments":")" + args +
+           R"("}}]},{"role":"tool","tool_call_id":"c1","content":")" + result +
+           R"("}])" + extra + "}";
+  };
+  const auto effort_of = [&](bool agent, const std::string& body) {
+    FakeBackend backend;
+    backend.jev_gate_agent = agent;
+    backend.piece_sequence = {{"ok."}};
+    const auto response =
+        gufo::server::HandleOpenAiChat(Request(body), backend);
+    Expect(response.status == 200, "Jev agent gate request succeeds");
+    return backend.last_request.reasoning.effort;
+  };
+  const std::string routine =
+      build("bash", R"({\"command\":\"ls src\"})", "a.cpp\\nb.cpp", "");
+  Expect(effort_of(true, routine) == gufo::ReasoningEffort::kLow,
+         "Routine inspection result lowers effort to low");
+  Expect(effort_of(false, routine) != gufo::ReasoningEffort::kLow,
+         "Agent gate is inert unless enabled");
+  const std::string failing = build("bash", R"({\"command\":\"ls src\"})",
+                                    "ls: no such file or directory", "");
+  Expect(effort_of(true, failing) != gufo::ReasoningEffort::kLow,
+         "Failure signal keeps the caller's effort");
+  const std::string build_cmd =
+      build("bash", R"({\"command\":\"make -j8\"})", "done", "");
+  Expect(effort_of(true, build_cmd) != gufo::ReasoningEffort::kLow,
+         "Build and test commands keep the caller's effort");
+  const std::string explicit_low =
+      build("bash", R"({\"command\":\"ls src\"})", "a.cpp",
+            R"(,"reasoning_effort":"minimal")");
+  Expect(effort_of(true, explicit_low) == gufo::ReasoningEffort::kMinimal,
+         "Agent gate never raises a lower caller effort");
+}
+
 int main() {
+  TestJevAgentGateLowersRoutineToolTurns();
   TestJevFinishContinuesUnfinishedTurns();
   TestToolCallRenderParseRoundTrip();
   TestToolTagBoundaries();

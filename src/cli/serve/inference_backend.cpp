@@ -4549,6 +4549,7 @@ private:
 struct InferenceBackend::Impl {
   // Written once during startup, before the first request is admitted.
   bool jev_gate_option{false};
+  bool jev_gate_agent_option{false};
   bool jev_pre_option{false};
   bool jev_inline_option{false};
   bool jev_finish_option{false};
@@ -5790,6 +5791,20 @@ bool InferenceBackend::jev_gate_enabled() const {
 #endif
 }
 
+bool InferenceBackend::jev_gate_agent_enabled() const {
+#if defined(ENGINE_ENABLE_HIP)
+  if (!impl_->jev_gate_agent_option) {
+    return false;
+  }
+  const auto state = impl_->Snapshot();
+  return state != nullptr &&
+         state->scheduler->runner().Descriptor().state_abi ==
+             std::string(kQwenFlashNextStateAbi);
+#else
+  return false;
+#endif
+}
+
 bool InferenceBackend::jev_inline_enabled() const {
 #if defined(ENGINE_ENABLE_HIP)
   if (!impl_->jev_inline_option) {
@@ -5907,6 +5922,10 @@ void InferenceBackend::set_reasoning_defaults(
 
 void InferenceBackend::set_jev_gate_enabled(bool enabled) {
   impl_->jev_gate_option = enabled;
+}
+
+void InferenceBackend::set_jev_gate_agent_enabled(bool enabled) {
+  impl_->jev_gate_agent_option = enabled;
 }
 
 void InferenceBackend::set_jev_inline_enabled(bool enabled) {

@@ -662,9 +662,11 @@ void PrintServeHelp(std::string_view program_name,
         "Reasoning tokens before </think> is forced: -1 unlimited, 0 none "
         "(default: -1)",
         "Reasoning Defaults", &reasoning_budget);
-    parser.AddOption("", "--jev-gate", "MODE",
-                     "Flash-Next reasoning pre-gate: on or off (default: on)",
-                     "Reasoning Defaults", &jev_gate);
+    parser.AddOption(
+        "", "--jev-gate", "MODE",
+        "Flash-Next reasoning pre-gate: on, off, or agent (also lowers "
+        "effort on routine tool-result turns; default: on)",
+        "Reasoning Defaults", &jev_gate);
     parser.AddOption(
         "", "--jev-inline", "MODE",
         "Inline jev yes/no answering inside <think>: on or off (default: off)",
@@ -1229,7 +1231,8 @@ int RunServe(std::span<const char* const> args) {
         "Reasoning Defaults", &reasoning_budget);
     llm_parser.AddOption(
         "", "--jev-gate", "MODE",
-        "Flash-Next reasoning pre-gate: on or off (default: on)",
+        "Flash-Next reasoning pre-gate: on, off, or agent (also lowers "
+        "effort on routine tool-result turns; default: on)",
         "Reasoning Defaults", &jev_gate);
     llm_parser.AddOption(
         "", "--jev-inline", "MODE",
@@ -1399,8 +1402,8 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error: --reasoning-budget must be -1 or nonnegative\n";
       return 2;
     }
-    if (jev_gate != "on" && jev_gate != "off") {
-      std::cerr << "Error: --jev-gate must be on or off\n";
+    if (jev_gate != "on" && jev_gate != "off" && jev_gate != "agent") {
+      std::cerr << "Error: --jev-gate must be on, off, or agent\n";
       return 2;
     }
     if (jev_inline != "on" && jev_inline != "off") {
@@ -1523,7 +1526,8 @@ int RunServe(std::span<const char* const> args) {
         max_tokens < 0 ? 0 : static_cast<std::size_t>(max_tokens),
         sampling_config, SamplingOptionsSupplied(llm_parser));
     backend->set_reasoning_defaults(*reasoning_defaults);
-    backend->set_jev_gate_enabled(jev_gate == "on");
+    backend->set_jev_gate_enabled(jev_gate != "off");
+    backend->set_jev_gate_agent_enabled(jev_gate == "agent");
     backend->set_jev_inline_enabled(jev_inline == "on");
     backend->set_jev_pre_enabled(jev_pre == "on");
     backend->set_jev_finish_enabled(jev_finish == "on");

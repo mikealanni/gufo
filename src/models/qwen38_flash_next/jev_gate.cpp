@@ -2,10 +2,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstddef>
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace gufo::models::qwen38_flash_next {
 namespace {
@@ -238,6 +240,207 @@ JevGateDecision ClassifyJevRequest(std::string_view text) {
     return {ReasoningEffort::kLow, false};
   }
   return {ReasoningEffort::kMedium, true};
+}
+
+namespace {
+
+constexpr std::size_t kAgentShellOutputMax = 4000;
+constexpr std::size_t kAgentReadHead = 160;
+constexpr std::size_t kAgentOtherHead = 400;
+
+constexpr std::array<std::string_view, 17> kAgentFailWords{{
+    "error",
+    "failed",
+    "failure",
+    "traceback",
+    "exception",
+    "fatal",
+    "panic",
+    "segfault",
+    "assertion",
+    "no such file",
+    "not found",
+    "permission denied",
+    "undefined reference",
+    "timed out",
+    "timeout",
+    "command not found",
+    "exit code",
+}};
+
+constexpr std::array<std::string_view, 7> kAgentReadTools{{
+    "read",
+    "filesystem_read_multiple_files",
+    "glob",
+    "grep",
+    "list",
+    "ls",
+    "filesystem_directory_tree",
+}};
+
+constexpr std::array<std::string_view, 7> kAgentLightTools{{
+    "todowrite",
+    "todoread",
+    "edit",
+    "write",
+    "memory_store_context",
+    "memory_multi_search_context",
+    "get_goal",
+}};
+
+// First words of read-only shell inspection commands.
+constexpr std::array<std::string_view, 29> kAgentInspect{{
+    "ls",    "cat",   "head", "tail", "wc",   "stat", "pwd",   "echo",
+    "find",  "grep",  "rg",   "tree", "file", "nl",   "du",    "df",
+    "which", "sleep", "test", "[",    "date", "ps",   "pgrep", "git",
+    "sed",   "awk",   "sort", "uniq", "diff",
+}};
+
+constexpr std::array<std::string_view, 8> kAgentGitRead{{
+    "status",
+    "log",
+    "diff",
+    "show",
+    "branch",
+    "ls-files",
+    "rev-parse",
+    "remote",
+}};
+
+bool AgentWordChar(char c) noexcept {
+  return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
+}
+
+std::string AgentFold(std::string_view text) {
+  std::string out(text.size(), '\0');
+  std::transform(text.begin(), text.end(), out.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return out;
+}
+
+// True when `folded` holds a failure word on word boundaries. "exit code" only
+// counts when a non-zero digit follows.
+bool AgentHasFailure(std::string_view folded) {
+  for (const auto word : kAgentFailWords) {
+    for (std::size_t pos = folded.find(word); pos != std::string_view::npos;
+         pos = folded.find(word, pos + 1)) {
+      const bool left = pos == 0 || !AgentWordChar(folded[pos - 1]);
+      const std::size_t next = pos + word.size();
+      const bool right = next >= folded.size() || !AgentWordChar(folded[next]);
+      if (!left || !right)
+        continue;
+      if (word != "exit code")
+        return true;
+      if (next + 1 < folded.size() && folded[next] == ' ' &&
+          folded[next + 1] >= '1' && folded[next + 1] <= '9') {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+std::string_view AgentHead(std::string_view text, std::size_t limit) {
+  return text.substr(0, std::min(text.size(), limit));
+}
+
+std::string_view FirstWord(std::string_view text, std::size_t* end) {
+  std::size_t i = 0;
+  while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i])))
+    ++i;
+  const std::size_t start = i;
+  if (i < text.size() && text[i] == '[') {
+    *end = i + 1;
+    return text.substr(i, 1);
+  }
+  while (i < text.size() && AgentWordChar(text[i]))
+    ++i;
+  *end = i;
+  return text.substr(start, i - start);
+}
+
+bool AgentInList(std::string_view word,
+                 std::span<const std::string_view> list) {
+  return std::find(list.begin(), list.end(), word) != list.end();
+}
+
+// A shell command that only looks at the machine: optional `cd X &&` prefix,
+// then a read-only first word. Pipes and redirects are not inspected further;
+// the output failure scan covers a failing pipeline.
+bool AgentInspectCommand(std::string_view command) {
+  std::size_t end = 0;
+  std::string_view word = FirstWord(command, &end);
+  if (word == "cd") {
+    std::size_t sep = command.find("&&", end);
+    std::size_t sep_len = 2;
+    const std::size_t semi = command.find(';', end);
+    if (sep == std::string_view::npos ||
+        (semi != std::string_view::npos && semi < sep)) {
+      sep = semi;
+      sep_len = 1;
+    }
+    if (sep == std::string_view::npos)
+      return false;
+    command.remove_prefix(sep + sep_len);
+    word = FirstWord(command, &end);
+  }
+  if (!AgentInList(word, kAgentInspect))
+    return false;
+  if (word == "git") {
+    std::string_view rest = command.substr(end);
+    std::size_t sub_end = 0;
+    const std::string_view sub = FirstWord(rest, &sub_end);
+    return AgentInList(sub, kAgentGitRead);
+  }
+  if (word == "sed") {
+    return command.substr(end).find("-n") != std::string_view::npos;
+  }
+  if (word == "awk" || word == "sort" || word == "uniq" || word == "diff")
+    return true;
+  return true;
+}
+
+bool AgentRoutine(const JevToolResult& result) {
+  if (result.tool == "bash") {
+    if (!AgentInspectCommand(result.command) ||
+        result.output.size() >= kAgentShellOutputMax) {
+      return false;
+    }
+    return !AgentHasFailure(AgentFold(result.output));
+  }
+  if (AgentInList(result.tool, kAgentReadTools)) {
+    return !AgentHasFailure(
+        AgentFold(AgentHead(result.output, kAgentReadHead)));
+  }
+  if (AgentInList(result.tool, kAgentLightTools)) {
+    return !AgentHasFailure(
+        AgentFold(AgentHead(result.output, kAgentOtherHead)));
+  }
+  return false;
+}
+
+bool AgentTurnRoutine(const std::vector<JevToolResult>& turn) {
+  return !turn.empty() && std::all_of(turn.begin(), turn.end(), AgentRoutine);
+}
+
+}  // namespace
+
+JevAgentDecision ClassifyJevAgentTurn(
+    const std::vector<std::vector<JevToolResult>>& turns) {
+  if (turns.empty())
+    return {false, "no-tool-result"};
+  if (!AgentTurnRoutine(turns.back()))
+    return {false, "tool-result-not-routine"};
+  std::size_t run = 0;
+  for (std::size_t i = turns.size() - 1; i-- > 0;) {
+    if (!AgentTurnRoutine(turns[i]))
+      break;
+    ++run;
+  }
+  if (run >= kJevAgentMaxRun)
+    return {false, "run-limit"};
+  return {true, "routine-tool-result"};
 }
 
 }  // namespace gufo::models::qwen38_flash_next

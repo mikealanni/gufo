@@ -311,6 +311,9 @@ public:
   /// request that carries no explicit reasoning control. Only the model family
   /// it was tuned for, with the server option enabled, returns true.
   [[nodiscard]] virtual bool jev_gate_enabled() const { return false; }
+  /// When true, a tool-loop turn whose pending tool results are all routine is
+  /// lowered to low reasoning effort (never raised, never for failures).
+  [[nodiscard]] virtual bool jev_gate_agent_enabled() const { return false; }
   [[nodiscard]] virtual bool jev_inline_enabled() const { return false; }
   /// When true, a chat turn that stops with no tool call and a rule-detected
   /// unfinished ending is resumed with a continuation turn.
