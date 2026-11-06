@@ -561,11 +561,13 @@ __launch_bounds__(WavesPerBlock * 32, (MinWaves * 32 / HardwareWaveSize > 0
               __builtin_amdgcn_sched_barrier(0);
             }
             float dots[RowsPerWave][TokensPerStep] = {};
-            if constexpr (WType == core::GgmlType::kQ5_K && Batch == 8 &&
-                          RowsPerWave == 4 && NarrowIndex &&
-                          TokensPerStep == 1) {
+            if constexpr (RowsPerWave == 4 && NarrowIndex &&
+                          ((WType == core::GgmlType::kQ5_K && Batch == 8 &&
+                            TokensPerStep == 1) ||
+                           (WType == core::GgmlType::kQ4_K && Batch == 4 &&
+                            TilesPerStage == 2 && TokensPerStep == 4))) {
               // Convert each row's four coefficients before its dependent FMAs.
-              // This schedule is faster for the batch-eight Q5 FFN geometries;
+              // This schedule helps batch-eight Q5 and batch-four Q4 FFNs;
               // each output retains the scalar dot product's accumulation
               // order.
 #pragma unroll
@@ -658,8 +660,8 @@ __launch_bounds__(WavesPerBlock * 32, (MinWaves * 32 / HardwareWaveSize > 0
   }
 
   if constexpr (DistributedOutput) {
-    static_assert(Batch == 8 || Batch == 14 || Batch == 16);
-    constexpr Index kColumns = Batch == 8 ? 8 : 16;
+    static_assert(Batch == 5 || Batch == 8 || Batch == 14 || Batch == 16);
+    constexpr Index kColumns = Batch <= 8 ? 8 : 16;
     constexpr Index kLanesPerToken = LogicalLanes / kColumns;
     float final[RowsPerWave];
 #pragma unroll

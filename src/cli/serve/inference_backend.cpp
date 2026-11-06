@@ -703,6 +703,8 @@ public:
     result.draft_rounds = verification.draft_count > 0 ? 1 : 0;
     result.draft_tokens = verification.draft_count;
     result.draft_accepted_tokens = verification.accepted_count;
+    result.lookup_tokens = verification.lookup_tokens;
+    result.lookup_accepted_tokens = verification.lookup_accepted_tokens;
     result.execution_plan = {
         .kind = verification.physical_width > 1
                     ? TextExecutionPlanKind::kBatched

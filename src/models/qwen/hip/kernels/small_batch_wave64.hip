@@ -71,6 +71,16 @@ void Launch(const void* w, const float* x, float* y, std::size_t m,
         }
       };
   const bool down = m == 5120 && k == 17408;
+  if constexpr (Type == core::GgmlType::kIQ4_XS && Batch == 5) {
+    // Keep the scalar partials and use the eight-column reduction for five
+    // live tokens. Empty columns stay zero and never write output.
+    constexpr std::size_t kRowsPerBlock = 16 * 4 * 2;
+    SmallBatchKQuantExactFp32GEMMKernel<16, 5, 4, Type, 1, 4, Groups, true, 1,
+                                        64, 16, true>
+        <<<((m + kRowsPerBlock - 1) / kRowsPerBlock) * Groups, 512, 0,
+           stream>>>(w, x, y, m, k);
+    return;
+  }
   if constexpr (Batch > 8) {
     if constexpr (Batch == 14 && Type != core::GgmlType::kQ6_K) {
       if (m == 17408 && k == 5120) {
@@ -236,11 +246,7 @@ void LaunchBatch(const void* w, const float* x, float* y, std::size_t batch,
       }
       return;
     case 5:
-      if constexpr (Type == core::GgmlType::kQ4_K ||
-                    Type == core::GgmlType::kQ5_K ||
-                    Type == core::GgmlType::kQ6_K) {
-        Launch<Type, 5>(w, x, y, m, k, stream);
-      }
+      Launch<Type, 5>(w, x, y, m, k, stream);
       return;
     case 6:
       if constexpr (Type != core::GgmlType::kQ6_K) {
@@ -558,7 +564,7 @@ bool TryLaunchKQuantSmallBatchWave64(core::GgmlType type, const void* w,
       LaunchBatch<core::GgmlType::kQ5_K>(w, x, y, batch, m, k, stream, groups);
       return true;
     case core::GgmlType::kIQ4_XS:
-      if (!((batch == 4 && down) || (batch >= 6 && (up || down)))) {
+      if (!((batch == 4 && down) || (batch >= 5 && (up || down)))) {
         return false;
       }
       LaunchBatch<core::GgmlType::kIQ4_XS>(w, x, y, batch, m, k, stream,

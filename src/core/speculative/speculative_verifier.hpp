@@ -303,6 +303,8 @@ public:
     std::vector<float> next_token_logits;
     bool hit_eos{false};
     std::size_t physical_width{1};
+    std::size_t lookup_tokens{0};
+    std::size_t lookup_accepted_tokens{0};
   };
 
   struct StepRequest {

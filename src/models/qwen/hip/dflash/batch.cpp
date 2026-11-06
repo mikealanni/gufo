@@ -305,7 +305,7 @@ QwenDFlashGpuExecutor::ForwardBlockBatch(
           request.temperature > 0.0F ? &proposal.candidate_ids : nullptr,
           request.temperature > 0.0F ? &proposal.candidate_probabilities
                                      : nullptr,
-          request.trace);
+          request.trace, request.sampler);
     }
     return proposals;
   }
@@ -489,7 +489,9 @@ QwenDFlashGpuExecutor::ForwardBlockBatch(
   emit("logits", scratch.logits, config.vocab_size, true);
   std::array<kernels::DFlashSelectorSequence, 8> sequences{};
   for (std::size_t index = 0; index < requests.size(); ++index)
-    sequences[index] = {counts[index], requests[index].temperature};
+    sequences[index] = {counts[index], requests[index].temperature,
+                        requests[index].executor->PrepareDraftSampling(
+                            requests[index].sampler, stream)};
   kernels::LaunchDFlashSelectorBatch(
       scratch.logits, scratch.selector, weights.selector_predecessor.data,
       weights.selector_successor.data, scratch.tokens, scratch.confidences,

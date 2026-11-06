@@ -141,7 +141,7 @@ void LaunchBatchedFusedQKNormRoPEKvWrite(
     hipStream_t stream = nullptr, float* lse_out = nullptr,
     std::uint32_t key_begin = 0, bool skip_kv_write = false,
     std::span<float> packed_k_workspace = {},
-    std::span<float> packed_v_workspace = {});
+    std::span<float> packed_v_workspace = {}, std::size_t first_query = 0);
 
 /// Block-sparse prefill attention (opt-in, training-free): each 32-query tile
 /// attends to `sink_blocks` leading blocks, a window of `local_blocks` recent

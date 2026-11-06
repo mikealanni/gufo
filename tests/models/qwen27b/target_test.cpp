@@ -130,6 +130,37 @@ void CheckPrefillReplay(
               << " logits=" << Fingerprint(expected) << " features=" << features
               << '\n';
 
+    if (length >= 1024 && model->GetWeights().layers.front().ffn_gate.type !=
+                              gufo::core::GgmlType::kQ8_0) {
+      const auto cropped = executor->SaveSnapshot(end);
+      if (prefix)
+        executor->RestoreSnapshot(*prefix);
+      else
+        executor->Reset();
+      // Capturing the last layer requires every FFN output row and therefore
+      // retains the original full prefill computation as an independent
+      // control for final query/FFN tile pruning. Earlier DFlash taps remain
+      // live in the normal path above.
+      const std::array final_layer{executor->GetConfig().num_layers - 1U};
+      executor->SetPromptHiddenCapture(true, final_layer);
+      (void)executor->ForwardPromptBatch(prompt, depth);
+      Expect(ByteEqual(Logits(*executor), expected),
+             "final output tile changed full-vocabulary prefill logits");
+      Expect(executor->GetPromptHiddenStates().size() ==
+                 length * executor->GetConfig().hidden_size,
+             "last-layer capture must retain all prompt rows");
+      executor->SetPromptHiddenCapture(true, layers);
+      (void)executor->ForwardToken(tokens[end], end);
+      const auto full_continuation = Logits(*executor);
+      executor->RestoreSnapshot(*cropped);
+      (void)executor->ForwardToken(tokens[end], end);
+      Expect(ByteEqual(Logits(*executor), full_continuation),
+             "final output tile changed continued cache state");
+      executor->RestoreSnapshot(*cropped);
+      std::cout << "final output tile tokens=" << length
+                << ": full capture and continuation logits exact\n";
+    }
+
     if (check_chunks) {
       for (const std::uint32_t budget : {512U, 2048U}) {
         executor->RestoreSnapshot(*prefix);

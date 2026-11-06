@@ -17,6 +17,102 @@ namespace {
 
 constexpr std::size_t kSamplingThreads = 256;
 constexpr std::size_t kArgmaxTile = 4096;
+constexpr std::size_t kCandidateTile = 1024;
+
+// As in Flash-Next, a token outside its tile's top Keep cannot enter the
+// global top Keep. Reduce bounded tile winners instead of sorting the whole
+// vocabulary. The ordered float bits and original ID preserve radix ordering,
+// lowest-ID ties and signed-zero equivalence, including after penalties.
+template<unsigned Keep>
+__global__ void SamplingCandidateTileKernel(const float* logits,
+                                            const std::uint32_t* input,
+                                            std::uint32_t* output,
+                                            float* scores, std::size_t size,
+                                            std::size_t vocab_size) {
+  using Sort = hipcub::BlockRadixSort<std::uint64_t, kSamplingThreads, 4>;
+  __shared__ typename Sort::TempStorage scratch;
+  std::uint64_t keys[4];
+#pragma unroll
+  for (unsigned j = 0; j < 4; ++j) {
+    const auto index = blockIdx.x * kCandidateTile + threadIdx.x * 4 + j;
+    const auto id = index < size ? (input ? input[index] : index) : UINT32_MAX;
+    keys[j] = 0;
+    if (id < vocab_size) {
+      const float value = logits[id];
+      const auto bits = __float_as_uint(value == 0.0F ? 0.0F : value);
+      const auto ordered = bits & 0x80000000U ? ~bits : bits ^ 0x80000000U;
+      keys[j] = (static_cast<std::uint64_t>(ordered) << 32) |
+                (UINT32_MAX - static_cast<std::uint32_t>(id));
+    }
+  }
+  Sort(scratch).SortDescending(keys);
+#pragma unroll
+  for (unsigned j = 0; j < 4; ++j) {
+    const auto rank = threadIdx.x * 4 + j;
+    if (rank < min(std::size_t{Keep}, size)) {
+      const auto id = UINT32_MAX - static_cast<std::uint32_t>(keys[j]);
+      output[blockIdx.x * Keep + rank] = id;
+      if (scores)
+        scores[rank] = id < vocab_size ? logits[id] : -INFINITY;
+    }
+  }
+}
+
+template<unsigned Keep>
+void SelectSamplingCandidates(GpuSamplingWorkspace* workspace,
+                              hipStream_t stream) {
+  const auto tiles = [](std::size_t size) {
+    return (size + kCandidateTile - 1) / kCandidateTile;
+  };
+  unsigned passes = 1;
+  for (auto size = workspace->vocab_size; size > kCandidateTile;
+       size = tiles(size) * Keep)
+    ++passes;
+  auto* destination =
+      passes % 2 != 0 ? workspace->sorted_token_ids : workspace->token_ids;
+  const std::uint32_t* source = nullptr;
+  auto size = workspace->vocab_size;
+  for (;;) {
+    const auto blocks = tiles(size);
+    SamplingCandidateTileKernel<Keep>
+        <<<static_cast<unsigned>(blocks), kSamplingThreads, 0, stream>>>(
+            workspace->adjusted_logits, source, destination,
+            blocks == 1 ? workspace->sorted_logits : nullptr, size,
+            workspace->vocab_size);
+    if (blocks == 1)
+      break;
+    size = blocks * Keep;
+    source = destination;
+    destination = destination == workspace->sorted_token_ids
+                      ? workspace->token_ids
+                      : workspace->sorted_token_ids;
+  }
+}
+
+void SortSamplingLogits(GpuSamplingWorkspace* workspace, std::size_t keep,
+                        hipStream_t stream) {
+  if (keep > 0 && keep <= 64 && workspace->vocab_size > kCandidateTile) {
+    if (keep <= 32)
+      SelectSamplingCandidates<32>(workspace, stream);
+    else
+      SelectSamplingCandidates<64>(workspace, stream);
+    return;
+  }
+  HIP_CHECK(hipcub::DeviceRadixSort::SortPairsDescending(
+      workspace->sort_temp_storage, workspace->sort_temp_storage_bytes,
+      workspace->adjusted_logits, workspace->sorted_logits,
+      workspace->token_ids, workspace->sorted_token_ids, workspace->vocab_size,
+      0, static_cast<int>(sizeof(float) * 8U), stream));
+}
+
+std::size_t SamplingTopCount(const GpuSamplingParameters& parameters,
+                             std::size_t vocab_size) {
+  return parameters.top_k > 0
+             ? std::min(vocab_size,
+                        std::max(static_cast<std::size_t>(parameters.top_k),
+                                 parameters.min_keep))
+             : 0;
+}
 
 __global__ void ScatterDraftProbabilitiesKernel(
     const std::uint32_t* __restrict__ draft_candidate_ids,
@@ -1128,20 +1224,18 @@ void FreeGpuSamplingWorkspace(GpuSamplingWorkspace* workspace) noexcept {
 }
 
 void LaunchGPUSortLogits(const float* logits, GpuSamplingWorkspace* workspace,
-                         hipStream_t stream) {
+                         hipStream_t stream, std::size_t keep) {
   if (logits == nullptr || workspace == nullptr || workspace->vocab_size == 0) {
     throw std::invalid_argument("invalid GPU candidate sort");
   }
   const auto size = workspace->vocab_size;
+  if (keep > size)
+    throw std::invalid_argument("candidate count exceeds vocabulary");
   PrepareCandidateLogitsKernel<<<
       static_cast<unsigned>((size + kSamplingThreads - 1) / kSamplingThreads),
       kSamplingThreads, 0, stream>>>(logits, workspace->adjusted_logits,
                                      workspace->token_ids, size);
-  HIP_CHECK(hipcub::DeviceRadixSort::SortPairsDescending(
-      workspace->sort_temp_storage, workspace->sort_temp_storage_bytes,
-      workspace->adjusted_logits, workspace->sorted_logits,
-      workspace->token_ids, workspace->sorted_token_ids, size, 0,
-      static_cast<int>(sizeof(float) * 8U), stream));
+  SortSamplingLogits(workspace, keep, stream);
 }
 
 void LaunchGPUSampling(const float* logits, std::uint32_t* out_token,
@@ -1200,11 +1294,8 @@ void LaunchGPUSampling(const float* logits, std::uint32_t* out_token,
     return;
   }
 
-  HIP_CHECK(hipcub::DeviceRadixSort::SortPairsDescending(
-      workspace->sort_temp_storage, workspace->sort_temp_storage_bytes,
-      workspace->adjusted_logits, workspace->sorted_logits,
-      workspace->token_ids, workspace->sorted_token_ids, vocab_size, 0,
-      static_cast<int>(sizeof(float) * 8U), stream));
+  SortSamplingLogits(workspace, SamplingTopCount(parameters, vocab_size),
+                     stream);
   SortedSamplingKernel<<<1, kSamplingThreads, 0, stream>>>(
       workspace->sorted_logits, workspace->sorted_token_ids, out_token,
       vocab_size, parameters.temperature, parameters.top_k, parameters.top_p,
@@ -1274,11 +1365,8 @@ void LaunchGPUSpeculativeSampling(
   }
 
   if (needs_ordering) {
-    HIP_CHECK(hipcub::DeviceRadixSort::SortPairsDescending(
-        workspace->sort_temp_storage, workspace->sort_temp_storage_bytes,
-        workspace->adjusted_logits, workspace->sorted_logits,
-        workspace->token_ids, workspace->sorted_token_ids, vocab_size, 0,
-        static_cast<int>(sizeof(float) * 8U), stream));
+    SortSamplingLogits(workspace, SamplingTopCount(parameters, vocab_size),
+                       stream);
   }
   // The unsorted token IDs are dead after sorting. Reuse that buffer for q;
   // residual evaluation then makes one lookup per vocabulary token.

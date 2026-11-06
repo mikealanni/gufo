@@ -188,6 +188,9 @@ struct TextDecodeStep {
   std::size_t draft_rounds{0};
   std::size_t draft_tokens{0};
   std::size_t draft_accepted_tokens{0};
+  /// Of draft_tokens: proposals copied from the context (prompt lookup).
+  std::size_t lookup_tokens{0};
+  std::size_t lookup_accepted_tokens{0};
   /// The share of the draft taken from the token history, not the predictor.
   std::size_t suffix_draft_tokens{0};
   std::size_t suffix_accepted_tokens{0};

@@ -89,7 +89,8 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/dflash/model.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/dflash/executor.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/dflash/batch.cpp
-    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/dflash/backend.cpp)
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/dflash/backend.cpp
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/dflash/sampling.cpp)
 
   # HIP helpers must share the kernel's wave size, so compile this unit
   # separately while the other Qwen kernels retain wave32.

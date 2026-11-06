@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <span>
 
+#include "src/core/sampling.hpp"
+
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
 
@@ -102,9 +104,20 @@ void LaunchDFlashSelectorStep(
     std::uint32_t vocab_size, std::uint32_t selector_rank,
     std::uint32_t selector_top_k, hipStream_t stream);
 
+struct DFlashSampling {
+  float repeat_penalty{1.0F};
+  float frequency_penalty{0.0F}, presence_penalty{0.0F};
+  std::uint32_t repeat_last_n{0};
+  const sampling::TokenPenalty* penalties{nullptr};
+  std::uint32_t penalty_count{0};
+  const sampling::TokenId* history{nullptr};
+  std::uint32_t history_count{0};
+};
+
 struct DFlashSelectorSequence {
   std::uint32_t count;
   float temperature;
+  DFlashSampling sampling;
 };
 
 // Proposal rows are contiguous by sequence. Each token sequence includes its

@@ -342,6 +342,53 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size, bool want_lse,
                         lse_elements * sizeof(float)) != 0)
           std::abort();
       }
+      // Final-layer prefill keeps only the tile containing its last token.
+      // Check the same query positions with packed and canonical KV, ragged
+      // depths/tails, LSE, and every bounded head-group workspace above.
+      if (batch_size > 32) {
+        const std::size_t first_query = (batch_size - 1) / 32 * 32;
+        HIP_CHECK(hipMemset(d_out_new, 0xA5, q_elements * sizeof(float)));
+        HIP_CHECK(hipMemset(d_lse_new, 0xA5, lse_elements * sizeof(float)));
+        if (!gufo::hip::LaunchQwenWmmaAttention(
+                d_q, d_k, d_v, d_gate, d_cache, v_cache, d_cache_f16,
+                cache_f16_v, d_out_new, 0, start_pos, batch_size, kMaxContext,
+                kNumHeads, kNumKvHeads, kHeadDim, nullptr, lse_new, key_begin,
+                true, k_work, v_work, first_query))
+          std::abort();
+        HIP_CHECK(hipMemcpy(again.data(), d_out_new, q_elements * sizeof(float),
+                            hipMemcpyDeviceToHost));
+        const auto first = first_query * attention_size;
+        if (std::memcmp(again.data() + first, got.data() + first,
+                        (q_elements - first) * sizeof(float)) != 0)
+          std::abort();
+        const auto* bytes =
+            reinterpret_cast<const unsigned char*>(again.data());
+        if (!std::all_of(bytes, bytes + first * sizeof(float),
+                         [](auto byte) { return byte == 0xA5; }))
+          std::abort();
+        if (want_lse) {
+          std::vector<float> actual(lse_elements);
+          HIP_CHECK(hipMemcpy(actual.data(), d_lse_new,
+                              lse_elements * sizeof(float),
+                              hipMemcpyDeviceToHost));
+          for (std::size_t head = 0; head < kNumHeads; ++head) {
+            const auto offset = head * batch_size + first_query;
+            if (std::memcmp(actual.data() + offset,
+                            lse_expected.data() + offset,
+                            (batch_size - first_query) * sizeof(float)) != 0)
+              std::abort();
+            const auto* prefix = reinterpret_cast<const unsigned char*>(
+                actual.data() + head * batch_size);
+            if (!std::all_of(prefix, prefix + first_query * sizeof(float),
+                             [](auto byte) { return byte == 0xA5; }))
+              std::abort();
+          }
+        }
+        // Keep the original complete output for the later oracle comparison.
+        upload(d_out_new, got);
+        if (want_lse)
+          upload(d_lse_new, lse_expected);
+      }
       for (std::size_t i = 0; i < storage.size(); ++i) {
         float* data = storage[i];
         std::array<std::uint8_t, 64> first{};

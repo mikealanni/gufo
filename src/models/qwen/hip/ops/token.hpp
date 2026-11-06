@@ -68,9 +68,10 @@ void AllocateGpuSamplingWorkspace(GpuSamplingWorkspace* workspace,
 void FreeGpuSamplingWorkspace(GpuSamplingWorkspace* workspace) noexcept;
 
 /// Sorts finite logits into workspace.sorted_logits/sorted_token_ids.
+/// A nonzero keep requests only that exact prefix; other entries are undefined.
 /// Equal logits retain ascending token IDs. Non-finite values sort last.
 void LaunchGPUSortLogits(const float* logits, GpuSamplingWorkspace* workspace,
-                         hipStream_t stream = nullptr);
+                         hipStream_t stream = nullptr, std::size_t keep = 0);
 
 /// Samples one device-resident logit row and writes a single device token.
 ///

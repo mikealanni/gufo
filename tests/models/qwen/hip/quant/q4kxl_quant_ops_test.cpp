@@ -24,6 +24,7 @@
 #include <cstring>
 #include <iostream>
 #include <span>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -782,9 +783,29 @@ void TestFp16Norm() {
   }
 }
 
+void TestRaggedFfnProjections() {
+  const FormatCase format{gufo::core::GgmlType::kIQ4_XS, "IQ4_XS"};
+  for (const auto rows : {17408U, 34816U})
+    TestSmallBatchExactness(format, 5, rows, 5120);
+  TestSmallBatchExactness(format, 5, 5120, 17408);
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  const FormatCase q4{gufo::core::GgmlType::kQ4_K, "Q4_K"};
+  if (argc == 2 && std::string_view(argv[1]) == "--verify-projections") {
+    TestDecodeGemv(q4);
+    TestDecodeGemv({gufo::core::GgmlType::kIQ4_XS, "IQ4_XS"});
+    TestRaggedFfnProjections();
+    for (const auto batch : {4U, 8U}) {
+      for (const auto rows : {17408U, 34816U})
+        TestSmallBatchExactness(q4, batch, rows, 5120);
+      TestSmallBatchExactness(q4, batch, 5120, 17408);
+    }
+    TestSmallBatchExactness(q4, 3, 17408, 5120);
+    return g_failed ? 1 : 0;
+  }
   TestFp16Norm();
   for (const auto& format : kFormats) {
     TestFp16Prefill(format, 4097, 257);
@@ -836,6 +857,10 @@ int main() {
       TestSmallBatchExactness(format, batch);
     }
   }
+  TestRaggedFfnProjections();
+  for (const auto rows : {17408U, 34816U})
+    TestSmallBatchExactness(q4, 4, rows, 5120);
+  TestSmallBatchExactness(q4, 4, 5120, 17408);
   TestSmallBatchExactness({gufo::core::GgmlType::kQ4_K, "Q4_K"}, 8, 1280, 5120);
   const FormatCase q8{gufo::core::GgmlType::kQ8_0, "Q8_0"};
   TestSmallBatchExactness(q8, 16, 34816, 5120);

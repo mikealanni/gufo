@@ -557,7 +557,11 @@ __device__ __forceinline__ void FinalizeSelector(
     uint32_t* __restrict__ candidate_ids,
     float* __restrict__ candidate_probabilities, uint32_t partial_count,
     uint32_t selector_rank, uint32_t selector_top_k, uint32_t head_rows,
-    uint32_t tail_base) {
+    uint32_t tail_base, DFlashSampling sampling = {},
+    // Earlier iterations of this kernel write this history. Reload it for
+    // each conditional q; cached read-only loads break sampled replay.
+    const volatile uint32_t* previous_tokens = nullptr,
+    uint32_t previous_count = 0) {
   __shared__ float shared_scores[kSelectorThreads * kMaxSelectorTopK];
   __shared__ uint32_t shared_ids[kSelectorThreads * kMaxSelectorTopK];
   __shared__ float
@@ -636,7 +640,45 @@ __device__ __forceinline__ void FinalizeSelector(
           shared_transition[(candidate_index * kSelectorTransitionLanes) +
                             part];
     }
-    const float score = top_scores[candidate_index] + transition;
+    float score = top_scores[candidate_index] + transition;
+    const auto id = top_ids[candidate_index];
+    if (sampling.frequency_penalty != 0.0F ||
+        sampling.presence_penalty != 0.0F || sampling.repeat_penalty != 1.0F) {
+      uint32_t generated = 0;
+      uint32_t low = 0, high = sampling.penalty_count;
+      while (low < high) {
+        const auto middle = low + (high - low) / 2;
+        if (sampling.penalties[middle].token < id)
+          low = middle + 1;
+        else
+          high = middle;
+      }
+      if (low < sampling.penalty_count && sampling.penalties[low].token == id)
+        generated = sampling.penalties[low].generated_count;
+      for (uint32_t i = 0; i < previous_count; ++i)
+        generated += previous_tokens[i] == id;
+      bool repeated = false;
+      if (sampling.repeat_penalty != 1.0F && sampling.repeat_last_n > 0) {
+        const auto retained = min(sampling.history_count,
+                                  sampling.repeat_last_n > previous_count
+                                      ? sampling.repeat_last_n - previous_count
+                                      : 0U);
+        for (uint32_t i = sampling.history_count - retained;
+             i < sampling.history_count; ++i)
+          repeated |= sampling.history[i] == id;
+        const auto first = previous_count > sampling.repeat_last_n
+                               ? previous_count - sampling.repeat_last_n
+                               : 0U;
+        for (uint32_t i = first; i < previous_count; ++i)
+          repeated |= previous_tokens[i] == id;
+      }
+      if (repeated)
+        score = score <= 0.0F ? score * sampling.repeat_penalty
+                              : score / sampling.repeat_penalty;
+      score -= sampling.frequency_penalty * static_cast<float>(generated);
+      if (generated != 0)
+        score -= sampling.presence_penalty;
+    }
     path_scores[candidate_index] = score;
     if (score > best_score) {
       best_score = score;
@@ -665,15 +707,19 @@ __device__ __forceinline__ void FinalizeSelector(
     const float inverse_denominator = 1.0F / fmaxf(denominator, 1e-30F);
     float threshold =
         fminf(fmaxf(*sample_uniform, 0.0F), 0.99999994F) * denominator;
-    uint32_t sampled_index = selector_top_k - 1U;
+    uint32_t sampled_index = best_index;
+    bool selected = false;
     for (uint32_t index = 0; index < selector_top_k; ++index) {
       const float probability = path_scores[index] * inverse_denominator;
       if (candidate_probabilities != nullptr) {
         candidate_probabilities[index] = probability;
       }
-      threshold -= path_scores[index];
-      if (threshold < 0.0F && sampled_index == selector_top_k - 1U) {
+      if (!selected && probability > 0.0F)
         sampled_index = index;
+      threshold -= path_scores[index];
+      if (threshold < 0.0F && !selected) {
+        sampled_index = index;
+        selected = true;
       }
     }
     *output_token =
@@ -750,7 +796,8 @@ __global__ void dflash_selector_finalize_batch_kernel(
         candidate_probabilities != nullptr ? candidate_probabilities + candidate
                                            : nullptr,
         partial_count, selector_rank, selector_top_k, batch.head_rows,
-        batch.tail_base);
+        batch.tail_base, sequence.sampling,
+        tokens + batch.token_offsets[blockIdx.x] + 1U, step);
     // Thread zero publishes the predecessor for this sequence's next step.
     // Other sequences own separate token, probability and partial buffers.
     if (threadIdx.x == 0U)

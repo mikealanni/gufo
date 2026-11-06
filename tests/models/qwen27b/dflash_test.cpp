@@ -457,6 +457,22 @@ void TestConcurrentBlocks(
            "concurrent backend snapshot size");
     return bytes;
   };
+  std::vector<gufo::sampling::SamplerState> samplers;
+  samplers.reserve(backends.size());
+  for (std::size_t index = 0; index < backends.size(); ++index) {
+    gufo::sampling::SamplingConfig config{
+        .temperature = temperatures[index],
+        .top_k = index % 2 ? 4 : 20,
+        .top_p = index % 3 ? 0.8F : 1.0F,
+        .min_p = index % 2 ? 0.1F : 0.0F,
+        .repeat_penalty = 1.1F,
+        .repeat_last_n = 8,
+        .frequency_penalty = index % 3 ? 0.2F : 0.0F,
+        .presence_penalty = index % 2 ? 1.5F : 0.0F,
+    };
+    samplers.emplace_back(config, sequences[index]);
+    samplers.back().Accept(sequences[index].back());
+  }
   for (std::size_t round = 0; round < 2; ++round) {
     std::array<DraftProposal, 8> expected;
     std::array<std::vector<std::uint8_t>, 8> expected_state;
@@ -473,12 +489,11 @@ void TestConcurrentBlocks(
       // different lengths; a tiny cap would conceal accidental policy changes.
       const auto limit =
           index < 5 ? 7U : 1U + static_cast<std::uint32_t>(index % 7U);
-      expected[index] =
-          temperatures[index] > 0.0F
-              ? backend.ProposeSampled(sequences[index], positions[index],
-                                       limit, temperatures[index],
-                                       &expected_rng[index])
-              : backend.Propose(sequences[index], positions[index], limit);
+      expected[index] = backend.ProposeForRequest(
+          {&backend, sequences[index], positions[index], limit,
+           temperatures[index],
+           temperatures[index] > 0.0F ? &expected_rng[index] : nullptr,
+           &samplers[index]});
       accepted[index] = std::min(index % 4U, expected[index].tokens.size());
       backend.AcceptFeedback(
           std::span(expected[index].tokens).first(accepted[index]), 4);
@@ -486,7 +501,8 @@ void TestConcurrentBlocks(
       backend.RestoreSnapshot(*initial_state[index]);
       requests.push_back({&backend, sequences[index], positions[index], limit,
                           temperatures[index],
-                          temperatures[index] > 0.0F ? &rng[index] : nullptr});
+                          temperatures[index] > 0.0F ? &rng[index] : nullptr,
+                          &samplers[index]});
     }
     // Both sampled and mixed greedy/sampled cohorts must retain their
     // private proposal lengths, selector probabilities and random draws.
@@ -497,6 +513,31 @@ void TestConcurrentBlocks(
         Expect(batch.size() == width, "sampled cohort result count");
         for (std::size_t row = 0; row < batch.size(); ++row) {
           const auto index = first + row;
+          if (batch[row].tokens != expected[index].tokens ||
+              batch[row].candidate_ids != expected[index].candidate_ids ||
+              !exact(batch[row].candidate_probabilities,
+                     expected[index].candidate_probabilities) ||
+              rng[index] != expected_rng[index]) {
+            std::cerr << "cohort width=" << width << " first=" << first
+                      << " index=" << index << " round=" << round << " tokens="
+                      << (batch[row].tokens == expected[index].tokens)
+                      << " ids="
+                      << (batch[row].candidate_ids ==
+                          expected[index].candidate_ids)
+                      << " rng=" << (rng[index] == expected_rng[index]) << '\n';
+            for (std::size_t i = 0;
+                 i < batch[row].candidate_probabilities.size() &&
+                 i < expected[index].candidate_probabilities.size();
+                 ++i)
+              if (batch[row].candidate_probabilities[i] !=
+                  expected[index].candidate_probabilities[i]) {
+                std::cerr << "q[" << i
+                          << "]=" << batch[row].candidate_probabilities[i]
+                          << " expected="
+                          << expected[index].candidate_probabilities[i] << '\n';
+                break;
+              }
+          }
           Expect(
               batch[row].tokens == expected[index].tokens &&
                   batch[row].candidate_ids == expected[index].candidate_ids &&
@@ -622,17 +663,32 @@ void CaptureAcceptanceTrace(
   const auto request =
       gufo::json::parse(std::string(std::istreambuf_iterator<char>(input), {}));
   const auto text = request.member_str("prompt");
+  const auto* input_messages = request.find("messages");
   const auto limit = request.member_size("max_tokens", 128);
-  Expect(!text.empty() && limit > 0 && limit <= 256,
-         "acceptance trace requires a prompt and 1..256 output tokens");
+  Expect(
+      (!text.empty() || input_messages != nullptr) && limit > 0 && limit <= 256,
+      "acceptance trace requires a prompt and 1..256 output tokens");
   std::string rendered = text;
   if (const auto* raw = request.find("raw");
       raw == nullptr || !raw->as_bool()) {
-    const std::vector<gufo::tokenization::ChatMessage> messages{
+    std::vector<gufo::tokenization::ChatMessage> messages{
         {gufo::tokenization::ChatRole::kSystem,
          "You are a helpful, respectful, and honest assistant.", "", ""},
         {gufo::tokenization::ChatRole::kUser, text, "", ""},
     };
+    if (input_messages != nullptr) {
+      messages.clear();
+      for (const auto& message : input_messages->items()) {
+        const auto role = message.member_str("role");
+        Expect(role == "system" || role == "user" || role == "assistant",
+               "acceptance trace supports text conversation roles");
+        messages.push_back(
+            {role == "system"      ? gufo::tokenization::ChatRole::kSystem
+             : role == "assistant" ? gufo::tokenization::ChatRole::kAssistant
+                                   : gufo::tokenization::ChatRole::kUser,
+             message.member_str("content"), "", ""});
+      }
+    }
     const auto chat = gufo::tokenization::QwenChatTemplate::Render(
         messages, {.add_generation_prompt = true, .enable_thinking = false});
     Expect(chat.has_value(), "render acceptance trace prompt");
@@ -640,18 +696,15 @@ void CaptureAcceptanceTrace(
   }
   const auto& tokenizer = target_model->GetTokenizer();
   const auto prompt = tokenizer.Encode(rendered);
-  Expect(prompt.size() + limit < 2048, "bounded acceptance trace context");
+  const auto capacity = static_cast<std::uint32_t>(
+      ((prompt.size() + limit + 2047) / 2048) * 2048);
+  Expect(capacity <= 65536, "bounded acceptance trace context");
   std::string error;
   auto executor =
-      gufo::hip::QwenGpuExecutor::Create(target_model, &error, 2048);
+      gufo::hip::QwenGpuExecutor::Create(target_model, &error, capacity);
   Expect(executor != nullptr, error);
-  gufo::models::GenerationOptions generation;
-  generation.max_new_tokens = limit;
-  const auto reference = executor->Generate(prompt, generation);
-  Expect(!reference.empty(),
-         "acceptance trace needs a nonempty AR continuation");
   auto backend = gufo::hip::QwenDFlashGpuDraftBackend::Create(
-      draft_model, {.max_context = 2048, .max_draft_tokens = 7}, &error);
+      draft_model, {.max_context = capacity, .max_draft_tokens = 7}, &error);
   Expect(backend != nullptr, error);
   auto* inspect = backend.get();
   gufo::speculative::SpeculativeVerifier verifier(
@@ -661,6 +714,21 @@ void CaptureAcceptanceTrace(
        .enable_adaptive_draft_length = false,
        .use_batched_verification = true});
   Token current = verifier.Prime(prompt);
+  const Token first = current;
+  const auto target_prefix = executor->SaveSnapshot(prompt.size());
+  const auto draft_prefix = verifier.Snapshot();
+  std::vector<std::uint8_t> persistent(draft_prefix->PersistentPayloadBytes());
+  Expect(draft_prefix->SerializePersistent(persistent) == persistent.size(),
+         "acceptance trace serializes the full draft state");
+  // Rebuild from the same captured features before target restore clears the
+  // capture buffer. This isolates draft priming from target prefill arithmetic.
+  auto rebuilt = gufo::hip::QwenDFlashGpuDraftBackend::Create(
+      draft_model, {.max_context = capacity, .max_draft_tokens = 7}, &error);
+  Expect(rebuilt != nullptr, error);
+  const auto features = executor->GetPromptHiddenStates();
+  Expect(rebuilt->PrimeTargetContext(
+             {prompt, features, features.size() / prompt.size(), first}),
+         "acceptance trace rebuilds draft context");
   auto sequence = prompt;
   sequence.push_back(current);
   std::vector<Token> output{current};
@@ -701,16 +769,243 @@ void CaptureAcceptanceTrace(
       break;
     current = step.next_token;
   }
+  // Compare the complete trajectory, including proposed widths and acceptance,
+  // after memory/persistent restore and independent draft priming. Reuse the
+  // single expensive target prefill for every arm.
+  for (const int arm : {0, 1, 2}) {
+    executor->RestoreSnapshot(*target_prefix);
+    gufo::speculative::SpeculativeVerifier rebuilt_verifier(
+        *executor, *rebuilt,
+        {.max_draft_tokens = 7,
+         .initial_draft_tokens = 7,
+         .enable_adaptive_draft_length = false,
+         .use_batched_verification = true});
+    if (arm == 0)
+      verifier.RestoreSnapshot(*draft_prefix);
+    else if (arm == 1)
+      verifier.RestorePersistentSnapshot(persistent);
+    auto& replay = arm == 2 ? rebuilt_verifier : verifier;
+    auto replay_sequence = prompt;
+    replay_sequence.push_back(first);
+    std::vector<Token> replay_output{first};
+    current = first;
+    std::size_t round = 0;
+    while (replay_output.size() < limit) {
+      const auto step = replay.VerifyStep(
+          replay_sequence, replay_sequence.size() - 1, current,
+          tokenizer.GetEosTokenId(), limit - replay_output.size());
+      const auto& expected = rows.items().at(round++);
+      Expect(step.draft_count == expected.member_size("drafted") &&
+                 step.accepted_count == expected.member_size("accepted") &&
+                 tokenizer.Decode(step.emitted_tokens) ==
+                     expected.member_str("emitted"),
+             "draft acceptance changed after restore or re-priming");
+      for (std::size_t index = 0; index < step.emitted_tokens.size(); ++index) {
+        if (step.hit_eos && index + 1 == step.emitted_tokens.size())
+          break;
+        replay_output.push_back(step.emitted_tokens[index]);
+        replay_sequence.push_back(step.emitted_tokens[index]);
+      }
+      if (step.hit_eos)
+        break;
+      current = step.next_token;
+    }
+    Expect(replay_output == output && round == rows.size(),
+           "draft replay must preserve every output ID and round");
+  }
+  executor->RestoreSnapshot(*target_prefix);
+  std::vector<Token> reference{first};
+  while (reference.size() < limit) {
+    const auto token = executor->ForwardToken(
+        reference.back(), prompt.size() + reference.size() - 1);
+    if (tokenizer.IsStopToken(token))
+      break;
+    reference.push_back(token);
+  }
   Expect(output == reference, "acceptance trace must reproduce every AR ID");
   auto document = Value::object();
   document["request"] = request;
   document["completion"] = tokenizer.Decode(output);
   document["tokens"] = output.size();
   document["exact_ar"] = true;
+  document["prompt_tokens"] = prompt.size();
+  document["exact_draft_memory_restore"] = true;
+  document["exact_draft_persistent_restore"] = true;
+  document["exact_draft_reprime"] = true;
   document["steps"] = std::move(rows);
   std::ofstream file(output_path);
   file << document.dump() << '\n';
   Expect(file.good(), "write acceptance trace");
+}
+
+void TestGreedyLookupGate(
+    const std::shared_ptr<const gufo::hip::QwenDFlashGpuModel>& model) {
+  using Token = gufo::tokenization::TokenId;
+  using Policy = gufo::speculative::DFlashDraftPolicy;
+  const auto width = model->GetDFlashConfig().target_layer_ids.size() *
+                     model->GetConfig().hidden_size;
+  for (const auto policy : {Policy::kAdaptive, Policy::kFixed}) {
+    std::string error;
+    auto backend = gufo::hip::QwenDFlashGpuDraftBackend::Create(
+        model, {.max_context = 256, .max_draft_tokens = 7, .policy = policy},
+        &error);
+    Expect(backend != nullptr, error);
+    std::vector<Token> sequence(64);
+    for (std::size_t i = 0; i < sequence.size(); ++i)
+      sequence[i] = 1 + i % 16;
+    std::vector<float> features(63 * width, 0.01F);
+    Expect(backend->PrimeTargetContext({std::span(sequence).first(63), features,
+                                        width, sequence.back()}),
+           "prime greedy lookup fixture");
+    // Corrective target tokens lower the adaptive neural estimate. Fixed
+    // policy keeps its neutral estimate and must retain the longer gate.
+    const std::size_t first_copy = policy == Policy::kAdaptive ? 11 : 23;
+    bool copied = false;
+    for (std::size_t round = 0; round <= first_copy; ++round) {
+      auto saved = round == first_copy ? backend->Snapshot() : nullptr;
+      const auto proposal = backend->Propose(sequence, sequence.size() - 1, 7);
+      if (proposal.from_lookup) {
+        Expect(round == first_copy && proposal.candidates_per_token == 0,
+               "only weak neural acceptance enables short greedy matches");
+        for (std::size_t i = 0; i < proposal.tokens.size(); ++i)
+          Expect(proposal.tokens[i] == Token(1 + (sequence.size() + i) % 16),
+                 "greedy lookup must copy the indexed continuation");
+        std::vector<std::uint8_t> bytes(saved->PersistentPayloadBytes());
+        Expect(saved->SerializePersistent(bytes) == bytes.size(),
+               "serialize pre-lookup acceptance history");
+        for (const bool persistent : {false, true}) {
+          if (persistent)
+            backend->RestorePersistentSnapshot(bytes);
+          else
+            backend->RestoreSnapshot(*saved);
+          const auto replay =
+              backend->Propose(sequence, sequence.size() - 1, 7);
+          Expect(replay.from_lookup && replay.tokens == proposal.tokens,
+                 "restored neural history must choose the same copy gate");
+        }
+        copied = true;
+        break;
+      }
+      Expect(round < first_copy, "greedy copy gate failed to open");
+      const auto correction = Token(1 + sequence.size() % 16);
+      backend->AcceptFeedback({}, correction);
+      backend->UpdateTargetHidden(std::span(features).first(width));
+      sequence.push_back(correction);
+    }
+    Expect(copied, "greedy copy gate never found the repeated history");
+  }
+  std::cout
+      << "DFlash greedy lookup: private acceptance gate and restore pass\n";
+}
+
+void TestHistoryLookup(
+    const std::shared_ptr<const gufo::hip::QwenDFlashGpuModel>& model) {
+  using Token = gufo::tokenization::TokenId;
+  std::string error;
+  auto backend = gufo::hip::QwenDFlashGpuDraftBackend::Create(
+      model, {.max_context = 256, .max_draft_tokens = 7}, &error);
+  Expect(backend != nullptr, error);
+  const auto width = model->GetDFlashConfig().target_layer_ids.size() *
+                     model->GetConfig().hidden_size;
+  std::array<Token, 16> pattern;
+  for (std::size_t i = 0; i < pattern.size(); ++i)
+    pattern[i] = 1 + i;
+  const auto special = [&](std::string_view text) {
+    const auto id = model->GetTokenizer().FindSpecialToken(text);
+    Expect(id.has_value(), "lookup fixture control token is missing");
+    return *id;
+  };
+  // Message framing is excluded, but real thinking/tool tokens are valid
+  // copied continuations. Keep these reference spellings independent.
+  pattern[2] = special("<think>");
+  pattern[5] = special("</think>");
+  pattern[8] = special("<tool_call>");
+  pattern[11] = special("</tool_call>");
+  const auto at = [&](std::size_t index) {
+    return pattern[index % pattern.size()];
+  };
+  std::vector<Token> sequence(64);
+  for (std::size_t i = 0; i < sequence.size(); ++i)
+    sequence[i] = at(i);
+  // The nearest initial match ends at 55: its seven-token continuation
+  // crosses this boundary. The earlier occurrence at 39 remains valid.
+  sequence[61] = special("<|im_end|>");
+  std::vector<float> features(63 * width, 0.01F);
+  Expect(backend->PrimeTargetContext(
+             {std::span(sequence).first(63), features, width, sequence.back()}),
+         "prime lookup fixture");
+  std::uint64_t rng = 731;
+  bool copied = false;
+  for (std::size_t round = 0; round < 32 && !copied; ++round) {
+    const auto before = rng;
+    auto proposal =
+        backend->ProposeSampled(sequence, sequence.size() - 1, 7, 0.7F, &rng);
+    copied = proposal.candidates_per_token == 1;
+    if (copied) {
+      Expect(
+          round >= 23 && rng == before,
+          "sampled lookup requires a long generated match and no draft draw");
+      for (std::size_t i = 0; i < proposal.tokens.size(); ++i)
+        Expect(proposal.tokens[i] == at(sequence.size() + i) &&
+                   proposal.candidate_ids[i] == proposal.tokens[i] &&
+                   proposal.candidate_probabilities[i] == 1.0F,
+               "lookup must report its exact conditional point mass");
+      const auto correction = at(sequence.size() + proposal.tokens.size());
+      backend->AcceptFeedback(proposal.tokens, correction);
+      for (std::size_t i = 0; i <= proposal.tokens.size(); ++i)
+        backend->UpdateTargetHidden(std::span(features).first(width));
+      sequence.insert(sequence.end(), proposal.tokens.begin(),
+                      proposal.tokens.end());
+      sequence.push_back(correction);
+    } else {
+      Expect(rng != before, "neural drafting draws its private random values");
+      const auto correction = at(sequence.size());
+      backend->AcceptFeedback({}, correction);
+      backend->UpdateTargetHidden(std::span(features).first(width));
+      sequence.push_back(correction);
+    }
+  }
+  Expect(copied, "DFlash must use a matching prompt history");
+  const auto saved = backend->Snapshot();
+  std::vector<std::uint8_t> bytes(saved->PersistentPayloadBytes());
+  Expect(saved->SerializePersistent(bytes) == bytes.size(),
+         "serialize lookup state");
+  const auto initial_rng = rng;
+  const auto expected =
+      backend->ProposeSampled(sequence, sequence.size() - 1, 7, 0.7F, &rng);
+  Expect(expected.candidates_per_token == 1 && rng == initial_rng,
+         "verified copies resume without consuming draft RNG");
+  for (const bool persistent : {false, true}) {
+    if (persistent)
+      backend->RestorePersistentSnapshot(bytes);
+    else
+      backend->RestoreSnapshot(*saved);
+    const auto actual =
+        backend->ProposeSampled(sequence, sequence.size() - 1, 7, 0.7F, &rng);
+    Expect(actual.tokens == expected.tokens &&
+               actual.candidate_ids == expected.candidate_ids &&
+               actual.candidate_probabilities ==
+                   expected.candidate_probabilities &&
+               rng == initial_rng,
+           "lookup state and point mass must survive both snapshot forms");
+  }
+  backend->RestoreSnapshot(*saved);
+  backend->BeginRequest();
+  const auto restarted =
+      backend->ProposeSampled(sequence, sequence.size() - 1, 7, 0.7F, &rng);
+  Expect(restarted.candidates_per_token > 1 && rng != initial_rng,
+         "a new request must not resume the previous answer's copy");
+  // Version 3 did not carry lookup state and kept these bytes zero.
+  bytes[8] = 3;
+  std::fill(bytes.begin() + 72, bytes.begin() + 80, std::uint8_t{0});
+  backend->RestorePersistentSnapshot(bytes);
+  const auto legacy_rng = rng;
+  const auto legacy =
+      backend->ProposeSampled(sequence, sequence.size() - 1, 7, 0.7F, &rng);
+  Expect(legacy.candidates_per_token > 1 && rng != legacy_rng,
+         "old snapshots remain readable and start without lookup history");
+  std::cout << "DFlash prompt lookup: point mass, RNG, restore and request "
+               "reset pass\n";
 }
 
 }  // namespace
@@ -755,6 +1050,10 @@ int main(int argc, const char* const* argv) {
       CaptureAcceptanceTrace(target_model, dflash_model, argv[4], argv[5]);
       return 0;
     }
+    TestGreedyLookupGate(dflash_model);
+    TestHistoryLookup(dflash_model);
+    if (argc == 4 && std::string_view(argv[3]) == "--lookup-only")
+      return 0;
     TestConcurrentBlocks(target_model, dflash_model);
     if (argc == 4 && std::string_view(argv[3]) == "--concurrency-only")
       return 0;
