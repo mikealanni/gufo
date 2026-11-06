@@ -72,6 +72,78 @@ bool HasAny(std::string_view text, std::span<const std::string_view> phrases) {
       [text](std::string_view phrase) { return HasBounded(text, phrase); });
 }
 
+// Filler the model puts before a question; the cue must follow it directly.
+constexpr std::array<std::string_view, 12> kLeadIns{{
+    "wait",
+    "hmm",
+    "so",
+    "but",
+    "and",
+    "or",
+    "okay",
+    "ok",
+    "actually",
+    "now",
+    "then",
+    "alternatively",
+}};
+
+// Open questions cannot be answered Yes/No.
+constexpr std::array<std::string_view, 8> kWhWords{{
+    "what",
+    "which",
+    "where",
+    "why",
+    "how",
+    "when",
+    "who",
+    "whose",
+}};
+
+// A cue with fewer words after it ("is that true?", "is it?") carries no
+// content, so jev would be judging nothing.
+constexpr std::size_t kMinWordsAfterCue = 3;
+
+bool StartsWithWord(std::string_view text,
+                    std::span<const std::string_view> words) {
+  for (const auto word : words) {
+    if (text.size() >= word.size() && text.compare(0, word.size(), word) == 0 &&
+        (text.size() == word.size() ||
+         !IsWordChar(static_cast<char>(text[word.size()])))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::size_t CountWords(std::string_view text) {
+  std::size_t count = 0;
+  bool in_word = false;
+  for (const char c : text) {
+    const bool word = IsWordChar(c);
+    count += word && !in_word;
+    in_word = word;
+  }
+  return count;
+}
+
+std::string_view StripLeadIns(std::string_view text) {
+  for (bool again = true; again;) {
+    again = false;
+    while (!text.empty() && !IsWordChar(text.front())) {
+      text.remove_prefix(1);
+    }
+    for (const auto lead : kLeadIns) {
+      if (StartsWithWord(text, std::span(&lead, 1))) {
+        text.remove_prefix(lead.size());
+        again = true;
+        break;
+      }
+    }
+  }
+  return text;
+}
+
 std::string Normalize(std::string_view text) {
   std::string out;
   out.reserve(text.size());
@@ -104,7 +176,18 @@ bool IsJevSelfQuestion(std::string_view sentence) {
   if (HasAny(folded, kReaderWords)) {
     return false;
   }
-  return HasAny(folded, kSelfCues);
+  std::string_view rest = StripLeadIns(folded);
+  if (StartsWithWord(rest, kWhWords)) {
+    return false;
+  }
+  for (const auto cue : kSelfCues) {
+    if (!StartsWithWord(rest, std::span(&cue, 1))) {
+      continue;
+    }
+    const std::string_view tail = rest.substr(cue.size());
+    return CountWords(tail) >= kMinWordsAfterCue;
+  }
+  return false;
 }
 
 void JevInlineScanner::Reset() {
