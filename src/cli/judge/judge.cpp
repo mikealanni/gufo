@@ -1,13 +1,16 @@
 #include "src/cli/judge/judge.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -15,6 +18,7 @@
 
 #include "src/cli/arg_parser.hpp"
 #include "src/core/gguf_reader.hpp"
+#include "src/models/qwen38_flash_next/jev_finish.hpp"
 #include "src/models/qwen38_flash_next/jev_inline.hpp"
 
 #if defined(GUFO_NPU)
@@ -190,6 +194,119 @@ void ReplayTraces(const auto& model, const std::string& path) {
       total ? 100.0 - pct(yes) : 0.0, repeats);
 }
 
+// One labeled turn of the finish-detector corpus: a header of `key: value`
+// lines, then `@@task` and `@@response` sections.
+struct FinishDoc {
+  std::string name, label, source, finish, task, response;
+  bool tool{false};
+  bool synthetic{false};
+};
+
+bool LoadFinishDoc(const std::filesystem::path& path, FinishDoc* doc) {
+  std::ifstream in(path);
+  if (!in)
+    return false;
+  std::stringstream buffer;
+  buffer << in.rdbuf();
+  const std::string text = buffer.str();
+  const auto task_at = text.find("\n@@task\n");
+  const auto response_at = text.find("\n@@response\n");
+  if (task_at == std::string::npos || response_at == std::string::npos)
+    return false;
+  std::istringstream header(text.substr(0, task_at));
+  for (std::string line; std::getline(header, line);) {
+    const auto colon = line.find(": ");
+    if (colon == std::string::npos)
+      continue;
+    const std::string key = line.substr(0, colon);
+    const std::string value = line.substr(colon + 2);
+    if (key == "label")
+      doc->label = value;
+    else if (key == "source")
+      doc->source = value;
+    else if (key == "finish")
+      doc->finish = value;
+    else if (key == "tool")
+      doc->tool = value == "1";
+    else if (key == "synthetic")
+      doc->synthetic = value == "1";
+  }
+  constexpr std::size_t kTaskSkip = 8;
+  constexpr std::size_t kResponseSkip = 12;
+  doc->task =
+      text.substr(task_at + kTaskSkip, response_at - task_at - kTaskSkip);
+  doc->response = text.substr(response_at + kResponseSkip);
+  doc->name = path.filename().string();
+  return true;
+}
+
+std::string OneLineTail(const std::string& text) {
+  constexpr std::size_t kTailChars = 140;
+  std::string tail =
+      text.size() > kTailChars ? text.substr(text.size() - kTailChars) : text;
+  for (auto& c : tail)
+    c = c == '\n' ? ' ' : c;
+  return tail;
+}
+
+// Scores the rule-based finish detector against a labeled corpus directory.
+int RunFinishReplay(const std::string& dir, bool verbose) {
+  namespace flash = models::qwen38_flash_next;
+  struct Tally {
+    int fires{0}, tp{0}, fp{0};
+  };
+  std::vector<FinishDoc> docs;
+  for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+    FinishDoc doc;
+    if (LoadFinishDoc(entry.path(), &doc))
+      docs.push_back(std::move(doc));
+  }
+  std::map<std::string, Tally> rules;
+  std::map<std::string, std::array<int, 4>> sources;  // tp fp fn tn
+  for (const auto& doc : docs) {
+    const bool positive = doc.label == "unfinished";
+    const auto hits = flash::EvaluateFinishRules(doc.task, doc.response,
+                                                 doc.tool, doc.finish);
+    const bool fired =
+        !hits.empty() && hits.front().score >= flash::kJevFinishThreshold;
+    for (const auto& hit : hits) {
+      if (hit.score < flash::kJevFinishThreshold)
+        continue;
+      auto& tally = rules[hit.rule];
+      ++tally.fires;
+      ++(positive ? tally.tp : tally.fp);
+    }
+    auto& cell = sources[doc.source + (doc.synthetic ? "(syn)" : "")];
+    ++cell[fired ? (positive ? 0 : 1) : (positive ? 2 : 3)];
+    if (verbose && fired != positive && !doc.synthetic) {
+      std::printf("%s %s [%s] ...%s\n", fired ? "FP" : "FN", doc.name.c_str(),
+                  fired ? hits.front().rule.c_str() : doc.finish.c_str(),
+                  OneLineTail(doc.response).c_str());
+    }
+  }
+  std::printf("docs=%zu threshold=%.2f\n", docs.size(),
+              flash::kJevFinishThreshold);
+  for (const auto& [rule, tally] : rules) {
+    std::printf(
+        "rule %-10s TP=%d FP=%d precision=%.3f\n", rule.c_str(), tally.tp,
+        tally.fp,
+        tally.fires ? static_cast<double>(tally.tp) / tally.fires : 0.0);
+  }
+  int tp = 0, fp = 0, fn = 0, tn = 0;
+  for (const auto& [source, c] : sources) {
+    std::printf("%-16s TP=%d FP=%d FN=%d TN=%d\n", source.c_str(), c[0], c[1],
+                c[2], c[3]);
+    tp += c[0];
+    fp += c[1];
+    fn += c[2];
+    tn += c[3];
+  }
+  std::printf("ALL TP=%d FP=%d FN=%d TN=%d precision=%.3f recall=%.3f\n", tp,
+              fp, fn, tn, tp + fp ? static_cast<double>(tp) / (tp + fp) : 0.0,
+              tp + fn ? static_cast<double>(tp) / (tp + fn) : 0.0);
+  return 0;
+}
+
 }  // namespace
 
 int RunJudge(std::span<const char* const> args) {
@@ -202,6 +319,8 @@ int RunJudge(std::span<const char* const> args) {
   bool use_gpu = false;
   bool code = false;
   bool batched = false;
+  bool finish_verbose = false;
+  std::string finish_replay;
 
   ArgParser parser("gufo judge",
                    "Run the resident NPU judge on one question or the "
@@ -228,8 +347,16 @@ int RunJudge(std::span<const char* const> args) {
       "", "--batched",
       "Run --battery/--code through AnswerBatch (4 questions/NPU pass)",
       "Battery", &batched);
+  parser.AddOption("", "--finish-replay", "DIR",
+                   "Score the rule-based finish detector on a labeled corpus",
+                   "Finish", &finish_replay);
+  parser.AddFlag("", "--finish-verbose", "List finish-replay misses", "Finish",
+                 &finish_verbose);
   if (!parser.Parse(args))
     return 2;
+
+  if (!finish_replay.empty())
+    return RunFinishReplay(finish_replay, finish_verbose);
 
   if (model_path.empty()) {
     std::fprintf(stderr, "judge: --model is required\n");
