@@ -2,6 +2,7 @@
 #define GUFO_MODELS_QWEN38_FLASH_NEXT_JEV_GATE_HPP_
 
 #include <cstddef>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -37,6 +38,12 @@ struct JevToolResult {
 struct JevAgentDecision {
   bool lower{false};
   std::string_view reason;
+  /// Why the turn kept the caller's effort: `tool=<name>` for a tool the
+  /// policy does not know, `cmd=<word>` for a shell command that is not
+  /// read-only inspection, `failure-signal tool=<name>` or `output-large
+  /// tool=<name>`, each followed by `blocked=<k>/<n>` results of the turn;
+  /// `run=<n>` when the routine-run back-off applies. Empty when lowered.
+  std::string blocker;
 };
 
 /// Per-turn policy for coding-agent loops. `turns` lists the tool-result

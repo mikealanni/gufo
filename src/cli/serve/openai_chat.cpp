@@ -839,10 +839,12 @@ bool ApplyJevAgentGate(TextGenerationBackend& backend, ChatRequest* chat) {
   const auto decision = models::qwen38_flash_next::ClassifyJevAgentTurn(turns);
   Logger::LogFormatted(
       LogLevel::kInfo, "jev-gate",
-      "mode=agent role=tool turns=%zu effort=%s budget=%zu reason=%.*s",
+      "mode=agent role=tool turns=%zu effort=%s budget=%zu reason=%.*s "
+      "blocker=%s",
       turns.size(), JevEffortName(in_effort),
       decision.lower ? kJevAgentRoutineBudgetTokens : std::size_t{0},
-      static_cast<int>(decision.reason.size()), decision.reason.data());
+      static_cast<int>(decision.reason.size()), decision.reason.data(),
+      decision.blocker.empty() ? "none" : decision.blocker.c_str());
   if (decision.lower) {
     const std::size_t caller =
         chat->reasoning.budget_tokens.value_or(kJevAgentRoutineBudgetTokens);
