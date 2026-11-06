@@ -98,13 +98,47 @@ std::uint64_t QwenGpuArena::RecurrentIoIdentity() const noexcept {
          live_recurrent_;
 }
 
+std::size_t QwenGpuArena::SsmReplayLogBytes(const core::ModelConfig& config,
+                                            std::size_t capacity) {
+  return static_cast<std::size_t>(config.SsmLayerCount()) * capacity *
+         (config.SsmQkvSize() + 2 * config.ssm_time_step_rank) * sizeof(float);
+}
+
+bool QwenGpuArena::EnsureSsmReplayCapacity(std::size_t rows) {
+  // One pass always fits its rows in a power-of-two ring with the capture's
+  // initial capacity as the floor.
+  std::size_t capacity = kSsmReplayCapacity;
+  while (capacity < rows) {
+    capacity *= 2;
+  }
+  if (capacity <= replay_capacity_) {
+    return false;
+  }
+  // The captures of an old ring are unreadable; every caller starts a new
+  // pass afterwards, and the next one re-allocates at the new capacity.
+  if (d_ssm_replay_qkv_ != nullptr) {
+    HIP_CHECK(hipFree(d_ssm_replay_qkv_));
+    HIP_CHECK(hipFree(d_ssm_replay_alpha_));
+    HIP_CHECK(hipFree(d_ssm_replay_beta_));
+    HIP_CHECK(hipFree(d_ssm_replay_enabled_));
+    d_ssm_replay_qkv_ = nullptr;
+    d_ssm_replay_alpha_ = nullptr;
+    d_ssm_replay_beta_ = nullptr;
+    d_ssm_replay_enabled_ = nullptr;
+  }
+  replay_capacity_ = capacity;
+  replay_captured_positions_ = 0;
+  replay_capture_active_ = false;
+  return true;
+}
+
 bool QwenGpuArena::AllocateSsmReplayLog() {
   if (d_ssm_replay_qkv_ != nullptr) {
     return false;
   }
 
   const std::size_t layer_slots =
-      static_cast<std::size_t>(config_.SsmLayerCount()) * kSsmReplayCapacity;
+      static_cast<std::size_t>(config_.SsmLayerCount()) * replay_capacity_;
   HIP_CHECK(hipMalloc(&d_ssm_replay_qkv_,
                       layer_slots * config_.SsmQkvSize() * sizeof(float)));
   HIP_CHECK(
@@ -149,7 +183,7 @@ bool QwenGpuArena::CanReplaySsmPosition(std::uint32_t position) const noexcept {
       replay_captured_positions_ == 0) {
     return false;
   }
-  return replay_captured_positions_ <= kSsmReplayCapacity &&
+  return replay_captured_positions_ <= replay_capacity_ &&
          position >= saved_context_ && position <= replay_last_position_;
 }
 
@@ -169,10 +203,10 @@ const float* QwenGpuArena::GetReplayQkv(std::uint32_t layer,
     throw std::out_of_range("SSM replay position is outside the capture");
   }
   const std::size_t slot =
-      static_cast<std::size_t>(position) % kSsmReplayCapacity;
+      static_cast<std::size_t>(position) % replay_capacity_;
   const std::size_t offset =
       (static_cast<std::size_t>(config_.SsmLayerIndex(layer)) *
-           kSsmReplayCapacity +
+           replay_capacity_ +
        slot) *
       config_.SsmQkvSize();
   return d_ssm_replay_qkv_ + offset;
@@ -184,10 +218,10 @@ const float* QwenGpuArena::GetReplayAlpha(std::uint32_t layer,
     throw std::out_of_range("SSM replay position is outside the capture");
   }
   const std::size_t slot =
-      static_cast<std::size_t>(position) % kSsmReplayCapacity;
+      static_cast<std::size_t>(position) % replay_capacity_;
   const std::size_t offset =
       (static_cast<std::size_t>(config_.SsmLayerIndex(layer)) *
-           kSsmReplayCapacity +
+           replay_capacity_ +
        slot) *
       config_.ssm_time_step_rank;
   return d_ssm_replay_alpha_ + offset;
@@ -199,10 +233,10 @@ const float* QwenGpuArena::GetReplayBeta(std::uint32_t layer,
     throw std::out_of_range("SSM replay position is outside the capture");
   }
   const std::size_t slot =
-      static_cast<std::size_t>(position) % kSsmReplayCapacity;
+      static_cast<std::size_t>(position) % replay_capacity_;
   const std::size_t offset =
       (static_cast<std::size_t>(config_.SsmLayerIndex(layer)) *
-           kSsmReplayCapacity +
+           replay_capacity_ +
        slot) *
       config_.ssm_time_step_rank;
   return d_ssm_replay_beta_ + offset;

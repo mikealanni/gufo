@@ -318,6 +318,7 @@ struct QwenMoePrefillScratch {
 /// Preallocated, zero-allocation GPU execution arena on gfx1151.
 class QwenGpuArena {
 public:
+  friend class QwenGpuExecutor;
   explicit QwenGpuArena(
       const core::ModelConfig& config, std::uint32_t max_context = 4096,
       QwenExecutionPolicy policy = QwenExecutionPolicy::Production());
@@ -361,6 +362,11 @@ public:
                                             std::uint32_t position) const;
   [[nodiscard]] const float* GetReplayBeta(std::uint32_t layer,
                                            std::uint32_t position) const;
+  /// Grows the replay ring to hold `rows` rows of one pass (a power of two
+  /// slots). Call before the pass captures; returns true when buffers moved.
+  [[nodiscard]] bool EnsureSsmReplayCapacity(std::size_t rows);
+  [[nodiscard]] static std::size_t SsmReplayLogBytes(
+      const core::ModelConfig& config, std::size_t capacity);
 
   float* d_hidden{nullptr};
   float* d_normed{nullptr};
@@ -475,6 +481,7 @@ private:
   float* d_ssm_replay_alpha_{nullptr};
   float* d_ssm_replay_beta_{nullptr};
   std::uint32_t* d_ssm_replay_enabled_{nullptr};
+  std::size_t replay_capacity_{kSsmReplayCapacity};
   std::uint32_t saved_context_{0};
   std::uint32_t replay_last_position_{0};
   std::size_t replay_captured_positions_{0};
@@ -570,6 +577,11 @@ public:
   /// sequence retains its own causal attention, recurrence and replay state.
   [[nodiscard]] static std::vector<std::vector<tokenization::TokenId>>
   ForwardVerificationBatch(std::span<const QwenGpuVerificationItem> items);
+  /// Rows one session may verify in a single pass. A chain longer than eight
+  /// rows (a prompt-lookup copy) shares every projection across its rows and
+  /// runs attention in eight-row segments, so each row has the arithmetic of
+  /// consecutive ordinary verifications; the replay ring grows to hold it.
+  static constexpr std::size_t kMaxWideVerificationRows = 64;
   void CommitVerificationChunk(
       std::span<const tokenization::TokenId> committed_tokens,
       std::uint32_t start_pos);
