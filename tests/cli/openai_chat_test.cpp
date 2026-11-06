@@ -1,5 +1,6 @@
 #include "src/cli/serve/openai_chat.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -154,7 +155,13 @@ public:
       result.cache_common_prefix_tokens = 2;
       result.cache_checkpoint_tokens = 5;
     }
-    for (const std::string& piece : pieces) {
+    const auto& call_pieces =
+        piece_sequence.empty()
+            ? pieces
+            : piece_sequence[std::min<std::size_t>(
+                  static_cast<std::size_t>(chat_calls.load()) - 1,
+                  piece_sequence.size() - 1)];
+    for (const std::string& piece : call_pieces) {
       if ((is_cancelled && is_cancelled()) || (on_token && !on_token(piece))) {
         result.cancelled = true;
         result.finish_reason = FinishReason::kCancelled;
@@ -200,6 +207,9 @@ public:
   }
   [[nodiscard]] bool supports_images() const override { return image_support; }
   bool image_support{true};
+  [[nodiscard]] bool jev_finish_enabled() const override { return jev_finish; }
+  bool jev_finish{false};
+  std::vector<std::vector<std::string>> piece_sequence;
 
   bool WaitForFirstPiece() {
     std::unique_lock<std::mutex> lock(mutex);
@@ -6263,7 +6273,93 @@ void TestParallelCallSeparatorIsNotContent() {
     }
 }
 
+void TestJevFinishContinuesUnfinishedTurns() {
+  const std::string request =
+      R"({"model":"test-model","messages":[{"role":"user","content":"Write the plan."}])";
+  const std::string cut = "Here is the plan, step one is to read the";
+  for (const bool enabled : {false, true}) {
+    FakeBackend backend;
+    backend.jev_finish = enabled;
+    backend.piece_sequence = {{cut}, {"config and then edit the file."}};
+    const auto response =
+        gufo::server::HandleOpenAiChat(Request(request + "}"), backend);
+    Expect(response.status == 200, "Jev finish request succeeds");
+    auto body = gufo::json::parse(response.body);
+    std::string content;
+    for (const auto& choice : body["choices"].items())
+      content = choice.find("message")->member_str("content");
+    Expect(backend.chat_calls == (enabled ? 2 : 1),
+           "Continuation runs only when --jev-finish is on");
+    Expect(enabled ? content == cut + "\n\nconfig and then edit the file."
+                   : content == cut,
+           "Continuation text is appended to one response");
+    if (enabled) {
+      const auto& messages = backend.last_request.messages;
+      Expect(messages.size() == 3 && messages[2].content.starts_with(
+                                         "Continue; the task is not complete."),
+             "Continuation turn follows the cut-off assistant turn");
+    }
+  }
+  {
+    FakeBackend backend;
+    backend.jev_finish = true;
+    backend.piece_sequence = {{"All done."}};
+    const auto response =
+        gufo::server::HandleOpenAiChat(Request(request + "}"), backend);
+    Expect(backend.chat_calls == 1 && response.status == 200,
+           "A finished turn is never continued");
+  }
+  {
+    FakeBackend backend;
+    backend.jev_finish = true;
+    backend.finish_reason =
+        gufo::server::TextGenerationBackend::FinishReason::kLength;
+    backend.piece_sequence = {{cut}};
+    (void)gufo::server::HandleOpenAiChat(Request(request + "}"), backend);
+    Expect(backend.chat_calls == 1, "A length stop is never continued");
+  }
+  {
+    FakeBackend backend;
+    backend.jev_finish = true;
+    backend.piece_sequence = {{cut}};
+    (void)gufo::server::HandleOpenAiChat(Request(request + "}"), backend);
+    Expect(backend.chat_calls == 2,
+           "An identical unfinished ending is not continued a second time");
+  }
+  {
+    FakeBackend backend;
+    backend.jev_finish = true;
+    backend.piece_sequence = {
+        {cut},
+        {"Second, we then proceed to open and carefully inspect the"},
+        {"Third, finally we will go ahead and update all of the"},
+        {"Fourth, there is still more work to do on the"}};
+    (void)gufo::server::HandleOpenAiChat(Request(request + "}"), backend);
+    Expect(backend.chat_calls == 3, "At most two continuations per request");
+  }
+  {
+    FakeBackend backend;
+    backend.jev_finish = true;
+    backend.piece_sequence = {{cut}, {"config and then edit the file."}};
+    auto response = gufo::server::HandleOpenAiChat(
+        Request(request + R"(,"stream":true})"), backend);
+    Expect(response.status == 200 && response.streaming_body,
+           "Streaming jev finish request is accepted");
+    std::string output;
+    response.streaming_body([&](std::string_view chunk) {
+      output += chunk;
+      return true;
+    });
+    Expect(backend.chat_calls == 2 && output.ends_with("data: [DONE]\n\n") &&
+               output.find("config and then edit the file.") !=
+                   std::string::npos &&
+               output.find(R"("finish_reason":"stop")") != std::string::npos,
+           "Streaming continuation extends the same SSE response");
+  }
+}
+
 int main() {
+  TestJevFinishContinuesUnfinishedTurns();
   TestToolCallRenderParseRoundTrip();
   TestToolTagBoundaries();
   TestStreamingQuotedAndMalformedTools();

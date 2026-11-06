@@ -591,6 +591,7 @@ void PrintServeHelp(std::string_view program_name,
     std::string jev_gate = "on";
     std::string jev_inline = "off";
     std::string jev_pre = "off";
+    std::string jev_finish = "off";
     std::string speculative_backend;
     std::string dflash_model_path;
     std::string draft_policy;
@@ -673,6 +674,11 @@ void PrintServeHelp(std::string_view program_name,
         "Answer small yes/no requests with the resident jev judge before "
         "decoding the main model: on or off (default: off)",
         "Reasoning Defaults", &jev_pre);
+    parser.AddOption(
+        "", "--jev-finish", "MODE",
+        "Resume a chat turn that stops unfinished (cut-off sentence, unclosed "
+        "code fence, announced action never run): on or off (default: off)",
+        "Reasoning Defaults", &jev_finish);
 
     // Speculative & Hardware
     parser.AddOption("", "--speculative", "MODE",
@@ -1154,6 +1160,7 @@ int RunServe(std::span<const char* const> args) {
     std::string jev_gate = "on";
     std::string jev_inline = "off";
     std::string jev_pre = "off";
+    std::string jev_finish = "off";
     std::string speculative_backend;
     std::string dflash_model_path;
     std::string draft_policy;
@@ -1233,6 +1240,11 @@ int RunServe(std::span<const char* const> args) {
         "Answer small yes/no requests with the resident jev judge before "
         "decoding the main model: on or off (default: off)",
         "Reasoning Defaults", &jev_pre);
+    llm_parser.AddOption(
+        "", "--jev-finish", "MODE",
+        "Resume a chat turn that stops unfinished (cut-off sentence, unclosed "
+        "code fence, announced action never run): on or off (default: off)",
+        "Reasoning Defaults", &jev_finish);
     llm_parser.AddOption("", "--speculative", "MODE",
                          "HTTP draft backend: dspark, dflash2, mtp, or off",
                          "Speculative", &speculative_backend);
@@ -1399,6 +1411,10 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error: --jev-pre must be on or off\n";
       return 2;
     }
+    if (jev_finish != "on" && jev_finish != "off") {
+      std::cerr << "Error: --jev-finish must be on or off\n";
+      return 2;
+    }
     if (reasoning_budget >= 0)
       reasoning_defaults->budget_tokens =
           static_cast<std::size_t>(reasoning_budget);
@@ -1510,6 +1526,7 @@ int RunServe(std::span<const char* const> args) {
     backend->set_jev_gate_enabled(jev_gate == "on");
     backend->set_jev_inline_enabled(jev_inline == "on");
     backend->set_jev_pre_enabled(jev_pre == "on");
+    backend->set_jev_finish_enabled(jev_finish == "on");
     const auto effective_sampling =
         backend->sampling_defaults().Resolve(reasoning_defaults->enabled);
     server::ChatRequest default_request;

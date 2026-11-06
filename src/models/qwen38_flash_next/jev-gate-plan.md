@@ -1037,3 +1037,12 @@ only if a labeled set shows the judge separates them.
 - `--jev-pre on` serve (GUFO_DIR=gufo-jevgate): fixed MiniCPM5-1B loads on the NPU, 99 ms first call, `[jev-pre] yes=0.89 conf=0.89` (below kJevPreConfidence 0.9, so recalibrate with the 3-arm data).
 - Production launcher uses GUFO_NPU_DIR=$GUFO_DIR/tools/npu; a tree without the new `insts_512x*` files (e.g. ~/gufo before this branch merges) silently fell back to the CPU 0.6B judge. Now logged as `[jev] event=npu_judge_load_failed` / `npu_judge_unavailable action=cpu_fallback`.
 - MERGE ORDER: decode-1 upstream ports land first, then merge feat/jevgate (carries the insts files + xclbin programs), then decode-2.
+
+## Status 2026-11-06 — `--jev-finish on|off` wired (default off)
+
+- Chat Completions only (`HandleOpenAiChat`): after a turn with `finish=stop`, no tool call, no structured output, `JudgeFinish` runs on (last user message, response text). Unfinished at >= 0.6: re-submit the conversation + assistant text + user turn "Continue; the task is not complete. <reason>" via `backend.start_chat`; the cached prefix covers everything before the appended assistant turn.
+- Non-stream: continuation text is appended to one message (`\n\n` separated), reasoning appended, completion/reasoning/prefill tokens summed into usage. Stream: same SSE response continues (new filter state per round, `\n\n` delta between rounds), one terminal chunk at the end.
+- Guards: `finish=length` never continues; max 2 continues per request; same reason + same 200-byte tail never continues twice; any exception while continuing ends the response as it stands. Logs `[jev-finish] decision=continue|finished reason=… score=…`.
+- Not covered: Responses and Anthropic endpoints (`CreateCompatibilityResponse`), reasoning (`<think>`) is not judged.
+- Verified: `tests/cli/openai_chat_test` (off = 1 call and unchanged text; on = 2 calls, appended text, continuation turn shape; finished / length / identical-tail / two-continue cap; streaming). Live: serve with `--jev-finish on` answered 3 normal requests (stream and non-stream) with `decision=finished`. Not verified live: a real model producing an unfinished stop (cannot be provoked on demand).
+- Also fixed `openai_chat_test` link (needed jev_gate.cpp, jev_finish.cpp sources).

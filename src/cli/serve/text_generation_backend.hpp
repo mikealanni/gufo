@@ -312,6 +312,9 @@ public:
   /// it was tuned for, with the server option enabled, returns true.
   [[nodiscard]] virtual bool jev_gate_enabled() const { return false; }
   [[nodiscard]] virtual bool jev_inline_enabled() const { return false; }
+  /// When true, a chat turn that stops with no tool call and a rule-detected
+  /// unfinished ending is resumed with a continuation turn.
+  [[nodiscard]] virtual bool jev_finish_enabled() const { return false; }
   /// Yes/No probabilities from the resident judge for a pre-route check, or
   /// nullopt when no judge is enabled and loaded. A high-confidence verdict
   /// on a small yes/no request answers it without decoding the main model.

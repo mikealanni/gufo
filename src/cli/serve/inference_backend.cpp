@@ -4551,6 +4551,7 @@ struct InferenceBackend::Impl {
   bool jev_gate_option{false};
   bool jev_pre_option{false};
   bool jev_inline_option{false};
+  bool jev_finish_option{false};
 #if defined(ENGINE_ENABLE_HIP)
   std::shared_ptr<const core::GgufReader> jev_reader;
   std::shared_ptr<models::qwen38_flash_next::JevModel> jev_model;
@@ -5914,6 +5915,14 @@ void InferenceBackend::set_jev_inline_enabled(bool enabled) {
 
 void InferenceBackend::set_jev_pre_enabled(bool enabled) {
   impl_->jev_pre_option = enabled;
+}
+
+void InferenceBackend::set_jev_finish_enabled(bool enabled) {
+  impl_->jev_finish_option = enabled;
+}
+
+bool InferenceBackend::jev_finish_enabled() const {
+  return impl_->jev_finish_option;
 }
 
 std::optional<std::pair<float, float>> InferenceBackend::JevPreAnswer(
