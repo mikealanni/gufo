@@ -23,6 +23,7 @@
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/control_tokens.hpp"
 #include "src/models/qwen38_flash_next/jev_gate.hpp"
+#include "src/models/qwen38_flash_next/jev_goal.hpp"
 
 using gufo::tokenization::kImEnd;
 
@@ -211,6 +212,8 @@ public:
   bool image_support{true};
   [[nodiscard]] bool jev_finish_enabled() const override { return jev_finish; }
   bool jev_finish{false};
+  [[nodiscard]] bool jev_goal_enabled() const override { return jev_goal; }
+  bool jev_goal{false};
   [[nodiscard]] bool jev_gate_agent_enabled() const override {
     return jev_gate_agent;
   }
@@ -6462,7 +6465,150 @@ void TestJevAgentGateLowersRoutineToolTurns() {
          "Agent gate never raises a smaller caller budget");
 }
 
+void TestJevGoalTrackerStripsPhraseAndContinues() {
+  using gufo::models::qwen38_flash_next::HasJevGoalTrigger;
+  using gufo::models::qwen38_flash_next::StripJevGoalTrigger;
+  Expect(HasJevGoalTrigger("Fix it. Jev, make sure it's done.") &&
+             HasJevGoalTrigger("JEV MAKE SURE ITS DONE") &&
+             HasJevGoalTrigger("jev make sure it is done!") &&
+             HasJevGoalTrigger("jev finish it") &&
+             HasJevGoalTrigger("jev keep going until done") &&
+             !HasJevGoalTrigger("jevons paradox") &&
+             !HasJevGoalTrigger("make sure its done"),
+         "Trigger variants match, near-misses do not");
+  Expect(StripJevGoalTrigger("Fix the parser in a.cpp. Jev, make sure it's "
+                             "done.") == "Fix the parser in a.cpp." &&
+             StripJevGoalTrigger("jev make sure its done, fix the bug") ==
+                 "fix the bug" &&
+             StripJevGoalTrigger("do A jev make sure its done and then B") ==
+                 "do A and then B" &&
+             StripJevGoalTrigger("jev make sure its done") == "Continue." &&
+             StripJevGoalTrigger("plain text") == "plain text",
+         "Phrase and adjacent separators are stripped, the rest is kept");
+  Expect(StripJevGoalTrigger(StripJevGoalTrigger("x jev finish it y")) ==
+             StripJevGoalTrigger("x jev finish it y"),
+         "Stripping is idempotent");
+
+  const std::string user =
+      R"({"role":"user","content":"Fix the bug in parser.cpp. Jev, make sure it's done."})";
+  const std::string edit_turn =
+      R"(,{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"edit","arguments":"{\"filePath\":\"/src/parser.cpp\"}"}}]},{"role":"tool","tool_call_id":"c1","content":"Edit applied successfully."})";
+  const auto body = [&](const std::string& messages) {
+    return std::string(
+               R"({"model":"test-model","tools":[{"type":"function","function":{"name":"edit","parameters":{"type":"object","properties":{}}}}],"messages":[)") +
+           messages + "]}";
+  };
+  {
+    FakeBackend backend;
+    backend.jev_goal = false;
+    backend.piece_sequence = {{"Fixed, all done."}};
+    (void)gufo::server::HandleOpenAiChat(Request(body(user)), backend);
+    Expect(backend.last_request.messages[0].content.find("Jev") !=
+               std::string::npos,
+           "The phrase is left alone when --jev-goal is off");
+  }
+  {
+    FakeBackend backend;
+    backend.jev_goal = true;
+    backend.piece_sequence = {{"Fixed, all done."}, {"Edited it."}};
+    (void)gufo::server::HandleOpenAiChat(Request(body(user)), backend);
+    Expect(backend.chat_calls == 2,
+           "A done-claim with no edit evidence is continued once");
+    const auto& messages = backend.last_request.messages;
+    Expect(messages.size() == 3 &&
+               messages[0].content == "Fix the bug in parser.cpp." &&
+               messages[2].content.starts_with("Continue. Still open:"),
+           "The model sees the stripped goal and a concrete continue turn");
+    for (const auto& message : messages) {
+      Expect(message.content.find("Jev") == std::string::npos &&
+                 message.content.find("jev") == std::string::npos,
+             "The magic phrase never reaches the backend");
+    }
+  }
+  {
+    FakeBackend backend;
+    backend.jev_goal = true;
+    backend.piece_sequence = {{"Fixed, all done."}};
+    (void)gufo::server::HandleOpenAiChat(Request(body(user + edit_turn)),
+                                         backend);
+    Expect(backend.chat_calls == 1,
+           "A done-claim backed by an edit tool call is left alone");
+  }
+  {
+    FakeBackend backend;
+    backend.jev_goal = true;
+    backend.piece_sequence = {{"Here is how the parser works."}};
+    const std::string question =
+        R"({"role":"user","content":"Explain how the parser works. jev make sure its done"})";
+    (void)gufo::server::HandleOpenAiChat(Request(body(question)), backend);
+    Expect(backend.chat_calls == 1,
+           "A question that got a real answer is not continued");
+  }
+  {
+    FakeBackend backend;
+    backend.jev_goal = true;
+    backend.piece_sequence = {{"All done."},
+                              {"All done."},
+                              {"All done."},
+                              {"All done."},
+                              {"All done."}};
+    (void)gufo::server::HandleOpenAiChat(Request(body(user)), backend);
+    Expect(backend.chat_calls == 4,
+           "At most three automatic continuations per request");
+  }
+  {
+    FakeBackend backend;
+    backend.jev_goal = true;
+    backend.finish_reason =
+        gufo::server::TextGenerationBackend::FinishReason::kLength;
+    backend.piece_sequence = {{"All done."}};
+    (void)gufo::server::HandleOpenAiChat(Request(body(user)), backend);
+    Expect(backend.chat_calls == 1, "A length stop is never continued");
+  }
+  {
+    // Turn N and turn N+1 of one conversation render the same prefix bytes.
+    const auto prefix_of = [&](const std::string& messages) {
+      FakeBackend backend;
+      backend.jev_goal = true;
+      backend.piece_sequence = {{"Here is the situation as it stands."}};
+      (void)gufo::server::HandleOpenAiChat(Request(body(messages)), backend);
+      return backend.last_request.messages;
+    };
+    const auto first = prefix_of(user);
+    const auto second = prefix_of(
+        user + edit_turn +
+        R"(,{"role":"assistant","content":"Done."},{"role":"user","content":"Now add a test, jev finish it"})");
+    bool same = first.size() <= second.size();
+    for (std::size_t i = 0; same && i < first.size(); ++i)
+      same = first[i].content == second[i].content;
+    Expect(same && second.back().content == "Now add a test",
+           "Stripped prefix bytes are stable across turns of a conversation");
+  }
+  {
+    // The streaming path continues through the same hook.
+    FakeBackend backend;
+    backend.jev_goal = true;
+    backend.piece_sequence = {{"Fixed, all done."}, {"Edited it."}};
+    std::string stream_body = body(user);
+    stream_body.insert(stream_body.size() - 1, R"(,"stream":true)");
+    auto response =
+        gufo::server::HandleOpenAiChat(Request(stream_body), backend);
+    Expect(response.status == 200 && response.streaming_body,
+           "Streaming goal request is accepted");
+    std::string output;
+    response.streaming_body([&](std::string_view chunk) {
+      output += chunk;
+      return true;
+    });
+    Expect(backend.chat_calls == 2 &&
+               output.find("Edited it.") != std::string::npos &&
+               output.find("jev") == std::string::npos,
+           "Streaming goal continuation extends the same SSE response");
+  }
+}
+
 int main() {
+  TestJevGoalTrackerStripsPhraseAndContinues();
   TestJevAgentGateLowersRoutineToolTurns();
   TestJevFinishContinuesUnfinishedTurns();
   TestToolCallRenderParseRoundTrip();

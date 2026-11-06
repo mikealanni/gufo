@@ -318,6 +318,9 @@ public:
   /// When true, a chat turn that stops with no tool call and a rule-detected
   /// unfinished ending is resumed with a continuation turn.
   [[nodiscard]] virtual bool jev_finish_enabled() const { return false; }
+  /// When true, the magic phrase in a user message is stripped before the
+  /// model sees it and the goal tracker may continue a finished-looking turn.
+  [[nodiscard]] virtual bool jev_goal_enabled() const { return false; }
   /// Yes/No probabilities from the resident judge for a pre-route check, or
   /// nullopt when no judge is enabled and loaded. A high-confidence verdict
   /// on a small yes/no request answers it without decoding the main model.

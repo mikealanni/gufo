@@ -5,6 +5,7 @@ add_library(gufo_qwen38_flash_next STATIC
   continuation_layout.cpp
   jev_finish.cpp
   jev_gate.cpp
+  jev_goal.cpp
   jev_inline.cpp
   jev_model.cpp
   ngram.cpp

@@ -222,6 +222,7 @@ endif()
 
 add_library(gufo_llm_cli STATIC
   src/cli/bench/bench.cpp
+  src/cli/judge/goal_replay.cpp
   src/cli/judge/judge.cpp
   src/cli/prompt/prompt.cpp)
 target_link_libraries(gufo_llm_cli PUBLIC gufo_core gufo_flint gufo_laguna gufo_glm53_flash)
@@ -441,6 +442,7 @@ if (BUILD_TESTING)
     src/models/deepseek_v4_flash/tool_calls.cpp
     src/models/qwen38_flash_next/jev_gate.cpp
     src/models/qwen38_flash_next/jev_finish.cpp
+    src/models/qwen38_flash_next/jev_goal.cpp
   )
   target_link_libraries(openai_chat_test PRIVATE gufo_core)
   add_test(NAME openai_chat_test COMMAND openai_chat_test)
