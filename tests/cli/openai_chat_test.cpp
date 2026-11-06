@@ -20,6 +20,7 @@
 #include "src/core/json.hpp"
 #include "src/core/json_constraint.hpp"
 #include "src/models/deepseek_v4_flash/chat_template.hpp"
+#include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/control_tokens.hpp"
 
 using gufo::tokenization::kImEnd;
@@ -6373,34 +6374,63 @@ void TestJevAgentGateLowersRoutineToolTurns() {
            R"("}}]},{"role":"tool","tool_call_id":"c1","content":")" + result +
            R"("}])" + extra + "}";
   };
-  const auto effort_of = [&](bool agent, const std::string& body) {
+  const auto request_of = [&](bool agent, const std::string& body) {
     FakeBackend backend;
     backend.jev_gate_agent = agent;
     backend.piece_sequence = {{"ok."}};
     const auto response =
         gufo::server::HandleOpenAiChat(Request(body), backend);
     Expect(response.status == 200, "Jev agent gate request succeeds");
-    return backend.last_request.reasoning.effort;
+    return backend.last_request;
+  };
+  const auto render = [](const gufo::server::ChatRequest& request) {
+    const auto options =
+        gufo::tokenization::ResolveQwenChatOptions(request.reasoning, false);
+    return gufo::tokenization::QwenChatTemplate::Render(request.messages,
+                                                        request.tools, options);
   };
   const std::string routine =
       build("bash", R"({\"command\":\"ls src\"})", "a.cpp\\nb.cpp", "");
-  Expect(effort_of(true, routine) == gufo::ReasoningEffort::kLow,
-         "Routine inspection result lowers effort to low");
-  Expect(effort_of(false, routine) != gufo::ReasoningEffort::kLow,
+  const auto gated = request_of(true, routine);
+  const auto plain = request_of(false, routine);
+  Expect(gated.reasoning.budget_tokens.has_value() &&
+             *gated.reasoning.budget_tokens <= 512,
+         "Routine inspection result caps the thinking budget");
+  Expect(!plain.reasoning.budget_tokens.has_value(),
          "Agent gate is inert unless enabled");
+  Expect(gated.reasoning.effort == plain.reasoning.effort &&
+             gated.reasoning.enabled == plain.reasoning.enabled &&
+             gated.reasoning.preserve_thinking ==
+                 plain.reasoning.preserve_thinking,
+         "Agent gate leaves effort and thinking switches untouched");
+  {
+    gufo::ReasoningOptions low_effort = plain.reasoning;
+    low_effort.effort = gufo::ReasoningEffort::kLow;
+    gufo::server::ChatRequest lowered = plain;
+    lowered.reasoning = low_effort;
+    const auto lowered_prompt = render(lowered);
+    const auto plain_prompt_check = render(plain);
+    Expect(lowered_prompt.has_value() && plain_prompt_check.has_value() &&
+               *lowered_prompt != *plain_prompt_check,
+           "Changing the effort rewrites the rendered prompt (cache miss)");
+  }
+  const auto gated_prompt = render(gated);
+  const auto plain_prompt = render(plain);
+  Expect(gated_prompt.has_value() && gated_prompt == plain_prompt,
+         "Gated prompt is byte-identical to the ungated render");
   const std::string failing = build("bash", R"({\"command\":\"ls src\"})",
                                     "ls: no such file or directory", "");
-  Expect(effort_of(true, failing) != gufo::ReasoningEffort::kLow,
-         "Failure signal keeps the caller's effort");
+  Expect(!request_of(true, failing).reasoning.budget_tokens.has_value(),
+         "Failure signal keeps the caller's budget");
   const std::string build_cmd =
       build("bash", R"({\"command\":\"make -j8\"})", "done", "");
-  Expect(effort_of(true, build_cmd) != gufo::ReasoningEffort::kLow,
-         "Build and test commands keep the caller's effort");
-  const std::string explicit_low =
+  Expect(!request_of(true, build_cmd).reasoning.budget_tokens.has_value(),
+         "Build and test commands keep the caller's budget");
+  const std::string small_budget =
       build("bash", R"({\"command\":\"ls src\"})", "a.cpp",
-            R"(,"reasoning_effort":"minimal")");
-  Expect(effort_of(true, explicit_low) == gufo::ReasoningEffort::kMinimal,
-         "Agent gate never raises a lower caller effort");
+            R"(,"reasoning_budget_tokens":128)");
+  Expect(request_of(true, small_budget).reasoning.budget_tokens == 128,
+         "Agent gate never raises a smaller caller budget");
 }
 
 int main() {

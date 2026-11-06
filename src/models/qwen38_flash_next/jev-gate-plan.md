@@ -1065,3 +1065,24 @@ Why: on real opencode traffic (150k-token tool loops) none of the jev features f
 **Finish detector for tool-capable turns:** no code change needed. `JudgeFinish` already runs on any `finish=stop` turn without a tool call, including requests with `tools`; the empty-answer (0.9) and announce (0.8) rules catch an agent stalling. On opencode traffic it does not log because almost every turn ends in a tool call and returns before the log line. Pre-route stays single-turn by design.
 
 **Run it:** `./run-gufo.sh --jev-gate agent --jev-finish on` (plus `--jev-pre on`; inline off).
+
+## Incident 2026-11-06 — `--jev-gate agent` broke the prefix cache (fixed)
+
+**Symptom** (/tmp/run-gufo.log 16:19:41): r212 had prompt 207,738 tokens with cached_tokens=207,377 (prefill 361). The next turn was lowered (`mode=agent ... effort_out=low reason=routine-tool-result`) and request=10 prefilled 208,275 tokens from zero at ~1,700 tok/s (>2 min). Flipping back to the caller's effort on the following turn would miss again.
+
+**Cause:** `AppendReasoningInstruction` (src/models/qwen/chat_template.cpp, called at the system prefix) writes the effort directive (`kLowReasoningInstruction` / `kXHighReasoningInstruction`) at the START of the rendered prompt. Any effort change rewrites the first bytes, so every cached token after it is dead. Test `TestJevAgentGateLowersRoutineToolTurns` now asserts that rendering the same conversation at low vs the caller's effort yields different prompts.
+
+**Fix (70099195 -> next commit):** agent mode no longer touches effort/enabled/preserve_thinking. A routine tool-result turn now only caps `reasoning.budget_tokens` at `kJevAgentRoutineBudgetTokens` = 512 (min with the caller's budget, never raised); the cap is enforced at decode time by the existing reasoning-budget machinery (forced `</think>`, inference_backend.cpp BuildReasoningBudget), so the rendered prompt is byte-identical to the ungated render (asserted in the test). Log format: `[jev-gate] mode=agent role=tool turns=N effort=<caller> budget=<cap|0> reason=...`.
+
+**Savings re-estimate** (offline, 5,852 steps / 168 sessions, reasoning tokens ~ chars/4, lowered = 2,013 steps carrying ~683k reasoning tokens; saved = max(0, reasoning - budget) on lowered steps; total reasoning ~1.90M tokens):
+| budget | tokens saved | % of all reasoning | lowered steps actually capped | s/session @50 / @38 tok/s |
+|---|---|---|---|---|
+| 256 | 401k | 21.1% | 627 (31%) | 47.7 / 62.8 |
+| 512 (shipped) | 285k | 15.0% | 332 (16%) | 33.9 / 44.7 |
+| 1024 | 172k | 9.1% | 140 (7%) | 20.5 / 27.0 |
+Plus: no prefill penalty. Risk: a cap truncates thinking abruptly (stock budget semantics); only 16% of lowered steps are touched at 512.
+
+**Same-class issues checked (not changed):**
+- Plain `--jev-gate on` sets effort/enabled/preserve_thinking from the last user message only when the caller left them unset. In one conversation each new user turn can classify differently (low vs medium vs xhigh), rewriting the system-prefix directive and missing the cache for the whole conversation at that turn. Also combined with `agent` + caller-unset effort: turn 1 renders at the gate's effort, later tool-result turns at the server default, a miss. Opencode sets its own effort so it is unaffected; for effort-unset clients prefer a budget cap there too (FLAGGED, not changed).
+- `--jev-finish` continuation appends assistant+user turns. The prefix up to the previous generation prompt stays cached; the re-rendered assistant turn strips its thinking (it is no longer after the last user message), so only that turn's own tokens re-prefill (small), not the whole prompt.
+- Release binary must be rebuilt/restarted for the fix to run live; 8900 was not touched.
