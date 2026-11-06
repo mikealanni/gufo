@@ -1110,3 +1110,60 @@ Harm proxy (tool failure within next 2 steps): capped 22.9% vs kept 25.1% (histo
 **Where the long turns come from (live window, top steps):** 2117 tok = 942 reasoning + 1140 edit/write payload; 1850 = 404 + 1176 payload; 1703 = 1021 reasoning + 604 final text; 1370 (jevgate session) = 137 + 1097 final text; 1367 = 284 + 1058 payload. Overall output composition (all history): reasoning 70.4%, tool-call arguments 23.8%, text 5.7%. Today's reasoning is short (median 163 tok, p90 648, max 1,963), so a 512 cap rarely binds now; the big savings are historical rambles (steps >2000 chars = 18% of steps, 69% of reasoning; ten 10k+ token reasoning steps after trivial ls/read results).
 
 **Levers outside the agent gate (not implemented):** a global reasoning budget on every turn: cap 4096 removes 4.0% of reasoning (41 steps), 2048 removes 10.6% (197 steps = 2.4% of steps, 241k of 297k of it on tool-result turns), 1024 removes 24.5% (701 steps) — quality risk on hard turns, needs a live check. opencode's constant `variant: high` is cache-safe to change per session if medium is enough for a task class.
+
+## Goal tracker ("jev make sure its done") — 2026-11-06
+
+Off by default: `--jev-goal on`. Library `jev_goal.{hpp,cpp}`; replay
+`gufo judge --goal-replay <dir>` (+ `--goal-verbose`); exporter
+`tools/qwen-flash/export-opencode-sessions.py <opencode.db copy> <out dir>`.
+
+Design
+- Trigger table (constexpr): "jev make sure its done / it is done / its
+  finished / it is finished", "jev finish it / this", "jev keep going until
+  done / until its done"; case, punctuation and apostrophes are ignored.
+- The phrase (and the separators after it) is stripped from EVERY user message
+  at parse time, before the model or template sees it. Stripping is a pure
+  function of each message, so a conversation renders identical prefix bytes on
+  every request (test: turn N vs N+1 prefix equality). A message that is only
+  the phrase becomes "Continue.". Mode is on if any user message carries it;
+  serve is stateless, so it is re-derived per request.
+- Goal = stripped text of the latest trigger message (previous non-empty user
+  message if that one is only the phrase). Items by rule: change verb + file
+  path -> needs an edit/write call (or shell write, or delegation) touching the
+  file; change verb -> any write; commit/push/test/build asks -> a matching
+  shell command with no failure text; question/investigate -> a non-trivial
+  answer. Pasted logs (clauses > 240 chars) are ignored.
+- On a turn that ends with finish=stop and no tool call: continue when items
+  are open AND the model claims done (or the turn is empty), or when the last
+  sentence announces a step ("let me now", "I'll next") that never ran. A turn
+  that reports a blocker or hands a question back stays finished. Continue
+  message: "Continue. Still open: ...". Guards: max 3 per request chain, never
+  on finish=length, any error -> stock behavior.
+- Reuses the --jev-finish continuation path (re-submit with appended
+  assistant + user turn; streaming and non-streaming). Log:
+  `[jev-goal] mode=on items=N open=M action=continue|done|nudge reason=.. us=..`.
+- FINDING: `constrained_tools` is true for every request that carries tools
+  (all agent clients). The existing --jev-finish guard
+  `chat.constrained_tools -> return` therefore disables --jev-finish on all
+  opencode traffic. The goal tracker bypasses that guard; --jev-finish is left
+  unchanged (it still returns early with tools) — decide whether to relax it.
+
+Offline replay (550 opencode sessions, 7,359 user episodes, 4,957 turn ends;
+every user message treated as if it carried the trigger; truth = what the user
+sent next: strong = "continue/go/you didn't finish/re-sent the same ask",
+other = a new unrelated request, eof = session ended)
+- Final rules: 79 continues (1.6% of turn ends): strong 39, loose 1, other 32,
+  eof 7. precision(strong vs strong+loose+other) 0.54 against a 0.18 base rate
+  of "next message was a continue"; recall 4.5%. Many of the 32 "other" cases
+  are real stalls ("Writing the complete file now." then no file; "Let me
+  start by understanding the project" then stop) the label cannot see.
+- Per rule (fires: strong/other): intent 20: 9/8; open-change 28: 13/14;
+  open-commit 10: 6/4; open-build 9: 4/5; open-answer 11: 7/0; open-file 1.
+- Switched off (precision at or below base rate): last-failure (5 of 42 were
+  followed by a continue), loop nudge (5 of 21), open-test (6 of 22),
+  open-push. The toggles are `kRule*` constants in jev_goal.cpp.
+- Speed: mean 56 us, p50 36 us, p99 264 us, max 1.1 ms per decision over 10,000
+  evaluations (history up to thousands of messages; goal text capped to its two
+  ends). Strip: 4 us per 1 KB message (~1 ms per 370 KB pasted message).
+- Not verified live: no real opencode run with the flag on; Responses and
+  Anthropic endpoints are not wired; recall is low by design (precision first).

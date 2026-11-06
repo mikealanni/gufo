@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -35,6 +36,7 @@
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen38_flash_next/jev_finish.hpp"
 #include "src/models/qwen38_flash_next/jev_gate.hpp"
+#include "src/models/qwen38_flash_next/jev_goal.hpp"
 
 namespace gufo::server {
 
@@ -71,6 +73,8 @@ struct ParsedChatRequest {
   bool stream{false};
   bool include_usage{false};
   TextGenerationBackend::CancellationCheck is_cancelled;
+  /// Goal tracker state derived from the raw user messages (--jev-goal).
+  models::qwen38_flash_next::JevGoalSpec jev_goal;
 };
 
 struct ParsedToolCall {
@@ -789,6 +793,74 @@ const char* JevEffortName(ReasoningEffort effort) {
   return "unknown";
 }
 
+/// Role-neutral view of the conversation for the goal tracker. Index-aligned
+/// with `messages`; system and developer turns map to an inert tool slot.
+std::vector<models::qwen38_flash_next::JevGoalMessage> JevGoalHistory(
+    const std::vector<tokenization::ChatMessage>& messages) {
+  using models::qwen38_flash_next::JevGoalCall;
+  using models::qwen38_flash_next::JevGoalMessage;
+  std::vector<JevGoalMessage> history;
+  history.reserve(messages.size());
+  for (const auto& message : messages) {
+    JevGoalMessage view;
+    view.text = message.content;
+    switch (message.role) {
+      case tokenization::ChatRole::kUser:
+        view.role = JevGoalMessage::Role::kUser;
+        break;
+      case tokenization::ChatRole::kAssistant:
+        view.role = JevGoalMessage::Role::kAssistant;
+        for (const auto& call : message.tool_calls) {
+          JevGoalCall entry;
+          entry.id = call.id;
+          entry.name = call.name;
+          for (const auto& argument : call.arguments) {
+            if (argument.name == "command")
+              entry.command = argument.value;
+            else if (argument.name == "filePath" ||
+                     argument.name == "file_path" || argument.name == "path")
+              entry.path = argument.value;
+          }
+          view.calls.push_back(entry);
+        }
+        break;
+      default:
+        view.role = JevGoalMessage::Role::kTool;
+        view.tool_call_id = message.tool_call_id;
+        view.tool_name = message.name;
+        if (message.role != tokenization::ChatRole::kTool)
+          view.tool_call_id = {};
+        break;
+    }
+    history.push_back(std::move(view));
+  }
+  return history;
+}
+
+/// --jev-goal: detect the magic phrase in the RAW user messages, then strip it
+/// from every user message so the model never sees it. The strip is a pure
+/// function of each message, so the rendered prompt bytes are identical on
+/// every request of a conversation and the prefix cache stays valid.
+void ApplyJevGoal(TextGenerationBackend& backend, ChatRequest* chat,
+                  models::qwen38_flash_next::JevGoalSpec* spec) {
+  if (!backend.jev_goal_enabled())
+    return;
+  const auto history = JevGoalHistory(chat->messages);
+  *spec = models::qwen38_flash_next::DetectJevGoal(history);
+  if (!spec->active)
+    return;
+  for (auto& message : chat->messages) {
+    if (message.role != tokenization::ChatRole::kUser ||
+        !models::qwen38_flash_next::HasJevGoalTrigger(message.content)) {
+      continue;
+    }
+    message.content =
+        models::qwen38_flash_next::StripJevGoalTrigger(message.content);
+    for (auto& image : message.images)
+      image.offset = std::min(image.offset, message.content.size());
+  }
+}
+
 // Reasoning-token cap for a routine tool-loop turn. The effort directive sits
 // at the start of the rendered prompt, so changing the effort would rewrite
 // the whole prompt and miss the prefix cache; the cap is applied while
@@ -1004,6 +1076,7 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
       output->chat.add_vision_id = vision_id->as_bool();
     }
   }
+  ApplyJevGoal(backend, &output->chat, &output->jev_goal);
   ApplyJevGate(backend, &output->chat);
   const ReasoningOptions defaults = backend.reasoning_defaults();
   if (!output->chat.reasoning.enabled.has_value()) {
@@ -2970,20 +3043,66 @@ constexpr std::size_t kJevFinishTailBytes = 200;
 
 struct JevFinishState {
   int continues{0};
+  int goal_continues{0};
   std::string last_reason;
   std::string last_tail;
 };
 
+std::optional<ChatRequest> JevGoalContinuation(
+    const ChatRequest& chat, const models::qwen38_flash_next::JevGoalSpec& goal,
+    const ParsedGeneration& generated, JevFinishState& state) {
+  using models::qwen38_flash_next::JevGoalAction;
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto history = JevGoalHistory(chat.messages);
+  const auto decision = models::qwen38_flash_next::EvaluateJevGoal(
+      goal, history, generated.text, state.goal_continues);
+  const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now() - t0)
+                      .count();
+  const bool act = decision.action == JevGoalAction::kContinue ||
+                   decision.action == JevGoalAction::kNudge;
+  Logger::LogFormatted(
+      LogLevel::kInfo, "jev-goal",
+      "mode=on items=%zu open=%zu action=%s reason=%s us=%lld", decision.items,
+      decision.open,
+      decision.action == JevGoalAction::kContinue ? "continue"
+      : decision.action == JevGoalAction::kNudge  ? "nudge"
+                                                  : "done",
+      decision.reason.empty() ? "none" : decision.reason.c_str(),
+      static_cast<long long>(us));
+  if (!act)
+    return std::nullopt;
+  ++state.goal_continues;
+  ChatRequest next = chat;
+  next.messages.emplace_back(tokenization::ChatRole::kAssistant,
+                             generated.text);
+  next.messages.emplace_back(tokenization::ChatRole::kUser, decision.message);
+  return next;
+}
+
 std::optional<ChatRequest> JevFinishContinuation(
     const ChatRequest& chat, const TextGenerationBackend& backend,
     const TextGenerationBackend::Result& result,
-    const ParsedGeneration& generated, JevFinishState& state) {
-  if (!backend.jev_finish_enabled() ||
+    const ParsedGeneration& generated,
+    const models::qwen38_flash_next::JevGoalSpec& goal, JevFinishState& state) {
+  const bool goal_on = backend.jev_goal_enabled() && goal.active;
+  if ((!backend.jev_finish_enabled() && !goal_on) ||
       result.finish_reason != TextGenerationBackend::FinishReason::kStop ||
       !generated.tool_calls.empty() || chat.response_format ||
-      chat.constrained_tools || chat.messages.empty()) {
+      chat.messages.empty()) {
     return std::nullopt;
   }
+  // Agent clients always send tools, which makes every request
+  // `constrained_tools`; the goal tracker must work there. A text-only turn
+  // is a valid end of an agent loop, so the continuation keeps the tools.
+  if (goal_on) {
+    if (auto next = JevGoalContinuation(chat, goal, generated, state))
+      return next;
+  }
+  if (chat.constrained_tools)
+    return std::nullopt;
+  if (!backend.jev_finish_enabled())
+    return std::nullopt;
   std::string_view task;
   for (auto it = chat.messages.rbegin(); it != chat.messages.rend(); ++it) {
     if (it->role == tokenization::ChatRole::kUser) {
@@ -3072,8 +3191,9 @@ HttpResponse NonStreamingResponse(
   ChatRequest round_chat = request.chat;
   ParsedGeneration latest = generated;
   TextGenerationBackend::Result latest_result = result;
-  while (auto next = JevFinishContinuation(round_chat, backend, latest_result,
-                                           latest, finish_state)) {
+  while (auto next =
+             JevFinishContinuation(round_chat, backend, latest_result, latest,
+                                   request.jev_goal, finish_state)) {
     try {
       auto follow =
           backend.start_chat(*next, request.max_tokens, request.sampling,
@@ -3284,9 +3404,9 @@ HttpResponse StreamingResponse(
                                    generated.reasoning_content)) {
                   return;
                 }
-                if (auto next =
-                        JevFinishContinuation(round_chat, backend, round_result,
-                                              generated, finish_state)) {
+                if (auto next = JevFinishContinuation(
+                        round_chat, backend, round_result, generated,
+                        request.jev_goal, finish_state)) {
                   try {
                     auto follow = backend.start_chat(
                         *next, request.max_tokens, request.sampling,

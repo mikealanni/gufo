@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "src/cli/arg_parser.hpp"
+#include "src/cli/judge/goal_replay.hpp"
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen38_flash_next/jev_finish.hpp"
 #include "src/models/qwen38_flash_next/jev_inline.hpp"
@@ -321,6 +322,8 @@ int RunJudge(std::span<const char* const> args) {
   bool batched = false;
   bool finish_verbose = false;
   std::string finish_replay;
+  std::string goal_replay;
+  bool goal_verbose = false;
 
   ArgParser parser("gufo judge",
                    "Run the resident NPU judge on one question or the "
@@ -350,11 +353,18 @@ int RunJudge(std::span<const char* const> args) {
   parser.AddOption("", "--finish-replay", "DIR",
                    "Score the rule-based finish detector on a labeled corpus",
                    "Finish", &finish_replay);
+  parser.AddOption("", "--goal-replay", "DIR",
+                   "Score the goal tracker on exported opencode sessions",
+                   "Goal", &goal_replay);
+  parser.AddFlag("", "--goal-verbose", "List goal-replay false continues",
+                 "Goal", &goal_verbose);
   parser.AddFlag("", "--finish-verbose", "List finish-replay misses", "Finish",
                  &finish_verbose);
   if (!parser.Parse(args))
     return 2;
 
+  if (!goal_replay.empty())
+    return RunGoalReplay(goal_replay, goal_verbose);
   if (!finish_replay.empty())
     return RunFinishReplay(finish_replay, finish_verbose);
 

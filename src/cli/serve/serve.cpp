@@ -592,6 +592,7 @@ void PrintServeHelp(std::string_view program_name,
     std::string jev_inline = "off";
     std::string jev_pre = "off";
     std::string jev_finish = "off";
+    std::string jev_goal = "off";
     std::string speculative_backend;
     std::string dflash_model_path;
     std::string draft_policy;
@@ -681,6 +682,12 @@ void PrintServeHelp(std::string_view program_name,
         "Resume a chat turn that stops unfinished (cut-off sentence, unclosed "
         "code fence, announced action never run): on or off (default: off)",
         "Reasoning Defaults", &jev_finish);
+    parser.AddOption(
+        "", "--jev-goal", "MODE",
+        "Goal tracker: a user message containing the phrase \"jev make sure "
+        "its done\" (phrase stripped before the model sees it) keeps the turn "
+        "going while its asks have no evidence: on or off (default: off)",
+        "Reasoning Defaults", &jev_goal);
 
     // Speculative & Hardware
     parser.AddOption("", "--speculative", "MODE",
@@ -1163,6 +1170,7 @@ int RunServe(std::span<const char* const> args) {
     std::string jev_inline = "off";
     std::string jev_pre = "off";
     std::string jev_finish = "off";
+    std::string jev_goal = "off";
     std::string speculative_backend;
     std::string dflash_model_path;
     std::string draft_policy;
@@ -1248,6 +1256,12 @@ int RunServe(std::span<const char* const> args) {
         "Resume a chat turn that stops unfinished (cut-off sentence, unclosed "
         "code fence, announced action never run): on or off (default: off)",
         "Reasoning Defaults", &jev_finish);
+    llm_parser.AddOption(
+        "", "--jev-goal", "MODE",
+        "Goal tracker: a user message containing the phrase \"jev make sure "
+        "its done\" (phrase stripped before the model sees it) keeps the turn "
+        "going while its asks have no evidence: on or off (default: off)",
+        "Reasoning Defaults", &jev_goal);
     llm_parser.AddOption("", "--speculative", "MODE",
                          "HTTP draft backend: dspark, dflash2, mtp, or off",
                          "Speculative", &speculative_backend);
@@ -1418,6 +1432,10 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error: --jev-finish must be on or off\n";
       return 2;
     }
+    if (jev_goal != "on" && jev_goal != "off") {
+      std::cerr << "Error: --jev-goal must be on or off\n";
+      return 2;
+    }
     if (reasoning_budget >= 0)
       reasoning_defaults->budget_tokens =
           static_cast<std::size_t>(reasoning_budget);
@@ -1531,6 +1549,7 @@ int RunServe(std::span<const char* const> args) {
     backend->set_jev_inline_enabled(jev_inline == "on");
     backend->set_jev_pre_enabled(jev_pre == "on");
     backend->set_jev_finish_enabled(jev_finish == "on");
+    backend->set_jev_goal_enabled(jev_goal == "on");
     const auto effective_sampling =
         backend->sampling_defaults().Resolve(reasoning_defaults->enabled);
     server::ChatRequest default_request;
