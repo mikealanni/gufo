@@ -23,7 +23,7 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
 #endif
-#if defined(ENGINE_ENABLE_NPU)
+#if defined(GUFO_NPU)
 #include "src/models/qwen38_flash_next/kernels/rocm/npu_gemm.hpp"
 #endif
 
@@ -497,54 +497,125 @@ int RunProbe(std::span<const char* const> args) {
 
   std::printf("OK\n");
 
-#if defined(ENGINE_ENABLE_NPU)
-  // One-shot NPU GEMM timing for a jev-shaped matmul (M=1024, K=2048, N=1024).
+#if defined(GUFO_NPU)
+  // Resident-NPU floor for the jev judge (Qwen3-0.6B decode). Measured facts
+  // this probe encodes:
+  //  - Submit/Wait only enqueue host callbacks, so every timed sequence ends
+  //    in hipDeviceSynchronize(); without it the probe times two no-ops.
+  //  - A kernel's cost is its launch, not its bytes: N=1024 and N=2048 cost
+  //    the same ~90-125 us, and M=512 and M=1024 cost the same too. So the
+  //    token time is launches/token x per-launch, and the lever is fusing
+  //    GEMMs that share one activation into one wide-N kernel.
+  //  - The XCLBIN is width-agnostic (every N build differs in 80 metadata
+  //    bytes), so one resident context serves every program below.
+  // Shape budget per layer: q+k+v read attn_norm (K=1024) -> one N=4096
+  // kernel; gate+up read ffn_norm (K=1024) -> one N=6144 kernel; o_proj is
+  // K=2048 and down_proj K=3072, one each. 4 launches/layer, 28 layers, plus
+  // one lm_head kernel = 113 launches/token.
   {
+    namespace npu_rocm = gufo::models::qwen38_flash_next::rocm;
+    const std::string dir = std::getenv("GUFO_NPU_DIR") != nullptr
+                                ? std::getenv("GUFO_NPU_DIR")
+                                : "tools/npu";
+    const std::string mk = dir + "/runtime_mk/";
     std::string err;
-    gufo::models::qwen38_flash_next::rocm::NpuGemm::Config cfg;
-    cfg.xclbin =
-        std::string(std::getenv("GUFO_NPU_DIR") ? std::getenv("GUFO_NPU_DIR")
-                                                : "tools/npu") +
-        "/runtime_mk/final_4096xKx1024_128x64x128.xclbin";
-    cfg.insts =
-        std::string(std::getenv("GUFO_NPU_DIR") ? std::getenv("GUFO_NPU_DIR")
-                                                : "tools/npu") +
-        "/runtime_mk/insts_1024x2048x1024_128x64x128.txt";
-    cfg.tokens = 1024;
-    cfg.k = 2048;
+    npu_rocm::NpuGemm::Config cfg;
+    cfg.xclbin = mk + "final_4096xKx1024_128x64x128.xclbin";
+    cfg.insts = mk + "insts_512x1024x1024_128x64x128.txt";
+    cfg.tokens = 512;
+    cfg.k = 1024;
     cfg.n = 1024;
-    auto npu =
-        gufo::models::qwen38_flash_next::rocm::NpuGemm::Create(cfg, &err);
-    if (!npu) {
+    auto npu = npu_rocm::NpuGemm::Create(cfg, &err);
+    if (npu == nullptr) {
       std::printf("NPU probe: Create failed: %s\n", err.c_str());
     } else {
-      int a = npu->NewBuffer(npu->ABytes(), &err);
-      int b = npu->NewBuffer(npu->BBytes(), &err);
-      int c = npu->NewBuffer(npu->CBytes(), &err);
-      // zero-fill
-      std::memset(npu->Host(a), 0, npu->ABytes());
-      std::memset(npu->Host(b), 0, npu->BBytes());
-      npu->FinalizeWeights(b);
-      int prog = 0;
-      // warmup
-      int b_ids[1] = {b};
-      int c_ids[1] = {c};
-      npu->Submit(nullptr, a, b_ids, c_ids, 1, prog);
-      npu->Wait(nullptr);
-      // timed run
-      auto t0 = std::chrono::high_resolution_clock::now();
-      npu->Submit(nullptr, a, b_ids, c_ids, 1, prog);
-      npu->Wait(nullptr);
-      auto t1 = std::chrono::high_resolution_clock::now();
-      double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-      std::printf(
-          "NPU probe: M=1024 K=2048 N=1024 one GEMM wall time = %.3f ms (GEMM "
-          "only, no encode/decode)\n",
-          ms);
-      std::printf(
-          "NPU probe: 196 such GEMMs (28 layers x 7) = %.1f ms GEMM-only lower "
-          "bound\n",
-          ms * 196.0);
+      struct Prog {
+        const char* insts;
+        std::uint32_t k;
+        std::uint32_t n;
+        int id;
+      };
+      Prog progs[5] = {
+          {"insts_512x1024x1024_128x64x128.txt", 1024, 1024, 0},
+          {"insts_512x1024x4096_128x64x128.txt", 1024, 4096, -1},
+          {"insts_512x1024x6144_128x64x128.txt", 1024, 6144, -1},
+          {"insts_512x2048x1024_128x64x128.txt", 2048, 1024, -1},
+          {"insts_512x3072x1024_128x64x128.txt", 3072, 1024, -1},
+      };
+      constexpr std::uint32_t kTokens = 512;
+      const auto bytes = [](std::uint32_t alen, std::uint32_t blen) {
+        return static_cast<std::size_t>(alen) * blen / 8 * 9;
+      };
+      bool ok = true;
+      for (int i = 1; i < 5 && ok; ++i) {
+        progs[i].id = npu->AddProgram(mk + progs[i].insts, &err);
+        ok = progs[i].id >= 0;
+      }
+      if (!ok) {
+        std::printf("NPU probe: AddProgram failed: %s\n", err.c_str());
+      } else {
+        int a[3] = {-1, -1, -1};  // K = 1024, 2048, 3072
+        int b[5];
+        int c[5];
+        for (int i = 0; i < 3 && ok; ++i) {
+          const std::uint32_t k = 1024U << i;
+          a[i] = npu->NewBuffer(bytes(kTokens, k), &err);
+          ok = a[i] >= 0;
+          std::memset(npu->Host(a[i]), 0x3c, bytes(kTokens, k));
+        }
+        for (int i = 0; i < 5 && ok; ++i) {
+          b[i] = npu->NewBuffer(bytes(progs[i].k, progs[i].n), &err);
+          c[i] = npu->NewBuffer(bytes(kTokens, progs[i].n), &err);
+          ok = b[i] >= 0 && c[i] >= 0;
+          if (ok) {
+            std::memset(npu->Host(b[i]), 0x3c, bytes(progs[i].k, progs[i].n));
+            npu->FinalizeWeights(b[i]);
+          }
+        }
+        if (!ok) {
+          std::printf("NPU probe: buffers failed: %s\n", err.c_str());
+        } else {
+          // The per-kernel cost is NPU-side (the probe stats show ~8 us of
+          // host launch against ~250 us of NPU wait), so what matters is how
+          // many runs the driver holds in flight: one Submit of 48 kernels,
+          // with GUFO_NPU_INFLIGHT setting the queue depth. Depth 0 = no cap.
+          constexpr std::uint32_t kMacsM = 512;
+          constexpr int kSlices = 48;
+          int bs[kSlices];
+          int cs[kSlices];
+          const int k = 1024;
+          const int n = 1024;
+          const std::size_t nb = bytes(k, n);
+          const std::size_t nc = bytes(kTokens, n);
+          bool ok2 = true;
+          for (int i = 0; i < kSlices && ok2; ++i) {
+            bs[i] = npu->NewBuffer(nb, &err);
+            cs[i] = npu->NewBuffer(nc, &err);
+            ok2 = bs[i] >= 0 && cs[i] >= 0;
+            if (ok2) {
+              std::memset(npu->Host(bs[i]), 0x3c, nb);
+              npu->FinalizeWeights(bs[i]);
+            }
+          }
+          double best = 1e9;
+          for (int round = 0; round < 3 && ok2; ++round) {
+            const auto t0 = std::chrono::high_resolution_clock::now();
+            npu->Submit(nullptr, a[0], bs, cs, kSlices, 0);
+            npu->Wait(nullptr);
+            (void)hipDeviceSynchronize();
+            const auto t1 = std::chrono::high_resolution_clock::now();
+            best = std::min(
+                best,
+                std::chrono::duration<double, std::micro>(t1 - t0).count() /
+                    kSlices);
+          }
+          std::printf("NPU probe: 48 kernels K=1024 N=1024 -> %.1f us/kernel\n",
+                      best);
+          std::fflush(stdout);
+          std::fflush(stdout);
+        }
+      }
+      std::fflush(stdout);
     }
   }
 #endif

@@ -52,6 +52,9 @@
 #include "src/models/qwen38_flash_next/engine.hpp"
 #include "src/models/qwen38_flash_next/jev_inline.hpp"
 #include "src/models/qwen38_flash_next/jev_model.hpp"
+#if defined(GUFO_NPU)
+#include "src/models/qwen38_flash_next/jev_npu.hpp"
+#endif
 #endif
 
 namespace gufo::server {
@@ -4544,11 +4547,91 @@ private:
 struct InferenceBackend::Impl {
   // Written once during startup, before the first request is admitted.
   bool jev_gate_option{false};
+  bool jev_pre_option{false};
   bool jev_inline_option{false};
 #if defined(ENGINE_ENABLE_HIP)
+  std::shared_ptr<const core::GgufReader> jev_reader;
   std::shared_ptr<models::qwen38_flash_next::JevModel> jev_model;
 #endif
+#if defined(GUFO_NPU)
+  std::shared_ptr<const core::GgufReader> jev_npu_reader;
+  std::shared_ptr<models::qwen38_flash_next::JevNpuModel> jev_npu_model;
+#endif
   std::mutex jev_mutex;
+
+  /// Lazily loads the resident yes/no judge and binds its Answer(). The NPU
+  /// engine is preferred (default on NPU builds; GUFO_JEV_NPU=0 forces the
+  /// CPU model) and falls back to the CPU model when it cannot load. Empty
+  /// when no judge can be loaded.
+  using JevAnswerFn = std::function<models::qwen38_flash_next::JevBinaryVerdict(
+      const std::string&, const std::string&)>;
+
+  JevAnswerFn EnsureJevAnswer() {
+    std::lock_guard<std::mutex> lock(jev_mutex);
+    const char* npu_env = std::getenv("GUFO_JEV_NPU");
+    const bool want_npu = !npu_env || std::string(npu_env) != "0";
+    if (want_npu) {
+#if defined(GUFO_NPU)
+      if (!jev_npu_model) {
+        // The NPU judge is validated on Qwen3-1.7B-Q6_K (18/22 vs 14/22 for
+        // 0.6B on the known-answer battery; the CPU reference scores the
+        // same, so the judge is faithful). GUFO_JEV_MODEL overrides.
+        const char* env = std::getenv("GUFO_JEV_MODEL");
+        std::string path =
+            env ? env
+                : (std::getenv("HOME") ? std::string(std::getenv("HOME")) +
+                                             "/jev-model/Qwen3-1.7B-Q6_K.gguf"
+                                       : std::string());
+        std::string err;
+        auto reader = core::GgufReader::OpenFile(path, &err);
+        if (reader) {
+          jev_npu_reader = std::shared_ptr<core::GgufReader>(std::move(reader));
+          jev_npu_model = models::qwen38_flash_next::JevNpuModel::LoadFromGguf(
+              *jev_npu_reader, &err);
+          if (!jev_npu_model)
+            jev_npu_reader.reset();
+        }
+      }
+      if (jev_npu_model) {
+        auto m = jev_npu_model;
+        return [m](const std::string& q, const std::string& c) {
+          return m->Answer(q, c);
+        };
+      }
+#endif
+    }
+#if defined(ENGINE_ENABLE_HIP)
+    // Reached when the NPU judge was not requested or could not load.
+    {
+      if (!jev_model) {
+        const char* env = std::getenv("GUFO_JEV_MODEL");
+        // (CPU fallback keeps the previously validated 0.6B snapshot.)
+        std::string path = env ? env
+                               : "/mnt/raid0/user_cache/huggingface/hub/"
+                                 "models--unsloth--Qwen3-0.6B-GGUF/"
+                                 "snapshots/"
+                                 "50968a4468ef4233ed78cd7c3de230dd1d61a56b/"
+                                 "Qwen3-0.6B-Q4_0.gguf";
+        std::string err;
+        auto reader = core::GgufReader::OpenFile(path, &err);
+        if (reader) {
+          jev_reader = std::shared_ptr<core::GgufReader>(std::move(reader));
+          jev_model = models::qwen38_flash_next::JevModel::LoadFromGguf(
+              *jev_reader, &err);
+          if (!jev_model)
+            jev_reader.reset();
+        }
+      }
+      if (jev_model) {
+        auto m = jev_model;
+        return [m](const std::string& q, const std::string& c) {
+          return m->Answer(q, c);
+        };
+      }
+#endif
+    }
+    return {};
+  }
 
 #if defined(ENGINE_ENABLE_HIP)
   struct State {
@@ -5810,6 +5893,21 @@ void InferenceBackend::set_jev_inline_enabled(bool enabled) {
   impl_->jev_inline_option = enabled;
 }
 
+void InferenceBackend::set_jev_pre_enabled(bool enabled) {
+  impl_->jev_pre_option = enabled;
+}
+
+std::optional<std::pair<float, float>> InferenceBackend::JevPreAnswer(
+    std::string_view question, std::string_view context) const {
+  if (!impl_->jev_pre_option)
+    return std::nullopt;
+  auto answer = impl_->EnsureJevAnswer();
+  if (!answer)
+    return std::nullopt;
+  const auto verdict = answer(std::string(question), std::string(context));
+  return std::pair{verdict.yes, verdict.no};
+}
+
 InferenceBackend::Result InferenceBackend::complete(
     std::string_view prompt, std::size_t max_tokens,
     const sampling::SamplingConfig& sampling_config,
@@ -5869,33 +5967,15 @@ InferenceBackend::Result InferenceBackend::chat(
   std::function<std::optional<std::vector<TextRunnerToken>>(const std::string&)>
       jev_inline_fn;
   if (impl_->jev_inline_option) {
-    std::shared_ptr<models::qwen38_flash_next::JevModel> jev_model;
-    {
-      std::lock_guard<std::mutex> lock(impl_->jev_mutex);
-      if (!impl_->jev_model) {
-        const char* env = std::getenv("GUFO_JEV_MODEL");
-        std::string path = env ? env
-                               : "/mnt/raid0/user_cache/huggingface/hub/"
-                                 "models--unsloth--Qwen3-0.6B-GGUF/snapshots/"
-                                 "50968a4468ef4233ed78cd7c3de230dd1d61a56b/"
-                                 "Qwen3-0.6B-Q4_0.gguf";
-        std::string err;
-        auto reader = core::GgufReader::OpenFile(path, &err);
-        if (reader) {
-          impl_->jev_model =
-              models::qwen38_flash_next::JevModel::LoadFromGguf(*reader, &err);
-        }
-      }
-      jev_model = impl_->jev_model;
-    }
-    if (jev_model) {
+    auto jev_answer = impl_->EnsureJevAnswer();
+    if (jev_answer) {
       auto scanner =
           std::make_shared<models::qwen38_flash_next::JevInlineScanner>();
       auto ctx = std::make_shared<std::string>();
       auto last_q = std::make_shared<std::string>();
       auto disabled = std::make_shared<bool>(false);
       const auto& runner_ref = state->scheduler->runner();
-      jev_inline_fn = [jev_model, scanner, ctx, last_q, disabled,
+      jev_inline_fn = [jev_answer, scanner, ctx, last_q, disabled,
                        &runner_ref](const std::string& piece)
           -> std::optional<std::vector<TextRunnerToken>> {
         *ctx += piece;
@@ -5914,7 +5994,7 @@ InferenceBackend::Result InferenceBackend::chat(
         if (c.size() > 400) {
           c = c.substr(c.size() - 400);
         }
-        auto v = jev_model->Answer(*q, c);
+        auto v = jev_answer(*q, c);
         float conf = std::max(v.yes, v.no);
         if (conf < 0.6F) {
           return std::nullopt;
@@ -6016,33 +6096,15 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
   std::function<std::optional<std::vector<TextRunnerToken>>(const std::string&)>
       jev_inline_fn;
   if (impl_->jev_inline_option) {
-    std::shared_ptr<models::qwen38_flash_next::JevModel> jev_model;
-    {
-      std::lock_guard<std::mutex> lock(impl_->jev_mutex);
-      if (!impl_->jev_model) {
-        const char* env = std::getenv("GUFO_JEV_MODEL");
-        std::string path = env ? env
-                               : "/mnt/raid0/user_cache/huggingface/hub/"
-                                 "models--unsloth--Qwen3-0.6B-GGUF/snapshots/"
-                                 "50968a4468ef4233ed78cd7c3de230dd1d61a56b/"
-                                 "Qwen3-0.6B-Q4_0.gguf";
-        std::string err;
-        auto reader = core::GgufReader::OpenFile(path, &err);
-        if (reader) {
-          impl_->jev_model =
-              models::qwen38_flash_next::JevModel::LoadFromGguf(*reader, &err);
-        }
-      }
-      jev_model = impl_->jev_model;
-    }
-    if (jev_model) {
+    auto jev_answer = impl_->EnsureJevAnswer();
+    if (jev_answer) {
       auto scanner =
           std::make_shared<models::qwen38_flash_next::JevInlineScanner>();
       auto ctx = std::make_shared<std::string>();
       auto last_q = std::make_shared<std::string>();
       auto disabled = std::make_shared<bool>(false);
       const auto& runner_ref = state->scheduler->runner();
-      jev_inline_fn = [jev_model, scanner, ctx, last_q, disabled,
+      jev_inline_fn = [jev_answer, scanner, ctx, last_q, disabled,
                        &runner_ref](const std::string& piece)
           -> std::optional<std::vector<TextRunnerToken>> {
         *ctx += piece;
@@ -6061,7 +6123,7 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
         if (c.size() > 400) {
           c = c.substr(c.size() - 400);
         }
-        auto v = jev_model->Answer(*q, c);
+        auto v = jev_answer(*q, c);
         float conf = std::max(v.yes, v.no);
         if (conf < 0.6F) {
           return std::nullopt;

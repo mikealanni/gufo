@@ -142,6 +142,9 @@ if (ENGINE_ENABLE_HIP)
     src/core/hip/allocation_benchmark.hip)
   target_compile_definitions(gufo_diagnostics PRIVATE ENGINE_ENABLE_HIP=1)
   target_link_libraries(gufo_diagnostics PRIVATE hip::host roc::hipblas roc::rocblas)
+  if (GUFO_ENABLE_NPU)
+    target_compile_definitions(gufo_diagnostics PRIVATE GUFO_NPU=1)
+  endif()
 endif()
 
 add_library(gufo_core STATIC
@@ -219,6 +222,7 @@ endif()
 
 add_library(gufo_llm_cli STATIC
   src/cli/bench/bench.cpp
+  src/cli/judge/judge.cpp
   src/cli/prompt/prompt.cpp)
 target_link_libraries(gufo_llm_cli PUBLIC gufo_core gufo_flint gufo_laguna gufo_glm53_flash)
 if(ENGINE_ENABLE_HIP)

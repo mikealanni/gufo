@@ -312,6 +312,13 @@ public:
   /// it was tuned for, with the server option enabled, returns true.
   [[nodiscard]] virtual bool jev_gate_enabled() const { return false; }
   [[nodiscard]] virtual bool jev_inline_enabled() const { return false; }
+  /// Yes/No probabilities from the resident judge for a pre-route check, or
+  /// nullopt when no judge is enabled and loaded. A high-confidence verdict
+  /// on a small yes/no request answers it without decoding the main model.
+  [[nodiscard]] virtual std::optional<std::pair<float, float>> JevPreAnswer(
+      std::string_view /*question*/, std::string_view /*context*/) const {
+    return std::nullopt;
+  }
   /// The loaded tokenizer's control tokens, or null when it owns none. The
   /// parser treats a pipe-wrapped spelling as call framing only when this trie
   /// knows it; every other lookalike stays literal argument data (#383).

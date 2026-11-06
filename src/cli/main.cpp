@@ -11,6 +11,7 @@
 #include "src/cli/bench/bench.hpp"
 #include "src/cli/diagnose/diagnose.h"
 #include "src/cli/eval/eval.hpp"
+#include "src/cli/judge/judge.hpp"
 #include "src/cli/prompt/prompt.hpp"
 #include "src/cli/serve/serve.hpp"
 #include "src/cli/transcribe/transcribe.hpp"
@@ -44,6 +45,7 @@ void print_help(std::string_view program_name) {
       << "Commands:\n"
       << "  serve          Start the OpenAI-compatible HTTP server\n"
       << "  prompt         Execute one prompt request and exit\n"
+      << "  judge          Score one question with the resident GGUF judge\n"
       << "  chat           Start an interactive terminal conversation\n"
       << "  bench          Benchmark prompt processing and token generation\n"
       << "  eval           Evaluate an OpenAI-compatible text server\n"
@@ -102,6 +104,9 @@ int run(std::span<const char* const> args) {
     if (sub == "prompt") {
       return gufo::cli::RunPrompt(help_flag);
     }
+    if (sub == "judge") {
+      return gufo::cli::RunJudge(help_flag);
+    }
     if (sub == "bench") {
       return gufo::cli::RunBench(help_flag);
     }
@@ -148,6 +153,10 @@ int run(std::span<const char* const> args) {
 
   if (first_arg == "prompt") {
     return gufo::cli::RunPrompt(options.subspan(1));
+  }
+
+  if (first_arg == "judge") {
+    return gufo::cli::RunJudge(options.subspan(1));
   }
 
   if (first_arg == "video") {
