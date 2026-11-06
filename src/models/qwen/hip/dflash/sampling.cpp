@@ -1,11 +1,12 @@
+#include "src/core/sampling.hpp"
+
+#include <hip/hip_runtime.h>
+
 #include <algorithm>
 #include <cstddef>
 #include <span>
 
-#include <hip/hip_runtime.h>
-
 #include "src/core/hip/hip_utils.hpp"
-#include "src/core/sampling.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/kernels/dflash_kernels.hpp"
 

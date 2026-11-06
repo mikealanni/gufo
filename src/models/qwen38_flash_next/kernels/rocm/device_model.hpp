@@ -124,6 +124,7 @@ public:
   }
 
 private:
+  friend struct DeviceModelTestAccess;  // synthetic models in GPU tests
   DeviceModel() = default;
 
   Config config_;

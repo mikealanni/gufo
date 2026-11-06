@@ -105,6 +105,9 @@ public:
   [[nodiscard]] std::size_t SessionBytes(core::SessionMode mode,
                                          std::uint32_t context) const noexcept;
   [[nodiscard]] std::size_t DeferredScratchBytes() const;
+  /// Caps wide copy verification (Executor::LimitCopyRows); call before any
+  /// session is created.
+  void LimitCopyRows(std::uint32_t rows) noexcept;
   [[nodiscard]] const std::shared_ptr<qwen::vision::Encoder>& VisionEncoder()
       const noexcept {
     return vision_;
@@ -318,6 +321,13 @@ private:
   std::size_t suffix_cooldown_until_{
       0};  ///< position until which history drafts need a long match
   void SyncLookup();
+  /// Verification rows (anchor included) the next copy-only cycle of a
+  /// greedy session decoding alone may use; 0 before the first. A copy
+  /// accepted whole at this width doubles it up to max_copy_rows(); any
+  /// rejected copy returns it to the ordinary verifier width.
+  std::uint32_t copy_rows_{0};
+  /// Whole copies accepted in a row at copy_rows_ (two widen it).
+  std::uint32_t copy_streak_{0};
   SpeculativeStats stats_;
   std::shared_ptr<const qwen::vision::Prompt> image_prompt_;
   [[nodiscard]] std::span<const std::uint8_t> ImageIdentity(

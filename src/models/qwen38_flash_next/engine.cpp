@@ -382,6 +382,10 @@ std::size_t Model::DeferredScratchBytes() const {
   return executor_->DeferredScratchBytes();
 }
 
+void Model::LimitCopyRows(std::uint32_t rows) noexcept {
+  executor_->LimitCopyRows(rows);
+}
+
 std::size_t Session::AllocatedBytes() const noexcept {
   return session_->AllocatedBytes();
 }
@@ -515,6 +519,11 @@ void Session::ResetDraftPolicy() {
   if (continuation_hooks_)
     continuation_hooks_->BeforeExecution();
   draft_length_.Reset();
+  // A fully reused prompt can start decoding without SyncImpl. It still
+  // starts a new request: do not inherit a copy width or widen its first
+  // step.
+  copy_rows_ = 0;
+  copy_streak_ = 0;
 }
 
 std::uint32_t Session::Position() const noexcept {
@@ -536,6 +545,8 @@ void Session::ResetImpl(bool reuse_mtp) {
   tokens_.clear();
   lookup_ = LookupIndex{};
   suffix_cooldown_until_ = 0;
+  copy_rows_ = 0;
+  copy_streak_ = 0;
   hidden_base_ = 0;
   draft_length_.Reset();
   if (dflash_ && dflash_->executor) {
@@ -1011,6 +1022,8 @@ bool Session::SyncImpl(std::span<const std::int32_t> prompt,
     AssignError(error_msg, "prompt exceeds the session context");
     return false;
   }
+  copy_rows_ = 0;
+  copy_streak_ = 0;
   if (!valid_)
     Reset();
   // Recurrent state cannot be rewound, so any divergence restarts the
@@ -1264,6 +1277,8 @@ struct Session::PendingDecode {
     return 4;
   }
   PendingDecode() { slot_confidence.fill(-1.0F); }
+  /// A copy-only cycle here may verify more than max_speculative() rows.
+  bool wide{false};
 };
 
 void Session::AppendDraft(PendingDecode& pending) {
@@ -1328,6 +1343,17 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   }
   // Retrieval drafts: the token history may already contain what follows this
   // phrase. The index includes the anchor, which is committed in every outcome.
+  // A greedy session decoding alone may verify a copy wider than the MTP
+  // chain (Executor::ForwardWide): the shared projections read their weights
+  // once for every row. The width grows only while whole copies are accepted
+  // (FinishDecode), so a copy that diverges costs at most the last width.
+  const std::size_t wide_rows =
+      !defer_head && sampler.config().temperature == 0.0F
+          ? std::min<std::size_t>(
+                {max_tokens, room,
+                 static_cast<std::size_t>(exec.max_copy_rows()),
+                 std::max<std::size_t>(copy_rows_, exec.max_speculative())})
+          : 0;
   std::vector<std::int32_t> history_draft;
   if (Suffix().enabled && draft_enabled && cap > 1) {
     SyncLookup();
@@ -1337,8 +1363,10 @@ bool Session::PrepareDecode(const DecodeRequest& request,
     const std::uint32_t needed = tokens_.size() < suffix_cooldown_until_
                                      ? std::max(Suffix().min_match, 48U)
                                      : Suffix().min_match;
-    history_draft = lookup_.Draft(
-        needed, std::min<std::size_t>(cap - 1, Suffix().max_draft), &matched);
+    const std::size_t draft_room = std::max<std::size_t>(
+        std::min<std::size_t>(cap - 1, Suffix().max_draft),
+        wide_rows > 1 ? wide_rows - 1 : 0);
+    history_draft = lookup_.Draft(needed, draft_room, &matched);
     if (Suffix().log && !history_draft.empty()) {
       std::fprintf(stderr, "suffix: pos=%zu match=%u draft=%zu\n",
                    tokens_.size(), matched, history_draft.size());
@@ -1362,8 +1390,14 @@ bool Session::PrepareDecode(const DecodeRequest& request,
     pending->sampled = sampled;
     pending->gpu_greedy = gpu_greedy;
     pending->gpu_verification = gpu_greedy;
-    if (!pending->gpu_verification && verify_logits_.empty())
-      verify_logits_.resize(exec.max_speculative() * model_->VocabSize());
+    // Only a chain past the ordinary verifier width verifies through
+    // ForwardWide (DecodeStep).
+    pending->wide = !defer_head && gpu_greedy &&
+                    pending->chain.size() >
+                        static_cast<std::size_t>(exec.max_speculative());
+    if (!pending->gpu_verification &&
+        verify_logits_.size() < pending->chain.size() * model_->VocabSize())
+      verify_logits_.resize(pending->chain.size() * model_->VocabSize());
     return true;
   }
   if (DflashReady() && cap > 1 && !defer_head) {
@@ -1565,7 +1599,7 @@ bool Session::FinishDecode(const DecodeRequest& request,
     return true;
   }
   sampler.Accept(static_cast<sampling::TokenId>(anchor));
-  std::array<rocm::ArgmaxCandidate, kMaxMtpDraftTokens> greedy{};
+  std::array<rocm::ArgmaxCandidate, rocm::Executor::kWideRows - 1> greedy{};
   if (gpu_greedy &&
       !exec.GreedyMtpPredictions(std::span(greedy).first(k - 1), sampler,
                                  std::span(chain).subspan(1), error_msg)) {
@@ -1587,7 +1621,8 @@ bool Session::FinishDecode(const DecodeRequest& request,
         // forbidden argmax, download the remaining rows once and use exact
         // masked selection. Avoid one synchronization per rejected candidate.
         // SelectBatchLogits has already installed this session's row offset.
-        verify_logits_.resize(exec.max_speculative() * vocab);
+        verify_logits_.resize(std::max<std::size_t>(exec.max_speculative(), k) *
+                              vocab);
         auto rows = std::span(verify_logits_)
                         .subspan((keep - 1) * vocab, (k - keep + 1) * vocab);
         if (!exec.ReadVerificationRows(keep - 1, rows, error_msg))
@@ -1679,6 +1714,20 @@ bool Session::FinishDecode(const DecodeRequest& request,
     stats_.suffix_cycles += 1;
     stats_.suffix_drafted += k - 1;
     stats_.suffix_accepted += keep - 1;
+    // Only a copy cycle that may verify wide sets the width
+    // (PrepareDecode): two whole copies in a row at the current width
+    // double it, and any rejected copy returns it to the ordinary width.
+    if (pending.wide) {
+      const auto width = std::max(copy_rows_, exec.max_speculative());
+      if (keep < k) {
+        copy_rows_ = exec.max_speculative();
+        copy_streak_ = 0;
+      } else if (k >= width && ++copy_streak_ >= 2) {
+        copy_rows_ = std::min(
+            2 * width, std::max(exec.max_copy_rows(), exec.max_speculative()));
+        copy_streak_ = 0;
+      }
+    }
     if ((keep - 1) * 2 < k - 1)
       suffix_cooldown_until_ = base + keep + 32;
     if (Suffix().log) {
@@ -1702,6 +1751,17 @@ bool Session::FinishDecode(const DecodeRequest& request,
   // The next call knows the next sampled anchor. Defer draft catch-up until
   // then, retaining this session's target hidden rows across interleaving.
   exec.MtpRewind(*session_, base);
+  if (keep > exec.max_speculative()) {
+    // Snapshots and batched cycles keep at most max_speculative() hidden
+    // rows. Catch the draft block up to the last kept row now (K/V only,
+    // as for prompt rows) and keep that row's hidden.
+    const std::vector<std::int32_t> replay(tokens_.begin() + base + 1,
+                                           tokens_.begin() + base + keep);
+    if (!exec.MtpForward(*session_, replay, 0, {.kv_only = true}, error_msg) ||
+        !exec.KeepHiddenRow(*session_, keep - 1, error_msg))
+      return false;
+    hidden_base_ = base + keep - 1;
+  }
   if (correction) {
     // Evaluate the residual as the next cycle's anchor, avoiding a separate
     // target pass. Preserve the actual draw: resampling p would be biased.
@@ -1737,11 +1797,26 @@ bool Session::DecodeStep(std::size_t max_tokens,
   float* logits = !pending.speculative       ? logits_.data()
                   : pending.gpu_verification ? nullptr
                                              : verify_logits_.data();
-  if (!model_->executor_->Forward(
-          *session_, pending.chain, pending.chain.size(), logits,
-          pending.speculative ? rocm::Executor::ForwardMode::kVerify
-                              : rocm::Executor::ForwardMode::kDecode,
-          error_msg)) {
+  auto& exec = *model_->executor_;
+  if (pending.chain.size() > exec.max_speculative()) {
+    // A wide copy (PrepareDecode): verified in one pass, with the rows read
+    // like after ForwardBatch.
+    if (!pending.gpu_verification)
+      verify_logits_.resize(std::max(
+          verify_logits_.size(), pending.chain.size() * model_->VocabSize()));
+    if (!exec.ForwardWide(*session_, pending.chain, error_msg) ||
+        !exec.SelectBatchLogits(
+            0, static_cast<std::uint32_t>(pending.chain.size()),
+            pending.gpu_verification ? nullptr : verify_logits_.data(),
+            error_msg)) {
+      rocm::ReportTrimCounters("decode_step_forward_wide");
+      return false;
+    }
+  } else if (!exec.Forward(
+                 *session_, pending.chain, pending.chain.size(), logits,
+                 pending.speculative ? rocm::Executor::ForwardMode::kVerify
+                                     : rocm::Executor::ForwardMode::kDecode,
+                 error_msg)) {
     rocm::ReportTrimCounters("decode_step_forward");
     return false;
   }

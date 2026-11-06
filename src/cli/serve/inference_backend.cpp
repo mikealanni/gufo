@@ -1045,8 +1045,7 @@ public:
         if (claim.state_capacity_bytes.has_value() &&
             claim.per_request_state_bytes.has_value() &&
             claim.temporary_scratch_bytes.has_value() &&
-            *claim.per_request_state_bytes +
-                    *claim.temporary_scratch_bytes <=
+            *claim.per_request_state_bytes + *claim.temporary_scratch_bytes <=
                 *claim.state_capacity_bytes) {
           break;
         }
@@ -1226,9 +1225,9 @@ public:
   }
 
   [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
-    return std::make_unique<QwenTextRunnerState>(
-        model_, max_context_, drafts_, speculative_options_, execution_policy_,
-        copy_rows_);
+    return std::make_unique<QwenTextRunnerState>(model_, max_context_, drafts_,
+                                                 speculative_options_,
+                                                 execution_policy_, copy_rows_);
   }
 
   void PreparePrefixReuse(

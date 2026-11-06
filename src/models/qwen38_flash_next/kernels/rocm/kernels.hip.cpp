@@ -10796,10 +10796,10 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
   // block keep enough blocks in flight for one or two rows; four suit wider
   // verification batches (measured at d32K/d128K).
   const auto launch = [&](auto kernel, std::uint32_t group) {
-    hipLaunchKernelGGL(kernel, dim3(heads / group, n_tokens, z),
-                       dim3(kThreads), 0, stream, q, k_cache, v_cache, mask,
-                       mask_words, out, partials, start_pos, heads, kv_heads, d,
-                       ratio, sel_list, list_stride);
+    hipLaunchKernelGGL(kernel, dim3(heads / group, n_tokens, z), dim3(kThreads),
+                       0, stream, q, k_cache, v_cache, mask, mask_words, out,
+                       partials, start_pos, heads, kv_heads, d, ratio, sel_list,
+                       list_stride);
   };
   if (n_tokens <= 2) {
     launch(AttentionKernel<2>, 2);

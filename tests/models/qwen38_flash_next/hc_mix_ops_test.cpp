@@ -217,7 +217,8 @@ void CheckFusedDecodeMixer(std::uint32_t tokens, bool with_inject) {
   constexpr std::uint32_t kRank = 320;
   constexpr std::size_t kDim = std::size_t{kStreams} * kHidden;
   constexpr float kEps = 1e-6F;
-  const std::uint32_t parts = q::HcInjectParts(kHidden);  const std::uint32_t lo_cols =
+  const std::uint32_t parts = q::HcInjectParts(kHidden);
+  const std::uint32_t lo_cols =
       static_cast<std::uint32_t>(qfn_mmq_q8_1_bytes(1, kRank) / 36 * 32);
   const std::size_t rows = std::size_t{tokens} * kDim;
   const std::size_t mixed_count = std::size_t{tokens} * kHidden;

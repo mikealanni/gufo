@@ -525,8 +525,8 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
       // Q8_1 codes instead of rounding to BF16 first.
       if (half_prefill || npu_o) {
         LaunchFloatToFp16(arena_.d_ssm_out + output_first_row * attention_size,
-                          arena_.d_scratch_bf16,
-                          output_rows * attention_size, arena_.stream);
+                          arena_.d_scratch_bf16, output_rows * attention_size,
+                          arena_.stream);
       } else if (reads_q8_act(layer.attn_output)) {
         LaunchQuantizeActivationQ8_1FromFp32(
             arena_.d_ssm_out, arena_.d_scratch_q8_act, batch_size,

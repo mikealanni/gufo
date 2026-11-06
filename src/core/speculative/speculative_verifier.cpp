@@ -256,9 +256,9 @@ SpeculativeVerifier::SpeculativeVerifier(
   ConfigureAdaptiveDraftPolicy();
 }
 
-SpeculativeVerifier::SpeculativeVerifier(
-    hip::QwenGpuExecutor& target_executor, IDraftBackend& draft_backend,
-    SpeculativeOptions options)
+SpeculativeVerifier::SpeculativeVerifier(hip::QwenGpuExecutor& target_executor,
+                                         IDraftBackend& draft_backend,
+                                         SpeculativeOptions options)
     : owned_target_executor_(
           std::make_unique<QwenGpuSpeculativeTarget>(target_executor)),
       target_executor_(owned_target_executor_.get()),
@@ -339,15 +339,14 @@ void SpeculativeVerifier::UpdateAdaptiveDraftLength(std::size_t accepted,
 tokenization::TokenId SpeculativeVerifier::AdvanceCommittedToken(
     tokenization::TokenId token, std::uint32_t position) {
   const auto next = target_executor_->ForwardToken(token, position);
-  if (Draft() != nullptr &&
-      Draft()->RequiresTargetHiddenStates()) {
+  if (Draft() != nullptr && Draft()->RequiresTargetHiddenStates()) {
     const auto hidden = target_executor_->CopyLastHidden();
-    if (hidden.empty() || !Draft()->AppendTargetContext(
-                              {.prompt_tokens = std::span(&token, 1),
-                               .prompt_hidden_states = hidden,
-                               .hidden_size = hidden.size(),
-                               .first_token = next},
-                              position)) {
+    if (hidden.empty() ||
+        !Draft()->AppendTargetContext({.prompt_tokens = std::span(&token, 1),
+                                       .prompt_hidden_states = hidden,
+                                       .hidden_size = hidden.size(),
+                                       .first_token = next},
+                                      position)) {
       throw std::runtime_error("draft failed to append committed target token");
     }
   }
@@ -496,8 +495,8 @@ void SpeculativeVerifier::PrepareTargetOnlyStep(PreparedStep& prepared,
   if (defer_target_only) {
     prepared.target_only = true;
     prepared.inputs = {request.current_token};
-    prepared.capture_hidden = Draft() != nullptr &&
-                              Draft()->RequiresTargetHiddenStates();
+    prepared.capture_hidden =
+        Draft() != nullptr && Draft()->RequiresTargetHiddenStates();
     prepared.capture_logits =
         (prepared.sampled || options_.retain_frontier_logits) &&
         !target_executor_->SupportsDeviceResidentSampling();
@@ -822,8 +821,8 @@ SpeculativeVerifier::ProcessVerificationChunk(
   if (prepared.sampled)
     sampler.SetRngState(working_sampler.rng_state());
   Draft()->AcceptFeedback(std::span<const tokenization::TokenId>(
-                                     proposal.tokens.data(), accepted_count),
-                                 correction_token);
+                              proposal.tokens.data(), accepted_count),
+                          correction_token);
   return result;
 }
 
@@ -1007,8 +1006,7 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifySequentialStep(
   }
 
   const std::size_t num_draft = proposal.tokens.size();
-  const bool capture_target_hidden =
-      Draft()->RequiresTargetHiddenStates();
+  const bool capture_target_hidden = Draft()->RequiresTargetHiddenStates();
   std::size_t accepted_count = 0;
   tokenization::TokenId correction_token = 0;
   std::vector<float> correction_logits;
@@ -1132,8 +1130,8 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifySequentialStep(
   UpdateAdaptiveDraftLength(accepted_count, num_draft);
 
   Draft()->AcceptFeedback(std::span<const tokenization::TokenId>(
-                                     proposal.tokens.data(), accepted_count),
-                                 correction_token);
+                              proposal.tokens.data(), accepted_count),
+                          correction_token);
 
   return result;
 }
