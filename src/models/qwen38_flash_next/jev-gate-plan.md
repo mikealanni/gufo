@@ -1031,3 +1031,9 @@ only if a labeled set shows the judge separates them.
 - **Engine guard:** `LoadFromGguf` refuses a GGUF whose tokenizer has no BPE merges (the SPM-style conversion; its ids do not line up with the embedding rows) and one where vocab < embedding rows or Yes/No/!/Answer fail to round-trip. The error names the remedy; `GUFO_JEV_TOKENIZER_GGUF` still overrides. The original broken 1B now fails loudly instead of scoring 6/10.
 - **Serve default:** `EnsureJevAnswer` tries fixed 1B -> Qwen3-1.7B-Q6_K -> CPU; `GUFO_JEV_MODEL` overrides (single path, no fallback).
 - **Calibration needed (no thresholds changed):** `TryJevPreRoute` (openai_chat.cpp) answers a whole "yes or no" request from jev when `max(yes,no) >= kJevPreConfidence (0.9)`. With the graded 1B, ~0% of replay answers clear 0.9, so the pre-route will almost never fire (safe, but its gain disappears); with saturated Qwen3 it fired on ~70% including wrong answers. Part A effort routing (`jev_gate`) does not use this cutoff. Re-pick the pre-route cutoff (likely 0.7-0.8) from labeled yes/no requests; the inline Part B 0.6 cutoff is unmeasured against truth and stays off.
+
+## Status 2026-11-06 — serve check of the 1B default
+
+- `--jev-pre on` serve (GUFO_DIR=gufo-jevgate): fixed MiniCPM5-1B loads on the NPU, 99 ms first call, `[jev-pre] yes=0.89 conf=0.89` (below kJevPreConfidence 0.9, so recalibrate with the 3-arm data).
+- Production launcher uses GUFO_NPU_DIR=$GUFO_DIR/tools/npu; a tree without the new `insts_512x*` files (e.g. ~/gufo before this branch merges) silently fell back to the CPU 0.6B judge. Now logged as `[jev] event=npu_judge_load_failed` / `npu_judge_unavailable action=cpu_fallback`.
+- MERGE ORDER: decode-1 upstream ports land first, then merge feat/jevgate (carries the insts files + xclbin programs), then decode-2.
