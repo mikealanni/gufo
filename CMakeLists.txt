@@ -316,6 +316,10 @@ if (ENGINE_ENABLE_HIP AND GUFO_BUILD_TOOLS)
 
   add_executable(wmma_layout_test tools/bench/wmma_layout_test.hip)
   target_link_libraries(wmma_layout_test PRIVATE gufo_core hip::device)
+
+  add_executable(qwen27b_verify_sweep EXCLUDE_FROM_ALL
+    ${PROJECT_SOURCE_DIR}/tools/qwen27b/verify_sweep/sweep.hip)
+  target_link_libraries(qwen27b_verify_sweep PRIVATE gufo_core hip::device)
 endif()
 
 install(TARGETS gufo DESTINATION bin)
