@@ -4593,14 +4593,18 @@ struct InferenceBackend::Impl {
         std::string err;
         for (const auto& path : paths) {
           auto reader = core::GgufReader::OpenFile(path, &err);
-          if (!reader)
+          if (!reader) {
+            Logger::Warn("jev", "event=judge_unreadable path=" + path +
+                                    " reason=" + err);
             continue;
+          }
           jev_npu_reader = std::shared_ptr<core::GgufReader>(std::move(reader));
           jev_npu_model = models::qwen38_flash_next::JevNpuModel::LoadFromGguf(
               *jev_npu_reader, &err);
           if (jev_npu_model)
             break;
-          std::fprintf(stderr, "jev: %s: %s\n", path.c_str(), err.c_str());
+          Logger::Warn("jev", "event=npu_judge_load_failed path=" + path +
+                                  " reason=" + err);
           jev_npu_reader.reset();
         }
       }
@@ -4610,6 +4614,9 @@ struct InferenceBackend::Impl {
           return m->Answer(q, c);
         };
       }
+      Logger::Warn("jev",
+                   "event=npu_judge_unavailable action=cpu_fallback note="
+                   "different_model_and_calibration");
 #endif
     }
 #if defined(ENGINE_ENABLE_HIP)
