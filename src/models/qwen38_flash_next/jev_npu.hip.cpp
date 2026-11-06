@@ -70,6 +70,7 @@ struct JevConfig {
   std::uint32_t num_layers{0}, hidden{0}, intermediate{0}, heads{0},
       kv_heads{0}, head_dim{0}, vocab{0}, context{0};
   float rope_theta{1000000.0F};
+  bool rope_interleaved{false};
   float rms_eps{1e-6F};
   // Per-head Q/K RMSNorm before RoPE is a Qwen3 architectural feature, not
   // a standard Llama one (MiniCPM5 has neither tensor). Set at load time
@@ -256,7 +257,8 @@ __global__ void JevRopeKernel(float* q, float* k, const std::uint32_t* startpos,
                               std::uint32_t n, std::uint32_t q_dim,
                               std::uint32_t kv_dim, std::uint32_t heads,
                               std::uint32_t kv_heads, std::uint32_t hd,
-                              float theta, std::uint32_t seq_cap) {
+                              float theta, std::uint32_t seq_cap,
+                              bool interleaved) {
   const std::uint32_t row = blockIdx.x;
   if (row >= n)
     return;
@@ -278,10 +280,14 @@ __global__ void JevRopeKernel(float* q, float* k, const std::uint32_t* startpos,
     base = k + static_cast<std::size_t>(row) * kv_dim +
            static_cast<std::size_t>(kh) * hd;
   }
-  const float a = base[dd];
-  const float b = base[dd + hd / 2];
-  base[dd] = a * c - b * sn;
-  base[dd + hd / 2] = a * sn + b * c;
+  // llama.cpp's llama-arch converter permutes q/k rows so adjacent pairs
+  // (2i, 2i+1) rotate together (NORM rope); qwen3 keeps HF half-split NEOX.
+  const std::uint32_t ia = interleaved ? 2 * dd : dd;
+  const std::uint32_t ib = interleaved ? 2 * dd + 1 : dd + hd / 2;
+  const float a = base[ia];
+  const float b = base[ib];
+  base[ia] = a * c - b * sn;
+  base[ib] = a * sn + b * c;
 }
 
 __global__ void JevStoreKvKernel(const float* k, const float* v, __half* kc,
@@ -520,7 +526,16 @@ struct JevNpuModel::Impl {
   // architecture models (MiniCPM5) do: their template literally starts
   // with `{{- bos_token }}` -- diffed character-for-character against
   // the real GGUF chat_template string. Empty for qwen3, "<s>" for llama.
-  std::string bos_prefix;
+  // Token id prepended to every prompt (llama-arch models); "<s>" text does
+  // not tokenize to the BOS id, it splits into ordinary pieces.
+  std::optional<TokenId> bos_id;
+
+  std::vector<TokenId> EncodePrompt(const std::string& prompt) const {
+    auto tokens = tokenizer->Encode(prompt);
+    if (bos_id)
+      tokens.insert(tokens.begin(), *bos_id);
+    return tokens;
+  }
   std::uint32_t emb_rows{0};
 
   std::unique_ptr<rocm::NpuGemm> npu;
@@ -556,6 +571,11 @@ struct JevNpuModel::Impl {
   // whenever an exact-match instruction file exists (every model this
   // engine has run so far besides MiniCPM5-2B).
   std::uint32_t n_qkv_cap{0};
+  // Same idea for the o / down outputs when hidden is not a whole number of
+  // 1024-wide N tiles (MiniCPM5-1B: 1536).
+  std::uint32_t n_o_cap{0};
+  std::uint32_t n_down_cap{0};
+  std::uint32_t n_gu_cap{0};
   std::uint8_t* d_embtab{nullptr};
   std::uint8_t* d_outtab{nullptr};
   float *h_qnw{nullptr}, *h_knw{nullptr}, *h_attnorm{nullptr},
@@ -570,6 +590,10 @@ struct JevNpuModel::Impl {
     const std::uint32_t n_qkv_cap =
         this->n_qkv_cap != 0 ? this->n_qkv_cap : n_qkv;
     const std::uint32_t n_gu = 2 * inter;
+    const std::uint32_t n_gu_cap = this->n_gu_cap != 0 ? this->n_gu_cap : n_gu;
+    const std::uint32_t n_o_cap = this->n_o_cap != 0 ? this->n_o_cap : hidden;
+    const std::uint32_t n_down_cap =
+        this->n_down_cap != 0 ? this->n_down_cap : hidden;
 
     auto encode_one = [&](const std::vector<JevTensor>& srcs,
                           const std::vector<std::uint32_t>& widths,
@@ -640,15 +664,15 @@ struct JevNpuModel::Impl {
         return false;
       s = {layer.wo};
       ws = {hidden};
-      if (!encode_one(s, ws, q_dim, hidden, wo[l]))
+      if (!encode_one(s, ws, q_dim, n_o_cap, wo[l]))
         return false;
       s = {layer.ffn_gate, layer.ffn_up};
       ws = {inter, inter};
-      if (!encode_one(s, ws, hidden, n_gu, wgu[l]))
+      if (!encode_one(s, ws, hidden, n_gu_cap, wgu[l]))
         return false;
       s = {layer.ffn_down};
       ws = {hidden};
-      if (!encode_one(s, ws, inter, hidden, wdown[l]))
+      if (!encode_one(s, ws, inter, n_down_cap, wdown[l]))
         return false;
     }
     return true;
@@ -659,7 +683,6 @@ struct JevNpuModel::Impl {
     // Prompt
     std::string prompt;
     prompt.reserve(question.size() + context.size() + 512);
-    prompt.append(bos_prefix);
     // Matches tok.apply_chat_template(..., enable_thinking=False) exactly
     // (diffed character-for-character against the real HF template output
     // -- every turn needs its own kImEnd; this was missing before and
@@ -689,7 +712,7 @@ struct JevNpuModel::Impl {
     // reproduced on CPU bf16 reference) -- this is the fix, not a model
     // or NPU bug. See jev-gate-plan.md's 2026-11-05 status.
     prompt.append("<think>\n\n</think>\n\n");
-    const auto tokens = tokenizer->Encode(prompt);
+    const auto tokens = EncodePrompt(prompt);
     if (tokens.empty())
       return {};
     const std::uint32_t n =
@@ -711,6 +734,10 @@ struct JevNpuModel::Impl {
     const std::uint32_t n_qkv_cap =
         this->n_qkv_cap != 0 ? this->n_qkv_cap : n_qkv;
     const std::uint32_t n_gu = 2 * inter;
+    const std::uint32_t n_gu_cap = this->n_gu_cap != 0 ? this->n_gu_cap : n_gu;
+    const std::uint32_t n_o_cap = this->n_o_cap != 0 ? this->n_o_cap : hidden;
+    const std::uint32_t n_down_cap =
+        this->n_down_cap != 0 ? this->n_down_cap : hidden;
 
     // Embed with the GPU into d_x (M x hidden), zero-padded beyond n. No
     // KV reset is needed: JevStoreKvKernel rewrites every cache row.
@@ -747,10 +774,11 @@ struct JevNpuModel::Impl {
         static_cast<std::size_t>(M) * inter / 8 * 9;
     const std::size_t c_qkv_bytes =
         static_cast<std::size_t>(M) * n_qkv_cap / 8 * 9;
-    const std::size_t c_o_bytes = static_cast<std::size_t>(M) * hidden / 8 * 9;
-    const std::size_t c_gu_bytes = static_cast<std::size_t>(M) * n_gu / 8 * 9;
+    const std::size_t c_o_bytes = static_cast<std::size_t>(M) * n_o_cap / 8 * 9;
+    const std::size_t c_gu_bytes =
+        static_cast<std::size_t>(M) * n_gu_cap / 8 * 9;
     const std::size_t c_down_bytes =
-        static_cast<std::size_t>(M) * hidden / 8 * 9;
+        static_cast<std::size_t>(M) * n_down_cap / 8 * 9;
 
     // NPU staging buffers are allocated once and reused across calls: XRT
     // buffer setup is milliseconds and must not repeat per decision.
@@ -772,7 +800,7 @@ struct JevNpuModel::Impl {
     float* qkv = nullptr;
     float* gu = nullptr;
     hipHostMalloc(&qkv, M * n_qkv_cap * sizeof(float));
-    hipHostMalloc(&gu, M * n_gu * sizeof(float));
+    hipHostMalloc(&gu, M * n_gu_cap * sizeof(float));
     for (std::uint32_t l = 0; l < config.num_layers; ++l) {
       // attn norm (gamma rows pre-dequantized at load)
       rocm::RmsNormRows(d_x, h_attnorm + static_cast<std::size_t>(l) * hidden,
@@ -833,7 +861,8 @@ struct JevNpuModel::Impl {
       // rope (NEOX) on the GPU; then store the roped K/V as half cache rows.
       hipLaunchKernelGGL(JevRopeKernel, dim3(n, heads + kv_heads), dim3(hd / 2),
                          0, stream, d_qn, d_kn, d_startpos, n, q_dim, kv_dim,
-                         heads, kv_heads, hd, config.rope_theta, M);
+                         heads, kv_heads, hd, config.rope_theta, M,
+                         config.rope_interleaved);
       hipLaunchKernelGGL(JevStoreKvKernel, dim3(M), dim3(kv_dim), 0, stream,
                          d_kn, d_v, d_kcache[l], d_vcache[l], n, kv_dim);
 
@@ -860,8 +889,8 @@ struct JevNpuModel::Impl {
       npu->Submit(stream, a_qdim, bs_o, cs_o, 1, prog_o);
       npu->Wait(stream);
       hipStreamSynchronize(stream);
-      rocm::NpuDecodeOutput(npu->Staged(stream, c_o), d_attn_out, n, hidden,
-                            hidden, 0, false, stream);
+      rocm::NpuDecodeOutput(npu->Staged(stream, c_o), d_attn_out, n, n_o_cap,
+                            hidden, 0, false, stream, hidden);
       hipStreamSynchronize(stream);
       // residual x += attn_out (GPU)
       hipLaunchKernelGGL(JevAddKernel, dim3((n * hidden + 255) / 256),
@@ -891,15 +920,15 @@ struct JevNpuModel::Impl {
       hipStreamSynchronize(stream);
 
       // decode c_gu -> gate (first inter) + up (second inter)
-      rocm::NpuDecodeOutput(npu->Staged(stream, c_gu), gu, n, n_gu, n_gu, 0,
-                            false, stream);
+      rocm::NpuDecodeOutput(npu->Staged(stream, c_gu), gu, n, n_gu_cap,
+                            n_gu_cap, 0, false, stream);
       hipStreamSynchronize(stream);
       // swiglu straight from the fused gate|up GEMM output (GPU)
       hipLaunchKernelGGL(
           JevSwigluGuKernel,
           dim3(static_cast<std::uint32_t>(
               (static_cast<std::size_t>(n) * inter + 255) / 256)),
-          dim3(256), 0, stream, gu, d_act, inter, n_gu,
+          dim3(256), 0, stream, gu, d_act, inter, n_gu_cap,
           static_cast<std::size_t>(n) * inter);
 
       // down GEMM
@@ -919,8 +948,8 @@ struct JevNpuModel::Impl {
       npu->Submit(stream, a_inter, bs_down, cs_down, 1, prog_down);
       npu->Wait(stream);
       hipStreamSynchronize(stream);
-      rocm::NpuDecodeOutput(npu->Staged(stream, c_down), d_ffn_out, n, hidden,
-                            hidden, 0, false, stream);
+      rocm::NpuDecodeOutput(npu->Staged(stream, c_down), d_ffn_out, n,
+                            n_down_cap, hidden, 0, false, stream, hidden);
       hipStreamSynchronize(stream);
       // residual (GPU)
       hipLaunchKernelGGL(JevAddKernel, dim3((n * hidden + 255) / 256),
@@ -983,6 +1012,10 @@ struct JevNpuModel::Impl {
     const std::uint32_t n_qkv_cap =
         this->n_qkv_cap != 0 ? this->n_qkv_cap : n_qkv;
     const std::uint32_t n_gu = 2 * inter;
+    const std::uint32_t n_gu_cap = this->n_gu_cap != 0 ? this->n_gu_cap : n_gu;
+    const std::uint32_t n_o_cap = this->n_o_cap != 0 ? this->n_o_cap : hidden;
+    const std::uint32_t n_down_cap =
+        this->n_down_cap != 0 ? this->n_down_cap : hidden;
 
     // n is always count*kJevSeqCap, never based on any one question's
     // length: every slot is kJevSeqCap rows regardless of how many of
@@ -999,7 +1032,6 @@ struct JevNpuModel::Impl {
       const auto [question, context] = items[qid];
       std::string prompt;
       prompt.reserve(question.size() + context.size() + 512);
-      prompt.append(bos_prefix);
       // See Run()'s identical framing above -- kImEnd was missing after
       // every turn, a pre-existing bug this fix also corrects.
       prompt.append(tokenization::kImStart);
@@ -1023,7 +1055,7 @@ struct JevNpuModel::Impl {
       // See Run()'s identical framing above: the no-think suffix is the
       // fix for Qwen3's bare-yes/no Yes-saturation, not an NPU bug.
       prompt.append("<think>\n\n</think>\n\n");
-      const auto tokens = tokenizer->Encode(prompt);
+      const auto tokens = EncodePrompt(prompt);
       const std::uint32_t len = std::min<std::uint32_t>(
           static_cast<std::uint32_t>(tokens.size()), kJevSeqCap);
       lens_host[qid] = len;
@@ -1065,10 +1097,11 @@ struct JevNpuModel::Impl {
         static_cast<std::size_t>(M) * inter / 8 * 9;
     const std::size_t c_qkv_bytes =
         static_cast<std::size_t>(M) * n_qkv_cap / 8 * 9;
-    const std::size_t c_o_bytes = static_cast<std::size_t>(M) * hidden / 8 * 9;
-    const std::size_t c_gu_bytes = static_cast<std::size_t>(M) * n_gu / 8 * 9;
+    const std::size_t c_o_bytes = static_cast<std::size_t>(M) * n_o_cap / 8 * 9;
+    const std::size_t c_gu_bytes =
+        static_cast<std::size_t>(M) * n_gu_cap / 8 * 9;
     const std::size_t c_down_bytes =
-        static_cast<std::size_t>(M) * hidden / 8 * 9;
+        static_cast<std::size_t>(M) * n_down_cap / 8 * 9;
     if (a_hidden < 0) {
       a_hidden = npu->NewBuffer(a_hidden_bytes, nullptr);
       a_qdim = npu->NewBuffer(a_qdim_bytes, nullptr);
@@ -1087,7 +1120,7 @@ struct JevNpuModel::Impl {
     float* qkv = nullptr;
     float* gu = nullptr;
     hipHostMalloc(&qkv, M * n_qkv_cap * sizeof(float));
-    hipHostMalloc(&gu, M * n_gu * sizeof(float));
+    hipHostMalloc(&gu, M * n_gu_cap * sizeof(float));
     for (std::uint32_t l = 0; l < config.num_layers; ++l) {
       rocm::RmsNormRows(d_x, h_attnorm + static_cast<std::size_t>(l) * hidden,
                         d_norm, M, hidden, 1, config.rms_eps, stream);
@@ -1135,7 +1168,8 @@ struct JevNpuModel::Impl {
       }
       hipLaunchKernelGGL(JevRopeKernel, dim3(n, heads + kv_heads), dim3(hd / 2),
                          0, stream, d_qn, d_kn, d_startpos, n, q_dim, kv_dim,
-                         heads, kv_heads, hd, config.rope_theta, kJevSeqCap);
+                         heads, kv_heads, hd, config.rope_theta, kJevSeqCap,
+                         config.rope_interleaved);
       hipLaunchKernelGGL(JevStoreKvBatchedKernel, dim3(n), dim3(kv_dim), 0,
                          stream, d_kn, d_v, d_kcache[l], d_vcache[l], n,
                          kv_dim);
@@ -1163,8 +1197,8 @@ struct JevNpuModel::Impl {
       npu->Submit(stream, a_qdim, bs_o, cs_o, 1, prog_o);
       npu->Wait(stream);
       hipStreamSynchronize(stream);
-      rocm::NpuDecodeOutput(npu->Staged(stream, c_o), d_attn_out, M, hidden,
-                            hidden, 0, false, stream);
+      rocm::NpuDecodeOutput(npu->Staged(stream, c_o), d_attn_out, M, n_o_cap,
+                            hidden, 0, false, stream, hidden);
       hipStreamSynchronize(stream);
 
       hipLaunchKernelGGL(JevAddKernel, dim3((n * hidden + 255) / 256),
@@ -1190,14 +1224,14 @@ struct JevNpuModel::Impl {
       npu->Submit(stream, a_hidden, bs_gu, cs_gu, 1, prog_gu);
       npu->Wait(stream);
       hipStreamSynchronize(stream);
-      rocm::NpuDecodeOutput(npu->Staged(stream, c_gu), gu, M, n_gu, n_gu, 0,
-                            false, stream);
+      rocm::NpuDecodeOutput(npu->Staged(stream, c_gu), gu, M, n_gu_cap,
+                            n_gu_cap, 0, false, stream);
       hipStreamSynchronize(stream);
       hipLaunchKernelGGL(
           JevSwigluGuKernel,
           dim3(static_cast<std::uint32_t>(
               (static_cast<std::size_t>(n) * inter + 255) / 256)),
-          dim3(256), 0, stream, gu, d_act, inter, n_gu,
+          dim3(256), 0, stream, gu, d_act, inter, n_gu_cap,
           static_cast<std::size_t>(n) * inter);
 
       hipLaunchKernelGGL(JevToHalfKernel, dim3((n * inter + 255) / 256),
@@ -1216,8 +1250,8 @@ struct JevNpuModel::Impl {
       npu->Submit(stream, a_inter, bs_down, cs_down, 1, prog_down);
       npu->Wait(stream);
       hipStreamSynchronize(stream);
-      rocm::NpuDecodeOutput(npu->Staged(stream, c_down), d_ffn_out, M, hidden,
-                            hidden, 0, false, stream);
+      rocm::NpuDecodeOutput(npu->Staged(stream, c_down), d_ffn_out, M,
+                            n_down_cap, hidden, 0, false, stream, hidden);
       hipStreamSynchronize(stream);
 
       hipLaunchKernelGGL(JevAddKernel, dim3((n * hidden + 255) / 256),
@@ -1274,8 +1308,6 @@ std::unique_ptr<JevNpuModel> JevNpuModel::LoadFromGguf(
   }
   const std::string prefix = std::string(*architecture) + ".";
   auto impl = std::make_unique<Impl>();
-  if (*architecture == "llama")
-    impl->bos_prefix = "<s>";
   auto getu = [&](const std::string& k, std::uint32_t def) {
     auto v = reader.GetMetadataUint32(k);
     return v.has_value() ? *v : def;
@@ -1325,12 +1357,27 @@ std::unique_ptr<JevNpuModel> JevNpuModel::LoadFromGguf(
     if (i == 0)
       impl->config.has_qk_norm = !L.q_norm.empty() && !L.k_norm.empty();
   }
-  impl->tokenizer = tokenization::QwenTokenizer::CreateFromGguf(reader);
+  {
+    // Some community GGUFs ship a vocab list that does not match their own
+    // embedding rows (MiniCPM5-1B-SFT). GUFO_JEV_TOKENIZER_GGUF borrows the
+    // tokenizer from another GGUF of the same family.
+    const char* tok_path = std::getenv("GUFO_JEV_TOKENIZER_GGUF");
+    std::string tok_err;
+    auto tok_reader =
+        tok_path ? core::GgufReader::OpenFile(tok_path, &tok_err) : nullptr;
+    impl->tokenizer =
+        tok_reader ? tokenization::QwenTokenizer::CreateFromGguf(*tok_reader)
+                   : tokenization::QwenTokenizer::CreateFromGguf(reader);
+  }
   if (!impl->tokenizer) {
     if (error_msg)
       *error_msg = "jev: tokenizer load failed";
     return nullptr;
   }
+  if (*architecture == "llama" &&
+      impl->tokenizer->GetBosTokenId() != tokenization::kInvalidTokenId)
+    impl->bos_id = impl->tokenizer->GetBosTokenId();
+  impl->config.rope_interleaved = *architecture == "llama";
   if (const char* env = std::getenv("GUFO_JEV_SYS"))
     impl->sys_prompt = env;
   {
@@ -1384,9 +1431,12 @@ std::unique_ptr<JevNpuModel> JevNpuModel::LoadFromGguf(
   const std::uint32_t n_qkv_cap = pad_to_available_n(hidden, n_qkv);
   impl->n_qkv_cap = n_qkv_cap;
   impl->prog_qkv = impl->npu->AddProgram(insts(hidden, n_qkv_cap), &err);
-  impl->prog_o = impl->npu->AddProgram(insts(q_dim, hidden), &err);
-  impl->prog_gu = impl->npu->AddProgram(insts(hidden, n_gu), &err);
-  impl->prog_down = impl->npu->AddProgram(insts(inter, hidden), &err);
+  impl->n_o_cap = pad_to_available_n(q_dim, hidden);
+  impl->prog_o = impl->npu->AddProgram(insts(q_dim, impl->n_o_cap), &err);
+  impl->n_gu_cap = pad_to_available_n(hidden, n_gu);
+  impl->prog_gu = impl->npu->AddProgram(insts(hidden, impl->n_gu_cap), &err);
+  impl->n_down_cap = pad_to_available_n(inter, hidden);
+  impl->prog_down = impl->npu->AddProgram(insts(inter, impl->n_down_cap), &err);
   if (impl->prog_qkv < 0 || impl->prog_o < 0 || impl->prog_gu < 0 ||
       impl->prog_down < 0) {
     if (error_msg)
