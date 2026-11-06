@@ -3149,6 +3149,96 @@ HttpResponse StreamingResponse(
   };
 }
 
+/// Pre-route answering: a small, self-contained request that explicitly asks
+/// for a Yes/No answer is put to the resident jev judge, and a confident
+/// verdict is returned without decoding the main model at all. Only requests
+/// with no tools, no structured output and a single user turn qualify.
+constexpr float kJevPreConfidence = 0.9F;
+constexpr std::size_t kJevPreMaxPromptBytes = 512;
+
+std::optional<HttpResponse> TryJevPreRoute(const ParsedChatRequest& parsed,
+                                           TextGenerationBackend& backend) {
+  const auto& chat = parsed.chat;
+  if (!chat.tools.empty() || chat.response_format != nullptr ||
+      chat.constrained_tools || !chat.forced_tool_name.empty() ||
+      !chat.stop_sequences.empty() || chat.return_progress) {
+    return std::nullopt;
+  }
+  if (chat.messages.size() != 1)
+    return std::nullopt;
+  const auto& message = chat.messages.front();
+  if (message.role != tokenization::ChatRole::kUser)
+    return std::nullopt;
+  const std::string& prompt = message.content;
+  if (prompt.empty() || prompt.size() > kJevPreMaxPromptBytes)
+    return std::nullopt;
+  std::string lowered(prompt.size(), '\0');
+  std::transform(
+      prompt.begin(), prompt.end(), lowered.begin(),
+      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  if (lowered.find("yes or no") == std::string::npos &&
+      lowered.find("no or yes") == std::string::npos) {
+    return std::nullopt;
+  }
+  const auto verdict = backend.JevPreAnswer(prompt, {});
+  if (!verdict)
+    return std::nullopt;
+  const float confidence = std::max(verdict->first, verdict->second);
+  Logger::LogFormatted(LogLevel::kInfo, "jev-pre", "yes=%.2f no=%.2f conf=%.2f",
+                       verdict->first, verdict->second, confidence);
+  if (confidence < kJevPreConfidence)
+    return std::nullopt;
+  const std::string answer = verdict->first >= verdict->second ? "Yes." : "No.";
+
+  if (!parsed.stream) {
+    json::Value response = json::Value::object();
+    response["id"] = RandomId("chatcmpl-");
+    response["object"] = "chat.completion";
+    response["created"] = Now();
+    response["model"] = backend.model_id();
+    json::Value choice = json::Value::object();
+    choice["index"] = 0;
+    json::Value out_message = json::Value::object();
+    out_message["role"] = "assistant";
+    out_message["content"] = answer;
+    choice["message"] = std::move(out_message);
+    choice["finish_reason"] = "stop";
+    json::Value choices = json::Value::array();
+    choices.push_back(std::move(choice));
+    response["choices"] = std::move(choices);
+    json::Value usage = json::Value::object();
+    usage["prompt_tokens"] = 0;
+    usage["completion_tokens"] = 1;
+    usage["total_tokens"] = 1;
+    response["usage"] = std::move(usage);
+    return HttpResponse{.status = 200,
+                        .reason = "OK",
+                        .body = response.dump(),
+                        .headers = {{"Server-Timing", "jev-pre;dur=1"}}};
+  }
+
+  const std::string id = RandomId("chatcmpl-");
+  const long long created = Now();
+  const std::string model = backend.model_id();
+  json::Value role_delta = json::Value::object();
+  role_delta["role"] = "assistant";
+  json::Value content_delta = json::Value::object();
+  content_delta["content"] = answer;
+  std::string body =
+      Sse(ChoiceChunk(id, created, model, std::move(role_delta))) +
+      Sse(ChoiceChunk(id, created, model, std::move(content_delta))) +
+      Sse(ChoiceChunk(id, created, model, json::Value::object(), "stop")) +
+      "data: [DONE]\n\n";
+  return HttpResponse{
+      .status = 200,
+      .reason = "OK",
+      .body = std::move(body),
+      .headers = {{"Content-Type", "text/event-stream"},
+                  {"Cache-Control", "no-cache"},
+                  {"X-Accel-Buffering", "no"}},
+  };
+}
+
 }  // namespace
 
 bool ParseOpenAiResponseMessage(const json::Value& item,
@@ -3940,6 +4030,8 @@ HttpResponse HandleOpenAiChat(const HttpRequest& request,
   if (auto error = ParseRequest(request, backend, &parsed); error.has_value()) {
     return std::move(*error);
   }
+  if (auto pre = TryJevPreRoute(parsed, backend); pre.has_value())
+    return std::move(*pre);
   try {
     const auto initial_output_state = backend.initial_output_state(parsed.chat);
     auto generation =

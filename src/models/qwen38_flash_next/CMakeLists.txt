@@ -61,9 +61,12 @@ if (ENGINE_ENABLE_HIP)
     ${QFN_ROCM_DIR}/device_model.cpp
     ${QFN_ROCM_DIR}/executor.cpp
     ${QFN_ROCM_DIR}/batch.cpp
-    engine.cpp)
+    engine.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/jev_npu.hip.cpp)
   target_sources(gufo_qwen38_flash_next PRIVATE ${QFN_HIP_SOURCES})
   set_source_files_properties(${QFN_ROCM_DIR}/kernels.hip.cpp PROPERTIES LANGUAGE HIP)
+  set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/jev_npu.hip.cpp
+    PROPERTIES LANGUAGE HIP)
 
   # Optional: offload part of the wide-batch dense projections to the XDNA2
   # NPU through XRT (see kernels/rocm/npu_gemm.hpp). Needs the XRT headers.

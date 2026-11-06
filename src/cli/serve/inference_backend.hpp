@@ -172,6 +172,8 @@ public:
   [[nodiscard]] ReasoningOptions reasoning_defaults() const override;
   [[nodiscard]] bool jev_gate_enabled() const override;
   [[nodiscard]] bool jev_inline_enabled() const override;
+  [[nodiscard]] std::optional<std::pair<float, float>> JevPreAnswer(
+      std::string_view question, std::string_view context) const override;
   [[nodiscard]] InitialOutputState initial_output_state(
       const ChatRequest& request) const override;
   void set_model_id(const std::string& model_id);
@@ -184,6 +186,7 @@ public:
   void set_reasoning_defaults(const ReasoningOptions& reasoning);
   void set_jev_gate_enabled(bool enabled);
   void set_jev_inline_enabled(bool enabled);
+  void set_jev_pre_enabled(bool enabled);
 
   /// Plain text completion (no chat framing).
   Result complete(std::string_view prompt, std::size_t max_tokens,

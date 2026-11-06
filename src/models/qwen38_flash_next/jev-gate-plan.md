@@ -29,6 +29,306 @@ without losing the answer quality that `xhigh` gives it on genuinely hard
 problems. This is a full rewrite of the original pre-gate-only draft —
 both mechanisms are now the main idea, not an optional stage 2.
 
+## Status 2026-11-05c — architecture decision: NPU+light-GPU-glue hybrid confirmed as production, NOT full-NPU microcode
+
+Reconciles a contradiction between this file and
+`~/torch2aie/examples/qwen3-decode-layer/TRACE-HANG-INSTRUMENTATION.md`:
+this file's "Status as of 2026-11-03" section below says the full-layer
+hang is still the open blocker — **that's stale.** It was resolved on
+2026-11-04 (root cause was the test oracle's stale 8B-model GQA
+constants, not an NPU bug) and that project went on to a full 28-layer
+pure-NPU Qwen3-0.6B decode at 3.87 tok/s (zero GPU, zero CPU compute).
+Full history in that doc, not repeated here.
+
+Given that real alternative exists, the question "should jev be
+pure-NPU (zero GPU) or NPU-GEMMs+light-GPU-glue" was asked and answered
+with real numbers from both paths:
+- **Current hybrid** (`jev_npu.hip.cpp`, this worktree): NPU GEMMs are
+  ~98% of FLOPs per decision (36-43ms); the entire GPU glue (embed,
+  RMSNorm, RoPE, attention, block-float encode/decode, final Yes/No
+  scoring) is one ~9.7ms burst (encode 6.0 + decode 1.4 + attention
+  2.3) — not sustained GPU load. **61-77ms/decision end to end.**
+- **torch2aie fully-NPU path**: zero GPU, zero CPU compute, but ~258ms/
+  decision (3.87 tok/s for the full 28-layer forward) — **~4x slower**.
+
+**Decision: keep the NPU+light-GPU-glue hybrid as production jev.**
+Accept the bounded, short GPU-glue burst for 4x the speed. The
+torch2aie fully-NPU decode layer is not being adopted for jev; it
+remains a proven, working artifact (in case GPU contention turns out
+to matter more than measured once jev runs concurrently with real
+Flash-Next decode load — re-open this decision if that measurement
+ever shows real contention, don't re-litigate it without one).
+
+**Current real status (2026-11-05, from the live punch list), supersedes
+scattered status entries below where they conflict:**
+
+| Model | Quant | NPU runnable | Battery | Notes |
+|---|---|---|---|---|
+| Qwen3-0.6B | Q6_K | yes, live judge | 6/10 trivia, 8/12 code | current default |
+| Qwen3-1.7B | Q6_K | yes (insts generated) | frozen all-Yes (explained: thinking-model artifact, see below) | CPU ref: 8/10, 11/12 with no-think suffix |
+| MiniCPM5-1B/2B | Q6_K (download `mradermacher`, not the local Q4_K_M) | not yet | — | Llama arch; no new dequant kernels needed now that a Q6_K build exists; see scoping below (arch-gate/qk-norm-guard/tokenizer-preset items) |
+| Qwen3-{0.6B,1.7B}-hf (bf16) | — | CPU reference only (`/tmp/refenv`) | — | used to validate NPU faithfulness, not for production |
+
+**The big finding (unblocks 1.7B):** Qwen3 small models answer bare
+yes/no prompts with Yes saturated (+9 logit gap, every framing tried
+including few-shot) — reproduced on torch CPU, so this was never an NPU
+bug. Fix: Qwen3's official no-think suffix
+(`<|im_start|>assistant\n<think>\n\n</think>\n\n`) after the assistant
+turn. CPU-verified: 1.7B goes from useless (frozen Yes) to 11/12 code,
+8/10 trivia.
+
+**Punch list (current), in priority order:**
+1. Port the no-think suffix into the judge's C++ prompt framing
+   (`JevNpuModel::Impl::Run`/`RunBatch` in `jev_npu.hip.cpp`) — the
+   unlock for 1.7B.
+2. NPU A/B: 1.7B vs 0.6B with the new framing → pick the production
+   judge model.
+3. Calibrate on real coding-agent traffic, not just the trivia/code
+   battery, plus the confidence threshold for Part B
+   ("silence = no injection" guardrail already specified below).
+4. MiniCPM5-1B/2B port — download the Q6_K GGUFs (`mradermacher`, see
+   below; no new dequant kernels needed, that was dropped once a Q6_K
+   build was found) plus the
+   architecture-gate/qk-norm-guard/tokenizer-preset items already
+   scoped below.
+5. Serve integration: `--jev-pre` exists already
+   (`EnsureJevAnswer`/`TryJevPreRoute` in `inference_backend.cpp`/
+   `openai_chat.cpp`) but is gated off in production because of the
+   pre-fix calibration bug; repoint it at the fixed Q6_K/no-think judge
+   and re-run the 3-arm measurement (`tests/functional/jev_gate_measure.sh`).
+6. Chase the NPU time floor: measured 36-43ms vs. ~21ms theoretical
+   per-decision NPU time, and the 61 vs 76ms call-to-call variance —
+   not yet root-caused.
+7. Cleanup: debug prints still in `jev_npu.hip.cpp`, format + commit
+   (`feat/jevgate`, currently all uncommitted).
+
+## Next: MiniCPM5-1B/2B port (scoped, not started)
+
+MiniCPM5-2B GGUF found at `/mnt/raid0/user_cache/huggingface/hub/models--bartowski--MiniCPM5-2B-GGUF`
+(`MiniCPM5-2B-Q4_K_M.gguf`; no 1B found in this cache, only 2B). Checked
+its metadata with `gguf-dump` (`~/.local/bin/gguf-dump --no-tensors`,
+much more reliable than hand-parsing the GGUF header -- don't redo that):
+`general.architecture = 'llama'`, `block_count=42`,
+`embedding_length=2048`, `feed_forward_length=6144`,
+`attention.head_count=16`, `attention.head_count_kv=2`,
+`rope.freq_base=5000000.0`, `rope.dimension_count=128`,
+`attention.layer_norm_rms_epsilon≈1e-6`. Same architecture family
+`jev_npu.hip.cpp` already supports generically (RMSNorm + RoPE + GQA +
+SwiGLU) -- this is a near drop-in, not a kernel rewrite, but three real
+things block it, found by reading `JevNpuModel::LoadFromGguf`
+(`jev_npu.hip.cpp:1462+`) directly, not guessed:
+
+1. **Architecture gate.** Line ~1465 hardcodes
+   `*architecture != "qwen3"` and rejects anything else. The rest of the
+   loader already derives its metadata key prefix from the architecture
+   string itself (`prefix = *architecture + "."`), so allowing `"llama"`
+   too should make the `llama.block_count` etc. lookups work without
+   further changes to that part.
+2. **Q/K-norm tensors are assumed to exist, unconditionally.**
+   `L.q_norm = BindTensor(reader, b + "attn_q_norm.weight")` /
+   `k_norm` likewise (`jev_npu.hip.cpp:1513-1514`), then
+   `DequantizeRow(impl->layers[l].q_norm, ...)` at load time
+   (`:1669-1672`) and `rocm::RmsNormRows(d_q, h_qnw, ...)` /
+   `RmsNormRows(d_k, h_knw, ...)` at runtime in **both** `Run()` and the
+   `RunBatch()` added above. Per-head Q/K RMSNorm before RoPE is a Qwen3
+   architectural feature, not a standard Llama-architecture one --
+   MiniCPM5 (plain `llama` arch) almost certainly has neither tensor.
+   `BindTensor` on a missing tensor returns one with `data == nullptr`
+   (`JevTensor::empty()` checks exactly this,
+   `jev_npu.hip.cpp:53-60`); `DequantizeRow` does
+   `tensor.data + row * row_bytes` with no null check
+   (`jev_npu.hip.cpp:112-117`) -- this **will crash** on load for a
+   model without these tensors, not fail gracefully. Fix: guard the two
+   `DequantizeRow` calls with `!tensor.empty()`, add a
+   `bool has_qk_norm` to `JevConfig` set at load time, and skip the
+   `RmsNormRows(d_q/d_k, ...)` step at runtime when false (feed `d_q`/
+   `d_k` straight into RoPE unnormalized instead of through `d_qn`/
+   `d_kn`) -- applying RMSNorm with a zero/garbage gamma would silently
+   corrupt output rather than just fail, so this must be skipped, not
+   defaulted.
+3. **Tokenizer preset unverified.** MiniCPM5's GGUF declares
+   `tokenizer.ggml.pre = 'minicpm5'`, a custom pre-tokenizer regex
+   preset name. `QwenTokenizer::CreateFromGguf` (used unconditionally by
+   this loader, `jev_npu.hip.cpp:1519`) needs to actually support that
+   preset name in its regex table -- check this *before* trusting any
+   MiniCPM5 output, since an unrecognized preset is the kind of failure
+   that can produce plausible-looking but wrong tokenization silently,
+   not a loud error. Check `tokenization::QwenTokenizer`'s preset table
+   for `"minicpm5"` (or whatever fallback it uses for an unknown preset)
+   before doing anything else in this port -- if that's wrong, the rest
+   of the port isn't worth starting yet.
+
+**Model source changed (2026-11-05d): download Q6_K instead of adding
+Q4_K/Q8_0 dequant kernels.** The only GGUF found locally
+(`bartowski/MiniCPM5-2B-GGUF`, Q4_K_M) and the official `openbmb` repos
+only ship F16/Q4_K_M/Q8_0 -- neither is a quant type `jev_npu.hip.cpp`
+currently dequantizes (only `Q4_0`/`Q6_K` are implemented). Adding
+Q4_K/Q8_0 dequant kernels was the original plan but is real, unnecessary
+engineering when a Q6_K build already exists: `mradermacher` mirrors the
+full standard llama.cpp quant matrix (confirmed via the HF API, not
+guessed) for both sizes, instruct-tuned (not `-Base`) variants:
+- 2B: `mradermacher/MiniCPM5-2B-GGUF` → `MiniCPM5-2B.Q6_K.gguf`
+- 1B: `mradermacher/MiniCPM5-1B-SFT-GGUF` → `MiniCPM5-1B-SFT.Q6_K.gguf`
+  (`-SFT` is the instruct checkpoint name for the 1B release; the 1B
+  i1-GGUF variant also has `Q4_0` if Q6_K turns out to need
+  requantization-level accuracy checking, but start with Q6_K)
+
+Download these instead of starting point 2's Q4_K/Q8_0 dequant work --
+that work is now out of scope for this port entirely, not just
+deferred, since there's no remaining reason to need it.
+
+Build order once resumed: (1) download the Q6_K GGUFs above, (2)
+tokenizer preset check (cheapest to verify, blocks everything else if
+wrong), (3) architecture gate (point 1), (4) q/k-norm guard at load +
+both runtime paths (point 2), (5) build, then validate with `gufo judge
+--model .../MiniCPM5-2B.Q6_K.gguf --battery` and `--battery --batched`
+against known-answer verdicts the same way the Qwen3 batching change was
+validated above -- bit-identical verdicts between single and batched
+paths is the correctness bar, not just "it doesn't crash."
+
+## Status 2026-11-05e — MiniCPM5 port: mechanically done, output blocked by the same suspected bug as Qwen3-1.7B
+
+Done (builds clean, `MiniCPM5-2B-Q6_K.gguf` loads and runs end to end, no crash):
+- Q6_K GGUFs downloaded to `~/jev-model/` (`MiniCPM5-2B-Q6_K.gguf`,
+  `MiniCPM5-1B-SFT-Q6_K.gguf`), no new dequant kernels needed.
+- Architecture gate accepts `llama`; `has_qk_norm` guards the load-time
+  dequant and the runtime Q/K RMSNorm (copy `d_q`->`d_qn`, `d_k`->`d_kn`
+  when absent).
+- Tokenizer: `minicpm5` preset now maps to `kQwen35` (was silently `kNone` =
+  no pre-split regex at all). Known gap: minicpm5 groups digits `\p{N}{1,3}`,
+  `Qwen35PieceEnd` emits one digit at a time. NOT yet byte-verified against
+  the HF tokenizer.
+- Prompt: MiniCPM5's template is ChatML like Qwen (confirmed from the GGUF
+  `chat_template`) and its no-think suffix is byte-identical, but it also
+  prepends `bos_token` (`<s>`); added `Impl::bos_prefix`, set only for the
+  `llama` architecture.
+- N=2560 (2B qkv) has no instruction file and `aiecc` aborts in
+  `generateCdoArtifacts` generating it. Worked around by padding: `n_qkv_cap`
+  = smallest existing N >= n_qkv (4096), `encode_one` now sizes the weight
+  buffer to the padded width (its 4th arg was previously ignored), and
+  `JevSplitQkvKernel` takes the padded row stride. No effect on models with
+  an exact match.
+
+Result: 2B battery 6/10 trivia, 7/12 code, every answer ~0.96-0.97 Yes
+(saturated, same signature as Qwen3-1.7B). MiniCPM5-2B has `q_dim == hidden`
+(2048 == 2048), the only confirmed structural difference behind the Qwen3-1.7B
+failure (`JEV-1.7B-BUG.md`), so this is very likely the same unresolved
+engine bug, not a MiniCPM5 problem. Not CPU-verified.
+
+Differentiator test, not yet run: MiniCPM5-1B has `hidden=1536`,
+`q_dim=2048` (unequal) so it should work if the hypothesis is right. It needs
+new instruction files for K=1536 base, qkv (n_qkv=2560, padded to 4096), o
+(K=2048,N=1536), gu (K=1536,N=9216), down (K=4608,N=1536); N=1536/9216 may hit
+the same `aiecc` crash. Resume after the 1.7B bug is fixed.
+
+## Status 2026-11-05b — batched AnswerBatch: ~2.2-2.6x throughput, verified bit-identical
+
+Added `JevNpuModel::AnswerBatch` (`jev_npu.hip.cpp`'s `Impl::RunBatch`,
+`kJevBatchMax`/`kJevSeqCap` constants) — answers up to 4 independent
+questions in one NPU pass instead of one question per pass. The NPU
+program and every staging buffer were already fixed at M=512 rows
+regardless of how many are real tokens (single-question `Run()` already
+pads one ~30-token question out to 512 rows every call), so packing 4
+questions into 4x128-row slots instead of 1 question into mostly-padding
+uses capacity that was already being spent and thrown away. Verified via
+`gufo judge --battery --batched` against the existing `--battery`
+baseline: **verdicts bit-identical** (same yes/no probabilities to 2
+decimals, same 6/10 score, same misses) across all 10 trivia questions —
+batching is numerically transparent. Measured: **29.9 ms/question
+batched vs 61-77 ms/question single-question — ~2.2-2.6x throughput.**
+
+Implementation: each question gets a fixed `kJevSeqCap=128`-row slot
+(`kJevBatchMax=4`, `4*128=M=512`); `JevRopeKernel` gained a `seq_cap`
+param (position resets per slot, `row % seq_cap` not global `row`);
+new `JevStoreKvBatchedKernel`/`JevAttnBatchedKernel` variants added
+rather than modifying the single-question kernels in place (`AttnBatched`
+takes `seq_cap` + a `d_lens` device array so causal attention never
+crosses a slot boundary or reads past that question's own real length);
+GEMM projections (qkv/o/gu/down) needed no changes at all since they're
+purely row-independent. `judge.cpp` gained `--batched` wired through a
+new `print_battery_batched` using `AnswerBatch` directly, for exactly
+this kind of regression check going forward.
+
+Not yet done: wiring this into the real Part A/B call sites (still
+single-question `Answer()` there) — `AnswerBatch` exists and is proven,
+but nothing outside the judge CLI calls it yet. For Part A (one pre-gate
+call per request) batching doesn't apply directly; for Part B (multiple
+self-posed questions per request) this is exactly the shape of workload
+to batch into one `AnswerBatch` call instead of several `Answer()` calls.
+
+## Status 2026-11-05 (late) — 1.7B CORRECT: two engine bugs fixed; A/B settled (1.7B wins)
+
+The "garbage output" bug was TWO real engine bugs (full write-up +
+ruled-out list in `JEV-1.7B-BUG.md`, now RESOLVED):
+
+1. `encode_one` encoded every 128-col weight tile from rows 0..127 with
+   K truncated to 128 (`row0`/`k_valid` args to `NpuEncodeWeightsQuant`).
+   Fixed: one full-width encode call per source into the fused buffer.
+2. `JevAttnKernel`/`JevAttnBatchedKernel` softmax max reduction kept each
+   thread's butterfly *suffix* max and skipped `red[0]`, weighting keys by
+   `exp(s_p − suffixmax_p)`. Near-uniform early layers hid it (cos 0.999
+   at L0–L2), peaked deep layers diverged (0.23 by L27). Fixed: adopt
+   `max(red[0..warps])`. (The `sum` reduction was already correct.)
+
+Validation vs torch fp32 CPU reference (same no-think framing, n=54):
+qkv-l0 elementwise cos 0.9999; `s2qkv` L13 = 2.485e6 vs torch 2.486e6
+(0.04%). **A/B settled — 1.7B is the production judge:** NPU 1.7B
+trivia 7/10 + code 11/12 = **18/22** (CPU 19/22; its 3 misses are the
+CPU model's own), NPU 0.6B 14/22 (CPU 13/22 — 0.6B base framing has
+`sep=NO`: every logit gap positive, so 0.6B cannot veto negatives at all).
+Timings (exclusive NPU, single calls): **1.7B ≈ 140 ms**, 0.6B ≈ 76 ms;
+batched (4 q/pass) 44.6 ms/question. `--batched` (RunBatch) verified
+identical scores — that's what serve would batch into later.
+
+`--jev-pre` serve wiring: `EnsureJevAnswer` now prefers the NPU judge on
+GUFO_NPU builds (GUFO_JEV_NPU=0 forces CPU), default model
+`$HOME/jev-model/Qwen3-1.7B-Q6_K.gguf`; CPU 0.6B snapshot stays the
+fallback. End-to-end serve test under `GUFO_JEV_PRE` in progress below.
+
+Calibration note: with the no-think framing the verdicts are saturated
+(0.00/1.00 on 19 of 22 battery questions); the useful calibration axis
+for real traffic is `kJevPreConfidence` in `openai_chat.cpp` (0.9) + the
+yes/no prompt detection, not per-question scores.
+
+## Status 2026-11-05 — standalone `gufo judge` fast + healthy; yes-bias root-caused; porting no-think framing
+
+Standalone judge (`gufo judge`, `src/cli/judge/`) on Qwen3-0.6B-Q6_K:
+**61–77 ms/call** (from 82–118), verdicts stable across repeats, battery
+trivia 6/10 + code 8/12. Perf work landed in `jev_npu.hip.cpp`: decode
+`n` rows instead of the 512 padding, activation encode window `enc_rows`
+(n rounded to 128) instead of 512, and NPU staging buffers (`a_hidden`,
+`c_qkv`, …) allocated once in `Impl` instead of per call (that alone was
+11–15 ms of `pre`). A partial-buffer `Submit` sync was tried and reverted:
+it isn't needed and (like the buffer-reuse mistake below) faults.
+
+**Call-2 `Memory Fault Error` in `NpuDecodeOutputKernel` — RESOLVED.** Root
+cause was allocating `qkv`/`gu` pinned host buffers once per process
+(cached in `h_qkv`/`h_gu`); allocating them per `Run()` call is clean
+(proved by A/B in an exclusive NPU window). Persistent NPU *staging*
+buffers are fine and stay. Post-fix battery shows no stale poisoning
+(`yes=0.000 no=0.000` symptom gone). Health check rule: validate every
+perf build with a multi-question battery in ONE process; repeats of one
+question hide stale-data poisoning. `~/jev-test.sh` wraps the exclusive
+window (stop supervisor+serve → test → `setsid` restart of
+`FORCE=1 JOBS=1 GUFO_EFFORT=low ./run-gufo.sh` → wait `/v1/models`; all
+fds of the restart must be redirected or the caller hangs on the pipe).
+
+**Judge intelligence (the "smarter for code" ask) — root-caused, not a
+compute bug.** Qwen3 models are thinking models: asked "Answer Yes or No"
+directly, raw Qwen3-1.7B on torch CPU bf16 answers p(Yes)=1.000 on ALL 22
+battery questions (+9 to +11 logit gap) for every single-shot AND few-shot
+framing tried; 0.6B separates weakly (13/22). The frozen all-Yes verdicts
+seen from the NPU 1.7B judge therefore mirror real model behavior —
+NPU math validated as faithful. The lever is Qwen3's **no-think suffix**:
+framing the assistant turn as `<|im_start|>assistant\n<think>\n\n</think>\n\n`
+(official `enable_thinking=False` template) gives **1.7B 19/22 total,
+11/12 code** on the CPU reference (sweep scripts in `~/jev-ref/`:
+`nothink_battery.py`, `prompt_sweep.py`; `/tmp/refenv/bin/python`,
+`Qwen3-{0.6B,1.7B}-hf` + `-GGUF` in `~/jev-model/`). Next: append that
+suffix (token ids via the judge tokenizer) in `JevNpuModel::Run` framing
+and adopt 1.7B (Q6_K) as the judge model; 0.6B stays the fallback.
+MiniCPM5-1B/2B ports follow.
+
 ## Status 2026-11-04 — Part A rule-gate MEASURED (3-arm), shipping; NPU chain debug continues separately
 
 `tests/functional/jev_gate_measure.sh`, 24 prompts (12 trivial, 12 hard),

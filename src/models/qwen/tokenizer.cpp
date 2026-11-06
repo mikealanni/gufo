@@ -409,6 +409,18 @@ std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromGguf(
       tokenizer->pre_tokenizer_ = PreTokenizer::kGlm4;
     } else if (*pre == "laguna") {
       tokenizer->pre_tokenizer_ = PreTokenizer::kLaguna;
+    } else if (*pre == "minicpm5") {
+      // MiniCPM5's tokenizer.json regex (llama.cpp's
+      // LLAMA_VOCAB_PRE_TYPE_MINICPM5) is byte-for-byte the same
+      // contraction/letter-run/punctuation-run family Qwen35PieceEnd
+      // already implements, with one known gap: minicpm5 groups digits
+      // `\p{N}{1,3}` (up to 3 per piece); Qwen35PieceEnd emits one digit
+      // at a time. Still far closer than falling through to kNone (which
+      // skips pre-split regex entirely and feeds the whole text into BPE
+      // merge as one chunk -- silently wrong, not just approximate).
+      // Verify byte-exact against the real HF tokenizer before trusting
+      // output on text with multi-digit numbers.
+      tokenizer->pre_tokenizer_ = PreTokenizer::kQwen35;
     }
   }
 
