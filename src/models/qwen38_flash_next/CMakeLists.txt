@@ -3,6 +3,7 @@
 add_library(gufo_qwen38_flash_next STATIC
   config.cpp
   continuation_layout.cpp
+  jev_finish.cpp
   jev_gate.cpp
   jev_inline.cpp
   jev_model.cpp

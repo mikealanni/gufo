@@ -985,3 +985,41 @@ Root causes (the earlier "q_dim/saturation/padding" theories were all wrong):
 4. **1B GGUF vocab is broken**: `MiniCPM5-1B-SFT-Q6_K.gguf` ships a vocab list that does not match its own embedding rows (id 22 = `<tr>` instead of `!`, newline = 65324). Embedding rows match HF ids. Workaround: `GUFO_JEV_TOKENIZER_GGUF=<2B gguf>` borrows the 2B tokenizer (identical to HF). Production use of 1B needs that env or a re-converted GGUF.
 
 Recommendation: 2B (18/22, same as Qwen3-1.7B, ~2x the NPU time per question) is not better than Qwen3-1.7B (18/22); 1B is ~2x faster per batched question (31-36 ms vs 59) at 17/22. Next: A/B on the replay traces before choosing; judge defaults unchanged.
+
+## Finish detector (rule-based "did the model stop unfinished?")
+
+`jev_finish.{hpp,cpp}`: `EvaluateFinishRules` / `JudgeFinish(task, response, had_tool_call, finish_reason)`.
+Silence means finished; a turn with a tool call is never flagged. Rules (score): length (1.0), unclosed
+code fence (0.95), empty answer on `stop` (0.9), open end `:` `,` `(` (0.85), last word dangling
+(0.85, lowercase only), announced next action in the last sentence (0.8), plan with no execution
+(0.7), unbalanced closed code block (0.65), unpunctuated last paragraph (0.62), tiny answer to a long
+task (0.45) and unpunctuated last list item (0.45). Threshold `kJevFinishThreshold = 0.6`.
+Handoffs to the reader ("tell me:", "run ...", lines containing you/please) are not flagged.
+
+Replay: `gufo judge --finish-replay <dir> [--finish-verbose]`. Corpus builder `~/jev-finish/build_corpus.py`
+(7,230 turns in `~/jev-finish/corpus`): opencode assistant turns (finish stop/length/tool-calls),
+`~/jev-gate-run` responses, the AIME #15 stop, and 600 synthetic mid-sentence truncations of finished
+answers. Labels: finished = natural stop or tool call; unfinished = finish=length, AIME #15, a stop
+that the user's next message answered with "continue"-style text (152 real cases), or a synthetic cut.
+
+Result at threshold 0.6: precision 0.796, recall 0.343 (TP 296, FP 76, FN 567, TN 6291).
+- Real user stops (opencode-cont, n=152): recall 0.18 (28), precision 1.0.
+- Synthetic mid-sentence cuts (n=600): recall 0.34. AIME #15 (empty answer, finish=stop): caught.
+- Per rule precision: length 1.0, stopword 1.0 (83), bare 1.0 (61), fence 0.93, open_end 0.93,
+  announce 0.56, empty 0.28.
+- The 76 "false positives" are label noise, not wrong flags: 60 are genuinely empty `stop` turns (0 or
+  reasoning-only output) and 15 of the other 16 were read by hand and are real stalls ("Let me start
+  by understanding the project structure." then stop, tool call written as text, answer cut inside a
+  code fence). One is borderline (status report ending "Next I'll do the same pass ..."). Nothing in
+  the 6,291 other finished turns was flagged. The "finished" label cannot see a model that stopped
+  early without the user saying so, so the strict precision understates the real one.
+- Unpunctuated list items (bare_item) fired on 98 finished turns, so it stays below the threshold.
+
+Integration (not wired): at the turn-end hook in `inference_backend.cpp`, when the model finishes with
+`finish=stop` and no tool call, call `JudgeFinish`; if `unfinished`, append a continuation user turn
+("Continue; the task is not complete." plus the reason) and resume decoding on the cached prefix.
+Loop guard: at most 2 auto-continues per request, never twice on the same reason with an unchanged
+tail, and never when `finish=length` is the cause (the budget, not the model, stopped it). Recall
+is the weak side (real stops are mostly "announce then stop" or empty, which it catches, but also
+finished-sounding summaries it cannot see); a jev yes/no on the task plus the tail would add recall
+only if a labeled set shows the judge separates them.
