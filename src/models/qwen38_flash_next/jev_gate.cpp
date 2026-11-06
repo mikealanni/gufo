@@ -413,7 +413,17 @@ std::string AgentBlocker(const JevToolResult& result) {
   if (AgentIsShell(result.tool)) {
     if (!AgentInspectCommand(result.command)) {
       std::size_t end = 0;
-      const std::string_view word = FirstWord(result.command, &end);
+      std::string_view command = result.command;
+      std::string_view word = FirstWord(command, &end);
+      if (word == "cd") {
+        const std::size_t amp = command.find("&&", end);
+        const std::size_t semi = command.find(';', end);
+        const std::size_t sep = std::min(amp, semi);
+        if (sep != std::string_view::npos) {
+          command.remove_prefix(sep + (sep == amp ? 2 : 1));
+          word = FirstWord(command, &end);
+        }
+      }
       return "cmd=" + std::string(word.substr(0, 24));
     }
     if (result.output.size() >= kAgentShellOutputMax)
