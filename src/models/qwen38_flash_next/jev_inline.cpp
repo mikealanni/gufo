@@ -176,6 +176,9 @@ bool IsJevSelfQuestion(std::string_view sentence) {
   if (HasAny(folded, kReaderWords)) {
     return false;
   }
+  if (HasBounded(folded, "or")) {
+    return false;
+  }
   std::string_view rest = StripLeadIns(folded);
   if (StartsWithWord(rest, kWhWords)) {
     return false;
