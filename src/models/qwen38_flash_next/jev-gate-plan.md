@@ -972,3 +972,16 @@ Findings:
   tightened, then re-measure; kJevPreConfidence cannot be inferred from this
   data (Part A needs the 3-arm run). Needs a ground-truth label set for real
   precision numbers.
+
+## Status 2026-11-06 — MiniCPM5 port WORKS (root causes found)
+
+CPU reference (`~/jev-ref/minicpm_battery.py`): 2B 18/22, 1B 19/22.
+NPU after fixes: **2B 9/10 + 9/12 = 18/22 (identical misses to CPU), 1B 9/10 + 8/12 = 17/22**; Qwen3-1.7B unchanged (7/10, 11/12). Batched 2B ~68-81 ms/q, 1B ~31-36 ms/q.
+
+Root causes (the earlier "q_dim/saturation/padding" theories were all wrong):
+1. **BOS**: prepending the text `"<s>"` tokenizes to ordinary pieces (`<`, `s>`), not BOS id 0. Now the BOS token id (from the tokenizer) is inserted into the token list (`EncodePrompt`).
+2. **RoPE layout**: llama.cpp's llama-arch converter permutes q/k rows so adjacent pairs (2i, 2i+1) rotate together (NORM rope). Qwen3 uses half-split NEOX. `JevRopeKernel` now takes `interleaved`, set for arch `llama`. This was the all-Yes bug on 2B.
+3. **1B shapes**: N=1536 / N=9216 instruction streams (generated fine by `gen_insts.sh`) compute WRONG results; N must be a whole number of 1024-wide tiles. The engine now pads o/down/gate-up outputs (`n_o_cap`, `n_down_cap`, `n_gu_cap`: 1536->2048, 9216->10240) like qkv (2560->3072); weight buffers zero-padded, decode uses `valid_cols`. New insts: 512x1536x{1024,3072,10240}, 512x4608x2048 (512x2048x2048 already existed).
+4. **1B GGUF vocab is broken**: `MiniCPM5-1B-SFT-Q6_K.gguf` ships a vocab list that does not match its own embedding rows (id 22 = `<tr>` instead of `!`, newline = 65324). Embedding rows match HF ids. Workaround: `GUFO_JEV_TOKENIZER_GGUF=<2B gguf>` borrows the 2B tokenizer (identical to HF). Production use of 1B needs that env or a re-converted GGUF.
+
+Recommendation: 2B (18/22, same as Qwen3-1.7B, ~2x the NPU time per question) is not better than Qwen3-1.7B (18/22); 1B is ~2x faster per batched question (31-36 ms vs 59) at 17/22. Next: A/B on the replay traces before choosing; judge defaults unchanged.
