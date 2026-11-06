@@ -2,11 +2,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
-#include <cstdio>
-#include <cstdlib>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -170,12 +170,11 @@ void ReplayTraces(const auto& model, const std::string& path) {
       strict_ok += conf >= kReplayStrictCutoff;
       yes += v.yes >= v.no;
       last_q = *q;
-      std::printf("%s yes=%.2f no=%.2f c60=%d c90=%d  Q: %s\n  next: %s\n",
-                  file.filename().string().c_str(), v.yes, v.no,
-                  conf >= kReplayInlineCutoff, conf >= kReplayStrictCutoff,
-                  q->c_str(),
-                  OneLine(text.substr(pos + kReplayPiece, kReplayNext))
-                      .c_str());
+      std::printf(
+          "%s yes=%.2f no=%.2f c60=%d c90=%d  Q: %s\n  next: %s\n",
+          file.filename().string().c_str(), v.yes, v.no,
+          conf >= kReplayInlineCutoff, conf >= kReplayStrictCutoff, q->c_str(),
+          OneLine(text.substr(pos + kReplayPiece, kReplayNext)).c_str());
     }
     std::printf("TRACE %s detections=%zu\n", file.filename().string().c_str(),
                 found);
