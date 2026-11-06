@@ -1365,14 +1365,43 @@ std::unique_ptr<JevNpuModel> JevNpuModel::LoadFromGguf(
     std::string tok_err;
     auto tok_reader =
         tok_path ? core::GgufReader::OpenFile(tok_path, &tok_err) : nullptr;
-    impl->tokenizer =
-        tok_reader ? tokenization::QwenTokenizer::CreateFromGguf(*tok_reader)
-                   : tokenization::QwenTokenizer::CreateFromGguf(reader);
+    const core::GgufReader& tok_src = tok_reader ? *tok_reader : reader;
+    // A BPE vocab without merges is an SPM-style conversion whose ids do not
+    // line up with the embedding rows (MiniCPM5-1B-SFT).
+    if (tok_src.GetMetadataStringArray("tokenizer.ggml.merges").empty()) {
+      if (error_msg)
+        *error_msg =
+            "jev: GGUF tokenizer has no BPE merges, so its token ids do not "
+            "match the embedding rows; use a correctly converted GGUF or set "
+            "GUFO_JEV_TOKENIZER_GGUF to a GGUF of the same family";
+      return nullptr;
+    }
+    impl->tokenizer = tokenization::QwenTokenizer::CreateFromGguf(tok_src);
   }
   if (!impl->tokenizer) {
     if (error_msg)
       *error_msg = "jev: tokenizer load failed";
     return nullptr;
+  }
+  {
+    // A vocab list that disagrees with the embedding rows silently produces a
+    // judge that answers garbage. Refuse it with the remedy instead.
+    const std::size_t vocab_n = impl->tokenizer->GetVocabSize();
+    bool ok = vocab_n >= impl->config.vocab;
+    for (const std::string_view probe : {"Yes", "No", "!", "Answer"}) {
+      const auto ids = impl->tokenizer->Encode(probe);
+      ok = ok && !ids.empty() && impl->tokenizer->Decode(ids) == probe;
+    }
+    if (!ok) {
+      if (error_msg)
+        *error_msg =
+            "jev: tokenizer does not match the embedding rows (vocab " +
+            std::to_string(vocab_n) + " vs " +
+            std::to_string(impl->config.vocab) +
+            ", or Yes/No/!/Answer fail to round-trip); use a correct GGUF "
+            "or set GUFO_JEV_TOKENIZER_GGUF to a GGUF of the same family";
+      return nullptr;
+    }
   }
   if (*architecture == "llama" &&
       impl->tokenizer->GetBosTokenId() != tokenization::kInvalidTokenId)

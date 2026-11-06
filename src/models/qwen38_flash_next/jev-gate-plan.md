@@ -1023,3 +1023,11 @@ tail, and never when `finish=length` is the cause (the budget, not the model, st
 is the weak side (real stops are mostly "announce then stop" or empty, which it catches, but also
 finished-sounding summaries it cannot see); a jev yes/no on the task plus the tail would add recall
 only if a labeled set shows the judge separates them.
+
+## Status 2026-11-06 — MiniCPM5-1B is the default judge; tokenizer fixed
+
+- **Fixed GGUF:** `~/jev-model/MiniCPM5-1B-SFT-Q6_K-fixed.gguf`. HF 1B and 2B `tokenizer.json` are identical (vocab 130072 entries, merges, added tokens), so the 2B GGUF's tokenizer keys (`tokens`, `token_type`, `merges`, `model`, `pre`, ids, chat template) replace the 1B's SPM-style ones (it had `scores`, no `merges`). Tensors are byte-identical (219/219 verified). Patcher: gguf-py (`/mnt/raid0/llama.cpp/gguf-py`), copy of KVs + raw tensors.
+- **Scores, no env var:** fixed 1B 9/10 trivia + 8/12 code; batched 32-38 ms/question. Original 1B + `GUFO_JEV_TOKENIZER_GGUF=<2B>`: identical 9/10 + 8/12. 2B 9/10 + 9/12, Qwen3-1.7B 7/10 + 11/12 (unchanged).
+- **Engine guard:** `LoadFromGguf` refuses a GGUF whose tokenizer has no BPE merges (the SPM-style conversion; its ids do not line up with the embedding rows) and one where vocab < embedding rows or Yes/No/!/Answer fail to round-trip. The error names the remedy; `GUFO_JEV_TOKENIZER_GGUF` still overrides. The original broken 1B now fails loudly instead of scoring 6/10.
+- **Serve default:** `EnsureJevAnswer` tries fixed 1B -> Qwen3-1.7B-Q6_K -> CPU; `GUFO_JEV_MODEL` overrides (single path, no fallback).
+- **Calibration needed (no thresholds changed):** `TryJevPreRoute` (openai_chat.cpp) answers a whole "yes or no" request from jev when `max(yes,no) >= kJevPreConfidence (0.9)`. With the graded 1B, ~0% of replay answers clear 0.9, so the pre-route will almost never fire (safe, but its gain disappears); with saturated Qwen3 it fired on ~70% including wrong answers. Part A effort routing (`jev_gate`) does not use this cutoff. Re-pick the pre-route cutoff (likely 0.7-0.8) from labeled yes/no requests; the inline Part B 0.6 cutoff is unmeasured against truth and stays off.
