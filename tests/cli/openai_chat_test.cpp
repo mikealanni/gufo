@@ -22,6 +22,7 @@
 #include "src/models/deepseek_v4_flash/chat_template.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/control_tokens.hpp"
+#include "src/models/qwen38_flash_next/jev_gate.hpp"
 
 using gufo::tokenization::kImEnd;
 
@@ -6426,6 +6427,34 @@ void TestJevAgentGateLowersRoutineToolTurns() {
       build("bash", R"({\"command\":\"make -j8\"})", "done", "");
   Expect(!request_of(true, build_cmd).reasoning.budget_tokens.has_value(),
          "Build and test commands keep the caller's budget");
+  const std::string shell_routine =
+      build("shell", R"({\"command\":\"grep -n foo src/a.cpp\"})", "1:foo", "");
+  Expect(request_of(true, shell_routine).reasoning.budget_tokens.has_value(),
+         "The newer `shell` tool name is treated like `bash`");
+  const std::string shell_build =
+      build("shell", R"({\"command\":\"cmake --build build\"})", "done", "");
+  Expect(!request_of(true, shell_build).reasoning.budget_tokens.has_value(),
+         "Build commands through `shell` keep the caller's budget");
+  {
+    using gufo::models::qwen38_flash_next::ClassifyJevAgentTurn;
+    using gufo::models::qwen38_flash_next::JevToolResult;
+    const std::vector<std::vector<JevToolResult>> mixed{
+        {{"read", "", "fine"},
+         {"mcp_unknown_tool", "", "ok"},
+         {"shell", "cmake --build build", "done"}}};
+    const auto decision = ClassifyJevAgentTurn(mixed);
+    Expect(!decision.lower &&
+               decision.blocker.find("tool=mcp_unknown_tool") !=
+                   std::string::npos &&
+               decision.blocker.find("blocked=2/3") != std::string::npos,
+           "One non-routine result blocks the turn and the blocker names it");
+    std::vector<std::vector<JevToolResult>> long_run(
+        7, std::vector<JevToolResult>{{"read", "", "fine"}});
+    const auto limited = ClassifyJevAgentTurn(long_run);
+    Expect(!limited.lower && limited.reason == "run-limit" &&
+               limited.blocker == "run=6",
+           "The routine-run back-off is reported with its run length");
+  }
   const std::string small_budget =
       build("bash", R"({\"command\":\"ls src\"})", "a.cpp",
             R"(,"reasoning_budget_tokens":128)");

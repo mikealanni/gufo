@@ -401,23 +401,42 @@ bool AgentInspectCommand(std::string_view command) {
   return true;
 }
 
-bool AgentRoutine(const JevToolResult& result) {
-  if (result.tool == "bash") {
-    if (!AgentInspectCommand(result.command) ||
-        result.output.size() >= kAgentShellOutputMax) {
-      return false;
+// opencode names its shell tool `bash` in older releases and `shell` in newer
+// ones; both take the same `command` argument.
+bool AgentIsShell(std::string_view tool) {
+  return tool == "bash" || tool == "shell";
+}
+
+// Empty when the result is routine, else the reason it is not.
+std::string AgentBlocker(const JevToolResult& result) {
+  const std::string tool(result.tool);
+  if (AgentIsShell(result.tool)) {
+    if (!AgentInspectCommand(result.command)) {
+      std::size_t end = 0;
+      const std::string_view word = FirstWord(result.command, &end);
+      return "cmd=" + std::string(word.substr(0, 24));
     }
-    return !AgentHasFailure(AgentFold(result.output));
+    if (result.output.size() >= kAgentShellOutputMax)
+      return "output-large tool=" + tool;
+    if (AgentHasFailure(AgentFold(result.output)))
+      return "failure-signal tool=" + tool;
+    return {};
   }
   if (AgentInList(result.tool, kAgentReadTools)) {
-    return !AgentHasFailure(
-        AgentFold(AgentHead(result.output, kAgentReadHead)));
+    return AgentHasFailure(AgentFold(AgentHead(result.output, kAgentReadHead)))
+               ? "failure-signal tool=" + tool
+               : std::string();
   }
   if (AgentInList(result.tool, kAgentLightTools)) {
-    return !AgentHasFailure(
-        AgentFold(AgentHead(result.output, kAgentOtherHead)));
+    return AgentHasFailure(AgentFold(AgentHead(result.output, kAgentOtherHead)))
+               ? "failure-signal tool=" + tool
+               : std::string();
   }
-  return false;
+  return "tool=" + tool;
+}
+
+bool AgentRoutine(const JevToolResult& result) {
+  return AgentBlocker(result).empty();
 }
 
 bool AgentTurnRoutine(const std::vector<JevToolResult>& turn) {
@@ -429,9 +448,22 @@ bool AgentTurnRoutine(const std::vector<JevToolResult>& turn) {
 JevAgentDecision ClassifyJevAgentTurn(
     const std::vector<std::vector<JevToolResult>>& turns) {
   if (turns.empty())
-    return {false, "no-tool-result"};
-  if (!AgentTurnRoutine(turns.back()))
-    return {false, "tool-result-not-routine"};
+    return {false, "no-tool-result", {}};
+  if (!AgentTurnRoutine(turns.back())) {
+    const auto& turn = turns.back();
+    std::size_t blocked = 0;
+    std::string first;
+    for (const auto& result : turn) {
+      auto why = AgentBlocker(result);
+      if (why.empty())
+        continue;
+      if (blocked++ == 0)
+        first = std::move(why);
+    }
+    return {false, "tool-result-not-routine",
+            first + " blocked=" + std::to_string(blocked) + "/" +
+                std::to_string(turn.size())};
+  }
   std::size_t run = 0;
   for (std::size_t i = turns.size() - 1; i-- > 0;) {
     if (!AgentTurnRoutine(turns[i]))
@@ -439,8 +471,8 @@ JevAgentDecision ClassifyJevAgentTurn(
     ++run;
   }
   if (run >= kJevAgentMaxRun)
-    return {false, "run-limit"};
-  return {true, "routine-tool-result"};
+    return {false, "run-limit", "run=" + std::to_string(run)};
+  return {true, "routine-tool-result", {}};
 }
 
 }  // namespace gufo::models::qwen38_flash_next

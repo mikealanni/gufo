@@ -1086,3 +1086,27 @@ Plus: no prefill penalty. Risk: a cap truncates thinking abruptly (stock budget 
 - Plain `--jev-gate on` sets effort/enabled/preserve_thinking from the last user message only when the caller left them unset. In one conversation each new user turn can classify differently (low vs medium vs xhigh), rewriting the system-prefix directive and missing the cache for the whole conversation at that turn. Also combined with `agent` + caller-unset effort: turn 1 renders at the gate's effort, later tool-result turns at the server default, a miss. Opencode sets its own effort so it is unaffected; for effort-unset clients prefer a budget cap there too (FLAGGED, not changed).
 - `--jev-finish` continuation appends assistant+user turns. The prefix up to the previous generation prompt stays cached; the re-rendered assistant turn strips its thinking (it is no longer after the last user message), so only that turn's own tokens re-prefill (small), not the whole prompt.
 - Release binary must be rebuilt/restarted for the fix to run live; 8900 was not touched.
+
+## Status 2026-11-06 — agent gate tuned from real opencode data
+
+Data: opencode.db now stores sessions in `session_message` (v2: assistant message = one step; `content` array of `reasoning`/`text`/`tool`; tool `state.input.command`, `state.content[].text`, `state.metadata.exit`). The earlier replay read the legacy `message`/`part` tables, which stop on 2026-11-03; the corrected extract has 8,155 Flash-Next steps in 181 sessions up to 2026-11-06 16:51 (scripts were scratch-only). opencode sends `variant: high` on every request.
+
+**Root cause of "42 of 48 not routine":** newer opencode names its shell tool `shell`, older `bash`. The classifier only knew `bash`, so every `shell` result was "unknown tool -> keep". Tool inventory (all history): read 3841, bash 3519, shell 1756 (143 of the 174 tools in the last hour), edit 699, grep 122, write 99, filesystem_read_multiple_files 88, task 79, glob 56, filesystem_directory_tree 52, todowrite 26, fetch_fetch 26, memory_store_context 19, question 15, get_goal 13, others <10.
+
+**Change:** `shell` is an alias of `bash` (same `command` argument). The `[jev-gate] mode=agent` line now carries `blocker=` (`tool=<name>` unknown tool, `cmd=<word>` non-inspect command, `failure-signal tool=<name>`, `output-large tool=<name>`, each + `blocked=<k>/<n>`; `run=<n>` for the 5-in-a-row back-off; `none` when lowered). One non-routine result among parallel results blocks the whole turn (all_of); 159 of 1,434 multi-result turns in history are mixed.
+
+**Not loosened (measured no gain):** read-only MCP tools (+0.0 pt), graded 1536 cap for passing build/test (+0.0 pt), narrow failure scan for inspect commands (+0.2 pt of reasoning, harm proxy gets worse: 24.8% vs 23.7%). Failure words inside file text (error/failed/exception) are what block 'inspect' results (334 'error' hits), but relaxing it was not clearly safe.
+
+**Offline replay (cap = min(actual reasoning tok, 512), reasoning tok = chars/4):**
+| window | rules | steps capped | cap binds | reasoning removed |
+|---|---|---|---|---|
+| all history (8,155 steps) | bash only | 29.9% | 391 | 11.9% (335k tok) |
+| all history | + shell alias | 38.3% | 579 | 16.9% (474k tok, ~58 s/session @45 tok/s) |
+| since Nov 6 (199 steps) | bash only | 9.5% | 0 | 0.0% |
+| since Nov 6 | + shell alias | 48.2% | 12 | 8.7% (~27 s/session) |
+| live window 16:33+ (74 steps) | + shell alias | 51.4% | 2 | 3.7% (~6 s/session) |
+Harm proxy (tool failure within next 2 steps): capped 22.9% vs kept 25.1% (history); 19.8% vs 26.4% (today). Weak evidence: capped turns ran uncapped in the data.
+
+**Where the long turns come from (live window, top steps):** 2117 tok = 942 reasoning + 1140 edit/write payload; 1850 = 404 + 1176 payload; 1703 = 1021 reasoning + 604 final text; 1370 (jevgate session) = 137 + 1097 final text; 1367 = 284 + 1058 payload. Overall output composition (all history): reasoning 70.4%, tool-call arguments 23.8%, text 5.7%. Today's reasoning is short (median 163 tok, p90 648, max 1,963), so a 512 cap rarely binds now; the big savings are historical rambles (steps >2000 chars = 18% of steps, 69% of reasoning; ten 10k+ token reasoning steps after trivial ls/read results).
+
+**Levers outside the agent gate (not implemented):** a global reasoning budget on every turn: cap 4096 removes 4.0% of reasoning (41 steps), 2048 removes 10.6% (197 steps = 2.4% of steps, 241k of 297k of it on tool-result turns), 1024 removes 24.5% (701 steps) — quality risk on hard turns, needs a live check. opencode's constant `variant: high` is cache-safe to change per session if medium is enough for a task class.
