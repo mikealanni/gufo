@@ -789,10 +789,16 @@ const char* JevEffortName(ReasoningEffort effort) {
   return "unknown";
 }
 
+// Reasoning-token cap for a routine tool-loop turn. The effort directive sits
+// at the start of the rendered prompt, so changing the effort would rewrite
+// the whole prompt and miss the prefix cache; the cap is applied while
+// decoding and leaves every prompt byte as the caller's effort renders it.
+constexpr std::size_t kJevAgentRoutineBudgetTokens = 512;
+
 // Tool-loop turn policy: the pending turn is the trailing run of tool messages.
 // Routine results (reads, listings, inspection commands without failure
-// signals) lower the effort to low; the caller's effort or the server default
-// is never raised, and anything unclear keeps it.
+// signals) cap the thinking budget; the caller's effort and budget are never
+// raised, and anything unclear keeps them.
 bool ApplyJevAgentGate(TextGenerationBackend& backend, ChatRequest* chat) {
   if (!backend.jev_gate_agent_enabled() || chat->messages.empty() ||
       chat->messages.back().role != tokenization::ChatRole::kTool) {
@@ -833,12 +839,16 @@ bool ApplyJevAgentGate(TextGenerationBackend& backend, ChatRequest* chat) {
   const auto decision = models::qwen38_flash_next::ClassifyJevAgentTurn(turns);
   Logger::LogFormatted(
       LogLevel::kInfo, "jev-gate",
-      "mode=agent role=tool turns=%zu effort_in=%s effort_out=%s reason=%.*s",
+      "mode=agent role=tool turns=%zu effort=%s budget=%zu reason=%.*s",
       turns.size(), JevEffortName(in_effort),
-      JevEffortName(decision.lower ? ReasoningEffort::kLow : in_effort),
+      decision.lower ? kJevAgentRoutineBudgetTokens : std::size_t{0},
       static_cast<int>(decision.reason.size()), decision.reason.data());
-  if (decision.lower)
-    chat->reasoning.effort = ReasoningEffort::kLow;
+  if (decision.lower) {
+    const std::size_t caller =
+        chat->reasoning.budget_tokens.value_or(kJevAgentRoutineBudgetTokens);
+    chat->reasoning.budget_tokens =
+        std::min(caller, kJevAgentRoutineBudgetTokens);
+  }
   return true;
 }
 
