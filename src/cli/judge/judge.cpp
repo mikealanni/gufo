@@ -324,6 +324,7 @@ int RunJudge(std::span<const char* const> args) {
   std::string finish_replay;
   std::string goal_replay;
   bool goal_verbose = false;
+  bool goal_bare = false;
 
   ArgParser parser("gufo judge",
                    "Run the resident NPU judge on one question or the "
@@ -358,13 +359,17 @@ int RunJudge(std::span<const char* const> args) {
                    "Goal", &goal_replay);
   parser.AddFlag("", "--goal-verbose", "List goal-replay false continues",
                  "Goal", &goal_verbose);
+  parser.AddFlag("", "--goal-bare",
+                 "Goal replay: also replay a bare trigger phrase as the "
+                 "latest message",
+                 "Goal", &goal_bare);
   parser.AddFlag("", "--finish-verbose", "List finish-replay misses", "Finish",
                  &finish_verbose);
   if (!parser.Parse(args))
     return 2;
 
   if (!goal_replay.empty())
-    return RunGoalReplay(goal_replay, goal_verbose);
+    return RunGoalReplay(goal_replay, goal_verbose, goal_bare);
   if (!finish_replay.empty())
     return RunFinishReplay(finish_replay, finish_verbose);
 
