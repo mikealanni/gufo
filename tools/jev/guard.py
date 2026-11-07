@@ -42,7 +42,7 @@ LIGHT_WORDS = {
     "git", "ls", "cat", "rg", "grep", "sed", "head", "tail", "echo", "pwd", "cd",
     "find", "wc", "diff", "mkdir", "cp", "mv", "rm", "touch", "curl", "tr", "sort",
     "uniq", "awk", "stat", "file", "which", "date", "printf", "true", "less", "more",
-    "tee", "xxd", "nl", "cut", "basename", "dirname", "readlink", "realpath", "du",
+    "tee", "xxd", "sha256sum", "md5sum", "sha1sum", "strings", "nm", "objdump", "readelf", "ldd", "nl", "cut", "basename", "dirname", "readlink", "realpath", "du",
     "df", "ps", "pgrep", "sleep", "wait", "kill", "tar", "unzip", "gh", "jj",
 }
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "upgrade",
@@ -126,6 +126,8 @@ def classify(command):
                 return verdict, inner
             continue
         if first_word(seg) in LIGHT_WORDS:
+            continue
+        if re.search(r"\s(--help|-h|--version)(\s|$)", seg):
             continue
         shell_c = first_word(seg) in ("bash", "sh", "eval", "xargs", "timeout", "nohup")
         if any(p.search(seg if shell_c else QUOTED.sub('""', seg)) for p in HEAVY):

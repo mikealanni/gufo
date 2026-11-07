@@ -49,6 +49,10 @@ if (ENGINE_ENABLE_HIP)
     continuation_probe.cpp)
   target_link_libraries(qwen38_flash_next_continuation_probe PRIVATE
     gufo_qwen38_flash_next)
+  add_executable(qwen38_flash_next_dflash_capture_probe EXCLUDE_FROM_ALL
+    dflash_capture_probe.cpp)
+  target_link_libraries(qwen38_flash_next_dflash_capture_probe PRIVATE
+    gufo_qwen38_flash_next hip::host)
   add_custom_target(qwen38_flash_next_model_tests
     DEPENDS qwen38_flash_next_session_test qwen38_flash_next_snapshot_test
       qwen38_flash_next_continuation_adapter_test)
