@@ -193,10 +193,13 @@ def find_pids(needle):
     return hits
 
 
-def biggest_foreign_rss(skip_pgid):
+MEM_RELEASE_QUIET = 30
+
+
+def biggest_foreign_rss(skip_pgid, skip_pids=()):
     best, best_pid = 0, 0
     for entry in os.listdir("/proc"):
-        if not entry.isdigit():
+        if not entry.isdigit() or int(entry) in skip_pids:
             continue
         try:
             if os.getpgid(int(entry)) == skip_pgid:
@@ -316,13 +319,22 @@ class Guard:
             log(f"gufo stopped, {mem_available_gb():.0f} GB available, stop_took={time.time() - t_stop:.1f}s")
             return True
 
-    async def after_test(self, label, pids_fn):
+    async def after_test(self, label, pids_fn, mem_release=False):
         """Restart gufo once the test processes are gone for a quiet period."""
         started = time.time()
         seen = False
         quiet_since = None
+        free_since = None
         while time.time() - started < self.a.max_hold:
             alive = pids_fn()
+            if mem_release:
+                if mem_available_gb() >= self.a.free_target_gb:
+                    free_since = free_since or time.time()
+                    if time.time() - free_since >= MEM_RELEASE_QUIET:
+                        log(f"memory recovered to {mem_available_gb():.0f} GB for {MEM_RELEASE_QUIET}s")
+                        break
+                else:
+                    free_since = None
             if alive:
                 seen, quiet_since = True, None
             else:
@@ -336,8 +348,8 @@ class Guard:
             f"watched={time.time() - started:.1f}s; restarting gufo")
         await self.start_gufo()
 
-    def begin_watch(self, label, pids_fn):
-        self.watch_task = asyncio.create_task(self.after_test(label, pids_fn))
+    def begin_watch(self, label, pids_fn, mem_release=False):
+        self.watch_task = asyncio.create_task(self.after_test(label, pids_fn, mem_release))
 
     async def decide(self, commands):
         """Returns the heavy segment that needs gufo stopped, or None."""
@@ -376,9 +388,12 @@ class Guard:
             low = low + 1 if mem_available_gb() < self.a.reactive_gb else 0
             if low >= 3:
                 low = 0
-                pid = biggest_foreign_rss(self.proc.pid if self.proc else -1)
+                own = {os.getpid()}
+                if self.judge is not None and self.judge.proc is not None:
+                    own.add(self.judge.proc.pid)
+                pid = biggest_foreign_rss(self.proc.pid if self.proc else -1, own)
                 if await self.stop_gufo(f"memory pressure, top process pid={pid}"):
-                    self.begin_watch(f"pid {pid}", lambda: [pid] if os.path.exists(f"/proc/{pid}") else [])
+                    self.begin_watch(f"pid {pid}", lambda: [pid] if os.path.exists(f"/proc/{pid}") else [], True)
 
     async def wait_ready(self, resp):
         t_wait = time.time()
