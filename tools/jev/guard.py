@@ -23,7 +23,7 @@ import aiohttp
 from aiohttp import web
 
 HEAVY = [re.compile(p) for p in (
-    r"\bgufo(\s+\S+)*?\s+(bench|serve|judge|diagnose|eval|transcribe)\b",
+    r"\bgufo(\s+\S+)*?\s+(bench|serve|judge|diagnose|eval|transcribe|prompt)\b",
     r"build/\S+/gufo\b",
     r"\bctest\b",
     r"\bcmake\s+--build\b",
@@ -97,13 +97,38 @@ def first_word(segment):
     return ""
 
 
+ASSIGN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(\S*)$")
+SUBST = re.compile(r"^[A-Za-z_]\w*=\$\((.*?)\)?$")
+QUOTED = re.compile(r"\"[^\"]*\"|'[^']*'")
+HOME = os.path.expanduser("~")
+
+
+def expand(seg, env):
+    for name, value in env.items():
+        seg = seg.replace("${" + name + "}", value).replace("$" + name, value)
+    return seg.replace("~/", HOME + "/")
+
+
 def classify(command):
     """Returns (verdict, segment): heavy / light / unknown."""
     unknown = ""
+    env = {}
     for seg in segments(command):
+        seg = expand(seg, env)
+        m = ASSIGN.match(seg.strip("\"'"))
+        if m:
+            env[m.group(1)] = m.group(2).strip("\"'")
+            continue
+        sub = SUBST.match(seg)
+        if sub:
+            verdict, inner = classify(sub.group(1))
+            if verdict == "heavy":
+                return verdict, inner
+            continue
         if first_word(seg) in LIGHT_WORDS:
             continue
-        if any(p.search(seg) for p in HEAVY):
+        shell_c = first_word(seg) in ("bash", "sh", "eval", "xargs", "timeout", "nohup")
+        if any(p.search(seg if shell_c else QUOTED.sub('""', seg)) for p in HEAVY):
             return "heavy", seg
         if not unknown:
             unknown = seg
@@ -230,6 +255,8 @@ class Guard:
         self.watch_task = None
         self.stops = 0
         self.inflight = 0
+        self.starter = None
+        self.last_fail = 0.0
 
     async def start_gufo(self):
         async with self.lock:
@@ -245,6 +272,7 @@ class Guard:
             while time.time() < deadline:
                 if self.proc.returncode is not None:
                     self.state = "down"
+                    self.last_fail = time.time()
                     log(f"gufo exited during start rc={self.proc.returncode}")
                     return
                 try:
@@ -353,8 +381,10 @@ class Guard:
     async def wait_ready(self, resp):
         t_wait = time.time()
         while not self.ready.is_set():
-            if self.state == "down" and (self.watch_task is None or self.watch_task.done()):
-                asyncio.create_task(self.start_gufo())
+            idle = self.starter is None or self.starter.done()
+            if (self.state == "down" and idle and time.time() - self.last_fail > 15
+                    and (self.watch_task is None or self.watch_task.done())):
+                self.starter = asyncio.create_task(self.start_gufo())
             try:
                 await asyncio.wait_for(self.ready.wait(), 10)
             except asyncio.TimeoutError:
