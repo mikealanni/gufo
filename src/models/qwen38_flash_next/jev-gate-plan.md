@@ -1209,3 +1209,66 @@ Replay (550 sessions, 4,957 turn ends):
 - Weak spot: the empty-turn fallback fires 14 times with 2 strong labels; kept
   because an empty assistant turn with no tool call is always a stall, but it is
   the first rule to drop if it nags.
+
+## jev-guard (2026-11-07) — keeps gufo out of the way of heavy local tests
+
+`tools/jev/guard.py`, started by `~/run-jev-guard.sh`. Public :8900 -> guard -> gufo on :8901.
+`gufo judge --stdio` serves the NPU judge to the guard as a child process.
+
+Behaviour: holds the final tool-call chunk of a response until gufo is stopped when the command
+is heavy (`gufo bench`, `ctest`, `cmake --build`, `prof.py run`, ...); holds incoming requests
+(SSE keepalives) while the test runs; restarts gufo about 8 s after the test process ends.
+Memory watchdog (free RAM < 2.5 GB for 3 samples) stops gufo for unknown commands. SIGTERM only.
+
+First live session (decode-2 work in opencode), measured:
+
+- stop 1.0 s; heavy tool call held 1.09 s; gufo load 28 s; guard overhead per test about 36 s.
+- unknown/light commands: hold 0.00-0.10 s (judge query 83-108 ms for unknown ones).
+- 10 requests held 340-400 s during the 6-minute build; none failed.
+- NPU judge vs patterns: judge p(Yes) sat in 0.37-0.47 for every command (heavy and harmless), so it
+  does not separate them; the pattern list decides, the judge is a tiebreak only (cutoff 0.85).
+- False stops found and fixed: `|` inside quotes split the command; read-only commands that mention
+  `tools/prof/`; `which rocprofv3`; `python3 -c` with a path in its source; `prof.py show`.
+- Process matcher fixed: the needle must be what /proc shows (no env prefix, no redirect, no quotes,
+  no `~`/`$` tokens, no shell keywords like `do`). Before the fix, a run that started with
+  `LD_LIBRARY_PATH=... ./gufo prompt` was never "seen" and gufo would have restarted at 30 s.
+- Two requests were cut off by my own guard swaps (stale request-id match, bad timing). A swap must
+  wait for `inflight == 0` on /jev-guard/status.
+
+Open: the pattern list is the weak part (judge cannot back it up); `after_test` falls back to a 30 s
+"never seen" restart; restart-on-start relies on run-gufo.sh refusing when RAM is short; opencode
+retries a dropped request by itself but a guard cannot type "continue" into the TUI.
+
+## Future: own NPU LLM engine (decided 2026-11-07: no closed-source runtime)
+
+Goal: a small LLM that generates on our NPU engine and serves chat/light turns while the big gufo
+is stopped for a test. Reference point (FastFlowLM page, closed source, not used): LFM3-1.7B Q4_0 on
+the same chip decodes 41 tok/s at 1k and 24 tok/s at 32k context.
+
+Measured here: NPU streams 30.3 GB/s of weights (97 us per 2.95 MB slice, pipelined depth 2+),
+~170 us dispatch latency unpipelined (`tools/bench/npu_decode_dispatch_bench.cpp`).
+Ceiling = bandwidth / bytes per token: MiniCPM5-1B Q6 block-float (~0.9 GB/token) about 30 tok/s,
+realistic 15-25; 4-bit weights roughly double that.
+
+Milestone 1 — MiniCPM5-1B generates on the NPU (current weights, current xclbin).
+  - decode loop with a growing per-sequence KV cache (today's engine rewrites KV per call);
+  - sampler (greedy + temperature/top-p), stop tokens, MiniCPM chat template;
+  - `gufo judge --serve` OpenAI-style /v1/chat/completions with streaming;
+  - measure tok/s at 1k/8k/32k context and correctness against the CPU reference.
+  Done when: coherent chat, >= 15 tok/s at 1k, text matches the CPU reference on a fixed prompt set.
+
+Milestone 2 — 4-bit weight streaming kernel.
+  - new AIE kernel that dequantizes Q4 in-core; new xclbin + instruction files;
+  - target about 2x the Milestone 1 speed (toward 40 tok/s).
+
+Milestone 3 — LFM3 support.
+  - GGUF arch + gated short-convolution layer (no such layer in the engine today);
+  - compare accuracy against the PyTorch reference (perplexity, GSM8K subset).
+
+Milestone 4 — guard integration.
+  - guard routes requests to the NPU server while the big gufo is down;
+  - limit it to light turns (status / "waiting for the test"); decide separately whether it may
+    attempt full agent turns (1B-class models are weak at tool calls and code edits).
+
+Milestone 5 — "continue" after a failure.
+  - check whether opencode exposes an API the guard can use to send a prompt after a dropped request.

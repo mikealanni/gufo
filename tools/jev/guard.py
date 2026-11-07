@@ -14,6 +14,7 @@ import asyncio
 import json
 import os
 import re
+import shlex
 import signal
 import sys
 import time
@@ -29,17 +30,21 @@ HEAVY = [re.compile(p) for p in (
     r"\bnix\s+(build|develop)\b",
     r"\brocprof\w*",
     r"model-bench\.py",
-    r"tools/(bench|prof)/",
+    r"^(?:\S*/)?(?:python3?|bash|sh)\s+(?!-c\b)\S*tools/prof/prof\.py\s+run\b",
+    r"^(?:\./)?tools/prof/prof\.py\s+run\b",
+    r"^(?:\S*/)?(?:python3?|bash|sh)\s+(?!-c\b)\S*tools/bench/",
+    r"^(?:\./)?tools/bench/",
     r"\bpytest\b",
-    r"\bpython3?\b.*\b(torch|hip|rocm)\b",
+    r"^(?:\S*/)?python3?\s+(?!-c\b)\S+.*\b(torch|hip|rocm)\b",
     r"run-gufo\.sh",
 )]
 LIGHT_WORDS = {
     "git", "ls", "cat", "rg", "grep", "sed", "head", "tail", "echo", "pwd", "cd",
     "find", "wc", "diff", "mkdir", "cp", "mv", "rm", "touch", "curl", "tr", "sort",
-    "uniq", "awk", "stat", "file", "which", "date", "env", "printf", "test", "true",
+    "uniq", "awk", "stat", "file", "which", "date", "printf", "true", "less", "more",
+    "tee", "xxd", "nl", "cut", "basename", "dirname", "readlink", "realpath", "du",
+    "df", "ps", "pgrep", "sleep", "wait", "kill", "tar", "unzip", "gh", "jj",
 }
-SEGMENT_SPLIT = re.compile(r"&&|\|\||;|\|")
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "upgrade",
        "proxy-authenticate", "proxy-authorization", "trailers", "content-length",
        "host", "content-encoding"}
@@ -61,7 +66,27 @@ def mem_available_gb():
 
 
 def segments(command):
-    return [s.strip() for s in SEGMENT_SPLIT.split(command) if s.strip()]
+    out, cur, quote, i = [], [], "", 0
+    while i < len(command):
+        ch = command[i]
+        if quote:
+            if ch == "\\" and quote == '"' and i + 1 < len(command):
+                cur.append(command[i:i + 2])
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+        elif ch in "'\"":
+            quote = ch
+        elif ch in ";|&\n":
+            out.append("".join(cur))
+            cur = []
+            i += 1
+            continue
+        cur.append(ch)
+        i += 1
+    out.append("".join(cur))
+    return [s.strip() for s in out if s.strip()]
 
 
 def first_word(segment):
@@ -76,9 +101,11 @@ def classify(command):
     """Returns (verdict, segment): heavy / light / unknown."""
     unknown = ""
     for seg in segments(command):
+        if first_word(seg) in LIGHT_WORDS:
+            continue
         if any(p.search(seg) for p in HEAVY):
             return "heavy", seg
-        if first_word(seg) not in LIGHT_WORDS and not unknown:
+        if not unknown:
             unknown = seg
     return ("unknown", unknown) if unknown else ("light", "")
 
@@ -98,6 +125,29 @@ def tool_commands(calls):
         if isinstance(cmd, str):
             out.append(cmd)
     return out
+
+
+SHELL_WORDS = {"do", "then", "else", "elif", "if", "while", "until", "time", "exec",
+               "nohup", "{", "(", "!"}
+REDIRECT = re.compile(r"\s\d*[<>]|\s&>")
+
+
+def needle_for(segment):
+    """What /proc/<pid>/cmdline shows: no env prefix, no redirects, no quotes."""
+    seg = REDIRECT.split(segment, 1)[0]
+    try:
+        tokens = shlex.split(seg)
+    except ValueError:
+        tokens = seg.split()
+    while tokens and (tokens[0] in SHELL_WORDS or
+                      ("=" in tokens[0] and not tokens[0].startswith("-"))):
+        tokens.pop(0)
+    keep = []
+    for token in tokens[:6]:
+        if token.startswith("~") or "$" in token or "`" in token:
+            break
+        keep.append(token)
+    return " ".join(keep) or segment[:120]
 
 
 def find_pids(needle):
@@ -179,6 +229,7 @@ class Guard:
         self.judge = None
         self.watch_task = None
         self.stops = 0
+        self.inflight = 0
 
     async def start_gufo(self):
         async with self.lock:
@@ -201,7 +252,7 @@ class Guard:
                         if r.status == 200:
                             self.state = "up"
                             self.ready.set()
-                            log("gufo is up")
+                            log(f"gufo is up, start_took={time.time() - deadline + self.a.start_timeout:.1f}s")
                             return
                 except aiohttp.ClientError:
                     pass
@@ -218,6 +269,7 @@ class Guard:
             self.state = "stopping"
             self.ready.clear()
             self.stops += 1
+            t_stop = time.time()
             log(f"stopping gufo ({reason})")
             os.killpg(self.proc.pid, signal.SIGTERM)
             try:
@@ -231,7 +283,7 @@ class Guard:
             while mem_available_gb() < self.a.free_target_gb and time.time() < deadline:
                 await asyncio.sleep(1)
             self.state = "down"
-            log(f"gufo stopped, {mem_available_gb():.0f} GB available")
+            log(f"gufo stopped, {mem_available_gb():.0f} GB available, stop_took={time.time() - t_stop:.1f}s")
             return True
 
     async def after_test(self, label, pids_fn):
@@ -249,8 +301,9 @@ class Guard:
                 grace = self.a.quiet if seen else self.a.appear_grace
                 if time.time() - quiet_since >= grace:
                     break
-            await asyncio.sleep(2)
-        log(f"test finished or timed out ({label}); restarting gufo")
+            await asyncio.sleep(0.5)
+        log(f"test finished or timed out ({label}) seen_process={seen} "
+            f"watched={time.time() - started:.1f}s; restarting gufo")
         await self.start_gufo()
 
     def begin_watch(self, label, pids_fn):
@@ -258,23 +311,29 @@ class Guard:
 
     async def decide(self, commands):
         """Returns the heavy segment that needs gufo stopped, or None."""
+        t0 = time.time()
+        chosen = None
         for cmd in commands:
             verdict, seg = classify(cmd)
-            if verdict == "heavy":
-                return seg
-            if verdict == "unknown" and self.judge is not None:
+            p = None
+            if verdict != "light" and self.judge is not None:
                 try:
                     p = await self.judge.yes_probability(JUDGE_PROMPT + seg)
                 except (asyncio.TimeoutError, RuntimeError, OSError):
                     p = None
-                log(f"judge on unknown command p_yes={p} cmd={seg[:80]!r}")
-                if p is not None and p >= self.a.judge_cutoff:
-                    return seg
-        return None
+            by_judge = verdict == "unknown" and p is not None and p >= self.a.judge_cutoff
+            log(f"decision pattern={verdict} judge_p_yes={p if p is None else round(p, 3)} "
+                f"judge_would_stop={p is not None and p >= self.a.judge_cutoff} "
+                f"acts={'stop' if verdict == 'heavy' or by_judge else 'none'} cmd={cmd[:100]!r}")
+            if chosen is None and (verdict == "heavy" or by_judge):
+                chosen = seg
+        log(f"decision_ms={round((time.time() - t0) * 1000)}")
+        return chosen
 
     async def prepare_for_test(self, segment):
         if await self.stop_gufo(f"heavy command: {segment[:80]}"):
-            needle = segment[:120]
+            needle = needle_for(segment)
+            log(f"watching processes matching {needle!r}")
             self.begin_watch(segment[:60], lambda: find_pids(needle))
 
     async def memory_watchdog(self):
@@ -292,6 +351,7 @@ class Guard:
                     self.begin_watch(f"pid {pid}", lambda: [pid] if os.path.exists(f"/proc/{pid}") else [])
 
     async def wait_ready(self, resp):
+        t_wait = time.time()
         while not self.ready.is_set():
             if self.state == "down" and (self.watch_task is None or self.watch_task.done()):
                 asyncio.create_task(self.start_gufo())
@@ -300,8 +360,16 @@ class Guard:
             except asyncio.TimeoutError:
                 if resp is not None:
                     await resp.write(b": jev-guard waiting for gufo\n\n")
+        log(f"request held {time.time() - t_wait:.1f}s")
 
     async def proxy(self, request):
+        self.inflight += 1
+        try:
+            return await self.proxy_inner(request)
+        finally:
+            self.inflight -= 1
+
+    async def proxy_inner(self, request):
         body = await request.read()
         try:
             stream = bool(json.loads(body or b"{}").get("stream"))
@@ -371,9 +439,11 @@ class Guard:
         if buf:
             held.append(buf)
         if holding:
+            t_hold = time.time()
             seg = await self.decide(tool_commands(calls))
             if seg:
                 await self.prepare_for_test(seg)
+            log(f"tool call held {time.time() - t_hold:.2f}s stopped={bool(seg)}")
         for event in held:
             await resp.write(event)
         await resp.write_eof()
@@ -381,7 +451,7 @@ class Guard:
 
     async def status(self, request):
         return web.json_response({
-            "state": self.state, "stops": self.stops,
+            "state": self.state, "stops": self.stops, "inflight": self.inflight,
             "mem_available_gb": round(mem_available_gb(), 1),
             "judge": self.judge is not None and self.judge.proc is not None
             and self.judge.proc.returncode is None})
