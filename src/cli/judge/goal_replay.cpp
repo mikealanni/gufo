@@ -203,7 +203,7 @@ std::string OneLine(std::string_view text, std::size_t limit, bool tail) {
 
 }  // namespace
 
-int RunGoalReplay(const std::string& dir, bool verbose) {
+int RunGoalReplay(const std::string& dir, bool verbose, bool bare) {
   std::vector<std::filesystem::path> files;
   for (const auto& entry : std::filesystem::directory_iterator(dir)) {
     if (entry.path().extension() == ".jsonl")
@@ -231,6 +231,7 @@ int RunGoalReplay(const std::string& dir, bool verbose) {
         goal.active = true;
         goal.text = events[u].text;
         goal.index = u;
+        goal.task_index = u;
       }
       std::size_t next_user = u + 1;
       while (next_user < events.size() && events[next_user].role != Role::kUser)
@@ -325,6 +326,67 @@ int RunGoalReplay(const std::string& dir, bool verbose) {
               sessions.size(), episodes, points.size());
   print("ALL", verdicts);
   print("FLASH-NEXT", flash_verdicts);
+
+  if (bare) {
+    // Bare phrase typed as the latest user message at every decision point;
+    // the goal must come from earlier turns.
+    static constexpr std::string_view kBare = "jev finish it";
+    std::array<Tally, 2> bare_verdicts;
+    std::size_t no_items = 0;
+    std::size_t from_history = 0;
+    std::size_t fired_fallback = 0;
+    std::vector<double> bare_micros;
+    std::map<const Session*, std::vector<flash::JevGoalMessage>> copies;
+    for (const auto& point : points) {
+      const auto& session = *point.session;
+      auto& messages = copies[&session];
+      if (messages.empty())
+        messages = session.messages;
+      std::size_t last_user = point.end;
+      while (last_user > 0 && session.events[last_user].role != Role::kUser)
+        --last_user;
+      if (session.events[last_user].role != Role::kUser)
+        continue;
+      const std::string_view saved = messages[last_user].text;
+      messages[last_user].text = kBare;
+      const auto t0 = std::chrono::steady_clock::now();
+      const auto spec = flash::DetectJevGoal(
+          std::span<const flash::JevGoalMessage>(messages.data(), point.end));
+      const auto decision = flash::EvaluateJevGoal(
+          spec,
+          std::span<const flash::JevGoalMessage>(messages.data(), point.end),
+          session.events[point.end].text, 0);
+      bare_micros.push_back(std::chrono::duration<double, std::micro>(
+                                std::chrono::steady_clock::now() - t0)
+                                .count());
+      messages[last_user].text = saved;
+      no_items += spec.items == 0;
+      from_history += spec.from_history;
+      const bool fired = decision.action == flash::JevGoalAction::kContinue ||
+                         decision.action == flash::JevGoalAction::kNudge;
+      fired_fallback += fired && decision.reason.find("no-items-fallback") !=
+                                     std::string::npos;
+      ++bare_verdicts[fired ? 0 : 1]
+            .by_label[static_cast<std::size_t>(point.label)];
+    }
+    std::printf(
+        "BARE-PHRASE points=%zu goal_from_history=%zu no_items=%zu "
+        "fallback_fires=%zu\n",
+        bare_micros.size(), from_history, no_items, fired_fallback);
+    print("BARE-PHRASE", bare_verdicts);
+    std::sort(bare_micros.begin(), bare_micros.end());
+    if (!bare_micros.empty()) {
+      double sum = 0.0;
+      for (const double us : bare_micros)
+        sum += us;
+      std::printf(
+          "bare timing detect+evaluate mean=%.1f us p50=%.1f us "
+          "p99=%.1f us max=%.1f us\n",
+          sum / bare_micros.size(), bare_micros[bare_micros.size() / 2],
+          bare_micros[static_cast<std::size_t>(bare_micros.size() * 0.99)],
+          bare_micros.back());
+    }
+  }
   for (const auto& [rule, tally] : rules) {
     const auto& c = tally.by_label;
     std::printf("rule %-16s fires=%d strong=%d loose=%d other=%d eof=%d\n",

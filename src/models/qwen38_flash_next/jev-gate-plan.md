@@ -1167,3 +1167,45 @@ other = a new unrelated request, eof = session ended)
   ends). Strip: 4 us per 1 KB message (~1 ms per 370 KB pasted message).
 - Not verified live: no real opencode run with the flag on; Responses and
   Anthropic endpoints are not wired; recall is low by design (precision first).
+
+### Goal tracker: bare phrase uses the earlier task — 2026-11-06 (evening)
+
+Live finding (serve log 18:01:44): a bare "jev finish it" logged
+`items=0 open=0 action=done` — the phrase matched but the trigger message had no
+task text and the tracker did not look back.
+
+Now:
+- `DetectJevGoal` walks back over up to 6 user messages from the trigger
+  message. It skips the bare phrase, `Continue.`, and ok/continue/go-on-style
+  turns (<= 32 chars from a small list). The goal is the most recent message
+  that yields >= 1 checklist item; its index is `spec.task_index` and evidence
+  (edits, commands, results) is read from there on, not from the trigger
+  message. No cross-message combining (precision first: stale items would nag).
+- No items anywhere: `items == 0` fallback. Only existing precision rules apply
+  (announced-but-never-run step) plus a truly empty turn; a plain "All done."
+  is left alone. Log reason carries `no-items-fallback` (`reason=no-items-fallback`
+  on done, `<rule>,no-items-fallback` on a continue).
+- Parse-time log, once per request when the phrase is present:
+  `[jev-goal] trigger=detected source=this-message|history items=N`.
+- Strip behavior and prefix stability unchanged. Tests:
+  `TestJevGoalTrackerBarePhraseUsesEarlierTask` (goal from history, evidence
+  after the task counts, trivial turns skipped, no-task fallback for a done-claim
+  and for an announced step). `openai_chat_test` passes.
+- New replay mode `gufo judge --goal-replay DIR --goal-bare`: at every decision
+  point the latest user message is replaced by a bare "jev finish it".
+
+Replay (550 sessions, 4,957 turn ends):
+- Baseline (trigger carries the task text): 85 fires, strict precision 0.482,
+  loose 0.494, strict recall 0.048 (was 79 fires / 0.54 before the empty-turn
+  fallback added 6 low-value fires).
+- Bare phrase: goal from earlier turns at 3,343 points, no items at 1,614
+  (fallback), 15 fallback fires. 77 fires, strict precision 0.338, recall 0.030.
+  Per-rule: open-change 28 fires (13 strong), intent 20 (9), empty-turn 14 (2
+  strong, 11 other), open-commit 10 (6), open-answer 11 (7), open-build 9 (4).
+- Speed: normal path mean 59 us / p50 38 us / p99 276 us; bare path (detect +
+  evaluate, evidence from an older task message so more history) mean 844 us,
+  p50 143 us, p99 7.8 ms (long sessions with large tool results). Decision runs
+  once per turn end, not per token, but p99 is above the 1 ms goal.
+- Weak spot: the empty-turn fallback fires 14 times with 2 strong labels; kept
+  because an empty assistant turn with no tool call is always a stall, but it is
+  the first rule to drop if it nags.

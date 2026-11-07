@@ -32,8 +32,12 @@ struct JevGoalMessage {
 /// that carries the latest trigger; the evidence window starts there.
 struct JevGoalSpec {
   bool active{false};
-  std::string text;  // goal text with the phrase stripped
-  std::size_t index{0};
+  std::string text;           // goal text with the phrase stripped
+  std::size_t index{0};       // message carrying the latest trigger
+  std::size_t task_index{0};  // message the goal text came from; evidence
+                              // is read from here on
+  std::size_t items{0};       // checklist items extracted from `text`
+  bool from_history{false};   // goal taken from an earlier message
 };
 
 /// What the tracker wants to do when the model hands control back.
@@ -61,8 +65,11 @@ inline constexpr int kJevGoalMaxContinues = 3;
 [[nodiscard]] std::string StripJevGoalTrigger(std::string_view text);
 
 /// Scans the RAW (unstripped) user messages. Active when any user message
-/// carries the trigger; the goal text is the stripped latest trigger message,
-/// or the previous non-empty user message when that one is only the phrase.
+/// carries the trigger. The goal comes from the most recent substantive user
+/// message (the trigger message itself, else earlier ones, up to 6 user
+/// messages back) that yields at least one checklist item; bare phrases,
+/// "continue"/"ok"-style turns and pasted logs are skipped. With no items
+/// anywhere, the spec has items == 0 and the tracker runs its fallback rules.
 [[nodiscard]] JevGoalSpec DetectJevGoal(
     std::span<const JevGoalMessage> messages);
 

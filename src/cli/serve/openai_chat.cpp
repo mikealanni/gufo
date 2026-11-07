@@ -849,6 +849,9 @@ void ApplyJevGoal(TextGenerationBackend& backend, ChatRequest* chat,
   *spec = models::qwen38_flash_next::DetectJevGoal(history);
   if (!spec->active)
     return;
+  Logger::LogFormatted(
+      LogLevel::kInfo, "jev-goal", "trigger=detected source=%s items=%zu",
+      spec->from_history ? "history" : "this-message", spec->items);
   for (auto& message : chat->messages) {
     if (message.role != tokenization::ChatRole::kUser ||
         !models::qwen38_flash_next::HasJevGoalTrigger(message.content)) {

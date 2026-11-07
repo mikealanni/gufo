@@ -6465,6 +6465,77 @@ void TestJevAgentGateLowersRoutineToolTurns() {
          "Agent gate never raises a smaller caller budget");
 }
 
+void TestJevGoalTrackerBarePhraseUsesEarlierTask() {
+  const std::string task =
+      R"({"role":"user","content":"Fix the bug in parser.cpp."})";
+  const std::string chatter =
+      R"(,{"role":"assistant","content":"Looking at it now."})";
+  const std::string edit_turn =
+      R"(,{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"edit","arguments":"{\"filePath\":\"/src/parser.cpp\"}"}}]},{"role":"tool","tool_call_id":"c1","content":"Edit applied successfully."})";
+  const std::string bare = R"(,{"role":"user","content":"jev finish it"})";
+  const std::string ok = R"(,{"role":"user","content":"ok"})";
+  const std::string ok_first = R"({"role":"user","content":"ok"})";
+  const auto body = [&](const std::string& messages) {
+    return std::string(
+               R"({"model":"test-model","tools":[{"type":"function","function":{"name":"edit","parameters":{"type":"object","properties":{}}}}],"messages":[)") +
+           messages + "]}";
+  };
+  {
+    FakeBackend backend;
+    backend.jev_goal = true;
+    backend.piece_sequence = {{"All done."}, {"Edited it."}};
+    (void)gufo::server::HandleOpenAiChat(Request(body(task + chatter + bare)),
+                                         backend);
+    Expect(backend.chat_calls == 2,
+           "A bare phrase takes its goal from the earlier task message");
+    const auto& messages = backend.last_request.messages;
+    Expect(messages.size() >= 4 &&
+               messages.back().content.starts_with("Continue. Still open:") &&
+               messages.back().content.find("parser.cpp") != std::string::npos,
+           "The continue turn names the open item from the earlier task");
+    for (const auto& message : messages) {
+      Expect(message.content.find("jev") == std::string::npos,
+             "The bare phrase never reaches the backend");
+    }
+  }
+  {
+    FakeBackend backend;
+    backend.jev_goal = true;
+    backend.piece_sequence = {{"All done."}};
+    (void)gufo::server::HandleOpenAiChat(Request(body(task + edit_turn + bare)),
+                                         backend);
+    Expect(backend.chat_calls == 1,
+           "Edits made after the earlier task count as evidence");
+  }
+  {
+    FakeBackend backend;
+    backend.jev_goal = true;
+    backend.piece_sequence = {{"All done."}, {"Edited it."}};
+    (void)gufo::server::HandleOpenAiChat(
+        Request(body(task + chatter + ok + bare)), backend);
+    Expect(backend.chat_calls == 2,
+           "Trivial turns between the task and the bare phrase are skipped");
+  }
+  {
+    FakeBackend backend;
+    backend.jev_goal = true;
+    backend.piece_sequence = {{"All done."}};
+    (void)gufo::server::HandleOpenAiChat(Request(body(ok_first + bare)),
+                                         backend);
+    Expect(backend.chat_calls == 1,
+           "With no task anywhere the fallback leaves a done-claim alone");
+  }
+  {
+    FakeBackend backend;
+    backend.jev_goal = true;
+    backend.piece_sequence = {{"I'll now run the tests."}, {"Ran them."}};
+    (void)gufo::server::HandleOpenAiChat(Request(body(ok_first + bare)),
+                                         backend);
+    Expect(backend.chat_calls == 2,
+           "With no task the fallback still continues an announced step");
+  }
+}
+
 void TestJevGoalTrackerStripsPhraseAndContinues() {
   using gufo::models::qwen38_flash_next::HasJevGoalTrigger;
   using gufo::models::qwen38_flash_next::StripJevGoalTrigger;
@@ -6609,6 +6680,7 @@ void TestJevGoalTrackerStripsPhraseAndContinues() {
 
 int main() {
   TestJevGoalTrackerStripsPhraseAndContinues();
+  TestJevGoalTrackerBarePhraseUsesEarlierTask();
   TestJevAgentGateLowersRoutineToolTurns();
   TestJevFinishContinuesUnfinishedTurns();
   TestToolCallRenderParseRoundTrip();

@@ -795,7 +795,41 @@ std::string StripJevGoalTrigger(std::string_view text) {
   return trimmed.empty() ? "Continue." : trimmed;
 }
 
+bool TrivialTurn(std::string_view stripped) {
+  static constexpr std::array<std::string_view, 16> kTrivial{{
+      "continue",
+      "ok",
+      "okay",
+      "go",
+      "go on",
+      "go ahead",
+      "yes",
+      "yep",
+      "do it",
+      "proceed",
+      "keep going",
+      "continue please",
+      "thanks",
+      "thank you",
+      "status",
+      "next",
+  }};
+  constexpr std::size_t kTrivialMaxChars = 32;
+  if (stripped.size() > kTrivialMaxChars)
+    return false;
+  const std::string folded = Fold(stripped);
+  std::string_view view = folded;
+  while (!view.empty() && view.front() == ' ')
+    view.remove_prefix(1);
+  while (!view.empty() && view.back() == ' ')
+    view.remove_suffix(1);
+  if (view.empty())
+    return true;
+  return std::find(kTrivial.begin(), kTrivial.end(), view) != kTrivial.end();
+}
+
 JevGoalSpec DetectJevGoal(std::span<const JevGoalMessage> messages) {
+  constexpr int kUserLookback = 6;
   JevGoalSpec spec;
   std::size_t trigger = messages.size();
   for (std::size_t i = 0; i < messages.size(); ++i) {
@@ -808,12 +842,32 @@ JevGoalSpec DetectJevGoal(std::span<const JevGoalMessage> messages) {
     return spec;
   spec.active = true;
   spec.index = trigger;
-  for (std::size_t i = trigger + 1; i-- > 0;) {
+  spec.task_index = trigger;
+  bool have_text = false;
+  int seen = 0;
+  for (std::size_t i = trigger + 1; i-- > 0 && seen < kUserLookback;) {
     if (messages[i].role != JevGoalMessage::Role::kUser)
       continue;
-    std::string stripped = StripJevGoalTrigger(messages[i].text);
-    if (stripped != "Continue.") {
-      spec.text = std::move(stripped);
+    ++seen;
+    // Pasted logs can be hundreds of KB: only copy when the phrase is there.
+    std::string owned;
+    std::string_view view = messages[i].text;
+    if (HasJevGoalTrigger(view)) {
+      owned = StripJevGoalTrigger(view);
+      view = owned;
+    }
+    if (view == "Continue." || TrivialTurn(view))
+      continue;
+    const std::size_t items = ExtractItems(view).size();
+    if (!have_text) {
+      spec.text = std::string(view);  // fallback text when nothing yields items
+      have_text = true;
+    }
+    if (items > 0) {
+      spec.text = std::string(view);
+      spec.task_index = i;
+      spec.items = items;
+      spec.from_history = i != trigger;
       break;
     }
   }
@@ -827,7 +881,7 @@ JevGoalDecision EvaluateJevGoal(const JevGoalSpec& spec,
   if (!spec.active)
     return decision;
   decision.action = JevGoalAction::kDone;
-  const auto calls = CollectCalls(history, spec.index);
+  const auto calls = CollectCalls(history, spec.task_index);
   std::vector<Item> items = ExtractItems(spec.text);
   decision.items = items.size();
 
@@ -917,6 +971,7 @@ JevGoalDecision EvaluateJevGoal(const JevGoalSpec& spec,
   // Precision first: a turn that honestly reports a blocker or hands a
   // question back stays finished. The tracker acts on false completion claims,
   // announced steps that never ran, and empty turns.
+  const bool no_items = items.empty();
   std::string rule;
   std::string reason;
   if (!open.empty() && (claims_done || empty_turn)) {
@@ -926,12 +981,19 @@ JevGoalDecision EvaluateJevGoal(const JevGoalSpec& spec,
              !acknowledges) {
     rule = "last-failure";
     reason = "claims-done-but-last-test-or-build-failed";
+  } else if (no_items && Trim(final_text).empty()) {
+    rule = "empty-turn";
+    reason = "empty-turn";
   } else if (!intent.empty()) {
     rule = "intent";
     reason = "announced-next-step";
   } else {
+    if (no_items)
+      decision.reason = "no-items-fallback";
     return decision;
   }
+  if (no_items)
+    reason += ",no-items-fallback";
   decision.action = JevGoalAction::kContinue;
   decision.rule = rule;
   decision.reason = reason;
