@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -112,6 +113,45 @@ void print_battery_batched(const models::qwen38_flash_next::JevNpuModel& model,
                         .count();
   std::printf("SCORE %zu/%zu  total=%.1f ms  avg=%.1f ms/question\n", ok, count,
               ms, ms / static_cast<double>(count));
+}
+#endif
+
+#if defined(GUFO_NPU)
+std::string Unescape(std::string_view text) {
+  std::string out;
+  for (std::size_t i = 0; i < text.size(); ++i) {
+    if (text[i] != '\\' || i + 1 == text.size()) {
+      out.push_back(text[i]);
+      continue;
+    }
+    const char next = text[++i];
+    out.push_back(next == 'n' ? '\n' : next == 't' ? '\t' : next);
+  }
+  return out;
+}
+
+int ServeStdio(const models::qwen38_flash_next::JevNpuModel& model) {
+  std::printf("READY\n");
+  std::fflush(stdout);
+  std::string line;
+  while (std::getline(std::cin, line)) {
+    const auto tab = line.find('\t');
+    const std::string question =
+        Unescape(std::string_view(line).substr(0, tab));
+    const std::string context =
+        tab == std::string::npos
+            ? std::string()
+            : Unescape(std::string_view(line).substr(tab + 1));
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto verdict = model.Answer(question, context);
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0)
+                          .count();
+    std::printf("%s %.3f %.3f %.1f\n", verdict.yes >= verdict.no ? "Yes" : "No",
+                verdict.yes, verdict.no, ms);
+    std::fflush(stdout);
+  }
+  return 0;
 }
 #endif
 
@@ -325,6 +365,7 @@ int RunJudge(std::span<const char* const> args) {
   std::string goal_replay;
   bool goal_verbose = false;
   bool goal_bare = false;
+  bool stdio = false;
 
   ArgParser parser("gufo judge",
                    "Run the resident NPU judge on one question or the "
@@ -363,6 +404,10 @@ int RunJudge(std::span<const char* const> args) {
                  "Goal replay: also replay a bare trigger phrase as the "
                  "latest message",
                  "Goal", &goal_bare);
+  parser.AddFlag("", "--stdio",
+                 "Serve questions from stdin: one 'question<TAB>context' line "
+                 "each (\\n, \\t, \\\\ escaped), one verdict line back",
+                 "Serve", &stdio);
   parser.AddFlag("", "--finish-verbose", "List finish-replay misses", "Finish",
                  &finish_verbose);
   if (!parser.Parse(args))
@@ -377,7 +422,7 @@ int RunJudge(std::span<const char* const> args) {
     std::fprintf(stderr, "judge: --model is required\n");
     return 2;
   }
-  if (!battery && !code && question.empty() && replay.empty()) {
+  if (!stdio && !battery && !code && question.empty() && replay.empty()) {
     std::fprintf(stderr, "judge: --question, --battery or --code required\n");
     return 2;
   }
@@ -397,6 +442,8 @@ int RunJudge(std::span<const char* const> args) {
       std::fprintf(stderr, "judge: %s\n", err.c_str());
       return 1;
     }
+    if (stdio)
+      return ServeStdio(*model);
     if (!question.empty()) {
       for (int i = 0; i < repeat; ++i) {
         const auto t0 = std::chrono::steady_clock::now();
