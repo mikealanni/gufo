@@ -236,7 +236,7 @@ class Guard:
             if self.state == "up":
                 return
             self.state = "starting"
-            env = dict(os.environ, PORT=str(self.a.upstream_port), HOST="127.0.0.1")
+            env = dict(os.environ, PORT=str(self.a.upstream_port), HOST="127.0.0.1", GUFO_GUARD="0")
             self.proc = await asyncio.create_subprocess_exec(
                 "bash", self.a.run_script, env=env, start_new_session=True,
                 stdin=asyncio.subprocess.DEVNULL)
