@@ -731,6 +731,73 @@ SamplingDistribution SamplerState::Distribution(
   return DistributionWithPenalties(logits, config_, penalties);
 }
 
+SamplingDistribution SamplerState::DistributionFromCandidates(
+    std::span<const LogitCandidate> logits) const {
+  config_.Validate();
+  if (config_.temperature <= 0 || config_.top_k <= 0 || NeedsConstraintMask())
+    throw std::invalid_argument("compact target requires unconstrained top-k");
+  auto working = *this;
+  auto& candidates = working.candidate_scratch_;
+  candidates.reserve(logits.size());
+  for (const auto& candidate : logits) {
+    if (!std::isfinite(candidate.value))
+      continue;
+    const double adjusted = AdjustedLogit(candidate.token, candidate.value);
+    if (!std::isfinite(adjusted))
+      throw std::runtime_error(
+          "sampling penalties produced a non-finite logit");
+    candidates.push_back({candidate.token, adjusted});
+  }
+  if (candidates.empty())
+    throw std::runtime_error("logit distribution contains no finite values");
+  const auto keep =
+      std::min(candidates.size(),
+               std::max<std::size_t>(
+                   config_.top_k, std::max<std::size_t>(config_.min_keep, 1)));
+  std::partial_sort(candidates.begin(), candidates.begin() + keep,
+                    candidates.end(), IsBetterProbability);
+  candidates.resize(keep);
+  // Same FP64 tail the full-row path applies to its selected set (Prepare-
+  // Selected): top-p against the candidate softmax, then the min-p floor.
+  std::size_t kept = candidates.size();
+  const std::size_t minimum = MinimumKept(config_, candidates.size());
+  if (config_.top_p < 1.0F && kept > 1) {
+    const double maximum = candidates.front().value;
+    double sum = 0.0;
+    for (const auto& candidate : candidates)
+      sum += std::exp((candidate.value - maximum) / config_.temperature);
+    const double target = static_cast<double>(config_.top_p) * sum;
+    double cumulative = 0.0;
+    std::size_t top_p_keep = 0;
+    while (top_p_keep < kept) {
+      cumulative += std::exp((candidates[top_p_keep].value - maximum) /
+                             config_.temperature);
+      ++top_p_keep;
+      if (top_p_keep >= minimum && cumulative >= target)
+        break;
+    }
+    kept = top_p_keep;
+  }
+  if (config_.min_p > 0.0F && kept > 1) {
+    const double threshold = candidates.front().value +
+                             static_cast<double>(config_.temperature) *
+                                 std::log(static_cast<double>(config_.min_p));
+    std::size_t min_p_keep = 0;
+    while (min_p_keep < kept && candidates[min_p_keep].value >= threshold)
+      ++min_p_keep;
+    kept = std::min(kept, std::max(min_p_keep, minimum));
+  }
+  candidates.resize(kept);
+  const double maximum = candidates.front().value;
+  double total = 0;
+  for (auto& candidate : candidates) {
+    candidate.value =
+        std::exp((candidate.value - maximum) / config_.temperature);
+    total += candidate.value;
+  }
+  return SamplingDistribution(std::move(candidates), total);
+}
+
 void SamplerState::DeferSample(TokenId token) {
   if (pending_sample_) {
     throw std::logic_error("a sampled token is already pending");

@@ -409,6 +409,17 @@ public:
       std::span<ArgmaxCandidate> predictions,
       const sampling::SamplerState& sampler,
       std::span<const std::int32_t> drafts, std::string* error_msg) const;
+  [[nodiscard]] static bool CanCompactMtpVerification(
+      const sampling::SamplerState& sampler);
+  /// Whether a sampled verification of `rows` rows can stay compact.
+  [[nodiscard]] static bool CanCompactWideVerification(
+      const sampling::SamplerState& sampler, std::size_t rows);
+  /// Candidate spans remain valid until this executor next verifies a
+  /// request. One transfer serves all rows; no full CPU rows are reconstructed.
+  [[nodiscard]] bool SampledMtpCandidates(
+      std::span<std::span<const sampling::LogitCandidate>> output,
+      const sampling::SamplerState& sampler,
+      std::span<const std::int32_t> drafts, std::string* error_msg) const;
 
   /// A session's complete context as one host byte payload: recurrent and
   /// PLE state, KV and indexer caches up to the position, and the draft
@@ -811,6 +822,14 @@ private:
   /// Shared transient storage, grown only for penalty-aware verification.
   mutable sampling::TokenPenalty* verification_penalties_{nullptr};
   mutable std::size_t verification_penalty_capacity_{0};
+  static constexpr std::size_t kCompactPenaltyLimit = 4096;
+  std::uint32_t* verification_ids_{nullptr};
+  std::uint32_t* verification_scratch_ids_{nullptr};
+  sampling::LogitCandidate* verification_candidates_{nullptr};
+  sampling::LogitCandidate* verification_candidates_host_{nullptr};
+  mutable std::vector<sampling::TokenPenalty> verification_penalty_host_;
+  /// Compact sampled candidates of a wide verification's rows.
+  mutable std::vector<std::vector<sampling::LogitCandidate>> wide_candidates_;
   /// Allocated only when concurrent decoding is first requested.
   mutable float* batch_logits_{nullptr};
   mutable Session::Control* batch_controls_{nullptr};

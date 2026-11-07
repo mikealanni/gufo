@@ -63,6 +63,14 @@ struct TokenPenalty {
   std::uint32_t repeated{0};
 };
 
+/// One entry of a device-gathered compact distribution: a vocabulary ID and
+/// its unmodified F32 logit. Verification uses these instead of downloading
+/// a whole vocabulary row.
+struct LogitCandidate {
+  TokenId token;
+  float value;
+};
+
 struct Probability {
   TokenId token{0};
   double value{0.0};
@@ -158,6 +166,13 @@ public:
   /// Compact logits use token_ids for penalties; returned IDs index logits.
   [[nodiscard]] SamplingDistribution Distribution(
       std::span<const float> logits, std::span<const TokenId> token_ids) const;
+  /// Exact target top-k from a complete candidate union. The caller proves
+  /// that omitted tokens cannot enter the post-penalty top-k. Candidates
+  /// have unique vocabulary IDs; returned IDs are those vocabulary IDs.
+  /// Requires bounded top-k, positive temperature and no active constraint.
+  /// Retains the full-row sampler's FP64 filtering and normalization.
+  [[nodiscard]] SamplingDistribution DistributionFromCandidates(
+      std::span<const LogitCandidate> logits) const;
   /// Retain a speculative residual draw for the next Sample call. Copies
   /// preserve this draw along with the RNG; resetting history discards it.
   void DeferSample(TokenId token);

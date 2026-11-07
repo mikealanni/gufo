@@ -1364,6 +1364,7 @@ Executor::~Executor() {
         static_cast<void*>(counts_host_),
         static_cast<void*>(bank_b_counts_host_),
         static_cast<void*>(mtp_candidates_host_),
+        static_cast<void*>(verification_candidates_host_),
         static_cast<void*>(tiles_host_), static_cast<void*>(bank_b_tiles_host_),
         static_cast<void*>(bank_b_control_host_),
         static_cast<void*>(bank_b_tokens_host_)}) {
@@ -1666,6 +1667,32 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     std::construct_at(e->mtp_candidates_host_);
     e->mtp_candidates_host_->size =
         std::min<std::size_t>(c.vocab_size, kMtpCandidates);
+  }
+
+  // Compact sampled verification: two rotating ID buffers, the candidate
+  // output and its pinned download. Rows match the ordinary verifier's
+  // chain (at most seven drafts).
+  const std::size_t verify_rows =
+      std::min<std::size_t>(7, e->options_.max_speculative - 1);
+  if (verify_rows != 0) {
+    e->verification_ids_ = Alloc<std::uint32_t>(
+        e->allocations_, verify_rows * MtpCandidateWorkspaceSize(c.vocab_size),
+        error_msg);
+    e->verification_scratch_ids_ = Alloc<std::uint32_t>(
+        e->allocations_, verify_rows * MtpCandidateWorkspaceSize(c.vocab_size),
+        error_msg);
+    const std::size_t candidates =
+        verify_rows * (kMtpCandidates + kCompactPenaltyLimit);
+    e->verification_candidates_ =
+        Alloc<sampling::LogitCandidate>(e->allocations_, candidates, error_msg);
+    void* host_candidates = nullptr;
+    if (!Check(GuardedHostMalloc(GUFO_SITE, &host_candidates,
+                                 candidates * sizeof(sampling::LogitCandidate)),
+               "pinned verification candidates", error_msg))
+      return nullptr;
+    e->verification_candidates_host_ =
+        static_cast<sampling::LogitCandidate*>(host_candidates);
+    e->verification_penalty_host_.reserve(verify_rows * kCompactPenaltyLimit);
   }
   for (void* p : e->allocations_) {
     if (p == nullptr) {
@@ -6702,6 +6729,113 @@ bool Executor::ReadVerificationRows(std::uint32_t row, std::span<float> logits,
                "constrained verification row download", error_msg) &&
          Check(hipStreamSynchronize(stream_), "constrained verification",
                error_msg);
+}
+
+bool Executor::CanCompactMtpVerification(
+    const sampling::SamplerState& sampler) {
+  const auto& config = sampler.config();
+  return config.uses_random_sampling() && config.top_k > 0 &&
+         std::size_t(config.top_k) <= kMtpCandidates &&
+         config.min_keep <= kMtpCandidates &&
+         sampler.penalties().size() + 8 <= kCompactPenaltyLimit &&
+         !sampler.NeedsConstraintMask();
+}
+
+bool Executor::CanCompactWideVerification(const sampling::SamplerState& sampler,
+                                          std::size_t rows) {
+  return CanCompactMtpVerification(sampler) &&
+         sampler.penalties().size() + rows + 8 <= kCompactPenaltyLimit;
+}
+
+bool Executor::SampledMtpCandidates(
+    std::span<std::span<const sampling::LogitCandidate>> output,
+    const sampling::SamplerState& sampler, std::span<const std::int32_t> drafts,
+    std::string* error_msg) const {
+  const auto rows = output.size();
+  if (rows > 7 && rows < wide_rows_ && drafts.size() == rows &&
+      selected_logits_ != nullptr &&
+      CanCompactWideVerification(sampler, rows)) {
+    // A wide copy verification: rows of at most seven at a time, each with
+    // the penalty history of the drafts before it, kept beyond the next
+    // piece's download.
+    const float* logits = selected_logits_;
+    auto tentative = sampler.WithoutConstraint();
+    wide_candidates_.resize(std::max(wide_candidates_.size(), rows));
+    bool ok = true;
+    for (std::size_t first = 0; ok && first < rows; first += 7) {
+      const auto count = std::min<std::size_t>(7, rows - first);
+      std::array<std::span<const sampling::LogitCandidate>, 7> piece{};
+      selected_logits_ = logits + first * config().vocab_size;
+      ok = SampledMtpCandidates(std::span(piece).first(count), tentative,
+                                drafts.subspan(first, count), error_msg);
+      for (std::size_t i = 0; ok && i < count; ++i) {
+        auto& kept = wide_candidates_[first + i];
+        kept.assign(piece[i].begin(), piece[i].end());
+        output[first + i] = kept;
+        tentative.Accept(static_cast<sampling::TokenId>(drafts[first + i]));
+      }
+    }
+    selected_logits_ = logits;
+    return ok;
+  }
+  if (rows == 0 || rows > 7 || rows >= options_.max_speculative ||
+      rows != drafts.size() || verification_ids_ == nullptr ||
+      !CanCompactMtpVerification(sampler)) {
+    AssignError(error_msg, "invalid compact MTP verification request");
+    return false;
+  }
+  auto& penalties = verification_penalty_host_;
+  penalties.clear();
+  GreedyPenaltyRows batch{};
+  auto tentative = sampler.WithoutConstraint();
+  for (std::size_t row = 0; row < rows; ++row) {
+    const auto counts = tentative.penalties();
+    penalties.insert(penalties.end(), counts.begin(), counts.end());
+    batch.offsets[row + 1] = static_cast<std::uint32_t>(penalties.size());
+    if (row + 1 < rows)
+      tentative.Accept(static_cast<sampling::TokenId>(drafts[row]));
+  }
+  if (!penalties.empty()) {
+    if (penalties.size() > verification_penalty_capacity_) {
+      const auto capacity =
+          std::max(penalties.size(), 2 * verification_penalty_capacity_);
+      sampling::TokenPenalty* allocated = nullptr;
+      if (!Check(hipMalloc(&allocated, capacity * sizeof(*allocated)),
+                 "verification penalty allocation", error_msg))
+        return false;
+      (void)hipFree(verification_penalties_);
+      verification_penalties_ = allocated;
+      verification_penalty_capacity_ = capacity;
+    }
+    batch.penalties = verification_penalties_;
+    if (!Check(hipMemcpyAsync(verification_penalties_, penalties.data(),
+                              penalties.size() * sizeof(penalties.front()),
+                              hipMemcpyHostToDevice, stream_),
+               "compact verification penalties", error_msg))
+      return false;
+  }
+  VerificationCandidates(VerificationLogits(), batch, verification_ids_,
+                         verification_scratch_ids_, verification_candidates_,
+                         static_cast<std::uint32_t>(rows), config().vocab_size,
+                         stream_);
+  const auto count =
+      rows * kMtpCandidates + static_cast<std::size_t>(penalties.size());
+  const bool copied =
+      Check(GuardedMemcpyAsync(GUFO_SITE, verification_candidates_host_,
+                               verification_candidates_,
+                               count * sizeof(sampling::LogitCandidate),
+                               hipMemcpyDeviceToHost, stream_),
+            "compact verification candidates", error_msg);
+  const bool completed =
+      Check(hipStreamSynchronize(stream_), "compact verification", error_msg);
+  if (!copied || !completed)
+    return false;
+  for (std::size_t row = 0; row < rows; ++row)
+    output[row] = {
+        verification_candidates_host_ + row * kMtpCandidates +
+            batch.offsets[row],
+        kMtpCandidates + batch.offsets[row + 1] - batch.offsets[row]};
+  return true;
 }
 
 bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,

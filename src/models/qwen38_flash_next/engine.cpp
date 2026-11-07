@@ -1343,12 +1343,20 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   }
   // Retrieval drafts: the token history may already contain what follows this
   // phrase. The index includes the anchor, which is committed in every outcome.
-  // A greedy session decoding alone may verify a copy wider than the MTP
-  // chain (Executor::ForwardWide): the shared projections read their weights
-  // once for every row. The width grows only while whole copies are accepted
-  // (FinishDecode), so a copy that diverges costs at most the last width.
+  // A greedy session decoding alone - or a sampled one whose rows verify
+  // compactly and replays nothing (no seed) - may verify a copy wider than
+  // the MTP chain (Executor::ForwardWide): the shared projections read their
+  // weights once for every row. The width grows only while whole copies are
+  // accepted (FinishDecode), so a copy that diverges costs at most the last
+  // width.
+  const bool wide_ready =
+      !defer_head &&
+      (sampler.config().temperature == 0.0F ||
+       (sampler.config().uses_random_sampling() && sampler.config().seed < 0 &&
+        rocm::Executor::CanCompactWideVerification(sampler,
+                                                   exec.max_copy_rows())));
   const std::size_t wide_rows =
-      !defer_head && sampler.config().temperature == 0.0F
+      wide_ready
           ? std::min<std::size_t>(
                 {max_tokens, room,
                  static_cast<std::size_t>(exec.max_copy_rows()),
@@ -1389,12 +1397,13 @@ bool Session::PrepareDecode(const DecodeRequest& request,
     pending->speculative = true;
     pending->sampled = sampled;
     pending->gpu_greedy = gpu_greedy;
-    pending->gpu_verification = gpu_greedy;
+    pending->gpu_verification =
+        gpu_greedy || rocm::Executor::CanCompactMtpVerification(sampler);
     // Only a chain past the ordinary verifier width verifies through
     // ForwardWide (DecodeStep).
-    pending->wide = !defer_head && gpu_greedy &&
-                    pending->chain.size() >
-                        static_cast<std::size_t>(exec.max_speculative());
+    pending->wide =
+        wide_ready && pending->chain.size() >
+                          static_cast<std::size_t>(exec.max_speculative());
     if (!pending->gpu_verification &&
         verify_logits_.size() < pending->chain.size() * model_->VocabSize())
       verify_logits_.resize(pending->chain.size() * model_->VocabSize());
@@ -1480,7 +1489,8 @@ bool Session::PrepareDecode(const DecodeRequest& request,
         pending->speculative = true;
         pending->sampled = sampled;
         pending->gpu_greedy = gpu_greedy;
-        pending->gpu_verification = gpu_greedy;
+        pending->gpu_verification =
+            gpu_greedy || rocm::Executor::CanCompactMtpVerification(sampler);
         pending->draft_rng = draft_rng;
         pending->width = pending->chain.size();
         if (!gpu_greedy && verify_logits_.size() <
@@ -1503,7 +1513,8 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   const std::uint32_t base = static_cast<std::uint32_t>(tokens_.size());
   const bool sampled = sampler.config().uses_random_sampling();
   const bool gpu_greedy = sampler.config().temperature == 0.0F;
-  const bool gpu_verification = gpu_greedy;
+  const bool gpu_verification =
+      gpu_greedy || rocm::Executor::CanCompactMtpVerification(sampler);
   const bool log_top = g_mtp_log.enabled && !defer_head;
   if (!defer_head &&
       !DraftCatchUp(anchor, true, error_msg,
@@ -1608,6 +1619,33 @@ bool Session::FinishDecode(const DecodeRequest& request,
   std::uint32_t keep = 1;
   std::optional<std::int32_t> correction;
   bool cpu_rows = false;
+  const auto download_remaining = [&](std::uint32_t first) {
+    verify_logits_.resize(std::max<std::size_t>(exec.max_speculative(), k) *
+                          vocab);
+    auto rows =
+        std::span(verify_logits_).subspan(first * vocab, (k - first) * vocab);
+    if (!exec.ReadVerificationRows(first, rows, error_msg))
+      return false;
+    cpu_rows = true;
+    return true;
+  };
+  std::array<std::span<const sampling::LogitCandidate>,
+             rocm::Executor::kWideRows - 1>
+      candidates{};
+  if (gpu_verification && !gpu_greedy) {
+    // Accepting the anchor may activate a tool grammar, reasoning budget,
+    // or exceed the bounded penalty workspace. Keep the complete-row path.
+    if (!rocm::Executor::CanCompactMtpVerification(sampler) ||
+        (k > exec.max_speculative() &&
+         !rocm::Executor::CanCompactWideVerification(sampler, k))) {
+      if (!download_remaining(0))
+        return false;
+    } else if (!exec.SampledMtpCandidates(std::span(candidates).first(k - 1),
+                                          sampler, std::span(chain).subspan(1),
+                                          error_msg)) {
+      return false;
+    }
+  }
   while (keep < k) {
     if (gpu_greedy && !cpu_rows) {
       const auto& prediction = greedy[keep - 1];
@@ -1647,10 +1685,16 @@ bool Session::FinishDecode(const DecodeRequest& request,
     }
     if (sampled) {
       const auto verify_t0 = std::chrono::steady_clock::now();
+      if (gpu_verification && !cpu_rows && sampler.NeedsConstraintMask() &&
+          !download_remaining(keep - 1))
+        return false;
       const auto verified =
-          VerifyMtpProposal(std::span<const float>(verify_logits_)
-                                .subspan((keep - 1) * vocab, vocab),
-                            proposals[keep - 1], sampler);
+          gpu_verification && !cpu_rows
+              ? VerifyMtpProposal(candidates[keep - 1], vocab,
+                                  proposals[keep - 1], sampler)
+              : VerifyMtpProposal(std::span<const float>(verify_logits_)
+                                      .subspan((keep - 1) * vocab, vocab),
+                                  proposals[keep - 1], sampler);
       if (g_mtp_log.enabled) {
         g_mtp_log.verify_ns += static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
