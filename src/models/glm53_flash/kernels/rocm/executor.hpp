@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/core/sampling.hpp"
 #include "src/models/glm53_flash/kernels/rocm/dsa.hpp"
 #include "src/models/glm53_flash/runtime/config.hpp"
 
@@ -148,6 +149,21 @@ public:
   bool ReadLogitRows(std::uint32_t first, std::uint32_t count,
                      float* destination);
 
+  // Whether a sampled verification of the previous forward can stay on the
+  // candidate path instead of downloading whole logit rows.
+  [[nodiscard]] static bool CanCompactVerification(
+      const sampling::SamplerState& sampler);
+  // Compact sampled verification: for each of the first `drafts.size()` kept
+  // rows, the exact union of that row's top-64 unpenalized tokens and its
+  // penalized tokens, with the penalty history of the drafts before it.
+  // `drafts` are chain[1..]: the token row i+1's verification commits when
+  // row i accepts. Rows beyond seven are gathered in pieces. `*out` spans
+  // remain valid until this executor gathers again.
+  bool SampledCandidates(
+      std::vector<std::vector<sampling::LogitCandidate>>* out,
+      const sampling::SamplerState& sampler,
+      std::span<const std::int32_t> drafts, std::string* error);
+
   // Zeroes the recurrent state and rewinds the session to position 0.
   void ResetSession(Session& session);
 
@@ -235,6 +251,17 @@ private:
   std::unordered_map<std::string, DeviceTensor> tensors_;
   std::vector<LayerWeights> weights_;
   std::unique_ptr<Scratch> scratch_;
+  // Compact sampled verification: rotating ID buffers, the candidate output
+  // and its pinned download (seven rows at a time, like the ordinary MTP
+  // verifier).  Allocated on first use.
+  std::uint32_t* verification_ids_{nullptr};
+  std::uint32_t* verification_scratch_ids_{nullptr};
+  sampling::LogitCandidate* verification_candidates_{nullptr};
+  sampling::LogitCandidate* verification_candidates_host_{nullptr};
+  sampling::TokenPenalty* verification_penalties_{nullptr};
+  std::size_t verification_penalty_capacity_{0};
+  std::vector<sampling::TokenPenalty> verification_penalty_host_;
+  std::vector<std::vector<sampling::LogitCandidate>> verification_rows_;
   struct BankFields {
     float* x[2]{};
     float *y{}, *post{}, *comb{}, *hc_mixes{};

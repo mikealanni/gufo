@@ -642,14 +642,32 @@ bool Session::DecodeImpl(std::size_t max_tokens,
   std::optional<std::int32_t> correction;
   if (speculative) {
     std::vector<std::int32_t> greedy;
-    if (gpu_greedy) {
-      greedy = exec.ArgmaxRows(k);
-    } else {
+    // A sampled session used to download a full vocabulary row per draft.
+    // The candidate path returns each row's exact post-penalty top-k
+    // instead; the CPU keeps its FP64 filtering and rejection sampler.
+    const bool compact = !gpu_greedy && sampled &&
+                         rocm::Executor::CanCompactVerification(sampler);
+    std::vector<std::vector<sampling::LogitCandidate>> candidates;
+    bool cpu_rows = !compact;
+    const auto download_remaining = [&](std::uint32_t first) {
       verify_logits_.resize(static_cast<std::size_t>(k) * vocab);
-      if (!exec.ReadLogitRows(0, k, verify_logits_.data())) {
+      if (!exec.ReadLogitRows(first, k - first,
+                              verify_logits_.data() + first * vocab)) {
         AssignError(error_msg, "verification readback failed");
         return false;
       }
+      cpu_rows = true;
+      return true;
+    };
+    if (gpu_greedy) {
+      greedy = exec.ArgmaxRows(k);
+    } else if (!compact) {
+      if (!download_remaining(0))
+        return false;
+    } else if (!exec.SampledCandidates(&candidates, sampler,
+                                       std::span(chain).subspan(1),
+                                       error_msg)) {
+      return false;
     }
     while (keep < k) {
       if (gpu_greedy) {
@@ -665,12 +683,21 @@ bool Session::DecodeImpl(std::size_t max_tokens,
         ++keep;
         continue;
       }
-      const auto row =
-          std::span<const float>(verify_logits_)
-              .subspan(static_cast<std::size_t>(keep - 1) * vocab, vocab);
       if (sampled) {
+        // Accepting the anchor or a draft may activate a tool grammar. Keep
+        // the complete-row path for constrained draws.
+        if (compact && !cpu_rows && sampler.NeedsConstraintMask() &&
+            !download_remaining(keep - 1))
+          return false;
         const auto verified =
-            qfn::VerifyMtpProposal(row, proposals[keep - 1], sampler);
+            compact && !cpu_rows
+                ? qfn::VerifyMtpProposal(std::span(candidates[keep - 1]), vocab,
+                                         proposals[keep - 1], sampler)
+                : qfn::VerifyMtpProposal(
+                      std::span<const float>(verify_logits_)
+                          .subspan(static_cast<std::size_t>(keep - 1) * vocab,
+                                   vocab),
+                      proposals[keep - 1], sampler);
         const auto token = static_cast<std::int32_t>(verified.token);
         if (is_stop(token)) {
           result->stop = true;
@@ -684,6 +711,9 @@ bool Session::DecodeImpl(std::size_t max_tokens,
         ++keep;
         continue;
       }
+      const auto row =
+          std::span<const float>(verify_logits_)
+              .subspan(static_cast<std::size_t>(keep - 1) * vocab, vocab);
       const auto decision =
           qfn::VerifyDraft(row, chain[keep], sampler, is_stop);
       if (decision != qfn::DraftDecision::kAccept) {

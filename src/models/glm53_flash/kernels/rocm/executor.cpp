@@ -20,6 +20,7 @@
 #include "src/models/glm53_flash/kernels/rocm/router.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/npu_gemm.hpp"
+#include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 
 extern "C" int ds4_mmq_init(int device);
 
@@ -29,6 +30,7 @@ namespace {
 
 using core::GgmlType;
 namespace qfn = gufo::models::qwen38_flash_next::rocm;
+namespace qfnk = gufo::models::qwen38_flash_next;
 
 constexpr std::size_t kTailMargin = 4096;
 constexpr std::size_t kUploadChunk = std::size_t{128} << 20;
@@ -212,6 +214,12 @@ Executor::~Executor() {
     hipblasDestroy(static_cast<hipblasHandle_t>(blas_));
   if (q8_fallback_ != nullptr)
     hipFree(q8_fallback_);
+  hipFree(verification_ids_);
+  hipFree(verification_scratch_ids_);
+  hipFree(verification_candidates_);
+  hipFree(verification_penalties_);
+  if (verification_candidates_host_ != nullptr)
+    hipHostFree(verification_candidates_host_);
   for (auto& [name, t] : tensors_) {
     if (t.q8_owned && t.q8 != nullptr)
       hipFree(t.q8);
@@ -1680,6 +1688,115 @@ std::vector<std::int32_t> Executor::ArgmaxRows(std::uint32_t rows) {
                  hipMemcpyDeviceToHost, stream_);
   hipStreamSynchronize(stream_);
   return out;
+}
+
+namespace {
+// Bounded per-row penalty workspace of the compact verification path.
+constexpr std::size_t kCompactPenaltyLimit = 4096;
+}  // namespace
+
+bool Executor::CanCompactVerification(const sampling::SamplerState& sampler) {
+  const auto& config = sampler.config();
+  return config.uses_random_sampling() && config.top_k > 0 &&
+         std::size_t(config.top_k) <= qfnk::kMtpCandidates &&
+         config.min_keep <= qfnk::kMtpCandidates &&
+         sampler.penalties().size() + 8 <= kCompactPenaltyLimit &&
+         !sampler.NeedsConstraintMask();
+}
+
+bool Executor::SampledCandidates(
+    std::vector<std::vector<sampling::LogitCandidate>>* out,
+    const sampling::SamplerState& sampler, std::span<const std::int32_t> drafts,
+    std::string* error) {
+  const std::size_t rows = drafts.size();
+  if (rows == 0 || !CanCompactVerification(sampler) ||
+      sampler.penalties().size() + rows + 8 > kCompactPenaltyLimit) {
+    if (error != nullptr)
+      *error = "sampled verification is not compact-eligible";
+    return false;
+  }
+  const auto vocab = static_cast<std::uint32_t>(config_.vocab_size);
+  if (verification_ids_ == nullptr) {
+    const auto ids = 7 * qfn::MtpCandidateWorkspaceSize(vocab);
+    if (!Alloc(&verification_ids_, ids, error) ||
+        !Alloc(&verification_scratch_ids_, ids, error) ||
+        !Alloc(&verification_candidates_,
+               7 * (qfnk::kMtpCandidates + kCompactPenaltyLimit), error) ||
+        hipHostMalloc(reinterpret_cast<void**>(&verification_candidates_host_),
+                      7 * (qfnk::kMtpCandidates + kCompactPenaltyLimit) *
+                          sizeof(sampling::LogitCandidate),
+                      hipHostMallocDefault) != hipSuccess) {
+      if (error != nullptr && error->empty())
+        *error = "verification candidate allocation failed";
+      return false;
+    }
+    verification_penalty_host_.reserve(7 * kCompactPenaltyLimit);
+  }
+  verification_rows_.resize(std::max(verification_rows_.size(), rows));
+  auto tentative = sampler.WithoutConstraint();
+  for (std::size_t first = 0; first < rows; first += 7) {
+    const auto count =
+        static_cast<std::uint32_t>(std::min<std::size_t>(7, rows - first));
+    auto& penalties = verification_penalty_host_;
+    penalties.clear();
+    qfn::GreedyPenaltyRows batch{};
+    for (std::uint32_t row = 0; row < count; ++row) {
+      const auto counts = tentative.penalties();
+      penalties.insert(penalties.end(), counts.begin(), counts.end());
+      batch.offsets[row + 1] = static_cast<std::uint32_t>(penalties.size());
+      if (row + 1 < count)
+        tentative.Accept(static_cast<sampling::TokenId>(drafts[first + row]));
+    }
+    if (!penalties.empty()) {
+      if (penalties.size() > verification_penalty_capacity_) {
+        const auto capacity =
+            std::max(penalties.size(), 2 * verification_penalty_capacity_);
+        sampling::TokenPenalty* allocated = nullptr;
+        if (hipMalloc(&allocated, capacity * sizeof(*allocated)) !=
+            hipSuccess) {
+          if (error != nullptr)
+            *error = "verification penalty allocation failed";
+          return false;
+        }
+        hipFree(verification_penalties_);
+        verification_penalties_ = allocated;
+        verification_penalty_capacity_ = capacity;
+      }
+      batch.penalties = verification_penalties_;
+      if (hipMemcpyAsync(verification_penalties_, penalties.data(),
+                         penalties.size() * sizeof(penalties.front()),
+                         hipMemcpyHostToDevice, stream_) != hipSuccess) {
+        if (error != nullptr)
+          *error = "verification penalty upload failed";
+        return false;
+      }
+    }
+    qfn::VerificationCandidates(scratch_->logits + first * vocab, batch,
+                                verification_ids_, verification_scratch_ids_,
+                                verification_candidates_, count, vocab,
+                                stream_);
+    const auto total = count * qfnk::kMtpCandidates +
+                       static_cast<std::size_t>(penalties.size());
+    if (hipMemcpyAsync(verification_candidates_host_, verification_candidates_,
+                       total * sizeof(sampling::LogitCandidate),
+                       hipMemcpyDeviceToHost, stream_) != hipSuccess ||
+        hipStreamSynchronize(stream_) != hipSuccess) {
+      if (error != nullptr)
+        *error = "verification candidate download failed";
+      return false;
+    }
+    tentative.Accept(static_cast<sampling::TokenId>(drafts[first + count - 1]));
+    for (std::uint32_t row = 0; row < count; ++row) {
+      const auto begin = row * qfnk::kMtpCandidates + batch.offsets[row];
+      auto& kept = verification_rows_[first + row];
+      kept.assign(verification_candidates_host_ + begin,
+                  verification_candidates_host_ + begin + qfnk::kMtpCandidates +
+                      batch.offsets[row + 1] - batch.offsets[row]);
+    }
+  }
+  out->assign(verification_rows_.begin(),
+              verification_rows_.begin() + static_cast<std::ptrdiff_t>(rows));
+  return true;
 }
 
 bool Executor::SaveState(Session& session, std::string* error) {
