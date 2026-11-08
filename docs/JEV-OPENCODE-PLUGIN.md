@@ -98,10 +98,10 @@ Not verified (must be checked in Task 0, do not assume):
 ## Detecting gufo
 
 From the opencode database the gufo providers are `kairic-direct` and
-`gufo-local`, model `Qwen3.8 Flash Next` (base URLs `http://127.0.0.1:8900/v1`
+`gufo-local` (older sessions; absent from the current config), model `Qwen3.8 Flash Next` (base URLs `http://127.0.0.1:8900/v1`
 and `http://192.168.6.138:8900/v1` in `~/.config/opencode/opencode.json`).
 Make the provider ids and the model id configurable
-(`JEV_GUFO_PROVIDERS`, default `kairic-direct,gufo-local`) and match
+(`JEV_GUFO_PROVIDERS`, default `kairic-direct,kairic-remote`, the two gufo providers in the current `opencode.json`) and match
 `model.providerID` from the hook input. Tool hooks (`tool.execute.*`) have no
 model in their input: look up the session's active model from the most recent
 `chat.message`/`chat.params` for that `sessionID` and cache it in memory.
@@ -147,7 +147,7 @@ the end of this file. Everything below is conditional on those results.
 
 ### 1. Command gate (log only)
 
-Hook: `tool.execute.before` when `tool === "bash"` and the session is on gufo.
+Hook: `tool.execute.before` (V2: `ctx.tool.hook("execute.before")`) when the tool is `shell` (the spike showed opencode v2.2.6 names it `shell`; accept `bash` too) and the session is on gufo.
 
 - Port `classify(command)` from `tools/jev/guard.py` to TypeScript:
   `HEAVY` patterns, `LIGHT_WORDS`, `segments`, `strip_launchers`/`LAUNCHER`,
@@ -165,7 +165,7 @@ Hook: `tool.execute.before` when `tool === "bash"` and the session is on gufo.
 
 ### 2. Goal tracker (log only)
 
-Hook: `chat.message` for user messages on gufo. Detect the same phrases as
+Hook: V2 `ctx.session.hook("prompt")` buffers the user text, and `ctx.session.hook("context")` (which knows the provider) evaluates it once per user message; `chat.message` is the V1 name for the same step. Detect the same phrases as
 `src/models/qwen38_flash_next/jev_goal.cpp` ("jev make sure its done", "jev
 finish it", the variants listed there). Log `matched`, which phrase, and whether
 the message was a bare phrase (then the task would come from earlier user
@@ -291,4 +291,115 @@ the plugin log agreeing with the daemon log.
 
 ## Spike results
 
-(to be filled in by Task 0)
+Done (2026-11-08, three `--standalone` runs on gufo; shared-service old code
+is superseded — use `--standalone` or restart the service after edits,
+because the file-plugin revision is keyed by target string, not content hash).
+
+- **Q1 loader — V2 wins (corrects the static guess above).** The installed
+  `@opencode-ai/plugin` 1.14.x d.ts describes V1 Hooks, but the v2.2.6
+  loader for `~/.config/opencode/plugins/jev.ts` rejects a bare function
+  (`Plugin must export a default definition with an id and an effect or
+  setup function`) and *ignores* a `setup()` that returns a hooks object
+  (loads active, hooks never fire). What works is `export default {
+  id: "jev-spike", async setup(ctx) { await ctx.tool.hook(...);
+  await ctx.session.hook(...); return () => {} } }`. `ctx` keys on this
+  build: `app, location, options, agent, aisdk, command, credential, event,
+  experimental, generate, model, provider, integration, mcp, permission,
+  plugin, reference, rpc, skill, storage, tool, vcs, websearch, worktree,
+  session, shell`. Spike: `tools/jev/opencode-plugin/spike.ts` (now V2),
+  symlinked to `~/.config/opencode/plugins/jev.ts`, `JEV_PLUGIN=off` kill
+  switch, JSONL to `~/.gufo/jev-log/plugin-spike.jsonl`.
+- **Runtime (from the live `load` line, `process.versions`):** node 26.3.0,
+  bun 1.4.4, sqlite 3.53.4, typescript 7.0.2 (host `bun` 1.3.13 / node
+  22.22.2 are *not* the runtime — do not use host numbers for the plugin).
+  `await import("bun:sqlite")` inside `setup` → `hasDatabase: true`
+  (host `bun -e` also returns `function`). **`bun:sqlite` is available**
+  in-plugin; the log-format note about INSERT-only into `jev.sqlite3`
+  stands (see Log format).
+- **Providers:** `~/.config/opencode/opencode.json` currently has
+  `kairic-direct` (`Qwen3.8 Flash Next` @ `http://127.0.0.1:8900/v1`) and
+  `kairic-remote` — **no `gufo-local`** (the plan's second id is absent).
+  Default `JEV_GUFO_PROVIDERS` should be `kairic-direct,kairic-remote` until
+  the config says otherwise.
+- **Parity data:** `~/dflash-train/guard_cmds.json` exists, 42,570 rows,
+  keys `{cmd, dur, sid, script_heavy, verdict}` — ready for the parity test.
+- **Bash tool args (live):** `tool.execute.before` fires with `tool:
+  "shell"` — **not `"bash"`** (fix Section 1's `tool === "bash"` check to
+  accept `shell`) and `input` keys `["command"]` with a string command
+  (`"ls /tmp"`). `tool.execute.after` adds `status: "completed"`.
+  Hook event keys: `tool.before: tool, sessionID, agent, messageID, id,
+  input`; `tool.after` adds `status, result`. `sessionID` **is** present on
+  tool hooks (plan's lookup-if-missing fallback not needed, but keep it).
+- **Session hooks (live):** `session.prompt` keys `sessionID, messageID,
+  prompt, metadata, delivery`; `session.context` keys `sessionID, model,
+  system, messages, options, agent, tools` with `model: {providerID:
+  "kairic-direct", id: "Qwen3.8 Flash Next"}`, `options` keys `["maxTokens"]`,
+  `messages` count 1 → 3 across the run, `tools` as `object` (not an array).
+  So a hook reads history via `event.messages` (and `ctx.session.context`
+  per the API docs) — no SDK-client guess needed.
+- **Q3 (effort-gate route) — partially answered, not proven.** `options` is
+  a mutable object (`maxTokens` present); per the server docs, request
+  overrides merge into the outgoing call and non-typed keys pass as provider
+  options. Whether a plugin-set `reasoning_budget_tokens`/`thinking_budget_tokens`
+  actually reaches the gufo OpenAI-compatible HTTP body is **still unverified**
+  — log-only forbids the mutation test. Needs a Phase-1 mutation test
+  against `openai_chat.cpp` ~line 754 before Phase 4 design.
+- **Event names (live, 63 events, 35 distinct `event.type`):** `agent.updated,
+  command.updated, integration.updated, location.shutdown,
+  mcp.resources.changed, mcp.status.changed, model.updated, plugin.updated,
+  provider.updated, reference.updated, session.execution.started,
+  session.execution.succeeded, session.inbox.delivered, session.inbox.enqueued,
+  session.instructions.updated, session.reasoning.delta,
+  session.reasoning.ended, session.reasoning.started, session.renamed,
+  session.step.ended, session.step.started, session.step.streamed,
+  session.text.delta, session.text.ended, session.text.started,
+  session.tool.called, session.tool.input.ended, session.tool.input.started,
+  session.tool.progress, session.tool.success, session.usage.updated,
+  shell.created, shell.exited, skill.updated, vcs.branch.updated,
+  websearch.updated`. **No `session.idle`** in short runs — the finish/goal
+  idle hook still needs a longer-idle run to name the exact event (Q4/Q5
+  remain open on idle-naming and subagent coverage; both are now cheap:
+  extend the `ctx.event.subscribe` loop and re-run).
+- **Q5 (subagents/background):** `tool.before` fired for the regular bash run;
+  subagent/background coverage needs a run that actually spawns them.
+
+Task 0 is complete pending the idle/subagent naming run. Sections 1–5 may
+now be built against these facts — with the `shell` tool name and the
+`kairic-direct,kairic-remote` default above.
+
+
+## Implementation status (2026-11-08, reviewed)
+
+Code: `tools/jev/opencode-plugin/` (`jev.ts` entry, `classify.ts`, `goal.ts`,
+`finish.ts`, `gate.ts`, `test/`, `compare.py`). Installed by symlink as
+`~/.config/opencode/plugins/jev.ts`. Uncommitted in the jevgate worktree.
+
+| Section | State |
+|---|---|
+| Spike (Task 0) | Done; results above. Q1, Q2 closed; Q3 (budget route), Q4 (idle name), Q5 (subagents) open. |
+| 1 command gate | Done: `classify.ts` port, JSONL plus `decisions` rows (`plugin-command`). Accepts `shell` and `bash`. |
+| 2 goal tracker | Done: 8 phrases, bare detection. Evaluated once per user message. Prompt text is logged only when a phrase matched. |
+| 3 finish detector | Done: evaluated once per turn end (events inside 1.5 s collapse). `session.idle` was not seen in short runs; the subscriber also uses `session.execution.succeeded` and `session.step.ended`. |
+| 4 effort gate | Port done (`gate.ts`); the turn builder is approximate (live blocker was `tool=tool`, not the shell command). Q3 unproven. |
+| 5 activity | Start record per model call; end record per turn end (`phase: "end"`). |
+| Retention | Daily JSONL files older than 14 days are deleted at startup; a day file stops growing at 64 MiB (one `error` record, then drops). `JEV_LOG_DIR` overrides the directory (tests use a temp dir). |
+
+Acceptance (section "Tests and acceptance criteria"):
+
+1. Parity: pass. 42,570 commands, fresh Python agreement 100.00%, zero heavy-to-light; median 0.014 ms, p99 0.117 ms.
+2. No mutation: pass (`test/safety.ts`).
+3. Fail-open: pass. `JEV_TEST_THROW=<hook>` injects an exception in `prompt`, `context`, `execute.before`, `execute.after`; each leaves one `error` record and does not throw.
+4. Overhead: pass (same numbers as 1).
+5. Gufo only: pass.
+6. Live: light, heavy and goal phrase seen in one session. First live comparison with the guard: `compare.py` matched 37 command pairs with 37 agreements (2 heavy, 35 light), 0 disagreements; 18 plugin rows and 17 guard rows are unmatched (not yet explained: likely text or timing differences between what the proxy and the plugin see).
+7. `compare.py`: built. The week of data it is meant to judge has not run yet.
+
+Review notes (fixed in this pass): the finish detector used to be permanently
+debounced per session (only the first idle was ever logged); the goal check
+ran only for the first prompt of a session; unmatched prompts were logged with
+their text; tests wrote into the real log directory; there was no activity end
+record, no retention and no fail-open test.
+
+Known remaining issues: the turn builder for the effort gate (above); the
+unmatched rows in `compare.py`; Q3/Q4/Q5; the daemon does not read the plugin
+log yet.
