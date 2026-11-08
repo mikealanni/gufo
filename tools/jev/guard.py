@@ -206,6 +206,86 @@ def find_pids(needle):
             hits.append(int(entry))
     return hits
 
+KFD = "/dev/kfd"
+KFD_SAMPLES = 2
+KFD_QUIET = 15
+SCRIPT_RE = re.compile(r"(?:(?<=\s)|^)(~?/[^\s'\"<>|;&]+\.(?:py|sh))")
+HEAVY_CONTENT = re.compile(
+    r"import\s+torch|from\s+torch|\bhipMalloc|\bhipLaunch|libamdhip|\bcuda\b|rocm|"
+    r"\bgufo\b|llama[._-]?cpp|\bvllm\b|safetensors|from_pretrained|\bcmake\s+--build|"
+    r"\bninja\b|\bmake\s+-j|/dev/kfd|\bgguf\b", re.I)
+SCRIPT_DEPTH = 2
+SCRIPT_BYTES = 65536
+
+
+def kfd_holders(skip_pgid, skip_pids):
+    out = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) in skip_pids:
+            continue
+        pid = int(entry)
+        try:
+            if os.getpgid(pid) == skip_pgid:
+                continue
+            for fd in os.listdir(f"/proc/{entry}/fd"):
+                if os.readlink(f"/proc/{entry}/fd/{fd}") == KFD:
+                    out.append(pid)
+                    break
+        except OSError:
+            continue
+    return out
+
+
+INTERPRETERS = {"python", "python3", "bash", "sh", "zsh", "node"}
+
+
+def executed_scripts(command):
+    out = []
+    for seg in segments(command):
+        seg = strip_launchers(seg)[0]
+        try:
+            tokens = shlex.split(seg)
+        except ValueError:
+            tokens = seg.split()
+        if not tokens:
+            continue
+        head = os.path.basename(tokens[0]).rstrip("0123456789.")
+        if head in INTERPRETERS:
+            rest = tokens[1:]
+            if rest and rest[0] == "-c":
+                continue
+            rest = [t for t in rest if not t.startswith("-")]
+            target = rest[0] if rest else None
+        else:
+            target = tokens[0]
+        if target and re.search(r"\.(py|sh)$", target) or (target and target.startswith(("./", "~/", "/"))):
+            out.append(os.path.expanduser(target))
+    return out
+
+
+def inspect_scripts(command, depth=SCRIPT_DEPTH, seen=None):
+    """Returns (heavy_reason, excerpt) from the script files a command executes."""
+    seen = seen if seen is not None else set()
+    excerpt = ""
+    for path in executed_scripts(command):
+        if path in seen:
+            continue
+        seen.add(path)
+        try:
+            with open(path, errors="replace") as f:
+                text = f.read(SCRIPT_BYTES)
+        except OSError:
+            continue
+        excerpt = excerpt or text[:1500]
+        m = HEAVY_CONTENT.search(text)
+        if m:
+            return f"{os.path.basename(path)} mentions {m.group(0)!r}", excerpt
+        if depth > 1:
+            reason, _ = inspect_scripts(" ; ".join(SCRIPT_RE.findall(text)), depth - 1, seen)
+            if reason:
+                return f"{os.path.basename(path)} -> {reason}", excerpt
+    return None, excerpt
+
 
 MEM_RELEASE_QUIET = 30
 MULTI_PASS_QUIET = 30
@@ -373,9 +453,16 @@ class Guard:
         for cmd in commands:
             verdict, seg = classify(cmd)
             p = None
-            if verdict != "light" and self.judge is not None:
+            excerpt = ""
+            if verdict == "unknown":
+                reason, excerpt = inspect_scripts(cmd)
+                if reason:
+                    log(f"script inspection: {reason}")
+                    verdict = "heavy"
+            if verdict == "unknown" and self.judge is not None:
                 try:
-                    p = await self.judge.yes_probability(JUDGE_PROMPT + seg)
+                    ctx = f"\nScript contents:\n{excerpt}" if excerpt else ""
+                    p = await self.judge.yes_probability(JUDGE_PROMPT + seg + ctx)
                 except (asyncio.TimeoutError, RuntimeError, OSError):
                     p = None
             by_judge = verdict == "unknown" and p is not None and p >= self.a.judge_cutoff
@@ -410,6 +497,29 @@ class Guard:
                 pid = biggest_foreign_rss(self.proc.pid if self.proc else -1, own)
                 if await self.stop_gufo(f"memory pressure, top process pid={pid}"):
                     self.begin_watch(f"pid {pid}", lambda: [pid] if os.path.exists(f"/proc/{pid}") else [], True)
+
+    def own_pids(self):
+        own = {os.getpid()}
+        if self.judge is not None and self.judge.proc is not None:
+            own.add(self.judge.proc.pid)
+        return own
+
+    def foreign_kfd(self):
+        return kfd_holders(self.proc.pid if self.proc else -1, self.own_pids())
+
+    async def kfd_watchdog(self):
+        hits = 0
+        while True:
+            await asyncio.sleep(1)
+            if self.state != "up":
+                hits = 0
+                continue
+            found = await asyncio.get_running_loop().run_in_executor(None, self.foreign_kfd)
+            hits = hits + 1 if found else 0
+            if hits >= KFD_SAMPLES:
+                hits = 0
+                if await self.stop_gufo(f"foreign GPU process pid={found[0]}"):
+                    self.begin_watch(f"kfd {found[0]}", self.foreign_kfd, quiet=KFD_QUIET)
 
     async def wait_ready(self, resp):
         t_wait = time.time()
@@ -530,6 +640,7 @@ class Guard:
                 log(f"judge sidecar unavailable ({exc}); using patterns and memory watchdog only")
                 self.judge = None
         asyncio.create_task(self.memory_watchdog())
+        asyncio.create_task(self.kfd_watchdog())
         asyncio.create_task(self.start_gufo())
         app = web.Application(client_max_size=1 << 30)
         app.router.add_get("/jev-guard/status", self.status)
