@@ -403,3 +403,24 @@ record, no retention and no fail-open test.
 Known remaining issues: the turn builder for the effort gate (above); the
 unmatched rows in `compare.py`; Q3/Q4/Q5; the daemon does not read the plugin
 log yet.
+
+
+## Operations: reloading the plugin (learned 2026-11-08)
+
+opencode keeps one long-running service (`opencode serve --service`) that holds
+the plugin module in memory. Editing `tools/jev/opencode-plugin/*.ts` does not
+reload it: the file-plugin revision is keyed by the target path string, not the
+content, so the service keeps running the old code (observed: a live session
+logged command rows but none of the goal, effort-gate, activity or finish
+records until the service was restarted).
+
+After every edit: kill the `opencode serve --service` process by pid (never
+`pkill -f`), then use opencode again (the TUI starts a new service and resumes
+open sessions). `status.py` warns when the service is older than the newest
+`.ts` file. For a hook-by-hook trace, create `~/.gufo/jev-log/plugin-trace.on`;
+the plugin then writes `plugin-trace.jsonl` (hook names, session, provider, key
+lists, never content). Delete the flag file to stop.
+
+Verified after the restart on a one-message session ("Reply with the single
+word ok. jev finish it"): `goal` matched `jev finish it`, `effort_gate`,
+`activity` start and end, and `finish` were all recorded.
