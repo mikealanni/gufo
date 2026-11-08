@@ -11,13 +11,18 @@ Sits on the public port, runs gufo on an internal port, and
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
+import queue
 import re
 import shlex
 import signal
+import sqlite3
 import sys
+import threading
 import time
+import uuid
 
 import aiohttp
 from aiohttp import web
@@ -55,6 +60,229 @@ JUDGE_PROMPT = ("Does this shell command need the whole GPU or most of the RAM "
 
 def log(msg):
     print(time.strftime("%Y-%m-%d %H:%M:%S"), "[jev-guard]", msg, flush=True)
+
+
+SECRET_KEYS = (
+    "sk-", "ghp_", "gho_", "ghs_", "github_pat_", "AKIA", "xoxb-",
+    "xoxp-", "AIza", "BEGIN PRIVATE KEY", "BEGIN OPENSSH PRIVATE KEY",
+    "-----BEGIN", "Bearer eyJ", "eyJhbGciOiJ",
+)
+
+
+def contains_secret(text):
+    return any(key in text for key in SECRET_KEYS)
+
+
+# Same schema as src/cli/judge/jev_log.cpp; the two writers share one db file.
+JEV_LOG_SCHEMA = """
+PRAGMA journal_mode=WAL;
+PRAGMA foreign_keys=ON;
+CREATE TABLE IF NOT EXISTS decisions (
+  id INTEGER PRIMARY KEY,
+  ts INTEGER NOT NULL,
+  model TEXT NOT NULL,
+  battery TEXT,
+  trigger TEXT NOT NULL,
+  prompt_hash TEXT NOT NULL,
+  score TEXT NOT NULL CHECK (score IN ('yes','no')),
+  logit_gap REAL NOT NULL,
+  duration_ms REAL NOT NULL,
+  threshold TEXT,
+  framing_ver TEXT,
+  action TEXT,
+  request_id TEXT,
+  session_id TEXT,
+  outcome TEXT CHECK (outcome IS NULL OR outcome IN
+    ('confirmed','diverged','retry','rerun','harmless')),
+  question TEXT
+);
+CREATE INDEX IF NOT EXISTS decisions_request ON decisions(request_id);
+CREATE VIRTUAL TABLE IF NOT EXISTS decisions_fts USING fts5(
+  question, content='decisions', content_rowid='id');
+CREATE TRIGGER IF NOT EXISTS decisions_ai AFTER INSERT ON decisions BEGIN
+  INSERT INTO decisions_fts(rowid, question)
+    VALUES (new.id, new.question);
+END;
+CREATE TABLE IF NOT EXISTS corrections (
+  id INTEGER PRIMARY KEY,
+  decision_id INTEGER NOT NULL REFERENCES decisions(id),
+  ts INTEGER NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('failure','correction','insight')),
+  wrong_score TEXT,
+  note TEXT
+);
+CREATE TABLE IF NOT EXISTS patterns (
+  id INTEGER PRIMARY KEY,
+  model TEXT NOT NULL,
+  pattern_hash TEXT NOT NULL,
+  yes_rate REAL NOT NULL,
+  hits INTEGER NOT NULL,
+  last_ts INTEGER NOT NULL,
+  UNIQUE(model, pattern_hash)
+);
+"""
+
+
+class GuardLog:
+    """Queued best-effort writer: the event loop never waits on disk.
+
+    A single thread owns the sqlite connection. A full queue drops the row
+    (counted) instead of blocking the proxy; failures are logged only.
+    """
+
+    QUEUE_MAX = 2000
+
+    def __init__(self, path):
+        self.path = path
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        conn = sqlite3.connect(path)
+        conn.executescript(JEV_LOG_SCHEMA)
+        conn.commit()
+        conn.close()
+        self.queue = queue.Queue(self.QUEUE_MAX)
+        self.dropped = 0
+        threading.Thread(target=self._writer, daemon=True, name="jev-log").start()
+
+    def _put(self, item):
+        try:
+            self.queue.put_nowait(item)
+        except queue.Full:
+            self.dropped += 1
+
+    def _writer(self):
+        conn = sqlite3.connect(self.path, timeout=5)
+        conn.execute("PRAGMA foreign_keys=ON")
+        while True:
+            kind, args = self.queue.get()
+            try:
+                if kind == "decision":
+                    conn.execute(
+                        "INSERT INTO decisions(ts, model, battery, trigger, "
+                        "prompt_hash, score, logit_gap, duration_ms, threshold, "
+                        "framing_ver, action, request_id, session_id, question) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", args)
+                else:
+                    request_id, prompt_hash, outcome, note = args
+                    conn.execute(
+                        "UPDATE decisions SET outcome=? WHERE request_id=? "
+                        "AND prompt_hash=? AND outcome IS NULL",
+                        (outcome, request_id, prompt_hash))
+                    if note:
+                        conn.execute(
+                            "INSERT INTO corrections(decision_id, ts, kind, wrong_score, note) "
+                            "SELECT id, ?, 'failure', score, ? FROM decisions "
+                            "WHERE request_id=? AND prompt_hash=?",
+                            (int(time.time()), note, request_id, prompt_hash))
+                conn.commit()
+            except sqlite3.Error as exc:
+                log(f"jev-log write failed: {exc}")
+
+    def record(self, model, trigger, prompt_hash, score, logit_gap,
+               duration_ms, threshold, framing_ver, action, request_id,
+               session_id, question):
+        self._put(("decision", (int(time.time()), model, "", trigger, prompt_hash,
+                                score, logit_gap, duration_ms, threshold,
+                                framing_ver, action, request_id, session_id,
+                                question)))
+
+    def set_outcome(self, request_id, prompt_hash, outcome, note=""):
+        self._put(("outcome", (request_id, prompt_hash, outcome, note)))
+
+
+LIGHT_TTL = 900
+LEARNED_FILE = os.path.expanduser("~/.gufo/jev-log/learned-heavy.json")
+LEARNED_MAX = 200
+LEARNED_TTL = 30 * 86400
+LEARN_SKIP = ("gufo", "jev", "guard.py", "lemonade", "ollama", "llama-server",
+              "xorg", "kwin", "gnome", "plasma", "pipewire", "claude", "opencode",
+              "/usr/", "/bin/", "/sbin/", "/opt/rocm", "/proc/", "/sys/")
+GENERIC_TOKENS = {"python", "python3", "bash", "sh", "echo", "true", "false", "cat",
+                  "grep", "head", "tail", "sleep", "time", "nohup", "setsid", "env"}
+LEARNED = {}
+
+
+def load_learned():
+    try:
+        with open(LEARNED_FILE) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return
+    now = time.time()
+    LEARNED.clear()
+    LEARNED.update({k: v for k, v in data.items()
+                    if isinstance(v, dict) and now - v.get("last", 0) < LEARNED_TTL})
+
+
+def save_learned():
+    try:
+        os.makedirs(os.path.dirname(LEARNED_FILE), exist_ok=True)
+        tmp = LEARNED_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(LEARNED, f, indent=1)
+        os.replace(tmp, LEARNED_FILE)
+    except OSError as exc:
+        log(f"learned-heavy save failed: {exc}")
+
+
+def proc_chain(pid, depth=4):
+    """Command lines of pid and its parents, nearest first."""
+    out = []
+    for _ in range(depth):
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                out.append(f.read().replace(b"\0", b" ").decode("utf-8", "replace").strip())
+            with open(f"/proc/{pid}/stat") as f:
+                pid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+        if pid <= 1:
+            break
+    return out
+
+
+def learn_key(cmdline):
+    """A stable script or program path from a process that was seen using the GPU."""
+    m = SCRIPT_RE.search(cmdline)
+    key = os.path.expanduser(m.group(1)) if m else None
+    if key is None:
+        first = cmdline.split(" ", 1)[0]
+        if first.startswith(("/home/", "/mnt/", "/tmp/")):
+            key = first
+    if key is None or len(key) < 8 or any(bad in key.lower() for bad in LEARN_SKIP):
+        return None
+    return key
+
+
+def learn_from_pid(pid):
+    chain = proc_chain(pid, depth=1)
+    key = learn_key(chain[0]) if chain else None
+    if key is None:
+        return None
+    now = time.time()
+    entry = LEARNED.setdefault(key, {"first": now, "hits": 0})
+    entry.update(last=now, hits=entry["hits"] + 1, cmd=chain[0][:200])
+    for old in sorted(LEARNED, key=lambda k: LEARNED[k]["last"])[:max(0, len(LEARNED) - LEARNED_MAX)]:
+        del LEARNED[old]
+    save_learned()
+    return key
+
+
+def light_matches(text, chain):
+    """True when a process in the chain plausibly came from this light command."""
+    try:
+        tokens = shlex.split(text)
+    except ValueError:
+        tokens = text.split()
+    joined = " ".join(chain)
+    for tok in tokens:
+        tok = tok.strip("\"'")
+        if len(tok) < 4 or tok in GENERIC_TOKENS or tok.startswith("-"):
+            continue
+        if tok in joined or os.path.basename(tok) in joined:
+            return True
+    return False
 
 
 def mem_available_gb():
@@ -122,6 +350,9 @@ def strip_launchers(seg):
 
 def classify(command):
     """Returns (verdict, segment): heavy / light / unknown."""
+    for key in LEARNED:
+        if key in command:
+            return "heavy", command
     unknown = ""
     env = {}
     for seg in segments(command):
@@ -357,6 +588,60 @@ class Guard:
         self.inflight = 0
         self.starter = None
         self.last_fail = 0.0
+        self.jev_log = None
+        self.pending_lights = []
+        self.run_id = uuid.uuid4().hex[:12]
+        self.want_up = True
+        load_learned()
+        if LEARNED:
+            log(f"learned heavy keys: {len(LEARNED)}")
+        if a.jev_log:
+            try:
+                self.jev_log = GuardLog(a.jev_log)
+                log(f"jev-log enabled at {a.jev_log}")
+            except Exception as exc:
+                log(f"jev-log disabled ({exc})")
+                self.jev_log = None
+
+    def judge_label(self):
+        stem = os.path.splitext(os.path.basename(self.a.judge_model or ""))[0]
+        return stem.lower() or "guard-judge"
+
+    def _record_decision(self, model, score, logit_gap, duration_ms, action,
+                         request_id, session_id, segment, command):
+        if self.jev_log is None:
+            return
+        raw = segment or command or ""
+        text = raw[:500].replace("\n", " ").replace("\r", " ")
+        if contains_secret(raw[:4000]):
+            text = "[redacted-secret]"
+        prompt_hash = hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()
+        self.jev_log.record(
+            model, "guard", prompt_hash, score, logit_gap, duration_ms,
+            str(self.a.judge_cutoff), "guard-v2", action, request_id,
+            session_id, text)
+        if action == "none":
+            self.pending_lights.append({"request_id": request_id, "hash": prompt_hash,
+                                        "ts": time.time(), "text": raw[:500]})
+            del self.pending_lights[:-100]
+
+    def _attribute_catch(self, pid, note):
+        """Blame a light decision only when the offending process matches it."""
+        chain = proc_chain(pid)
+        learned = learn_from_pid(pid)
+        if learned:
+            log(f"jev-log: learned heavy key {learned}")
+        if self.jev_log is None:
+            return
+        now = time.time()
+        self.pending_lights = [p for p in self.pending_lights if now - p["ts"] < LIGHT_TTL]
+        for light in reversed(self.pending_lights):
+            if light_matches(light["text"], chain):
+                self.jev_log.set_outcome(light["request_id"], light["hash"], "diverged", note)
+                self.pending_lights.remove(light)
+                log(f"jev-log: light decision diverged ({note}) cmd={light['text'][:80]!r}")
+                return
+        log(f"jev-log: watchdog catch ({note}) not attributable to any recent light decision")
 
     async def start_gufo(self):
         async with self.lock:
@@ -446,11 +731,18 @@ class Guard:
     def begin_watch(self, label, pids_fn, mem_release=False, quiet=None):
         self.watch_task = asyncio.create_task(self.after_test(label, pids_fn, mem_release, quiet))
 
-    async def decide(self, commands):
-        """Returns the heavy segment that needs gufo stopped, or None."""
+    async def decide(self, commands, session_id=""):
+        """Returns the heavy segment that needs gufo stopped, or None.
+
+        Writes one jev-log row per command in the batch. Lights (acted as
+        none) stay pending until a watchdog either blames one or the
+        operator labels it.
+        """
         t0 = time.time()
+        request_id = uuid.uuid4().hex
         chosen = None
         for cmd in commands:
+            cmd_t0 = time.time()
             verdict, seg = classify(cmd)
             p = None
             excerpt = ""
@@ -466,10 +758,28 @@ class Guard:
                 except (asyncio.TimeoutError, RuntimeError, OSError):
                     p = None
             by_judge = verdict == "unknown" and p is not None and p >= self.a.judge_cutoff
+            heavy = verdict == "heavy" or by_judge
             log(f"decision pattern={verdict} judge_p_yes={p if p is None else round(p, 3)} "
                 f"judge_would_stop={p is not None and p >= self.a.judge_cutoff} "
-                f"acts={'stop' if verdict == 'heavy' or by_judge else 'none'} cmd={cmd[:100]!r}")
-            if chosen is None and (verdict == "heavy" or by_judge):
+                f"acts={'stop' if heavy else 'none'} cmd={cmd[:100]!r}")
+            if heavy:
+                score = "yes"
+                logit_gap = 1.0 if verdict == "heavy" else 2 * p - 1
+            elif verdict == "light":
+                score = "no"
+                logit_gap = -1.0
+            elif p is not None:
+                score = "no"
+                logit_gap = 2 * p - 1
+            else:
+                score = "no"
+                logit_gap = 0.0
+            self._record_decision(
+                self.judge_label() if p is not None else "guard-patterns",
+                score, logit_gap, (time.time() - cmd_t0) * 1000,
+                "stop" if heavy else "none", request_id,
+                session_id or self.run_id, seg, cmd)
+            if chosen is None and heavy:
                 chosen = seg
         log(f"decision_ms={round((time.time() - t0) * 1000)}")
         return chosen
@@ -496,6 +806,7 @@ class Guard:
                     own.add(self.judge.proc.pid)
                 pid = biggest_foreign_rss(self.proc.pid if self.proc else -1, own)
                 if await self.stop_gufo(f"memory pressure, top process pid={pid}"):
+                    self._attribute_catch(pid, f"memory watchdog pid={pid}")
                     self.begin_watch(f"pid {pid}", lambda: [pid] if os.path.exists(f"/proc/{pid}") else [], True)
 
     def own_pids(self):
@@ -519,7 +830,40 @@ class Guard:
             if hits >= KFD_SAMPLES:
                 hits = 0
                 if await self.stop_gufo(f"foreign GPU process pid={found[0]}"):
+                    self._attribute_catch(found[0], f"kfd watchdog pid={found[0]}")
                     self.begin_watch(f"kfd {found[0]}", self.foreign_kfd, quiet=KFD_QUIET)
+
+    def session_key(self, request):
+        for name in ("x-session-id", "x-opencode-session", "x-session-affinity"):
+            value = request.headers.get(name)
+            if value:
+                return value[:64]
+        return self.run_id
+
+    async def supervisor(self):
+        """Notice a dead gufo and bring it back, but only when it is safe.
+
+        Safe means: no heavy-test watch is running, nothing foreign holds the
+        GPU, memory has recovered. It never starts anything on the GPU
+        beside a test, and never restarts the NPU judge while gufo serves.
+        """
+        while True:
+            await asyncio.sleep(3)
+            if self.state == "up" and self.proc is not None and self.proc.returncode is not None:
+                log(f"gufo exited unexpectedly rc={self.proc.returncode}")
+                self.state = "down"
+                self.ready.clear()
+                self.last_fail = time.time()
+            idle = self.starter is None or self.starter.done()
+            watching = self.watch_task is not None and not self.watch_task.done()
+            if not (self.want_up and self.state == "down" and idle and not watching):
+                continue
+            if time.time() - self.last_fail < 15 or mem_available_gb() < self.a.free_target_gb:
+                continue
+            if await asyncio.get_running_loop().run_in_executor(None, self.foreign_kfd):
+                continue
+            log("supervisor: gufo is down with nothing blocking it; starting")
+            self.starter = asyncio.create_task(self.start_gufo())
 
     async def wait_ready(self, resp):
         t_wait = time.time()
@@ -575,7 +919,7 @@ class Guard:
                     msg = json.loads(data)["choices"][0]["message"]
                     calls = {i: {"name": c["function"]["name"], "args": c["function"]["arguments"]}
                              for i, c in enumerate(msg.get("tool_calls") or [])}
-                    seg = await self.decide(tool_commands(calls))
+                    seg = await self.decide(tool_commands(calls), self.session_key(request))
                     if seg:
                         await self.prepare_for_test(seg)
                 except (ValueError, KeyError, IndexError, TypeError):
@@ -613,7 +957,7 @@ class Guard:
             held.append(buf)
         if holding:
             t_hold = time.time()
-            seg = await self.decide(tool_commands(calls))
+            seg = await self.decide(tool_commands(calls), self.session_key(request))
             if seg:
                 await self.prepare_for_test(seg)
             log(f"tool call held {time.time() - t_hold:.2f}s stopped={bool(seg)}")
@@ -641,6 +985,7 @@ class Guard:
                 self.judge = None
         asyncio.create_task(self.memory_watchdog())
         asyncio.create_task(self.kfd_watchdog())
+        asyncio.create_task(self.supervisor())
         asyncio.create_task(self.start_gufo())
         app = web.Application(client_max_size=1 << 30)
         app.router.add_get("/jev-guard/status", self.status)
@@ -654,6 +999,7 @@ class Guard:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, stop.set)
         await stop.wait()
+        self.want_up = False
         await self.stop_gufo("guard exiting")
         await runner.cleanup()
 
@@ -676,6 +1022,8 @@ def main():
     p.add_argument("--max-hold", type=float, default=7200)
     p.add_argument("--start-timeout", type=float, default=420)
     p.add_argument("--stop-timeout", type=float, default=120)
+    p.add_argument("--jev-log", default=f"{home}/.gufo/jev-log/jev.sqlite3",
+                   help="jev-log db file; set empty to disable")
     a = p.parse_args()
     a.upstream = f"http://127.0.0.1:{a.upstream_port}"
     asyncio.run(Guard(a).run())
