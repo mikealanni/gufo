@@ -79,6 +79,8 @@ public:
 
   /// False once a run timed out or failed: results since then are invalid.
   bool Healthy() const noexcept;
+  /// Marks the NPU failed so later work stays on the GPU.
+  void MarkFailed() noexcept;
 
   std::uint32_t tokens() const noexcept;
   std::uint32_t k() const noexcept;

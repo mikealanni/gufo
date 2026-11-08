@@ -748,7 +748,12 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
       // GUFO_NPU_GATE_SLICES sets how many 1024-row slices of attn_qkv (two
       // heads' query and gate rows each) the NPU computes in the attention
       // layers.
-      std::uint32_t gate_slices = 12;
+      // Whole-projection mode leaves these slices unstaged: the two-bank path
+      // does not read them and they measured no gain.
+      const char* whole_env = std::getenv("GUFO_NPU_WHOLE");
+      const bool whole_requested =
+          whole_env != nullptr && whole_env[0] != '\0' && whole_env[0] != '0';
+      std::uint32_t gate_slices = whole_requested ? 0 : 12;
       if (const char* gs = std::getenv("GUFO_NPU_GATE_SLICES"); gs != nullptr) {
         gate_slices = std::min(static_cast<std::uint32_t>(std::atoi(gs)), 12U);
       }

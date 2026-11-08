@@ -102,6 +102,8 @@ bool NpuGemm::Healthy() const noexcept {
   return false;
 }
 
+void NpuGemm::MarkFailed() noexcept {}
+
 void RegisterQwenNpuFfn() {}
 
 }  // namespace gufo::models::qwen38_flash_next::rocm

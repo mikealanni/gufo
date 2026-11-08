@@ -197,6 +197,21 @@ bool WidePrefill(std::uint32_t rows) {
   return prefill_phase && rows > kWidePrefillRows;
 }
 
+/// An NPU prefill that returns non-finite logits is discarded and the NPU
+/// stays off for the rest of the process.
+bool NpuLogitsCorrupt(NpuGemm* npu, const float* logits, std::size_t count) {
+  if (npu == nullptr || !npu->Healthy()) {
+    return false;
+  }
+  for (std::size_t i = 0; i < count; ++i) {
+    if (!std::isfinite(logits[i])) {
+      npu->MarkFailed();
+      return true;
+    }
+  }
+  return false;
+}
+
 /// Whether mmq's Q8_1 rows of width k carry no padding, so a producer's
 /// contiguous element order is the layout.
 bool UnpaddedQ8(std::uint32_t k) {
@@ -5153,11 +5168,19 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
            speculative ? "verify" : "decode")) {
     return false;
   }
-  if (const NpuGemm* npu = model_->npu(); npu != nullptr && !npu->Healthy()) {
+  if (NpuGemm* npu = model_->npu(); npu != nullptr && !npu->Healthy()) {
     AssignError(error_msg, "NPU run timed out; the batch result is discarded");
     return false;
   }
   if (n_logits > 0 && logits != nullptr) {
+    if (prefill_phase && n > 1 &&
+        NpuLogitsCorrupt(model_->npu(), logits_host_,
+                         static_cast<std::size_t>(n_logits) * c.vocab_size)) {
+      AssignError(error_msg,
+                  "NPU prefill returned non-finite logits; the batch result "
+                  "is discarded and the NPU is disabled");
+      return false;
+    }
     std::copy_n(logits_host_, static_cast<std::size_t>(n_logits) * c.vocab_size,
                 logits);
   }
@@ -5619,6 +5642,13 @@ bool Executor::ForwardPair(Session& session,
     }
 
     if (n_logits > 0 && logits != nullptr) {
+      if (NpuLogitsCorrupt(model_->npu(), logits_host_,
+                           static_cast<std::size_t>(n_logits) * c.vocab_size)) {
+        AssignError(error_msg,
+                    "NPU prefill returned non-finite logits; the batch result "
+                    "is discarded and the NPU is disabled");
+        return false;
+      }
       std::copy_n(logits_host_,
                   static_cast<std::size_t>(n_logits) * c.vocab_size, logits);
     }

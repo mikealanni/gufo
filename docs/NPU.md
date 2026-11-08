@@ -50,7 +50,7 @@ out). `GUFO_PREFILL_TILE=24576` (two 12288-token banks) prefills 24K-token promp
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `GUFO_NPU_SLICES` | `6` | 1024-row slices of the linear-attention `ssm_in` projection (z rows) computed on the NPU, 1 to 12. |
-| `GUFO_NPU_GATE_SLICES` | `12` | 1024-row slices of the attention `attn_qkv` projection (query and gate rows, two heads per slice) on the NPU, 0 to 12. `0` turns this part off. |
+| `GUFO_NPU_GATE_SLICES` | `12`, `0` with `GUFO_NPU_WHOLE=1` | 1024-row slices of the attention `attn_qkv` projection (query and gate rows, two heads per slice) on the NPU, 0 to 12. `0` turns this part off. |
 | `GUFO_NPU_SHEXP` | on | `0` keeps the shared-expert gate and up projections on the GPU. |
 | `GUFO_NPU_LAYERS` | all | Limit how many linear-attention layers use the NPU. |
 
@@ -64,6 +64,8 @@ The server's `--prefill-chunk` is a separate scheduling setting (how much a
 prefill runs before decoding gets a turn); `scripts/run-gufo.sh` keeps it at 4096.
 
 ### Two-bank prefill (experimental, not bit-identical)
+
+Recommended recipe for Flash-Next: `GUFO_NPU_DIR=tools/npu GUFO_TWO_BANK=1 GUFO_NPU_WHOLE=1` with the GPU fabric clock held (`scripts/run-gufo.sh` sets all of it). `GUFO_TWO_BANK=2` splits unevenly and was faster and clean in third-party runs; it keeps the F32 residual unless `GUFO_F16_RESIDUAL=1`. The plain slice mode (no `GUFO_NPU_WHOLE`) returned non-finite logits on the UD-IQ4_XS pack in a third-party run and is not recommended there.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
@@ -79,6 +81,7 @@ for the slice mode. See `EXPERIMENTS.md` for what was tried and rejected.
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `GUFO_NPU_TIMEOUT_MS` | `8000` | Time a single NPU run may take before it is treated as failed. |
+| (automatic) | on | A prefill that returns non-finite logits is discarded with an error and the NPU stays off until the process restarts, as after a timeout. |
 | `GUFO_NPU_KEEPALIVE` | on | `0` stops the 1 s heartbeat that keeps the NPU awake. |
 | `GUFO_NPU_WARMUP_MS` | `0` | Keep the NPU out of the first N ms of each prefill burst so the GPU's idle-to-full step happens alone. |
 | `GUFO_NPU_ISOLATE` | unset | `1` gives the NPU private buffers and copies through the CPU. Slower; for debugging. |

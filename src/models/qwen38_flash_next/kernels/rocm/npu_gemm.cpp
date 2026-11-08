@@ -615,6 +615,10 @@ bool NpuGemm::Healthy() const noexcept {
   return !impl_->failed;
 }
 
+void NpuGemm::MarkFailed() noexcept {
+  impl_->failed = true;
+}
+
 void* NpuGemm::Host(int id) const {
   return impl_->buffers.at(id).host;
 }
