@@ -109,6 +109,17 @@ def expand(seg, env):
     return seg.replace("~/", HOME + "/")
 
 
+LAUNCHER = re.compile(r"^(?:(?:nohup|setsid|time|nice|ionice|stdbuf|env|command|exec)(?:\s+-\S+)*\s+|[A-Za-z_]\w*=\S*\s+)+")
+
+
+def strip_launchers(seg):
+    m = LAUNCHER.match(seg.strip())
+    if not m:
+        return seg, False
+    detached = bool(re.search(r"\b(nohup|setsid)\b", m.group(0)))
+    return seg.strip()[m.end():], detached
+
+
 def classify(command):
     """Returns (verdict, segment): heavy / light / unknown."""
     unknown = ""
@@ -125,8 +136,11 @@ def classify(command):
             if verdict == "heavy":
                 return verdict, inner
             continue
+        seg, detached = strip_launchers(seg)
         if first_word(seg) in LIGHT_WORDS:
             continue
+        if detached and seg and not re.search(r"\s(--help|-h|--version)(\s|$)", seg):
+            return "heavy", seg
         if re.search(r"\s(--help|-h|--version)(\s|$)", seg):
             continue
         shell_c = first_word(seg) in ("bash", "sh", "eval", "xargs", "timeout", "nohup")
@@ -161,7 +175,7 @@ REDIRECT = re.compile(r"\s\d*[<>]|\s&>")
 
 def needle_for(segment):
     """What /proc/<pid>/cmdline shows: no env prefix, no redirects, no quotes."""
-    seg = REDIRECT.split(segment, 1)[0]
+    seg = strip_launchers(REDIRECT.split(segment, 1)[0])[0]
     try:
         tokens = shlex.split(seg)
     except ValueError:
@@ -194,6 +208,7 @@ def find_pids(needle):
 
 
 MEM_RELEASE_QUIET = 30
+MULTI_PASS_QUIET = 30
 
 
 def biggest_foreign_rss(skip_pgid, skip_pids=()):
@@ -319,7 +334,7 @@ class Guard:
             log(f"gufo stopped, {mem_available_gb():.0f} GB available, stop_took={time.time() - t_stop:.1f}s")
             return True
 
-    async def after_test(self, label, pids_fn, mem_release=False):
+    async def after_test(self, label, pids_fn, mem_release=False, quiet=None):
         """Restart gufo once the test processes are gone for a quiet period."""
         started = time.time()
         seen = False
@@ -340,7 +355,7 @@ class Guard:
             else:
                 if quiet_since is None:
                     quiet_since = time.time()
-                grace = self.a.quiet if seen else self.a.appear_grace
+                grace = (quiet or self.a.quiet) if seen else self.a.appear_grace
                 if time.time() - quiet_since >= grace:
                     break
             await asyncio.sleep(0.5)
@@ -348,8 +363,8 @@ class Guard:
             f"watched={time.time() - started:.1f}s; restarting gufo")
         await self.start_gufo()
 
-    def begin_watch(self, label, pids_fn, mem_release=False):
-        self.watch_task = asyncio.create_task(self.after_test(label, pids_fn, mem_release))
+    def begin_watch(self, label, pids_fn, mem_release=False, quiet=None):
+        self.watch_task = asyncio.create_task(self.after_test(label, pids_fn, mem_release, quiet))
 
     async def decide(self, commands):
         """Returns the heavy segment that needs gufo stopped, or None."""
@@ -376,7 +391,8 @@ class Guard:
         if await self.stop_gufo(f"heavy command: {segment[:80]}"):
             needle = needle_for(segment)
             log(f"watching processes matching {needle!r}")
-            self.begin_watch(segment[:60], lambda: find_pids(needle))
+            multi = bool(re.search(r"\.(py|sh)\b|&\s*$|\b(nohup|setsid)\b", segment))
+            self.begin_watch(segment[:60], lambda: find_pids(needle), quiet=MULTI_PASS_QUIET if multi else None)
 
     async def memory_watchdog(self):
         low = 0
