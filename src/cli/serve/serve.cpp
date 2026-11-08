@@ -589,7 +589,6 @@ void PrintServeHelp(std::string_view program_name,
     std::string preserve_thinking = "auto";
     std::int64_t reasoning_budget = -1;
     std::string jev_gate = "on";
-    std::string jev_inline = "off";
     std::string jev_pre = "off";
     std::string jev_finish = "off";
     std::string jev_goal = "off";
@@ -668,10 +667,6 @@ void PrintServeHelp(std::string_view program_name,
         "Flash-Next reasoning pre-gate: on, off, or agent (also lowers "
         "effort on routine tool-result turns; default: on)",
         "Reasoning Defaults", &jev_gate);
-    parser.AddOption(
-        "", "--jev-inline", "MODE",
-        "Inline jev yes/no answering inside <think>: on or off (default: off)",
-        "Reasoning Defaults", &jev_inline);
     parser.AddOption(
         "", "--jev-pre", "MODE",
         "Answer small yes/no requests with the resident jev judge before "
@@ -1167,7 +1162,6 @@ int RunServe(std::span<const char* const> args) {
     std::string preserve_thinking = "auto";
     std::int64_t reasoning_budget = -1;
     std::string jev_gate = "on";
-    std::string jev_inline = "off";
     std::string jev_pre = "off";
     std::string jev_finish = "off";
     std::string jev_goal = "off";
@@ -1242,10 +1236,6 @@ int RunServe(std::span<const char* const> args) {
         "Flash-Next reasoning pre-gate: on, off, or agent (also lowers "
         "effort on routine tool-result turns; default: on)",
         "Reasoning Defaults", &jev_gate);
-    llm_parser.AddOption(
-        "", "--jev-inline", "MODE",
-        "Inline jev yes/no answering inside <think>: on or off (default: off)",
-        "Reasoning Defaults", &jev_inline);
     llm_parser.AddOption(
         "", "--jev-pre", "MODE",
         "Answer small yes/no requests with the resident jev judge before "
@@ -1420,10 +1410,6 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error: --jev-gate must be on, off, or agent\n";
       return 2;
     }
-    if (jev_inline != "on" && jev_inline != "off") {
-      std::cerr << "Error: --jev-inline must be on or off\n";
-      return 2;
-    }
     if (jev_pre != "on" && jev_pre != "off") {
       std::cerr << "Error: --jev-pre must be on or off\n";
       return 2;
@@ -1546,7 +1532,6 @@ int RunServe(std::span<const char* const> args) {
     backend->set_reasoning_defaults(*reasoning_defaults);
     backend->set_jev_gate_enabled(jev_gate != "off");
     backend->set_jev_gate_agent_enabled(jev_gate == "agent");
-    backend->set_jev_inline_enabled(jev_inline == "on");
     backend->set_jev_pre_enabled(jev_pre == "on");
     backend->set_jev_finish_enabled(jev_finish == "on");
     backend->set_jev_goal_enabled(jev_goal == "on");

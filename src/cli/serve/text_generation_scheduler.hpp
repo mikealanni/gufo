@@ -81,9 +81,6 @@ public:
     bool stop_at_eos{true};
     std::vector<std::string> stop_sequences;
     bool return_progress{false};
-    std::function<std::optional<std::vector<TextRunnerToken>>(
-        const std::string& piece)>
-        jev_inline_fn;
   };
 
   class Request {

@@ -117,9 +117,6 @@ struct ScheduledRequest {
   bool preview_stops{false};
   std::size_t generated_output_bytes{0};
   StopSequenceFilter stop_filter;
-  std::function<std::optional<std::vector<TextRunnerToken>>(
-      const std::string& piece)>
-      jev_inline_fn;
 
   std::mutex output_mutex;
   std::condition_variable output_condition;
@@ -1334,11 +1331,6 @@ struct TextGenerationScheduler::Impl {
     }
     if (request->stop_filter.stopped())
       request->result.stop_sequence = request->stop_filter.matched_sequence();
-    if (request->jev_inline_fn) {
-      if (auto injected = request->jev_inline_fn(piece)) {
-        request->runner_request.InjectTokens(*injected);
-      }
-    }
     if (CompleteIfStopped(request)) {
       return false;
     }
@@ -2264,7 +2256,6 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
   request->stream_start_deadline =
       request->request_start + impl_->scheduler_policy.stream_start_delay;
   request->deadline = metadata.deadline;
-  request->jev_inline_fn = std::move(metadata.jev_inline_fn);
   if (!request->deadline.has_value() &&
       impl_->scheduler_policy.request_timeout.count() > 0) {
     request->deadline =

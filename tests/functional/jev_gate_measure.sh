@@ -394,7 +394,7 @@ for arm in $ARMS; do
       "${think:-0}" "${http:-0}" "${gate:-none}" | tee -a "$OUT/summary.tsv"
     # The labeled set: it is what "speed delta and correctness delta on the
     # same labeled set" is measured on, what decides Part A step 5
-    # (heuristics vs jev zero-shot), and what Part B's detector is tuned
+    # (heuristics vs jev zero-shot), and what the finish detector is tuned
     # against. `correct`/`note` are filled in by hand after grading.
     jq -cn --arg arm "$arm" --arg id "$id" --arg class "$class" \
       --arg gate "${gate:-none}" --rawfile text "$OUT/prompts/$id.txt" \

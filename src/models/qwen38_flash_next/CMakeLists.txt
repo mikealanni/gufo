@@ -6,7 +6,6 @@ add_library(gufo_qwen38_flash_next STATIC
   jev_finish.cpp
   jev_gate.cpp
   jev_goal.cpp
-  jev_inline.cpp
   jev_model.cpp
   ngram.cpp
   rope_yarn.cpp

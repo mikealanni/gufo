@@ -84,8 +84,7 @@ turn. CPU-verified: 1.7B goes from useless (frozen Yes) to 11/12 code,
 2. NPU A/B: 1.7B vs 0.6B with the new framing → pick the production
    judge model.
 3. Calibrate on real coding-agent traffic, not just the trivia/code
-   battery, plus the confidence threshold for Part B
-   ("silence = no injection" guardrail already specified below).
+   battery.
 4. MiniCPM5-1B/2B port — download the Q6_K GGUFs (`mradermacher`, see
    below; no new dequant kernels needed, that was dropped once a Q6_K
    build was found) plus the
@@ -257,9 +256,7 @@ this kind of regression check going forward.
 Not yet done: wiring this into the real Part A/B call sites (still
 single-question `Answer()` there) — `AnswerBatch` exists and is proven,
 but nothing outside the judge CLI calls it yet. For Part A (one pre-gate
-call per request) batching doesn't apply directly; for Part B (multiple
-self-posed questions per request) this is exactly the shape of workload
-to batch into one `AnswerBatch` call instead of several `Answer()` calls.
+call per request) batching doesn't apply directly.
 
 ## Status 2026-11-05 (late) — 1.7B CORRECT: two engine bugs fixed; A/B settled (1.7B wins)
 
@@ -660,9 +657,6 @@ future `make` invocation against this project:**
 ## Goal (speed first, quality must not regress)
 - Collapse trivial/lookup requests to `reasoning_effort=low` /
   `enable_thinking=false`, cutting wall time on that class to seconds.
-- Shorten real thinking on hard requests by answering their internal
-  yes/no checkpoints inline, without cutting off reasoning that still
-  needs the full budget.
 - Never silently downgrade a hard case, and never inject a wrong yes/no
   into the middle of a reasoning chain — a wrong call here is worse than
   slow, it's silently wrong.
@@ -708,7 +702,7 @@ Request entry / HTTP layer (pre-gate plugs in here):
   output becomes the new "default" only when the caller didn't explicitly
   override effort/thinking.
 
-Decode-time stream interception (inline jev plugs in here):
+Decode-time hook points:
 - `src/cli/serve/inference_backend.cpp:5767-5771,5852-5856` —
   `request.reasoning.budget_tokens` → `effective_sampling.reasoning_budget`.
   The token-budget accounting that any injected answer must stay inside.
@@ -752,62 +746,19 @@ Decode-time stream interception (inline jev plugs in here):
    below) only if the rule-based version measurably undershoots on your
    own prompt set. Keep whichever wins.
 
-## Part B — inline jev: answering self-posed questions mid-think
+## Part B removed (2026-11-08)
 
-This is the harder, higher-value half of the idea: while Flash-Next is
-still inside a `<think>` block, detect the moment it poses itself a
-binary question and answer it immediately instead of letting Flash-Next
-spend tokens reasoning it out.
+Part B (inline answering of the model's own yes/no questions inside
+`<think>`) was dropped completely: the engine flag `--jev-inline`, the
+decode-time injection hook in the scheduler, `JevInlineScanner`
+(`jev_inline.{hpp,cpp}`) and the offline `gufo judge --replay` mode no longer
+exist. Reason: the judge answered Yes too often and lacked the context to be
+safe (replay evidence in git history before this change). The pre-gate, the
+agent gate, the pre-route, the finish detector and the goal tracker remain.
+These are the pieces being ported to an opencode plugin
+(see `docs/JEV-OPENCODE-PLUGIN.md`).
 
-1. **Detect the question.** Watch the incrementally-decoded thinking text
-   (same text the SSE stream already produces) for a trailing sentence
-   that reads as a self-posed yes/no check — ends in `?`, matches patterns
-   like "is X the cause", "should I", "does this match". Keep detection
-   itself cheap: a short heuristic first (sentence-ending `?` plus a small
-   keyword set), falling back to the NPU classifier only if heuristics
-   misfire too often on your own transcripts.
-2. **Answer it.** Feed the detected question plus the reasoning-so-far
-   context into jev (the same zero-shot instruct model used for the
-   pre-gate, prompted for a yes/no answer instead of a difficulty rating).
-   Read the Yes-token versus No-token probability at the answer position
-   rather than letting it generate free text; treat anything below the
-   confidence threshold as `unsure`.
-3. **Splice the answer in.** If confidence clears a tuned threshold,
-   inject jev's answer as if Flash-Next had just written it ("Yes." /
-   "No, because <short reason>.") using the same token-injection mechanism
-   already used for forced `</think>` at `inference_backend.cpp:4521`,
-   then let Flash-Next's own decode continue from that point. If
-   confidence is low, do nothing — let Flash-Next reason it out itself,
-   unmodified. This is the single most important guardrail: **jev only
-   ever answers when confident; silence means stock behavior.**
-4. **Never answer the same shape of question twice in a row with
-   unchanged confidence** — if jev's answer didn't change Flash-Next's
-   next move (it re-asks essentially the same question), stop intervening
-   for the rest of that response and flag it in logs; that's a signal the
-   detector or the answer was wrong, not a loop to keep patching over.
-5. Budget accounting: injected tokens still count against
-   `effective_sampling.reasoning_budget`
-   (`inference_backend.cpp:5767-5771`) like any other thinking tokens —
-   do not give jev's answers a free pass on the budget, or a string of
-   confident-but-wrong injections can run the thinking budget out on a
-   bad premise just as fast as normal reasoning would.
-
-### Why this is harder than the pre-gate, build it second
-
-- Question detection runs live, many times per request, inside the decode
-  loop — not once at prefill like the pre-gate. Latency and NPU/GPU
-  contention per injection matter far more here.
-- A wrong pre-gate call costs one request's worth of effort. A wrong
-  inline answer corrupts the reasoning chain Flash-Next continues from —
-  it can silently derail an otherwise-correct bug hunt with no visible
-  error, which is worse than slow.
-- Validate on replayed transcripts first (`tests/functional/pi_agent.py`
-  per AGENTS.md's agent-loop replay guidance) before ever running it live:
-  take real past `<think>` traces, replay them with jev's answers spliced
-  in offline, and diff the final conclusion against the original
-  unmodified run before this ever touches a live request.
-
-## Model choice for jev (shared by both parts) — zero-shot, no training
+## Model choice for jev — zero-shot, no training
 
 No training step, no labeled set, no fine-tuning. Use a small pretrained
 **instruct** model directly, zero-shot, and read its answer straight off
@@ -816,7 +767,7 @@ No training step, no labeled set, no fine-tuning. Use a small pretrained
 **Qwen3-0.6B-Instruct** (or Qwen2.5-0.5B-Instruct) as jev itself:
 - Shares Flash-Next's own tokenizer/control-token framing
   (`src/models/qwen/chat_template.cpp`), so no second tokenizer subsystem
-  is needed in `openai_chat.cpp` or in the inline detector.
+  is needed in `openai_chat.cpp`.
 - Hidden size is still a multiple of 64 and fits the NPU tile shape below
   with no xclbin changes.
 
@@ -828,20 +779,12 @@ How each part reads jev's output, with no training involved:
   generate free text). This is the same technique the GLiClass-style
   zero-shot routers use: pretrained judgment, labels swappable at
   inference time, nothing retrained.
-- **Part B (inline yes/no):** prompt jev with the detected self-posed
-  question plus the reasoning-so-far context, and read the probability it
-  assigns to the "Yes" token versus the "No" token at the answer position
-  (not free-text generation). This is a documented technique with small
-  instruct models (e.g. Qwen2.5-0.5B-Instruct used this way on CPU) — the
-  model's own pretrained judgment is the answer, no labeled examples
-  needed.
 
-If zero-shot quality on your own bug set turns out to be too unreliable
-for Part B specifically (self-posed-question judgment is a narrower task
-than general difficulty rating), the fallback is a small trained
-yes/no head on a frozen embedding backbone (linear 1024→2 + softmax on
-Qwen3-Embedding-0.6B) — but only build that if the zero-shot version is
-measurably not good enough on real transcripts; don't start there.
+If zero-shot quality on your own set turns out to be too unreliable, the
+fallback is a small trained yes/no head on a frozen embedding backbone (linear
+1024→2 + softmax on Qwen3-Embedding-0.6B) — but only build that if the
+zero-shot version is measurably not good enough on real transcripts; don't
+start there.
 
 Lighter alternatives if tokenizer sharing isn't wanted: ModernBERT-base
 or BGE-small/MiniLM with a GLiClass-style zero-shot classification head —
@@ -908,22 +851,17 @@ scoping this, both verified against the current tree):
   (b) one real measured forward pass through the existing xclbin with
   jev's shapes wired (blocker 2) — this is the actual number that was
   missing before, get it now that both blockers have a plan, (c) only
-  after that number is in hand, decide whether Part A, Part B, or both run
-  on NPU, since Part B's many-calls-per-request profile is more sensitive
-  to per-call overhead than Part A's once-per-request profile.
+  after that number is in hand, decide whether Part A runs on the NPU.
 - Part A runs jev once per request at prefill time — cheap, no contention
-  concern expected. Part B runs jev many times per request, inline with
-  decode — verify with `tools/bench/npu_decode_dispatch_bench.cpp`-style
+  concern expected; verify with `tools/bench/npu_decode_dispatch_bench.cpp`-style
   measurement that it does not regress existing NPU prefill/decode
-  offload numbers before merging either part.
+  offload numbers before merging.
 
 ## Quality guardrails (apply to both parts)
 
 - Never let the pre-gate downgrade effort for a request that already has
   `reasoning_effort`/`enable_thinking` explicitly set by the caller — it
   only fills in the default.
-- Jev's inline answers only ever fire above a tuned confidence threshold;
-  below it, Flash-Next reasons the question out itself, unmodified.
 - Every change must report both speed delta and correctness delta on the
   same labeled set; a speed win with a correctness loss is a regression,
   not a result.
@@ -939,39 +877,6 @@ scoping this, both verified against the current tree):
   invocation pattern already in `engine.cpp`/`weights.cpp`.
 - No model name mentions of competitor projects anywhere in this file or
   commits built from it.
-
-## 2026-11-06 Part B offline replay (`gufo judge --replay <file|dir>`)
-
-Streams thinking traces through `JevInlineScanner` in 8-char pieces with the
-server's 2048-char window / 400-char context, scores each detection with the
-NPU judge (Qwen3-1.7B-Q6_K). Traces: 73 (13 Flash-Next `reasoning_content`
-from `~/jev-gate-run/responses/gate_on`, 60 random long opencode reasoning
-parts), saved in `~/jev-replay/traces`, output in `~/jev-replay/out.txt`.
-
-Result: 40 detections in 19/73 traces; 95% clear 0.6, 85% clear 0.9; 90% Yes /
-10% No; 1 repeat-stop.
-
-Findings:
-- The confidence cutoffs do not discriminate: the judge saturates to Yes
-  (1.00) on most detections, so 0.6 vs 0.9 differs by 10 points only. Raising
-  the cutoff will not make injection safer. Treat Part B inline as unsafe to
-  enable by default.
-- Scanner misfires: ~8/39 detections are wh-questions ("What are the three
-  most likely causes...", "Where do I look...", "Why are there 100 dict
-  objects...") and ~11/39 are context-free ("Is that true?", "Is that
-  likely?", "Is that desired?"). Injecting "Yes." into these is meaningless
-  or wrong. Fix the scanner first: require a yes/no aux start (is/does/do/
-  should/can/are/would) and reject bare anaphora ("that/this/it" only).
-- Context is the last 400 chars of the model's own thinking; for anaphoric
-  questions it is often insufficient. Wide context is not an option on the
-  128-row slot (kJevSeqCap).
-- One case where the judge said No=1.00 and the trace itself concluded Yes
-  (cgroup memory.current includes kernel memory), i.e. high-confidence
-  disagreement with the main model's own conclusion.
-- Recommendation: keep the inline cutoff at 0.9 until the scanner is
-  tightened, then re-measure; kJevPreConfidence cannot be inferred from this
-  data (Part A needs the 3-arm run). Needs a ground-truth label set for real
-  precision numbers.
 
 ## Status 2026-11-06 — MiniCPM5 port WORKS (root causes found)
 
@@ -1064,7 +969,7 @@ Why: on real opencode traffic (150k-token tool loops) none of the jev features f
 
 **Finish detector for tool-capable turns:** no code change needed. `JudgeFinish` already runs on any `finish=stop` turn without a tool call, including requests with `tools`; the empty-answer (0.9) and announce (0.8) rules catch an agent stalling. On opencode traffic it does not log because almost every turn ends in a tool call and returns before the log line. Pre-route stays single-turn by design.
 
-**Run it:** `./run-gufo.sh --jev-gate agent --jev-finish on` (plus `--jev-pre on`; inline off).
+**Run it:** `./run-gufo.sh --jev-gate agent --jev-finish on` (plus `--jev-pre on`).
 
 ## Incident 2026-11-06 — `--jev-gate agent` broke the prefix cache (fixed)
 
