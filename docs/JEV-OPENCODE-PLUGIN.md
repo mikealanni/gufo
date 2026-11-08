@@ -391,7 +391,7 @@ Acceptance (section "Tests and acceptance criteria"):
 3. Fail-open: pass. `JEV_TEST_THROW=<hook>` injects an exception in `prompt`, `context`, `execute.before`, `execute.after`; each leaves one `error` record and does not throw.
 4. Overhead: pass (same numbers as 1).
 5. Gufo only: pass.
-6. Live: light, heavy and goal phrase seen in one session. First live comparison with the guard: `compare.py` matched 37 command pairs with 37 agreements (2 heavy, 35 light), 0 disagreements; 18 plugin rows and 17 guard rows are unmatched (not yet explained: likely text or timing differences between what the proxy and the plugin see).
+6. Live: light, heavy and goal phrase seen in one session. First live comparison with the guard (`compare.py`, `~` normalised): 40 matched command pairs, 39 agree (2 heavy, 37 light), 1 disagreement, 15 plugin rows and 14 guard rows unmatched. The one disagreement is a judge false positive, not a plugin bug: the rules say `unknown` for `python3 ~/.shokunin/scripts/chroma-helper.py session continue ...`, the guard's NPU judge scored it 0.918 (cutoff 0.85) and the guard stopped gufo for a harmless command. The unmatched rows are mostly my own `ls /tmp` pings from before the plugin was installed and commands whose text differs between proxy and plugin.
 7. `compare.py`: built. The week of data it is meant to judge has not run yet.
 
 Review notes (fixed in this pass): the finish detector used to be permanently
