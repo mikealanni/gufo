@@ -591,6 +591,9 @@ class Guard:
         self.jev_log = None
         self.pending_lights = []
         self.run_id = uuid.uuid4().hex[:12]
+        self.last_activity = 0.0
+        self.gen_inflight = 0
+        self.idle_noted = False
         self.want_up = True
         load_learned()
         if LEARNED:
@@ -827,11 +830,26 @@ class Guard:
                 continue
             found = await asyncio.get_running_loop().run_in_executor(None, self.foreign_kfd)
             hits = hits + 1 if found else 0
+            if not found:
+                self.idle_noted = False
+            if hits >= KFD_SAMPLES and not self.opencode_active():
+                hits = 0
+                if not self.idle_noted:
+                    self.idle_noted = True
+                    since = (f"for {time.time() - self.last_activity:.0f}s" if self.last_activity
+                             else "since the guard started")
+                    log(f"foreign GPU process pid={found[0]} seen but opencode has not used gufo "
+                        f"{since}; leaving gufo running")
+                continue
             if hits >= KFD_SAMPLES:
                 hits = 0
                 if await self.stop_gufo(f"foreign GPU process pid={found[0]}"):
                     self._attribute_catch(found[0], f"kfd watchdog pid={found[0]}")
                     self.begin_watch(f"kfd {found[0]}", self.foreign_kfd, quiet=KFD_QUIET)
+
+    def opencode_active(self):
+        """True while a generation request is in flight or one finished recently."""
+        return self.gen_inflight > 0 or time.time() - self.last_activity < self.a.active_window
 
     def session_key(self, request):
         for name in ("x-session-id", "x-opencode-session", "x-session-affinity"):
@@ -881,10 +899,18 @@ class Guard:
 
     async def proxy(self, request):
         self.inflight += 1
+        generating = request.method == "POST" and request.path.endswith(
+            ("/chat/completions", "/completions", "/responses", "/messages"))
+        if generating:
+            self.gen_inflight += 1
+            self.last_activity = time.time()
         try:
             return await self.proxy_inner(request)
         finally:
             self.inflight -= 1
+            if generating:
+                self.gen_inflight -= 1
+                self.last_activity = time.time()
 
     async def proxy_inner(self, request):
         body = await request.read()
@@ -969,6 +995,8 @@ class Guard:
     async def status(self, request):
         return web.json_response({
             "state": self.state, "stops": self.stops, "inflight": self.inflight,
+            "opencode_active": self.opencode_active(),
+            "idle_s": round(time.time() - self.last_activity) if self.last_activity else None,
             "mem_available_gb": round(mem_available_gb(), 1),
             "judge": self.judge is not None and self.judge.proc is not None
             and self.judge.proc.returncode is None})
@@ -1022,6 +1050,8 @@ def main():
     p.add_argument("--max-hold", type=float, default=7200)
     p.add_argument("--start-timeout", type=float, default=420)
     p.add_argument("--stop-timeout", type=float, default=120)
+    p.add_argument("--active-window", type=float, default=600,
+                   help="seconds after the last generation request that opencode counts as using gufo")
     p.add_argument("--jev-log", default=f"{home}/.gufo/jev-log/jev.sqlite3",
                    help="jev-log db file; set empty to disable")
     a = p.parse_args()
