@@ -49,7 +49,21 @@ LIGHT_WORDS = {
     "uniq", "awk", "stat", "file", "which", "date", "printf", "true", "less", "more",
     "tee", "xxd", "sha256sum", "md5sum", "sha1sum", "strings", "nm", "objdump", "readelf", "ldd", "nl", "cut", "basename", "dirname", "readlink", "realpath", "du",
     "df", "ps", "pgrep", "sleep", "wait", "kill", "tar", "unzip", "gh", "jj",
+    "read", "export", "test", "[", "[[", "local", "return", "exit", "break", "continue",
 }
+SHELL_KEYWORDS = ("do", "then", "else", "elif", "if", "while", "until", "!", "{", "(")
+END_WORDS = {"done", "fi", "esac", "}", ")"}
+LOOP_HEADER = re.compile(r"^(?:for\s+\w+\s+in\b|for\s+\(\()")
+
+
+def strip_shell_keywords(seg):
+    """Drop leading do/then/if/while/... so the command that follows is judged."""
+    while True:
+        word = seg.split(None, 1)[0] if seg.split() else ""
+        if word in SHELL_KEYWORDS:
+            seg = seg[len(word):].lstrip()
+            continue
+        return seg
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "upgrade",
        "proxy-authenticate", "proxy-authorization", "trailers", "content-length",
        "host", "content-encoding"}
@@ -293,7 +307,17 @@ def mem_available_gb():
     return 0.0
 
 
+HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_]\w*)\1[^\n]*\n(.*?)\n[ \t]*\2[ \t]*(?=\n|$)", re.S)
+NL_MARK = "\x01"
+
+
+def protect_heredocs(command):
+    """Keep a here-document body inside the command that reads it."""
+    return HEREDOC.sub(lambda m: m.group(0).replace("\n", NL_MARK), command)
+
+
 def segments(command):
+    command = protect_heredocs(command.replace("\\\n", " "))
     out, cur, quote, i = [], [], "", 0
     while i < len(command):
         ch = command[i]
@@ -306,6 +330,8 @@ def segments(command):
                 quote = ""
         elif ch in "'\"":
             quote = ch
+        elif ch == "&" and ((cur and cur[-1] in "<>") or command[i + 1:i + 2] == ">"):
+            pass  # 2>&1, >&2, &>file: a redirect, not a separator
         elif ch in ";|&\n":
             out.append("".join(cur))
             cur = []
@@ -314,7 +340,7 @@ def segments(command):
         cur.append(ch)
         i += 1
     out.append("".join(cur))
-    return [s.strip() for s in out if s.strip()]
+    return [s.strip().replace(NL_MARK, "\n") for s in out if s.strip()]
 
 
 def first_word(segment):
@@ -368,6 +394,11 @@ def classify(command):
                 return verdict, inner
             continue
         seg, detached = strip_launchers(seg)
+        seg = strip_shell_keywords(seg)
+        if not seg or first_word(seg) in END_WORDS:
+            continue
+        if LOOP_HEADER.match(seg) and "$(" not in seg and "`" not in seg:
+            continue
         if first_word(seg) in LIGHT_WORDS:
             continue
         if detached and seg and not re.search(r"\s(--help|-h|--version)(\s|$)", seg):
