@@ -1177,3 +1177,67 @@ Milestone 4 — guard integration.
 
 Milestone 5 — "continue" after a failure.
   - check whether opencode exposes an API the guard can use to send a prompt after a dropped request.
+
+## Plugin-era milestones (added 2026-11-08, after the opencode plugin spike)
+
+Context: jev's decisions are moving into the opencode plugin (see `docs/JEV-OPENCODE-PLUGIN.md`).
+The plugin cannot run the NPU judge itself, so these milestones improve the one judge process the
+daemon owns and how the plugin uses it. Everything here is automatic: nothing is exposed as a
+user-facing API or endpoint, and nothing needs the user to start, call or configure it. Inference
+stays on the NPU; only fine-tuning (Milestone 6) runs elsewhere, offline, with gufo stopped.
+
+Milestone 6 — a trained decision model instead of a zero-shot one.
+  - Evidence: off-the-shelf small models answer "Yes" to nearly everything (Qwen3-0.6B and
+    Qwen3Guard-Gen-0.6B both failed the battery); MiniCPM5-1B-SFT is the best zero-shot judge
+    (9/10 trivia, 8/12 code) but gave a false "heavy" (0.918) on a harmless memory CLI command.
+    Small models trained specifically for decisions are reported to do far better.
+  - Fine-tune MiniCPM5-1B (dense, loads in the existing NPU path) on logged decisions: guard rows
+    and plugin rows with outcomes (`diverged`, `retry`, `rerun`, ...) from `jev.sqlite3`, plus the
+    rule verdicts as weak labels. Hold out whole sessions for evaluation.
+  - The training target is a typed decision: one of N options with a probability, not only
+    Yes/No. Keep the Yes/No gap as the two-option special case so the current code keeps working.
+  - Done when: on held-out sessions the tuned judge beats the zero-shot judge on false-heavy and
+    false-light rates at the current 0.85 cutoff, the 22-case battery does not regress, and the
+    exported GGUF loads in the NPU path unchanged.
+  - LFM3-d1-2B (a published decision model with typed, calibrated outputs) is a candidate only
+    after Milestone 3, because its hybrid convolution/attention layers do not load today.
+
+Milestone 7 — one read of a turn, several questions.
+  - The finish detector, the effort gate and the goal check each ask several questions about the
+    same turn text. Today each question re-reads its own context (a batch of 4 shares nothing).
+  - Read the turn once, keep its KV, and answer each question as a short suffix; an extension of a
+    previously read text reuses the earlier work. Bounded cache (a few recent turns), results
+    must equal the unshared runs.
+  - Done when: answers are bit-identical to the unshared path on the battery and the replay sets,
+    and the time for 4 questions about one 1,000-token turn drops by at least half.
+
+Milestone 8 — automatic plugin-to-judge channel (private, not an API).
+  - The plugin and the daemon talk over a private local channel (a Unix socket or the judge's
+    stdio), started and supervised by the daemon with the rest of jev. No network port, no
+    documentation for users, no keys. The contract is internal: a turn, a list of questions, and
+    for each question the option probabilities.
+  - Exactly one NPU judge process exists; the plugin never starts one. If the daemon or judge is
+    down, the plugin falls back to rules only and keeps logging.
+  - Done when: the plugin's finish, gate and goal checks can use the judge with no manual step, a
+    killed judge is restarted automatically, and a dead channel never blocks or delays a tool call
+    or a model request (fail open, 50 ms budget).
+
+Milestone 9 — measure the judge's cost to decode.
+  - JEV-REPORT lists "jev overhead on decode" as not measured. Measure gufo decode tok/s at 32k
+    to 128k depth with the judge idle against the judge answering questions at the real rate
+    (about 150 command checks and a few turn-level questions per hour).
+  - The GPU and NPU share the memory bus and power budget, and GPU+NPU at the same time needs the
+    fabric clock held at top speed (already a service on this box): confirm it is held, and
+    record any hang or corrupted NPU result as a failure.
+  - Done when: per-phase decode numbers (5% and 3 ms thresholds, per request, never averaged)
+    show the penalty, or show none, with the clock held and not held.
+
+Milestone 10 — observe-only streaming watcher.
+  - The plugin can see streamed reasoning and text deltas (events such as
+    `session.reasoning.delta`). Add a watcher that reads them and only logs what it would flag
+    (reasoning that loops, the same question asked repeatedly, a reply that stops mid-sentence).
+    It never alters the stream, the prompt or the history, which is why the removed inline
+    answering (Part B) is not coming back. A small safety model such as Qwen3Guard-Stream-0.6B
+    is the reference for this kind of watcher.
+  - Done when: a week of logs shows the flags are rare and mostly correct. Any later action on a
+    flag (for example an automatic continue) is a separate decision that needs its own evidence.
