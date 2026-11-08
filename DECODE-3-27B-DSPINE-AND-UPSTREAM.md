@@ -1,5 +1,16 @@
 # Brief 3: Qwen3.8-27B decode (DSpine drafter) and upstream catch-up for 27B + prefill
 
+## How to run this brief (read first)
+
+Repo `~/gufo`, branch `fork-enhancements`. Work in a NEW worktree off it, never in `~/gufo` itself:
+`git worktree add ~/gufo-27bport -b perf/qwen27b-upstream-port`. Upstream remote `upstream` is already fetched. Overlap with `DECODE-1-UPSTREAM-PORT.md`: items #874 #705 #988 #660 are listed there too; do each only once, and check HEAD first (PR numbers are not in our squashed log, grep the changed symbols and files).
+
+Rules (same as Brief 1): selective cherry-pick or hand-port only, no full merge, do not port the cache redesign (#540 family) unless the user asks; no competitor names in repo files or commits; single-line Conventional Commits; do not push; no `pkill -f` (kill by pid); one GPU job at a time; quality gate for every port (greedy output identical on 16 prompts, repo focused tests) and matched A/B timing at realistic depth.
+
+You are being served by the same gufo that this work disturbs. Expect jev-guard to stop gufo while a command needs the GPU or most of the RAM (27B benchmarks, GPU ctest, large builds) and to restart it afterwards; your request is held and resumes. That is normal. Do not rename, wrap, detach or background commands to avoid the guard. The jev opencode plugin only logs your commands in this phase; leave it alone.
+
+Order of work: Part 2 first (27B-only commits: #705, #988, #874, #992, #660, #688, then the shared K-quant and weight-loading items, then prefill items), one commit at a time, each with a dry-run cherry-pick and a measured A/B. Part 1 (DSpine) starts only after Part 2 has landed, and only with its step 1 (torch reproduction of the card's claim); that step needs the GPU for a long batch, so say so first and run it as one job. Report measured and unmeasured results separately.
+
 Status: future plan, written 2026-11-08. Nothing here is started. Same rules as `DECODE-1-UPSTREAM-PORT.md` and `DECODE-2-ENGINE-LEVERS.md`: no competitor names in repo files, no push, no `pkill -f`, one GPU job at a time, quality gate (greedy output must stay identical), depth-realistic timing (32k-128k), report measured vs unmeasured. Do not start without the user's go; the earlier decision "no more upstream PR rebases unless asked" still stands, so each port below is opt-in.
 
 ## Part 1: DSpine drafter for the 27B
