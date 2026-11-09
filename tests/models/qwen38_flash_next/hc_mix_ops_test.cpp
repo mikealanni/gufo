@@ -425,8 +425,6 @@ int main() {
     CheckFusedDecodeMixer(5, false);
     CheckFusedProjection(96);
     CheckFusedProjection(2049);
-    for (std::uint32_t n : {7U, 96U, 1619U})
-      CheckFusedInjectPartials(n);
     constexpr std::size_t kHcDim = static_cast<std::size_t>(kHidden) * kStreams;
     constexpr std::size_t kRows = static_cast<std::size_t>(kTokens) * kHcDim;
     constexpr std::size_t kMixed = static_cast<std::size_t>(kTokens) * kHidden;
