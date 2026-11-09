@@ -428,7 +428,7 @@ Summary of what changed since the plan below was written:
   `~/torch2aie/examples/qwen3-decode-layer/TRACE-HANG-INSTRUMENTATION.md`.
 
 - **External reference — HF `julianmb/MiniCPM5-2B-NPU2` discussion #2**
-  (same `ERT_CMD_STATE_TIMEOUT` on Strix Halo, closed FastFlowLM engine):
+  (same `ERT_CMD_STATE_TIMEOUT` on Strix Halo, third-party closed engine):
   every environment knob was swept — XRT 2.21→2.26, `-noert` (build-time-only
   flag, retracted), firmware, `force_cmdlist`, TDR, pmode, `iommu=pt`, chunk
   size — **identical timeout every time**. Confirms two things for us: (a) our
@@ -440,7 +440,7 @@ Summary of what changed since the plan below was written:
   submission-depth resources: split the chained layer into 2–3 host-side
   dispatches. Also: measured NPU decode is bandwidth-bound at ~63–88 GB/s
   effective (qwen3:0.6B-class = ~92 t/s whole-model), and their "63 t/s" was a
-  phantom of ROCm/FastFlowLM#716 (server answers with the resident model and
+  phantom of a public third-party NPU issue (server answers with the resident model and
   echoes the requested name) — in our jev 3-arm measurements, verify *what
   actually ran*, never trust the echoed model field.
 
@@ -1147,7 +1147,7 @@ retries a dropped request by itself but a guard cannot type "continue" into the 
 ## Future: own NPU LLM engine (decided 2026-11-07: no closed-source runtime)
 
 Goal: a small LLM that generates on our NPU engine and serves chat/light turns while the big gufo
-is stopped for a test. Reference point (FastFlowLM page, closed source, not used): LFM3-1.7B Q4_0 on
+is stopped for a test. Reference point (third-party page, closed source, not used): LFM3-1.7B Q4_0 on
 the same chip decodes 41 tok/s at 1k and 24 tok/s at 32k context.
 
 Measured here: NPU streams 30.3 GB/s of weights (97 us per 2.95 MB slice, pipelined depth 2+),

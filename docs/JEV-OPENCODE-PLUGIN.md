@@ -452,3 +452,25 @@ Limits seen in testing: `/jev status` and `/jev pause` worked end to end on a th
 `/jev resume` timed out once because gufo was stopped for a heavy test and the request waited. When
 gufo is down or busy use the file directly (`rm ~/.gufo/jev-log/plugin-pause` or
 `~/.gufo/jev-ctl.sh resume`), which does not need a model.
+
+## Production port (2026-11-09)
+
+The plugin now acts, not just logs. Engine flags `--jev-gate/--jev-finish/--jev-goal` are off in
+`run-gufo.sh` (`JEV_ENGINE=on` restores them); the engine code stays until the live test passes.
+
+| Feature | Where it runs now | Switch |
+|---|---|---|
+| Command gate (heavy lock, drain, stop) | plugin `execute.before` -> guard `/jev-guard/prepare`; unknown commands -> `/jev-guard/classify` (NPU judge) | `/jev feature command off` |
+| Effort gate (user turns + routine tool results) | plugin `context` hook decides, `http.request` hook writes `reasoning_effort` / `thinking` / `reasoning_budget_tokens` into the body | `/jev feature effort off` |
+| `/jev autoeffort off [level]` | plugin plan first, guard pin as fallback | file `autoeffort-off` |
+| Goal tracker | `prompt` hook strips the phrase; turn end evaluates and queues a continuation prompt | `/jev feature goal off` |
+| Finish detector | turn end, text-only turns, 2 continuations max, loop guard | `/jev feature finish off` |
+| Session identity | `http.request` adds `x-session-id`, `x-jev-plugin: 1` | pause the session |
+| `/jev` command | native `/jev2` (per-session id from the hook) plus the file command `/jev` | n/a |
+
+Stays outside the plugin: memory and kfd watchdogs, gufo supervisor, the single NPU judge (all need
+process and RAM visibility across sessions), and `--jev-pre` (answers only tool-less single-turn
+yes/no requests; opencode traffic always carries tools).
+
+Checks for the live test: `plugin-<date>.jsonl` features `effort_apply`, `goal_arm`, `goal_eval`,
+`finish` (field `acted`), `command_gate` (note `gate waited`); guard log lines `request keys:`.
