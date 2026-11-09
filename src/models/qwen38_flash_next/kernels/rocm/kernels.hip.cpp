@@ -4451,12 +4451,21 @@ __device__ __forceinline__ __attribute__((convergent)) void SyncLds() {
 // the writes stay conflict-free. The optional block mask follows the model's
 // sparse selection: keys at or past the query's incomplete tail block are
 // always visible, earlier blocks only when their bit is set.
+// Debug probes for the fused attention kernel (inf/NaN counters filled through
+// `dbg`, printed when GUFO_ATTN_DBG=1). Compiled out by default: they sit inside
+// the key sweep and cost register pressure and speed at depth even when unused.
+#ifndef GUFO_ATTN_PROBE
+#define GUFO_ATTN_PROBE 0
+#endif
+
+#if GUFO_ATTN_PROBE
 __device__ __forceinline__ bool HalfInfWord(unsigned w) {
   const auto inf = [](unsigned h) {
     return (h & 0x7C00u) == 0x7C00u && (h & 0x03FFu) == 0u;
   };
   return inf(w & 0xFFFFu) || inf(w >> 16);
 }
+#endif
 
 constexpr std::uint32_t kWmmaHeadDim = 256;
 constexpr std::uint32_t kWmmaQueryHeads = 24;
@@ -4489,7 +4498,12 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
     const __half* __restrict__ k_cache, const __half* __restrict__ v_cache,
     const std::uint32_t* __restrict__ mask, std::uint32_t mask_words,
     float* __restrict__ out, std::uint32_t start_pos, std::uint32_t n_tokens,
-    std::uint32_t first_query_group = 0, int* __restrict__ dbg = nullptr) {
+    std::uint32_t first_query_group = 0
+#if GUFO_ATTN_PROBE
+    ,
+    int* __restrict__ dbg = nullptr
+#endif
+) {
   // The launcher accepts only four-token selection blocks. Keep that
   // geometry constant throughout the key sweep.
   constexpr std::uint32_t ratio = kWmmaRatio;
@@ -4580,10 +4594,12 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
 #pragma unroll
       for (std::uint32_t v = 0; v < 4; ++v) {
         const float4 f = live ? qp[v] : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+#if GUFO_ATTN_PROBE
         if (dbg && !(std::isfinite(f.x) && std::isfinite(f.y) &&
                      std::isfinite(f.z) && std::isfinite(f.w))) {
           atomicAdd(dbg + 0, 1);
         }
+#endif
         q_frag[ks][(v * 4) + 0] = static_cast<_Float16>(f.x * attention_scale);
         q_frag[ks][(v * 4) + 1] = static_cast<_Float16>(f.y * attention_scale);
         q_frag[ks][(v * 4) + 2] = static_cast<_Float16>(f.z * attention_scale);
@@ -4784,6 +4800,7 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
       dst[j] = live ? *reinterpret_cast<const uint4*>(src + (j * 8))
                     : make_uint4(0u, 0u, 0u, 0u);
     }
+#if GUFO_ATTN_PROBE
     if (dbg && live) {
       bool bad = false;
 #pragma unroll
@@ -4798,6 +4815,7 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
         atomicExch(reinterpret_cast<unsigned*>(dbg + 3), key_position);
       }
     }
+#endif
   };
   // Coalesced: a wave reads one key row's 512 contiguous bytes.
   const auto load_k = [&](const Tile& tile, uint4* dst) {
@@ -4813,6 +4831,7 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
                      (static_cast<std::size_t>(key_position) * kWmmaKvWidth) +
                      d8)
                : make_uint4(0u, 0u, 0u, 0u);
+#if GUFO_ATTN_PROBE
       if (dbg && live) {
         const unsigned* w = reinterpret_cast<const unsigned*>(&dst[n]);
         if (HalfInfWord(w[0]) | HalfInfWord(w[1]) | HalfInfWord(w[2]) |
@@ -4821,6 +4840,7 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
           atomicExch(reinterpret_cast<unsigned*>(dbg + 12), key_position);
         }
       }
+#endif
     }
   };
 
@@ -4870,9 +4890,11 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
       // Each half writes its own slot; the reader sums them.
 #pragma unroll
       for (std::uint32_t i = 0; i < 8; ++i) {
+#if GUFO_ATTN_PROBE
         if (dbg && !std::isfinite(s_acc[i])) {
           atomicAdd(dbg + 4, 1);
         }
+#endif
         s_lds[s_kh][s_tile][(2 * i) + half_id][sub] = s_acc[i];
       }
     }
@@ -4935,10 +4957,12 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
           vals[m] = valid ? (s_lds[0][tile][row][col % 16] +
                              s_lds[1][tile][row][col % 16])
                           : -INFINITY;
+#if GUFO_ATTN_PROBE
           if (dbg && !std::isfinite(vals[m])) {
             atomicAdd(dbg + 5, 1);
             vals[m] = -INFINITY;
           }
+#endif
           part_max = fmaxf(part_max, vals[m]);
         }
 #pragma unroll
@@ -10925,6 +10949,7 @@ bool WmmaCausalAttention(const float* q, const float* gate,
       (mask != nullptr && mask_words > kWmmaMaxMaskWords)) {
     return false;
   }
+#if GUFO_ATTN_PROBE
   static int* const dbg = [] {
     const char* e = std::getenv("GUFO_ATTN_DBG");
     if (e == nullptr || e[0] != '1') {
@@ -10942,6 +10967,7 @@ bool WmmaCausalAttention(const float* q, const float* gate,
   if (dbg_live) {
     (void)hipMemsetAsync(dbg, 0, 32 * sizeof(int), stream);
   }
+#endif
   if (mask != nullptr) {
     constexpr std::uint32_t kPackedQueries = 4;
     const std::uint32_t first_group =
@@ -10955,13 +10981,24 @@ bool WmmaCausalAttention(const float* q, const float* gate,
       hipLaunchKernelGGL(
           (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true, true>),
           grid, dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask,
-          mask_words, out, start_pos, n_tokens, first_group, dbg);
+          mask_words, out, start_pos, n_tokens, first_group
+#if GUFO_ATTN_PROBE
+          ,
+          dbg
+#endif
+      );
     } else {
       hipLaunchKernelGGL(
           (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true>), grid,
           dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask,
-          mask_words, out, start_pos, n_tokens, first_group, dbg);
+          mask_words, out, start_pos, n_tokens, first_group
+#if GUFO_ATTN_PROBE
+          ,
+          dbg
+#endif
+      );
     }
+#if GUFO_ATTN_PROBE
     if (dbg_live) {
       int h[32] = {};
       (void)hipMemcpyAsync(h, dbg, sizeof(h), hipMemcpyDeviceToHost, stream);
@@ -10976,6 +11013,7 @@ bool WmmaCausalAttention(const float* q, const float* gate,
                      h[8], h[9], h[10], h[13], h[14], start_pos, n_tokens);
       }
     }
+#endif
     return true;
   }
   const std::uint32_t first_group =
