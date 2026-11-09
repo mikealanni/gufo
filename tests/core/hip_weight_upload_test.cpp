@@ -99,6 +99,9 @@ int main() {
   Device device(expected.size());
   Require(hipMemset(device.data, 0xa5, expected.size()) == hipSuccess,
           "initialize guards");
+  // The uploads run on non-blocking streams, which do not wait for the null
+  // stream; a late guard fill would overwrite them.
+  Require(hipDeviceSynchronize() == hipSuccess, "wait for guards");
   std::string error;
   auto upload = WeightUpload::Create(regions, &error);
   Require(upload != nullptr, error);
