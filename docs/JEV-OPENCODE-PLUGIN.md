@@ -424,3 +424,15 @@ lists, never content). Delete the flag file to stop.
 Verified after the restart on a one-message session ("Reply with the single
 word ok. jev finish it"): `goal` matched `jev finish it`, `effort_gate`,
 `activity` start and end, and `finish` were all recorded.
+
+### Pausing and stopping (added 2026-11-08)
+
+- **Pause only the plugin** (opencode and gufo keep running): `touch ~/.gufo/jev-log/plugin-pause`.
+  Every hook becomes a no-op within 2 seconds; `rm ~/.gufo/jev-log/plugin-pause` resumes.
+  `status.py` prints `PAUSED: YES` while the flag exists. `JEV_PLUGIN=off` also disables it but is
+  only read when the opencode service starts, so it cannot pause a service that is already running.
+- **Stop the current opencode turn without quitting opencode:** use opencode's interrupt key in the
+  TUI (Esc); the session stays open and can be continued.
+- **Stop gufo:** `~/jev-stop.sh` stops the guard and gufo and waits for the memory to come back.
+  opencode stays open, but its requests fail until gufo is started again with `~/run-gufo.sh`
+  (the guard only holds requests while it is itself stopping gufo for a heavy test).
