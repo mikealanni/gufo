@@ -393,14 +393,22 @@ export default {
         });
       } catch (err) { noteError("http.request", err); }
     });
-    // The /jev command template runs jev-ctl.sh through a shell; give that shell the session id.
+    // /jev: native command, so the session id comes from opencode itself (documented execute({ sessionID })).
     try {
-      await ctx.shell.hook("create.before", (e: any) => {
-        trace("shell.create.before", { keys: Object.keys(e ?? {}), sessionID: e?.sessionID, envKeys: Object.keys(e?.env ?? {}).filter((k) => k.startsWith("OPENCODE")) });
-        const sid = String(e?.sessionID ?? "");
-        if (sid && e?.env && !e.env.OPENCODE_SESSION_ID) e.env.OPENCODE_SESSION_ID = sid;
+      await ctx.command.transform((editor: any) => {
+        editor.add({
+          name: "jev",
+          description: "jev control: pause|resume [all] | autoeffort on|off [level] | feature <name> on|off | status",
+          execute: async (j: any) => {
+            const sid = String(j.sessionID ?? "");
+            const out = await control(LOG_DIR, sid, String(j.prompt?.text ?? ""));
+            trace("command.jev", { sid, out });
+            try { await ctx.session.synthetic({ sessionID: sid, text: out, resume: false }); } catch (err) { noteError("command.synthetic", err); }
+          },
+        });
       });
-    } catch (err) { noteError("shell.hook", err); }
+      try { await ctx.command.reload(); } catch (err) { noteError("command.reload", err); }
+    } catch (err) { noteError("command.register", err); }
     await ctx.tool.hook("execute.before", async (e: any) => {
       const sid = String(e.sessionID ?? "");
       const call = String(e.id ?? e.callID ?? "");

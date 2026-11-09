@@ -54,6 +54,7 @@ LIGHT_WORDS = {
     "uniq", "awk", "stat", "file", "which", "date", "printf", "true", "less", "more",
     "tee", "xxd", "sha256sum", "md5sum", "sha1sum", "strings", "nm", "objdump", "readelf", "ldd", "nl", "cut", "basename", "dirname", "readlink", "realpath", "du",
     "df", "ps", "pgrep", "sleep", "wait", "kill", "tar", "unzip", "gh", "jj",
+    "env", "printenv", "id", "whoami", "hostname", "uname", "nproc", "free", "uptime", "lsof", "ss",
     "read", "export", "test", "[", "[[", "local", "return", "exit", "break", "continue",
 }
 SHELL_KEYWORDS = ("do", "then", "else", "elif", "if", "while", "until", "!", "{", "(")
@@ -146,6 +147,7 @@ AUTOEFFORT_OFF = os.path.expanduser("~/.gufo/jev-log/autoeffort-off")
 EFFORT_LEVELS = {"minimal", "low", "medium", "high", "xhigh", "max"}
 DEFAULT_PINNED_EFFORT = "low"
 DRAIN_MAX = 1800
+MIN_NEEDLE_CHARS = 5
 WATCHDOG_DRAIN_MAX = 300
 MEM_HARD_FLOOR_GB = 1.5
 
@@ -1156,6 +1158,9 @@ class Guard:
             return web.json_response({"error": "bad json"}, status=400)
         if not segment:
             return web.json_response({"error": "segment required"}, status=400)
+        if len(needle_for(segment)) < MIN_NEEDLE_CHARS:
+            log(f"plugin asks to prepare for {segment[:60]!r}, but nothing specific can be watched; leaving gufo running")
+            return web.json_response({"state": self.state, "skipped": "generic", "mem_available_gb": round(mem_available_gb(), 1)})
         log(f"plugin asks to prepare for: {segment[:80]} (session {str(data.get('session', ''))[:24]})")
         await self.prepare_for_test(segment, own=False)
         return web.json_response({"state": self.state, "mem_available_gb": round(mem_available_gb(), 1)})

@@ -466,7 +466,7 @@ The plugin now acts, not just logs. Engine flags `--jev-gate/--jev-finish/--jev-
 | Goal tracker | `prompt` hook strips the phrase; turn end evaluates and queues a continuation prompt | `/jev feature goal off` |
 | Finish detector | turn end, text-only turns, 2 continuations max, loop guard | `/jev feature finish off` |
 | Session identity | `http.request` adds `x-session-id`, `x-jev-plugin: 1` | pause the session |
-| `/jev` command | native `/jev2` (per-session id from the hook) plus the file command `/jev` | n/a |
+| `/jev` command | native plugin command (`ctx.command.transform`), session id from `execute({ sessionID })`; output is a synthetic message with `resume: false`, so no model turn | n/a |
 
 Stays outside the plugin: memory and kfd watchdogs, gufo supervisor, the single NPU judge (all need
 process and RAM visibility across sessions), and `--jev-pre` (answers only tool-less single-turn
@@ -474,3 +474,15 @@ yes/no requests; opencode traffic always carries tools).
 
 Checks for the live test: `plugin-<date>.jsonl` features `effort_apply`, `goal_arm`, `goal_eval`,
 `finish` (field `acted`), `command_gate` (note `gate waited`); guard log lines `request keys:`.
+
+### Verified on 2026-11-09 (native `/jev`)
+
+`GET /api/command` lists `jev` once the plugin loads. `POST /api/session/<id>/command` with
+`{"name":"jev","text":"pause"}` creates `plugin-pause.<sessionID>` for that session only; `status`
+and `resume` work the same way. Output lands in the session inbox as a synthetic message and is
+delivered with the next turn. The `~/.config/opencode/plugins/jev.ts` symlink must point at the
+repo copy (`tools/jev/opencode-plugin/jev.ts`); a stale symlink to a deleted worktree makes the
+service skip the plugin silently.
+
+The guard refuses to stop gufo for a command whose process needle is shorter than 5 characters
+(a bare `env` matched `/usr/bin/env` wrappers and held gufo down for the full hold time).
