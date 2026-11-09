@@ -97,11 +97,13 @@ Not verified (must be checked in Task 0, do not assume):
 
 ## Detecting gufo
 
-From the opencode database the gufo providers are `kairic-direct` and
-`gufo-local` (older sessions; absent from the current config), model `Qwen3.8 Flash Next` (base URLs `http://127.0.0.1:8900/v1`
-and `http://192.168.6.138:8900/v1` in `~/.config/opencode/opencode.json`).
+The gufo providers in `~/.config/opencode/opencode.json` are `local-gufo` (base URL
+`http://127.0.0.1:8900/v1`, renamed from `kairic-direct` on 2026-11-08) and `kairic-remote`
+(`http://192.168.6.138:8900/v1`), model `Qwen3.8 Flash Next`. Sessions created before the
+rename carry the old provider id in opencode's database and are not logged until they are
+started again with `local-gufo`.
 Make the provider ids and the model id configurable
-(`JEV_GUFO_PROVIDERS`, default `kairic-direct,kairic-remote`, the two gufo providers in the current `opencode.json`) and match
+(`JEV_GUFO_PROVIDERS`, default `local-gufo,kairic-remote`) and match
 `model.providerID` from the hook input. Tool hooks (`tool.execute.*`) have no
 model in their input: look up the session's active model from the most recent
 `chat.message`/`chat.params` for that `sessionID` and cache it in memory.
@@ -206,7 +208,7 @@ file per day, create the directory if missing). Required fields on every record:
 
 ```json
 {"ts": 1794200000.123, "plugin_version": "0.1.0", "feature": "command_gate",
- "session": "ses_...", "call": "call_...", "provider": "kairic-direct",
+ "session": "ses_...", "call": "call_...", "provider": "local-gufo",
  "model": "Qwen3.8 Flash Next", "decision": {"verdict": "heavy", "would_stop": true},
  "cmd": "<first 500 chars, secrets redacted>", "dur_ms": null, "note": ""}
 ```
@@ -317,9 +319,9 @@ because the file-plugin revision is keyed by target string, not content hash).
   in-plugin; the log-format note about INSERT-only into `jev.sqlite3`
   stands (see Log format).
 - **Providers:** `~/.config/opencode/opencode.json` currently has
-  `kairic-direct` (`Qwen3.8 Flash Next` @ `http://127.0.0.1:8900/v1`) and
-  `kairic-remote` — **no `gufo-local`** (the plan's second id is absent).
-  Default `JEV_GUFO_PROVIDERS` should be `kairic-direct,kairic-remote` until
+  `local-gufo` (`Qwen3.8 Flash Next` @ `http://127.0.0.1:8900/v1`) and
+  `kairic-remote` (provider ids as of the spike; `kairic-direct` was renamed `local-gufo` afterwards).
+  Default `JEV_GUFO_PROVIDERS` should be `local-gufo,kairic-remote` until
   the config says otherwise.
 - **Parity data:** `~/dflash-train/guard_cmds.json` exists, 42,570 rows,
   keys `{cmd, dur, sid, script_heavy, verdict}` — ready for the parity test.
@@ -333,7 +335,7 @@ because the file-plugin revision is keyed by target string, not content hash).
 - **Session hooks (live):** `session.prompt` keys `sessionID, messageID,
   prompt, metadata, delivery`; `session.context` keys `sessionID, model,
   system, messages, options, agent, tools` with `model: {providerID:
-  "kairic-direct", id: "Qwen3.8 Flash Next"}`, `options` keys `["maxTokens"]`,
+  "local-gufo", id: "Qwen3.8 Flash Next"}`, `options` keys `["maxTokens"]`,
   `messages` count 1 → 3 across the run, `tools` as `object` (not an array).
   So a hook reads history via `event.messages` (and `ctx.session.context`
   per the API docs) — no SDK-client guess needed.
@@ -365,7 +367,7 @@ because the file-plugin revision is keyed by target string, not content hash).
 
 Task 0 is complete pending the idle/subagent naming run. Sections 1–5 may
 now be built against these facts — with the `shell` tool name and the
-`kairic-direct,kairic-remote` default above.
+`local-gufo,kairic-remote` default above.
 
 
 ## Implementation status (2026-11-08, reviewed)
