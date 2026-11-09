@@ -31,8 +31,6 @@ HEAVY = [re.compile(p) for p in (
     r"\bgufo(\s+\S+)*?\s+(bench|serve|judge|diagnose|eval|transcribe|prompt)\b",
     r"build/\S+/gufo\b",
     r"\bctest\b",
-    r"\bcmake\s+--build\b",
-    r"\bnix\s+(build|develop)\b",
     r"\brocprof\w*",
     r"model-bench\.py",
     r"^(?:\S*/)?(?:python3?|bash|sh)\s+(?!-c\b)\S*tools/prof/prof\.py\s+run\b",
@@ -45,6 +43,11 @@ HEAVY = [re.compile(p) for p in (
     r"(?:^|\s)(?:\./)?build/[\w.-]+/(?:\S*/)?tests/\S*(?:_test|_tests|_bench|_probe)\b",
 )]
 LIGHT_SCRIPTS = {"chroma-helper.py"}
+# Compiling uses CPU and RAM only, and swap covers the memory, so a build never
+# stops gufo. Running the built tests still does (ctest and the test binaries).
+BUILD_ONLY = re.compile(
+    r"^(?:\S*/)?(?:cmake\s+--build|ninja|make|nix\s+build"
+    r"|nix\s+develop\s+-c\s+(?:cmake\s+--build|ninja|make))\b")
 LIGHT_WORDS = {
     "git", "ls", "cat", "rg", "grep", "sed", "head", "tail", "echo", "pwd", "cd",
     "find", "wc", "diff", "mkdir", "cp", "mv", "rm", "touch", "curl", "tr", "sort",
@@ -421,6 +424,8 @@ def classify(command):
         if first_word(seg) in LIGHT_WORDS:
             continue
         if any(os.path.basename(x) in LIGHT_SCRIPTS for x in executed_scripts(seg)):
+            continue
+        if BUILD_ONLY.match(seg):
             continue
         if detached and seg and not re.search(r"\s(--help|-h|--version)(\s|$)", seg):
             return "heavy", seg
