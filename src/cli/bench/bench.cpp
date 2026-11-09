@@ -2357,6 +2357,13 @@ int RunBench(std::span<const char* const> args) {
             speculative_current_token = step_res.next_token;
           }
           acceptance_runs.push_back(spec_verifier->GetStats().AcceptanceRate());
+          if (opt.verbose) {
+            const auto& st = spec_verifier->GetStats();
+            std::cerr << "spec stats steps=" << st.total_verification_steps
+                      << " drafted=" << st.total_draft_tokens
+                      << " accepted=" << st.total_accepted_tokens
+                      << " emitted=" << st.total_emitted_tokens << '\n';
+          }
         } else {
           for (std::size_t step = 0; step < g_len; ++step) {
             greedy_current_token = gpu_exec->ForwardToken(greedy_current_token,
