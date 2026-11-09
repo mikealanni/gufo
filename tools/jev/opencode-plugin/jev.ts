@@ -12,7 +12,7 @@ import { judgeFinish } from "./finish.ts";
 import { control } from "./ctl.ts";
 import { hasGoalTrigger } from "./goal.ts";
 import { GOAL_MAX_CONTINUES, detectGoalSpec, evaluateGoal, extractItems, stripGoalTrigger, type GoalMessage } from "./goal-eval.ts";
-import { acquireHeavy, judgeCommand, releaseHeavy } from "./heavy.ts";
+import { acquireHeavy, judgeCommand, releaseHeavy, releaseSessionLocks } from "./heavy.ts";
 import { classifyJevAgentTurn, classifyJevRequest, K_ROUTINE_BUDGET_TOKENS, type AgentTurnResult } from "./gate.ts";
 import { applyPlan, baselineEffort, effortRank, pinnedEffort, setPlan, takePlan, type Plan } from "./effort.ts";
 
@@ -183,6 +183,7 @@ const goals = new Map<string, { text: string; continues: number }>();
 const finishes = new Map<string, { continues: number; lastReason: string; lastTail: string }>();
 const lastMsgs = new Map<string, any[]>();
 const injectedTexts = new Set<string>();
+const armed = new Set<string>();
 
 function resultTextOf(r: any): string {
   const v = r?.value ?? r;
@@ -237,18 +238,6 @@ export default {
         finishes.delete(sid);
         const g = goals.get(sid);
         if (g) g.continues = 0;
-        if (featureOn("goal") && hasGoalTrigger(text) && e.prompt && typeof e.prompt === "object") {
-          const prior = toGoalMessages(lastMsgs.get(sid) ?? []);
-          const spec = detectGoalSpec([...prior, { role: "user", text }]);
-          e.prompt.text = stripGoalTrigger(text);
-          goals.set(sid, { text: spec.text, continues: 0 });
-          const entry = seen.get(sid) ?? { provider: "", model: "" };
-          enqueue({
-            ts: Date.now() / 1000, plugin_version: PLUGIN_VERSION, feature: "goal_arm",
-            session: sid, call: String(e.messageID ?? ""), provider: entry.provider, model: entry.model,
-            decision: { items: spec.items, from_history: spec.fromHistory, goal: spec.text.slice(0, 120) }, segment: "", cmd: "", dur_ms: null, note: "",
-          });
-        }
       } catch (err) { noteError("prompt", err); }
     });
     await ctx.session.hook("context", async (e: any) => {
@@ -261,6 +250,32 @@ export default {
         const mid = (e.model?.id ?? e.model?.modelID) as string | undefined;
         if (sid && pid) seen.set(sid, { provider: pid, model: mid ?? "" });
         if (!sid || !isGufo(sid)) return;
+        // Goal phrase: stripped from every user message at render time (like the engine did), armed once per message.
+        if (featureOn("goal")) {
+          const all = (e.messages ?? []) as any[];
+          const raw = toGoalMessages(all);
+          const hit = all.some((m: any) => String(m?.role ?? m?.type ?? "") === "user" && hasGoalTrigger(messageText(m)));
+          if (hit) {
+            const spec = detectGoalSpec(raw);
+            const key = `${sid}:${spec.text.slice(0, 60)}`;
+            if (!armed.has(key)) {
+              armed.add(key);
+              if (armed.size > 500) armed.clear();
+              goals.set(sid, { text: spec.text, continues: 0 });
+              const en = seen.get(sid) ?? { provider: "", model: "" };
+              enqueue({
+                ts: Date.now() / 1000, plugin_version: PLUGIN_VERSION, feature: "goal_arm",
+                session: sid, call: "", provider: en.provider, model: en.model,
+                decision: { items: spec.items, from_history: spec.fromHistory, goal: spec.text.slice(0, 120) }, segment: "", cmd: "", dur_ms: null, note: "",
+              });
+            }
+            for (const m of all) {
+              if (String(m?.role ?? m?.type ?? "") !== "user") continue;
+              if (typeof m.content === "string") { if (hasGoalTrigger(m.content)) m.content = stripGoalTrigger(m.content); }
+              else if (Array.isArray(m.content)) for (const part of m.content) if (part?.type === "text" && typeof part.text === "string" && hasGoalTrigger(part.text)) part.text = stripGoalTrigger(part.text);
+            }
+          }
+        }
         lastMsgs.set(sid, (e.messages ?? []) as any[]);
         if (lastMsgs.size > 200) lastMsgs.clear();
         const entry = seen.get(sid)!;
@@ -498,6 +513,7 @@ export default {
             const t = (ev as any)?.type as string;
             if (t !== "session.idle" && t !== "session.execution.succeeded" && t !== "session.step.ended") continue;
             const sid = (ev as any)?.data?.sessionID as string | undefined;
+            if (sid && t !== "session.step.ended") releaseSessionLocks(LOG_DIR, sid);
             if (!sid || !isGufo(sid) || disabled(sid)) continue;
             // Several events fire for one turn end: handle the first, ignore the
             // rest for 1.5 s. A later turn in the same session is handled again.

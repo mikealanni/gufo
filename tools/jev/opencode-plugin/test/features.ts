@@ -11,7 +11,9 @@ check("stack trace gets xhigh", classifyJevRequest("Traceback (most recent call 
 check("plain request gets medium", classifyJevRequest("Please review this design for the cache layer in detail").effort === "medium");
 
 const b1: any = { messages: [] };
-check("plan adds effort and thinking", applyPlan(b1, { effort: "low", thinking: false, reason: "t" }).join() === "reasoning_effort,thinking");
+check("disabled thinking carries no effort", applyPlan(b1, { effort: "low", thinking: false, reason: "t" }).join() === "thinking");
+const b1b: any = {};
+check("enabled thinking carries effort", applyPlan(b1b, { effort: "medium", thinking: true, reason: "t" }).join() === "reasoning_effort,thinking");
 const b2: any = { reasoning_effort: "high" };
 check("caller effort wins", applyPlan(b2, { effort: "low", reason: "t" }).length === 0 && b2.reasoning_effort === "high");
 const b3: any = {};

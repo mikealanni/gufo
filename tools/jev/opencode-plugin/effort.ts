@@ -50,7 +50,8 @@ export function applyPlan(body: any, plan: Plan): string[] {
   const kwargs = body.chat_template_kwargs;
   const hasEffort = "reasoning_effort" in body || (kwargs && typeof kwargs === "object" && "reasoning_effort" in kwargs);
   const hasThinking = "thinking" in body || (kwargs && typeof kwargs === "object" && "enable_thinking" in kwargs);
-  if (plan.effort && !hasEffort) { body.reasoning_effort = plan.effort; added.push("reasoning_effort"); }
+  // The engine rejects an effort together with thinking disabled; disabled thinking needs no effort.
+  if (plan.effort && !hasEffort && plan.thinking !== false) { body.reasoning_effort = plan.effort; added.push("reasoning_effort"); }
   if (plan.thinking !== undefined && !hasThinking) { body.thinking = { type: plan.thinking ? "enabled" : "disabled" }; added.push("thinking"); }
   if (plan.budget !== undefined && !("reasoning_budget_tokens" in body) && !("thinking_budget_tokens" in body)) {
     body.reasoning_budget_tokens = plan.budget; added.push("reasoning_budget_tokens");

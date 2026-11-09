@@ -9,7 +9,7 @@ SAFE="$(printf '%s' "$SID" | tr -c 'A-Za-z0-9._-' '_')"
 ALL="$DIR/plugin-pause"
 ONE="$DIR/plugin-pause.$SAFE"
 ARG="${1:-}"; SCOPE="${2:-}"
-[ "$ARG" = "pause" ] || [ "$ARG" = "resume" ] || [ "$ARG" = "status" ] || [ "$ARG" = "autoeffort" ] || { set -- $ARG; ARG="${1:-}"; SCOPE="${2:-}"; }
+[ "$ARG" = "pause" ] || [ "$ARG" = "resume" ] || [ "$ARG" = "status" ] || [ "$ARG" = "autoeffort" ] || [ "$ARG" = "feature" ] || { set -- $ARG; ARG="${1:-}"; SCOPE="${2:-}"; }
 case "$ARG" in
   pause)
     mkdir -p "$DIR"
@@ -21,6 +21,14 @@ case "$ARG" in
     elif [ -n "$SID" ]; then rm -f "$ONE"; echo "jev plugin RESUMED for this session ($SID)."
       [ -e "$ALL" ] && echo "note: a global pause is still active (/jev resume all)."
     else echo "no session id available here; use: /jev resume all"; fi ;;
+  feature)
+    case "$SCOPE" in command|effort|goal|finish|pre) ;; *) echo "usage: /jev feature command|effort|goal|finish|pre on|off"; exit 0 ;; esac
+    F="$DIR/feature-off.$SCOPE"
+    case "${3:-}" in
+      off) mkdir -p "$DIR"; : > "$F"; echo "feature '$SCOPE' OFF." ;;
+      on) rm -f "$F"; echo "feature '$SCOPE' ON." ;;
+      *) [ -e "$F" ] && echo "feature '$SCOPE': off" || echo "feature '$SCOPE': on" ;;
+    esac ;;
   autoeffort)
     EF="$DIR/autoeffort-off"
     case "$SCOPE" in

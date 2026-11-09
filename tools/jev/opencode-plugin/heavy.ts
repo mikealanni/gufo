@@ -5,7 +5,7 @@ import { mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 
 import { join } from "node:path";
 
 const GUARD_URL = process.env.JEV_GUARD_URL ?? "http://127.0.0.1:8900";
-const LOCK_TTL_MS = 3 * 3600 * 1000;
+const LOCK_TTL_MS = 2 * 3600 * 1000;
 const WAIT_MAX_MS = 30 * 60 * 1000;
 const POLL_MS = 1000;
 const PREPARE_TIMEOUT_MS = 12 * 60 * 1000;
@@ -90,4 +90,13 @@ export async function judgeCommand(command: string, sid: string): Promise<boolea
     if (!r.ok) return false;
     return !!((await r.json()) as { heavy?: boolean }).heavy;
   } catch { return false; }
+}
+
+// A cancelled or aborted tool call never reaches execute.after: drop the session's locks when its turn ends.
+export function releaseSessionLocks(logDir: string, sid: string): void {
+  const dir = join(logDir, "heavy-lock");
+  let names: string[] = [];
+  try { names = readdirSync(dir); } catch { return; }
+  const prefix = `${sid}__`.replace(/[^\w.-]/g, "_");
+  for (const n of names) if (n.startsWith(prefix)) { try { unlinkSync(join(dir, n)); } catch { /* gone */ } }
 }
