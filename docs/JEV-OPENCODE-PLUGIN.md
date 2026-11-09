@@ -438,3 +438,17 @@ word ok. jev finish it"): `goal` matched `jev finish it`, `effort_gate`,
 - **Stop gufo:** `~/jev-stop.sh` stops the guard and gufo and waits for the memory to come back.
   opencode stays open, but its requests fail until gufo is started again with `~/run-gufo.sh`
   (the guard only holds requests while it is itself stopping gufo for a heavy test).
+
+### The /jev command (added 2026-11-08)
+
+`/jev pause`, `/jev resume` and `/jev status` in the opencode prompt. It is a markdown command
+(`tools/jev/opencode-plugin/jev-command.md`, symlinked to `~/.config/opencode/commands/jev.md`)
+whose shell block runs `~/.gufo/jev-ctl.sh '$1'` (symlink to `tools/jev/opencode-plugin/jev-ctl.sh`,
+which accepts only `pause`, `resume` or `status`). The shell block runs when the command is
+evaluated, before the prompt is submitted, then gufo is asked to repeat the output, so each use
+costs one short model turn. Pause creates the flag file described above and resume deletes it.
+
+Limits seen in testing: `/jev status` and `/jev pause` worked end to end on a throwaway session;
+`/jev resume` timed out once because gufo was stopped for a heavy test and the request waited. When
+gufo is down or busy use the file directly (`rm ~/.gufo/jev-log/plugin-pause` or
+`~/.gufo/jev-ctl.sh resume`), which does not need a model.
