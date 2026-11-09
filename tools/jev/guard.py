@@ -872,8 +872,8 @@ class Guard:
         if logged:
             log(f"generations done after {time.time() - t0:.1f}s")
 
-    async def drain_generations(self, segment):
-        self.heavy_waiting += 1
+    async def drain_generations(self, segment, own=True):
+        self.heavy_waiting += 1 if own else 0
         t0 = time.time()
         logged = False
         try:
@@ -883,12 +883,12 @@ class Guard:
                     logged = True
                 await asyncio.sleep(0.5)
         finally:
-            self.heavy_waiting -= 1
+            self.heavy_waiting -= 1 if own else 0
         if logged:
             log(f"other generations done after {time.time() - t0:.1f}s")
 
-    async def prepare_for_test(self, segment):
-        await self.drain_generations(segment)
+    async def prepare_for_test(self, segment, own=True):
+        await self.drain_generations(segment, own)
         if await self.stop_gufo(f"heavy command: {segment[:80]}"):
             needle = needle_for(segment)
             log(f"watching processes matching {needle!r}")
@@ -1095,10 +1095,22 @@ class Guard:
         await resp.write_eof()
         return resp
 
+    async def prepare(self, request):
+        try:
+            data = await request.json()
+            segment = str(data.get("segment", ""))[:300]
+        except ValueError:
+            return web.json_response({"error": "bad json"}, status=400)
+        if not segment:
+            return web.json_response({"error": "segment required"}, status=400)
+        log(f"plugin asks to prepare for: {segment[:80]} (session {str(data.get('session', ''))[:24]})")
+        await self.prepare_for_test(segment, own=False)
+        return web.json_response({"state": self.state, "mem_available_gb": round(mem_available_gb(), 1)})
+
     async def status(self, request):
         return web.json_response({
             "state": self.state, "stops": self.stops, "inflight": self.inflight,
-            "opencode_active": self.opencode_active(),
+            "opencode_active": self.opencode_active(), "prepare_api": 1,
             "idle_s": round(time.time() - self.last_activity) if self.last_activity else None,
             "mem_available_gb": round(mem_available_gb(), 1),
             "judge": self.judge is not None and self.judge.proc is not None
@@ -1120,6 +1132,7 @@ class Guard:
         asyncio.create_task(self.start_gufo())
         app = web.Application(client_max_size=1 << 30)
         app.router.add_get("/jev-guard/status", self.status)
+        app.router.add_post("/jev-guard/prepare", self.prepare)
         app.router.add_route("*", "/{tail:.*}", self.proxy)
         runner = web.AppRunner(app)
         await runner.setup()
