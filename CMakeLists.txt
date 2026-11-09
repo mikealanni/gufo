@@ -102,11 +102,14 @@ endif()
 add_subdirectory(src/cache)
 
 if (ENGINE_ENABLE_HIP)
+  add_library(gufo_hip_host STATIC src/core/hip/host_allocations.cpp)
+  target_link_libraries(gufo_hip_host PUBLIC hip::host)
+  target_include_directories(gufo_hip_host PUBLIC ${PROJECT_SOURCE_DIR})
   add_library(gufo_cache_hip STATIC
     src/core/hip/committed_backing.cpp
     src/core/hip/staging.cpp
     src/core/hip/transfer_pool.cpp)
-  target_link_libraries(gufo_cache_hip PUBLIC gufo_cache hip::host)
+  target_link_libraries(gufo_cache_hip PUBLIC gufo_cache gufo_hip_host hip::host)
   if (BUILD_TESTING)
     target_compile_options(gufo_cache_hip PRIVATE -UNDEBUG)
   endif()
@@ -216,7 +219,7 @@ if (ENGINE_ENABLE_HIP)
   target_include_directories(gufo_core SYSTEM PRIVATE
     ${HIPCUB_INCLUDE_DIR}
     ${ROCPRIM_INCLUDE_DIR})
-  target_link_libraries(gufo_core PUBLIC hip::host roc::hipblas
+  target_link_libraries(gufo_core PUBLIC gufo_hip_host hip::host roc::hipblas
     roc::hipblaslt roc::rocblas gufo_qwen38_flash_next_mmq)
 endif()
 
