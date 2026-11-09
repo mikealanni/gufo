@@ -142,6 +142,9 @@ CREATE TABLE IF NOT EXISTS patterns (
 """
 
 
+DRAIN_MAX = 1800
+
+
 class GuardLog:
     """Queued best-effort writer: the event loop never waits on disk.
 
@@ -658,6 +661,7 @@ class Guard:
         self.run_id = uuid.uuid4().hex[:12]
         self.last_activity = 0.0
         self.gen_inflight = 0
+        self.heavy_waiting = 0
         self.idle_noted = False
         self.want_up = True
         load_learned()
@@ -852,7 +856,23 @@ class Guard:
         log(f"decision_ms={round((time.time() - t0) * 1000)}")
         return chosen
 
+    async def drain_generations(self, segment):
+        self.heavy_waiting += 1
+        t0 = time.time()
+        logged = False
+        try:
+            while self.gen_inflight - self.heavy_waiting > 0 and time.time() - t0 < DRAIN_MAX:
+                if not logged:
+                    log(f"heavy command waits for other generations: {segment[:60]}")
+                    logged = True
+                await asyncio.sleep(0.5)
+        finally:
+            self.heavy_waiting -= 1
+        if logged:
+            log(f"other generations done after {time.time() - t0:.1f}s")
+
     async def prepare_for_test(self, segment):
+        await self.drain_generations(segment)
         if await self.stop_gufo(f"heavy command: {segment[:80]}"):
             needle = needle_for(segment)
             log(f"watching processes matching {needle!r}")
