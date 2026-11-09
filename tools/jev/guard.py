@@ -1045,6 +1045,17 @@ class Guard:
 
     async def proxy_inner(self, request):
         body = self.pin_effort(request, await request.read())
+        if request.method == "POST" and request.path.endswith("/chat/completions"):
+            try:
+                data = json.loads(body or b"{}")
+                kw = data.get("chat_template_kwargs")
+                log("request keys: effort=%s thinking=%s budget=%s kwargs=%s plugin=%s session=%s" % (
+                    data.get("reasoning_effort"), data.get("thinking"),
+                    data.get("reasoning_budget_tokens", data.get("thinking_budget_tokens")),
+                    sorted(kw) if isinstance(kw, dict) else None,
+                    request.headers.get("x-jev-plugin"), (request.headers.get("x-session-id") or "")[:16]))
+            except (ValueError, AttributeError):
+                pass
         try:
             stream = bool(json.loads(body or b"{}").get("stream"))
         except ValueError:
@@ -1076,7 +1087,7 @@ class Guard:
                     msg = json.loads(data)["choices"][0]["message"]
                     calls = {i: {"name": c["function"]["name"], "args": c["function"]["arguments"]}
                              for i, c in enumerate(msg.get("tool_calls") or [])}
-                    seg = await self.decide(tool_commands(calls), self.session_key(request))
+                    seg = None if self.plugin_owns_gate(request) else await self.decide(tool_commands(calls), self.session_key(request))
                     if seg:
                         await self.prepare_for_test(seg)
                 except (ValueError, KeyError, IndexError, TypeError):
@@ -1114,7 +1125,7 @@ class Guard:
             held.append(buf)
         if holding:
             t_hold = time.time()
-            seg = await self.decide(tool_commands(calls), self.session_key(request))
+            seg = None if self.plugin_owns_gate(request) else await self.decide(tool_commands(calls), self.session_key(request))
             if seg:
                 await self.prepare_for_test(seg)
             log(f"tool call held {time.time() - t_hold:.2f}s stopped={bool(seg)}")
@@ -1122,6 +1133,20 @@ class Guard:
             await resp.write(event)
         await resp.write_eof()
         return resp
+
+    def plugin_owns_gate(self, request):
+        if request.headers.get("x-jev-plugin") != "1":
+            return False
+        return not os.path.exists(os.path.expanduser("~/.gufo/jev-log/feature-off.command"))
+
+    async def classify_command(self, request):
+        try:
+            data = await request.json()
+            command = str(data.get("command", ""))[:4000]
+        except ValueError:
+            return web.json_response({"error": "bad json"}, status=400)
+        seg = await self.decide([command], str(data.get("session", ""))[:64])
+        return web.json_response({"heavy": bool(seg), "segment": seg or ""})
 
     async def prepare(self, request):
         try:
@@ -1138,7 +1163,7 @@ class Guard:
     async def status(self, request):
         return web.json_response({
             "state": self.state, "stops": self.stops, "inflight": self.inflight,
-            "opencode_active": self.opencode_active(), "prepare_api": 1, "pinned_effort": self.pinned_effort(),
+            "opencode_active": self.opencode_active(), "prepare_api": 1, "default_effort": os.environ.get("GUFO_EFFORT", "low"), "pinned_effort": self.pinned_effort(),
             "idle_s": round(time.time() - self.last_activity) if self.last_activity else None,
             "mem_available_gb": round(mem_available_gb(), 1),
             "judge": self.judge is not None and self.judge.proc is not None
@@ -1161,6 +1186,7 @@ class Guard:
         app = web.Application(client_max_size=1 << 30)
         app.router.add_get("/jev-guard/status", self.status)
         app.router.add_post("/jev-guard/prepare", self.prepare)
+        app.router.add_post("/jev-guard/classify", self.classify_command)
         app.router.add_route("*", "/{tail:.*}", self.proxy)
         runner = web.AppRunner(app)
         await runner.setup()
