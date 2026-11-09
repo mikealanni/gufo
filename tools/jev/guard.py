@@ -142,6 +142,9 @@ CREATE TABLE IF NOT EXISTS patterns (
 """
 
 
+AUTOEFFORT_OFF = os.path.expanduser("~/.gufo/jev-log/autoeffort-off")
+EFFORT_LEVELS = {"minimal", "low", "medium", "high", "xhigh", "max"}
+DEFAULT_PINNED_EFFORT = "low"
 DRAIN_MAX = 1800
 WATCHDOG_DRAIN_MAX = 300
 MEM_HARD_FLOOR_GB = 1.5
@@ -1015,8 +1018,33 @@ class Guard:
                 self.gen_inflight -= 1
                 self.last_activity = time.time()
 
+    def pinned_effort(self):
+        try:
+            with open(AUTOEFFORT_OFF) as fh:
+                level = fh.read().strip().lower()
+        except OSError:
+            return None
+        return level if level in EFFORT_LEVELS else DEFAULT_PINNED_EFFORT
+
+    def pin_effort(self, request, body):
+        if request.method != "POST" or not request.path.endswith("/chat/completions"):
+            return body
+        level = self.pinned_effort()
+        if level is None:
+            return body
+        try:
+            data = json.loads(body or b"{}")
+        except ValueError:
+            return body
+        kwargs = data.get("chat_template_kwargs")
+        if not isinstance(data, dict) or "reasoning_effort" in data or "thinking" in data or (
+                isinstance(kwargs, dict) and ("reasoning_effort" in kwargs or "enable_thinking" in kwargs)):
+            return body
+        data["reasoning_effort"] = level
+        return json.dumps(data).encode()
+
     async def proxy_inner(self, request):
-        body = await request.read()
+        body = self.pin_effort(request, await request.read())
         try:
             stream = bool(json.loads(body or b"{}").get("stream"))
         except ValueError:
@@ -1110,7 +1138,7 @@ class Guard:
     async def status(self, request):
         return web.json_response({
             "state": self.state, "stops": self.stops, "inflight": self.inflight,
-            "opencode_active": self.opencode_active(), "prepare_api": 1,
+            "opencode_active": self.opencode_active(), "prepare_api": 1, "pinned_effort": self.pinned_effort(),
             "idle_s": round(time.time() - self.last_activity) if self.last_activity else None,
             "mem_available_gb": round(mem_available_gb(), 1),
             "judge": self.judge is not None and self.judge.proc is not None
