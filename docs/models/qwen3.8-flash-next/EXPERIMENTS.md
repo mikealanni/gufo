@@ -1,5 +1,15 @@
 # Qwen3.8 Flash-Next experiments
 
+## Phoenix NPU with a discrete CUDA GPU (October 27, 2026)
+
+An external native Windows Strata adaptation tested Gufo-inspired projection,
+two-bank prefill and common-buffer mechanisms on Ryzen 9 7940HS/Phoenix plus
+an RTX 4070 Laptop. The strongest NPU candidate increased fresh-prefill
+latency by 2.35% / 3.61% in three matched pairs and remains disabled.
+See the [complete experiment report and review questions](PHOENIX_CUDA_NPU_REPORT.md)
+for all stages, failed controls, per-request evidence and the experimental
+Strata patch. These are not Gufo runtime benchmarks or a new supported backend.
+
 | Experiment | Decision / evidence |
 | --- | --- |
 | Vector loads for F16/BF16 small projections, October 20 (#681) | Retained: the whole-pass `SmallGemm` path (#518) took only F32 rows, while Flash-Next narrows router and GDN alpha/beta to F16 and keeps the indexer in BF16, so every decode and verification call used the scalar, bounds-checked loop. F16/BF16 rows of whole passes now take one 8-byte load per step, widened exactly, with the same FMA order. Production fixtures (F16 513/96x2560, BF16 128/512x2560) are bit-identical to the grouped scalar kernel. Isolated calls with weights rotated past MALL: router w2 29.4 to 17.7 us, alpha/beta w2 17.0 to 8.1 us. Served decode median 1.7% less time (compare.py, within margin). |
