@@ -474,7 +474,7 @@ KFD_QUIET = 15
 SCRIPT_RE = re.compile(r"(?:(?<=\s)|^)(~?/[^\s'\"<>|;&]+\.(?:py|sh))")
 HEAVY_CONTENT = re.compile(
     r"import\s+torch|from\s+torch|\bhipMalloc|\bhipLaunch|libamdhip|\bcuda\b|rocm|"
-    r"\bgufo\b|llama[._-]?cpp|\bvllm\b|safetensors|from_pretrained|\bcmake\s+--build|"
+    r"(?<!\.)\bgufo\b|llama[._-]?cpp|\bvllm\b|safetensors|from_pretrained|\bcmake\s+--build|"
     r"\bninja\b|\bmake\s+-j|/dev/kfd|\bgguf\b", re.I)
 SCRIPT_DEPTH = 2
 SCRIPT_BYTES = 65536
