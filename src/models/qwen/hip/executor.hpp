@@ -63,10 +63,14 @@ struct QwenSampledVerificationResult {
 struct QwenGpuWeightRegion {
   // Original reader address for tensor offsets; host_copy owns GPU-visible
   // immutable bytes, backed by transparent huge pages when available.
+  // Device placement, used whenever the heap has room: device_data is a
+  // hipMalloc allocation uploaded from the shard, and host_copy stays null.
+  // Mapped registration is the fallback when the heap is too small.
   const void* host_data{nullptr};
   void* device_data{nullptr};
   void* host_copy{nullptr};
   std::size_t size{0};
+  bool owns_device_allocation{false};
 };
 
 struct QwenGpuMemoryUsage {

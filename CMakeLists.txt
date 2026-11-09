@@ -154,6 +154,8 @@ add_library(gufo_core STATIC
   src/core/image.cpp
   src/core/crypto/sha256.cpp
   src/core/gguf_reader.cpp
+  $<$<NOT:$<PLATFORM_ID:Windows>>:src/core/platform/pages_posix.cpp>
+  $<$<PLATFORM_ID:Windows>:src/core/platform/pages_windows.cpp>
   src/core/gguf_identity.cpp
   src/core/json_constraint.cpp
   src/core/json_schema_lexeme.cpp
@@ -708,6 +710,14 @@ if (BUILD_TESTING)
 
   add_test(NAME gguf_reader_test COMMAND gguf_reader_test)
   set_tests_properties(gguf_reader_test PROPERTIES LABELS "cpu;core;gguf;model_config")
+
+  add_executable(platform_pages_test tests/core/platform_pages_test.cpp
+    $<$<NOT:$<PLATFORM_ID:Windows>>:src/core/platform/pages_posix.cpp>
+    $<$<PLATFORM_ID:Windows>:src/core/platform/pages_windows.cpp>)
+  target_link_libraries(platform_pages_test PRIVATE Threads::Threads)
+
+  add_test(NAME platform_pages_test COMMAND platform_pages_test)
+  set_tests_properties(platform_pages_test PROPERTIES LABELS "cpu;platform")
 
   add_executable(gguf_identity_test tests/core/gguf_identity_test.cpp)
   target_link_libraries(gguf_identity_test PRIVATE gufo_core)
