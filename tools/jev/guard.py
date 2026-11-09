@@ -143,6 +143,8 @@ CREATE TABLE IF NOT EXISTS patterns (
 
 
 DRAIN_MAX = 1800
+WATCHDOG_DRAIN_MAX = 300
+MEM_HARD_FLOOR_GB = 1.5
 
 
 class GuardLog:
@@ -856,6 +858,20 @@ class Guard:
         log(f"decision_ms={round((time.time() - t0) * 1000)}")
         return chosen
 
+    async def drain_for_watchdog(self, reason):
+        t0 = time.time()
+        logged = False
+        while self.gen_inflight > 0 and time.time() - t0 < WATCHDOG_DRAIN_MAX:
+            if mem_available_gb() < MEM_HARD_FLOOR_GB:
+                log(f"memory below {MEM_HARD_FLOOR_GB} GB; not waiting for generations")
+                return
+            if not logged:
+                log(f"waiting for in-flight generations before stopping ({reason})")
+                logged = True
+            await asyncio.sleep(0.5)
+        if logged:
+            log(f"generations done after {time.time() - t0:.1f}s")
+
     async def drain_generations(self, segment):
         self.heavy_waiting += 1
         t0 = time.time()
@@ -893,6 +909,7 @@ class Guard:
                 if self.judge is not None and self.judge.proc is not None:
                     own.add(self.judge.proc.pid)
                 pid = biggest_foreign_rss(self.proc.pid if self.proc else -1, own)
+                await self.drain_for_watchdog(f"memory pressure, top process pid={pid}")
                 if await self.stop_gufo(f"memory pressure, top process pid={pid}"):
                     self._attribute_catch(pid, f"memory watchdog pid={pid}")
                     self.begin_watch(f"pid {pid}", lambda: [pid] if os.path.exists(f"/proc/{pid}") else [], True)
@@ -928,6 +945,7 @@ class Guard:
                 continue
             if hits >= KFD_SAMPLES:
                 hits = 0
+                await self.drain_for_watchdog(f"foreign GPU process pid={found[0]}")
                 if await self.stop_gufo(f"foreign GPU process pid={found[0]}"):
                     self._attribute_catch(found[0], f"kfd watchdog pid={found[0]}")
                     self.begin_watch(f"kfd {found[0]}", self.foreign_kfd, quiet=KFD_QUIET)
