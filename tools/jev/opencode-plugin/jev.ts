@@ -9,8 +9,12 @@ import { Database } from "bun:sqlite";
 import { classify, containsSecret, inspectScripts } from "./classify.ts";
 import { detectGoal } from "./goal.ts";
 import { judgeFinish } from "./finish.ts";
-import { acquireHeavy, releaseHeavy } from "./heavy.ts";
-import { classifyJevAgentTurn, type AgentTurnResult } from "./gate.ts";
+import { control } from "./ctl.ts";
+import { hasGoalTrigger } from "./goal.ts";
+import { GOAL_MAX_CONTINUES, detectGoalSpec, evaluateGoal, extractItems, stripGoalTrigger, type GoalMessage } from "./goal-eval.ts";
+import { acquireHeavy, judgeCommand, releaseHeavy } from "./heavy.ts";
+import { classifyJevAgentTurn, classifyJevRequest, K_ROUTINE_BUDGET_TOKENS, type AgentTurnResult } from "./gate.ts";
+import { applyPlan, baselineEffort, effortRank, pinnedEffort, setPlan, takePlan, type Plan } from "./effort.ts";
 
 const PLUGIN_VERSION = "0.1.0";
 const LOG_DIR = process.env.JEV_LOG_DIR ?? join(homedir(), ".gufo", "jev-log");
@@ -157,10 +161,52 @@ function flagOn(path: string, key: string): boolean {
   pauseChecked.set(key, { at: now, on });
   return on;
 }
+const FEATURES = ["command", "effort", "goal", "finish", "pre"] as const;
+function featureOn(name: (typeof FEATURES)[number]): boolean {
+  return process.env[`JEV_${name.toUpperCase()}`] !== "off" && !flagOn(join(LOG_DIR, `feature-off.${name}`), `f:${name}`);
+}
 function disabled(sid = ""): boolean {
   if (process.env.JEV_PLUGIN === "off") return true;
   if (flagOn(PAUSE_FLAG, "")) return true;
   return sid ? flagOn(`${PAUSE_FLAG}.${sid.replace(/[^\w.-]/g, "_")}`, sid) : false;
+}
+function messageText(m: any): string {
+  if (!m) return "";
+  if (typeof m.content === "string") return m.content;
+  const parts = (Array.isArray(m.content) ? m.content : Array.isArray(m.parts) ? m.parts : []) as any[];
+  return parts.filter((p) => p?.type === "text").map((p) => String(p.text ?? "")).join("\n");
+}
+
+const FINISH_MAX_CONTINUES = 2;
+const FINISH_TAIL_CHARS = 200;
+const goals = new Map<string, { text: string; continues: number }>();
+const finishes = new Map<string, { continues: number; lastReason: string; lastTail: string }>();
+const lastMsgs = new Map<string, any[]>();
+const injectedTexts = new Set<string>();
+
+function resultTextOf(r: any): string {
+  const v = r?.value ?? r;
+  return typeof v === "string" ? v : v == null ? "" : JSON.stringify(v);
+}
+// Hook-shaped messages (assistant tool-call parts, tool-result parts) to the goal tracker's view.
+function toGoalMessages(msgs: any[]): GoalMessage[] {
+  const out: GoalMessage[] = [];
+  for (const m of msgs) {
+    const role = String(m?.role ?? m?.type ?? "");
+    const parts = (Array.isArray(m?.content) ? m.content : []) as any[];
+    if (role === "user") out.push({ role: "user", text: messageText(m) });
+    else if (role === "assistant") {
+      const calls = parts.filter((p) => p?.type === "tool-call").map((c) => ({
+        id: String(c.id ?? ""), name: String(c.name ?? ""),
+        command: String(c.input?.command ?? c.input?.cmd ?? ""),
+        path: String(c.input?.filePath ?? c.input?.file_path ?? c.input?.path ?? ""),
+      }));
+      out.push({ role: "assistant", text: messageText(m), calls });
+    } else if (role === "tool") {
+      for (const p of parts) if (p?.type === "tool-result") out.push({ role: "tool", text: resultTextOf(p.result), toolCallId: String(p.id ?? "") });
+    }
+  }
+  return out;
 }
 function isGufo(sessionID: string): boolean {
   const v = seen.get(sessionID);
@@ -184,6 +230,25 @@ export default {
         if (!sid) return;
         const text = typeof e.prompt === "string" ? e.prompt : (e.prompt?.text ?? "");
         if (typeof text === "string" && text) lastPrompt.set(sid, { text, messageID: String(e.messageID ?? "") });
+        if (!isGufo(sid) || typeof text !== "string" || !text) return;
+        const ours = injectedTexts.delete(`${sid}\n${text}`);
+        if (ours) return;
+        // A genuine user message: continuation budgets start over.
+        finishes.delete(sid);
+        const g = goals.get(sid);
+        if (g) g.continues = 0;
+        if (featureOn("goal") && hasGoalTrigger(text) && e.prompt && typeof e.prompt === "object") {
+          const prior = toGoalMessages(lastMsgs.get(sid) ?? []);
+          const spec = detectGoalSpec([...prior, { role: "user", text }]);
+          e.prompt.text = stripGoalTrigger(text);
+          goals.set(sid, { text: spec.text, continues: 0 });
+          const entry = seen.get(sid) ?? { provider: "", model: "" };
+          enqueue({
+            ts: Date.now() / 1000, plugin_version: PLUGIN_VERSION, feature: "goal_arm",
+            session: sid, call: String(e.messageID ?? ""), provider: entry.provider, model: entry.model,
+            decision: { items: spec.items, from_history: spec.fromHistory, goal: spec.text.slice(0, 120) }, segment: "", cmd: "", dur_ms: null, note: "",
+          });
+        }
       } catch (err) { noteError("prompt", err); }
     });
     await ctx.session.hook("context", async (e: any) => {
@@ -196,6 +261,8 @@ export default {
         const mid = (e.model?.id ?? e.model?.modelID) as string | undefined;
         if (sid && pid) seen.set(sid, { provider: pid, model: mid ?? "" });
         if (!sid || !isGufo(sid)) return;
+        lastMsgs.set(sid, (e.messages ?? []) as any[]);
+        if (lastMsgs.size > 200) lastMsgs.clear();
         const entry = seen.get(sid)!;
         // Effort gate (log-only): rebuild turns from trailing history.
         try {
@@ -242,6 +309,24 @@ export default {
             decision: { would_lower: decision.lower, reason: decision.reason, blocker: decision.blocker }, segment: "",
             cmd: "", dur_ms: null, note: "",
           });
+          // Effort plan: written into the request body by the http.request hook.
+          let plan: Plan | null = null;
+          const pinned = pinnedEffort(LOG_DIR);
+          if (pinned) plan = { effort: pinned, reason: "autoeffort-off" };
+          else if (featureOn("effort")) {
+            if (lastRole === "tool") {
+              const base = await baselineEffort();
+              if (decision.lower && effortRank(base) > effortRank("low")) plan = { budget: K_ROUTINE_BUDGET_TOKENS, reason: decision.reason };
+            } else {
+              const lastUser = [...msgs].reverse().find((m: any) => roleOf(m) === "user");
+              const text = messageText(lastUser);
+              if (text) {
+                const rd = classifyJevRequest(text);
+                plan = { effort: rd.effort, thinking: rd.needsThinking, reason: "request" };
+              }
+            }
+          }
+          setPlan(sid, plan);
         } catch (err) { noteError("context.effort_gate", err); }
         // Activity: one request record per model call (daemon reads start/end).
         enqueue({
@@ -268,6 +353,45 @@ export default {
         });
       } catch (err) { noteError("context", err); }
     });
+    await ctx.session.hook("http.request", async (e: any) => {
+      const sid = String(e.sessionID ?? "");
+      try {
+        if (!sid || disabled(sid) || !isGufo(sid)) return;
+        trace("http.request", { kind: e.kind, keys: Object.keys(e ?? {}), method: e.request?.method, url: e.request?.url });
+        e.request.headers.set("x-session-id", sid);
+        e.request.headers.set("x-jev-plugin", "1");
+        if (e.kind !== "primary" || e.request.method !== "POST") return;
+        const plan = takePlan(sid);
+        if (!plan) return;
+        const body = JSON.parse(await e.request.clone().text());
+        const added = applyPlan(body, plan);
+        if (added.length) {
+          const headers = new Headers(e.request.headers);
+          headers.delete("content-length");
+          e.request = new Request(e.request.url, { method: "POST", headers, body: JSON.stringify(body) });
+        }
+        const entry = seen.get(sid) ?? { provider: "", model: "" };
+        enqueue({
+          ts: Date.now() / 1000, plugin_version: PLUGIN_VERSION, feature: "effort_apply",
+          session: sid, call: "", provider: entry.provider, model: entry.model,
+          decision: { plan, added }, segment: "", cmd: "", dur_ms: null, note: "",
+        });
+      } catch (err) { noteError("http.request", err); }
+    });
+    try {
+      await ctx.command.transform((editor: any) => {
+        editor.add({
+          name: "jev2",
+          description: "jev control (native): pause|resume [all] | autoeffort on|off [level] | feature <name> on|off | status",
+          execute: async (j: any) => {
+            const sid = String(j.sessionID ?? "");
+            const out = await control(LOG_DIR, sid, String(j.prompt?.text ?? ""));
+            trace("command.jev2", { sid, out });
+            try { await ctx.session.synthetic({ sessionID: sid, description: "jev", text: out }); } catch (err) { noteError("command.synthetic", err); }
+          },
+        });
+      });
+    } catch (err) { noteError("command.register", err); }
     await ctx.tool.hook("execute.before", async (e: any) => {
       const sid = String(e.sessionID ?? "");
       const call = String(e.id ?? e.callID ?? "");
@@ -290,9 +414,14 @@ export default {
             if (insp.reason) verdict = "heavy";
           }
         } catch { verdict = "unknown"; }
+        let judged = false;
+        if (verdict === "unknown" && GATE_ON && featureOn("command") && cmd) {
+          judged = await judgeCommand(cmd, sid);
+          if (judged) { verdict = "heavy"; segment = segment || cmd.slice(0, 200); }
+        }
         const wouldStop = verdict === "heavy";
         let note = "";
-        if (wouldStop && GATE_ON) {
+        if (wouldStop && GATE_ON && featureOn("command")) {
           try {
             const g = await acquireHeavy(LOG_DIR, sid, call, segment || cmd, gufoSession);
             held.add(call);
@@ -342,7 +471,21 @@ export default {
         });
       } catch (err) { noteError("execute.after", err); }
     });
-    // Finish detector (log-only): evaluate the last assistant turn on idle.
+    async function injectPrompt(sid: string, text: string): Promise<void> {
+      injectedTexts.add(`${sid}\n${text}`);
+      try { await ctx.session.prompt({ sessionID: sid, text, delivery: "queue" }); }
+      catch (err) { injectedTexts.delete(`${sid}\n${text}`); noteError("inject", err); }
+    }
+    const subagent = new Map<string, boolean>();
+    async function isSubagent(sid: string): Promise<boolean> {
+      const known = subagent.get(sid);
+      if (known !== undefined) return known;
+      let child = false;
+      try { const info: any = await ctx.session.get({ sessionID: sid }); child = !!(info?.parentID ?? info?.parentId ?? info?.parent); } catch { child = false; }
+      subagent.set(sid, child);
+      return child;
+    }
+    // Turn end: finish detector and goal tracker.
     const lastTurnEnd = new Map<string, number>();
     const ctrl = new AbortController();
     void (async () => {
@@ -359,8 +502,9 @@ export default {
             // Several events fire for one turn end: handle the first, ignore the
             // rest for 1.5 s. A later turn in the same session is handled again.
             const nowMs = Date.now();
-            if (nowMs - (lastTurnEnd.get(sid) ?? 0) < 1500) continue;
-            lastTurnEnd.set(sid, nowMs);
+            const dkey = `${sid}:${t === "session.step.ended" ? "s" : "e"}`;
+            if (nowMs - (lastTurnEnd.get(dkey) ?? 0) < 1500) continue;
+            lastTurnEnd.set(dkey, nowMs);
             if (lastTurnEnd.size > 500) lastTurnEnd.clear();
             const entry = seen.get(sid)!;
             enqueue({
@@ -399,10 +543,44 @@ export default {
               // (Healthy: had_tool_call means unfinished never fires.)
             } catch { /* unreadable history: skip this idle */ continue; }
             const verdict = judgeFinish(task, response, hadTool, "stop");
+            let acted = "";
+            if (t !== "session.step.ended" && !hadTool && !(await isSubagent(sid))) {
+              const g = goals.get(sid);
+              if (g && featureOn("goal")) {
+                const hist = toGoalMessages(lastMsgs.get(sid) ?? []);
+                let taskIndex = 0;
+                for (let i = hist.length - 1; i >= 0; i--) if (hist[i].role === "user" && hist[i].text.startsWith(g.text.slice(0, 60))) { taskIndex = i; break; }
+                const spec = { active: true, text: g.text, index: taskIndex, taskIndex, items: extractItems(g.text).length, fromHistory: false };
+                const dec = evaluateGoal(spec, hist, response, g.continues);
+                enqueue({
+                  ts: Date.now() / 1000, plugin_version: PLUGIN_VERSION, feature: "goal_eval",
+                  session: sid, call: "", provider: entry.provider, model: entry.model,
+                  decision: { action: dec.action, items: dec.items, open: dec.open, rule: dec.rule, reason: dec.reason, continues: g.continues },
+                  segment: "", cmd: "", dur_ms: null, note: dec.message.slice(0, 200),
+                });
+                if (dec.action === "continue" || dec.action === "nudge") {
+                  g.continues++;
+                  acted = "goal";
+                  await injectPrompt(sid, dec.message);
+                }
+              }
+              if (!acted && featureOn("finish") && verdict.unfinished) {
+                const fs = finishes.get(sid) ?? { continues: 0, lastReason: "", lastTail: "" };
+                const tail = response.slice(-FINISH_TAIL_CHARS);
+                if (fs.continues >= FINISH_MAX_CONTINUES || (verdict.reason === fs.lastReason && tail === fs.lastTail)) {
+                  acted = "finish-loop-guard";
+                } else {
+                  fs.continues++; fs.lastReason = String(verdict.reason); fs.lastTail = tail;
+                  finishes.set(sid, fs);
+                  acted = "finish";
+                  await injectPrompt(sid, "Continue; the task is not complete. " + verdict.reason);
+                }
+              }
+            }
             enqueue({
               ts: Date.now() / 1000, plugin_version: PLUGIN_VERSION, feature: "finish",
               session: sid, call: "", provider: entry.provider, model: entry.model,
-              decision: { would_continue: verdict.unfinished, rule: verdict.unfinished ? String(verdict.reason) : "", score: verdict.score },
+              decision: { would_continue: verdict.unfinished, rule: verdict.unfinished ? String(verdict.reason) : "", score: verdict.score, acted },
               segment: "", cmd: redact(response.slice(0, 500)), dur_ms: null, note: "",
             });
           } catch (err) { noteError("event", err); }

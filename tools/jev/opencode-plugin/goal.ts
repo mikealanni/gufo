@@ -81,3 +81,16 @@ export function detectGoal(text: string): GoalHit {
   }
   return none;
 }
+
+export function findTrigger(text: string, from: number): [number, number] {
+  for (let pos = from; pos < text.length; pos++) {
+    if ((text[pos] ?? "").toLowerCase() !== "j") continue;
+    if (pos > 0 && isAlnum(text[pos - 1])) continue;
+    for (const phrase of TRIGGERS) {
+      const end = matchPhraseAt(text, pos, phrase);
+      if (end !== -1) return [pos, end];
+    }
+  }
+  return [-1, -1];
+}
+export const hasGoalTrigger = (text: string): boolean => findTrigger(text, 0)[0] !== -1;

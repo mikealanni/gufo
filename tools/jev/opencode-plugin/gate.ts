@@ -136,3 +136,61 @@ export function classifyJevAgentTurn(turns: AgentTurnResult[][]): AgentDecision 
 }
 
 export const K_ROUTINE_BUDGET_TOKENS = 512;
+
+// Port of ClassifyJevRequest (src/models/qwen38_flash_next/jev_gate.cpp): user-turn pre-gate.
+const SCAN_LIMIT = 64 * 1024;
+const TRIVIAL_MAX_CHARS = 160;
+const HARD_MIN_CHARS = 2000;
+const DIFF_FILES_FOR_XHIGH = 2;
+const STACK_MARKERS = ["traceback (most recent call last)", "panic:", "segmentation fault", "core dumped", "abort()", "caused by:", "exception:", "assertionerror", "undefined reference", "runtime error", "stack trace", "segfault", "kernel panic", "error[", "fatal error", "\tat "];
+const ERROR_LOCATIONS = [".cpp:", ".hpp:", ".cc:", ".py:", ".rs:", ".go:", ".java:", ".js:", ".ts:", ".rb:"];
+const DEBUG_PHRASES = ["fix this", "fix the bug", "why is", "why does", "doesn't work", "does not work", "not working", "won't start", "root cause", "misbehav"];
+const DEBUG_WORDS = ["debug", "broken", "regression", "repro", "failing", "crashing"];
+// The engine's kWorkPhrases array has 5 slots and 4 entries; the empty fifth matches every text.
+const WORK_PHRASES = ["add support", "change the", "update the", "write a", ""];
+const WORK_WORDS = ["implement", "refactor", "migrate", "optimize", "optimise", "fix", "port", "rename"];
+const LOOKUP_PHRASES = ["what is", "what's", "what are", "what does", "what do", "meaning of", "definition of", "how many", "how much"];
+const LOOKUP_WORDS = ["where", "when", "which", "translate", "list", "show", "convert", "spell", "define", "summarize", "version"];
+const SMALL_TALK = ["hi", "hello", "hey", "thanks", "thank you", "ok", "okay", "yes", "no", "nice", "great", "cool"];
+
+const isWordChar = (c: string): boolean => /[a-z0-9_]/.test(c);
+const hasAny = (t: string, list: string[]): boolean => list.some((p) => t.includes(p));
+function hasWord(t: string, w: string): boolean {
+  for (let pos = t.indexOf(w); pos !== -1; pos = t.indexOf(w, pos + 1)) {
+    const left = pos === 0 || !isWordChar(t[pos - 1]);
+    const next = pos + w.length;
+    const right = next >= t.length || !isWordChar(t[next]);
+    if (left && right) return true;
+  }
+  return false;
+}
+const hasAnyWord = (t: string, list: string[]): boolean => list.some((w) => hasWord(t, w));
+function count(t: string, needle: string): number {
+  let n = 0;
+  for (let pos = t.indexOf(needle); pos !== -1; pos = t.indexOf(needle, pos + needle.length)) n++;
+  return n;
+}
+const hasCode = (t: string): boolean => t.includes("```") || t.includes("~~~") || t.includes("diff --git") || t.includes("<function=");
+function isSmallTalk(t: string): boolean {
+  const trimmed = t.replace(/^[ \t\n\r!?.]+|[ \t\n\r!?.]+$/g, "");
+  return trimmed === "" || SMALL_TALK.includes(trimmed);
+}
+function isTrivial(f: string): boolean {
+  if (f.length > TRIVIAL_MAX_CHARS || hasCode(f)) return false;
+  return isSmallTalk(f) || f.includes("?") || hasAny(f, LOOKUP_PHRASES) || hasAnyWord(f, LOOKUP_WORDS);
+}
+function isHard(f: string, code: boolean): boolean {
+  return f.length >= HARD_MIN_CHARS || hasAny(f, STACK_MARKERS) || hasAny(f, ERROR_LOCATIONS) || hasAny(f, DEBUG_PHRASES) ||
+    hasAnyWord(f, DEBUG_WORDS) || count(f, "diff --git") >= DIFF_FILES_FOR_XHIGH ||
+    (code && (hasAny(f, WORK_PHRASES) || hasAnyWord(f, WORK_WORDS)));
+}
+
+export interface RequestDecision { effort: "low" | "medium" | "xhigh"; needsThinking: boolean }
+
+export function classifyJevRequest(text: string): RequestDecision {
+  const folded = text.slice(0, SCAN_LIMIT).replace(/[A-Z]/g, (c) => c.toLowerCase());
+  const code = hasCode(folded);
+  if (isHard(folded, code)) return { effort: "xhigh", needsThinking: true };
+  if (isTrivial(folded)) return { effort: "low", needsThinking: false };
+  return { effort: "medium", needsThinking: true };
+}

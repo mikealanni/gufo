@@ -53,7 +53,7 @@ export async function acquireHeavy(logDir: string, sid: string, call: string, se
     await new Promise((r) => setTimeout(r, POLL_MS));
   }
   let prepared = false;
-  if (!gufoSession) {
+  {
     try {
       const st = await fetch(`${GUARD_URL}/jev-guard/status`, { signal: AbortSignal.timeout(3000) });
       const info = st.ok ? await st.json() as { prepare_api?: number } : {};
@@ -75,4 +75,19 @@ export async function acquireHeavy(logDir: string, sid: string, call: string, se
 
 export function releaseHeavy(logDir: string, sid: string, call: string): void {
   try { unlinkSync(join(logDir, "heavy-lock", lockName(sid, call))); } catch { /* already gone */ }
+}
+
+const CLASSIFY_TIMEOUT_MS = 4000;
+// Commands the rules cannot place go to the guard's NPU judge; any failure means "not heavy".
+export async function judgeCommand(command: string, sid: string): Promise<boolean> {
+  try {
+    const r = await fetch(`${GUARD_URL}/jev-guard/classify`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ command, session: sid }),
+      signal: AbortSignal.timeout(CLASSIFY_TIMEOUT_MS),
+    });
+    if (!r.ok) return false;
+    return !!((await r.json()) as { heavy?: boolean }).heavy;
+  } catch { return false; }
 }
