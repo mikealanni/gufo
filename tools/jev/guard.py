@@ -209,9 +209,11 @@ LIGHT_TTL = 900
 LEARNED_FILE = os.path.expanduser("~/.gufo/jev-log/learned-heavy.json")
 LEARNED_MAX = 200
 LEARNED_TTL = 30 * 86400
-LEARN_SKIP = ("gufo", "jev", "guard.py", "lemonade", "ollama", "llama-server",
-              "xorg", "kwin", "gnome", "plasma", "pipewire", "claude", "opencode",
-              "/usr/", "/bin/", "/sbin/", "/opt/rocm", "/proc/", "/sys/")
+LEARN_SKIP = ("lemonade", "ollama", "llama-server", "xorg", "kwin", "gnome",
+              "plasma", "pipewire", "claude", "opencode", "/usr/", "/bin/",
+              "/sbin/", "/opt/rocm", "/proc/", "/sys/")
+LEARN_SKIP_NAMES = {"gufo", "gufo-server", "guard.py", "run-gufo.sh", "run-gufo-jev.sh",
+                    "run-jev-guard.sh", "jev-stop.sh", "jev-ctl.sh"}
 GENERIC_TOKENS = {"python", "python3", "bash", "sh", "echo", "true", "false", "cat",
                   "grep", "head", "tail", "sleep", "time", "nohup", "setsid", "env"}
 LEARNED = {}
@@ -256,22 +258,37 @@ def proc_chain(pid, depth=4):
     return out
 
 
-def learn_key(cmdline):
+def learn_key(cmdline, cwd=None):
     """A stable script or program path from a process that was seen using the GPU."""
-    m = SCRIPT_RE.search(cmdline)
-    key = os.path.expanduser(m.group(1)) if m else None
+    key = None
+    for tok in cmdline.split():
+        if re.search(r"\.(py|sh)$", tok) and not tok.startswith("-"):
+            key = os.path.expanduser(tok)
+            if not os.path.isabs(key) and cwd:
+                key = os.path.normpath(os.path.join(cwd, key))
+            break
     if key is None:
         first = cmdline.split(" ", 1)[0]
         if first.startswith(("/home/", "/mnt/", "/tmp/")):
             key = first
-    if key is None or len(key) < 8 or any(bad in key.lower() for bad in LEARN_SKIP):
+    if (key is None or not os.path.isabs(key) or len(key) < 8
+            or os.path.basename(key) in LEARN_SKIP_NAMES
+            or any(bad in key.lower() for bad in LEARN_SKIP)):
         return None
     return key
 
 
 def learn_from_pid(pid):
-    chain = proc_chain(pid, depth=1)
-    key = learn_key(chain[0]) if chain else None
+    chain = proc_chain(pid, depth=3)
+    key = None
+    for cmd in chain:
+        try:
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+        except OSError:
+            cwd = None
+        key = learn_key(cmd, cwd)
+        if key:
+            break
     if key is None:
         return None
     now = time.time()
@@ -503,6 +520,7 @@ INTERPRETERS = {"python", "python3", "bash", "sh", "zsh", "node"}
 
 def executed_scripts(command):
     out = []
+    cwd = None
     for seg in segments(command):
         seg = strip_launchers(seg)[0]
         try:
@@ -510,6 +528,10 @@ def executed_scripts(command):
         except ValueError:
             tokens = seg.split()
         if not tokens:
+            continue
+        if tokens[0] == "cd":
+            target_dir = next((t for t in tokens[1:] if not t.startswith("-")), None)
+            cwd = os.path.expanduser(target_dir) if target_dir else None
             continue
         head = os.path.basename(tokens[0]).rstrip("0123456789.")
         if head in INTERPRETERS:
@@ -521,7 +543,10 @@ def executed_scripts(command):
         else:
             target = tokens[0]
         if target and re.search(r"\.(py|sh)$", target) or (target and target.startswith(("./", "~/", "/"))):
-            out.append(os.path.expanduser(target))
+            path = os.path.expanduser(target)
+            if cwd and not os.path.isabs(path):
+                path = os.path.normpath(os.path.join(cwd, path))
+            out.append(path)
     return out
 
 
