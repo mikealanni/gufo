@@ -2,6 +2,7 @@
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
@@ -484,18 +485,33 @@ __device__ void MergeSelectorLists(float* scores, uint32_t* ids,
   __syncthreads();
 }
 
-__device__ __forceinline__ uint32_t RemapSelectorTokenId(
-    uint32_t id, uint32_t head_rows, uint32_t tail_base) {
-  return head_rows != 0 && id >= head_rows ? id - head_rows + tail_base : id;
-}
+/// Row ranges of the batch's draft-vocabulary sequences; rows of other
+/// sequences score the whole vocabulary.
+struct SelectorVocabRows {
+  DFlashSelectorVocab vocab[8];
+  uint32_t row_begin[8];
+  uint32_t row_end[8];
+  uint32_t count;
+};
 
 __global__ void dflash_selector_partial_topk_kernel(
-    const float* __restrict__ logits, const float* __restrict__ tail_logits,
-    float* __restrict__ partial_scores, uint32_t* __restrict__ partial_ids,
-    uint32_t head_rows, uint32_t tail_rows, uint32_t head_partial_count,
-    uint32_t selector_top_k) {
+    const float* __restrict__ logits, float* __restrict__ partial_scores,
+    uint32_t* __restrict__ partial_ids, uint32_t vocab_size,
+    uint32_t selector_top_k, uint64_t logits_stride = 0,
+    SelectorVocabRows vocab_rows = {}) {
+  logits += uint64_t(blockIdx.y) *
+            (logits_stride != 0 ? logits_stride : uint64_t(vocab_size));
   partial_scores += uint64_t(blockIdx.y) * gridDim.x * selector_top_k;
   partial_ids += uint64_t(blockIdx.y) * gridDim.x * selector_top_k;
+  DFlashSelectorVocab vocab{};
+  uint32_t vocab_row = 0;
+  for (uint32_t index = 0; index < vocab_rows.count; ++index) {
+    if (blockIdx.y >= vocab_rows.row_begin[index] &&
+        blockIdx.y < vocab_rows.row_end[index]) {
+      vocab = vocab_rows.vocab[index];
+      vocab_row = blockIdx.y - vocab_rows.row_begin[index];
+    }
+  }
   __shared__ float shared_scores[kSelectorThreads * kMaxSelectorTopK];
   __shared__ uint32_t shared_ids[kSelectorThreads * kMaxSelectorTopK];
 
@@ -507,24 +523,32 @@ __global__ void dflash_selector_partial_topk_kernel(
     local_ids[index] = 0;
   }
 
-  if (blockIdx.x < head_partial_count) {
-    const float* row_logits = logits + uint64_t(blockIdx.y) * head_rows;
-    const uint32_t begin = blockIdx.x * kSelectorTokensPerBlock;
-    const uint32_t requested_end = begin + kSelectorTokensPerBlock;
-    const uint32_t end = requested_end < head_rows ? requested_end : head_rows;
-    for (uint32_t token = begin + threadIdx.x; token < end; token += blockDim.x) {
-      InsertSelectorCandidate(row_logits[token], token, local_scores, local_ids,
+  const uint32_t begin = blockIdx.x * kSelectorTokensPerBlock;
+  const uint32_t requested_end = begin + kSelectorTokensPerBlock;
+  if (vocab.prefix == 0) {
+    const uint32_t end =
+        requested_end < vocab_size ? requested_end : vocab_size;
+    for (uint32_t token = begin + threadIdx.x; token < end;
+         token += blockDim.x) {
+      InsertSelectorCandidate(logits[token], token, local_scores, local_ids,
                               selector_top_k);
     }
-  } else if (tail_logits != nullptr && tail_rows != 0) {
-    const float* row_logits = tail_logits + uint64_t(blockIdx.y) * tail_rows;
-    const uint32_t tail_block = blockIdx.x - head_partial_count;
-    const uint32_t begin = tail_block * kSelectorTokensPerBlock;
-    const uint32_t requested_end = begin + kSelectorTokensPerBlock;
-    const uint32_t end = requested_end < tail_rows ? requested_end : tail_rows;
-    for (uint32_t token = begin + threadIdx.x; token < end; token += blockDim.x) {
-      InsertSelectorCandidate(row_logits[token], head_rows + token, local_scores,
-                              local_ids, selector_top_k);
+  } else {
+    // Column c < prefix is ID c; the table follows, and its empty slots
+    // score -inf, so they never enter the list.
+    const uint32_t columns = vocab.prefix + vocab.rows;
+    const uint32_t end = requested_end < columns ? requested_end : columns;
+    const float* table = vocab.logits + uint64_t(vocab_row) * vocab.rows;
+    for (uint32_t column = begin + threadIdx.x; column < end;
+         column += blockDim.x) {
+      if (column < vocab.prefix) {
+        InsertSelectorCandidate(logits[column], column, local_scores, local_ids,
+                                selector_top_k);
+      } else {
+        const uint32_t slot = column - vocab.prefix;
+        InsertSelectorCandidate(table[slot], uint32_t(vocab.ids[slot]),
+                                local_scores, local_ids, selector_top_k);
+      }
     }
   }
 
@@ -556,8 +580,8 @@ __device__ __forceinline__ void FinalizeSelector(
     float temperature, const float* __restrict__ sample_uniform,
     uint32_t* __restrict__ candidate_ids,
     float* __restrict__ candidate_probabilities, uint32_t partial_count,
-    uint32_t selector_rank, uint32_t selector_top_k, uint32_t head_rows,
-    uint32_t tail_base, DFlashSampling sampling = {},
+    uint32_t selector_rank, uint32_t selector_top_k,
+    DFlashSampling sampling = {},
     // Earlier iterations of this kernel write this history. Reload it for
     // each conditional q; cached read-only loads break sampled replay.
     const volatile uint32_t* previous_tokens = nullptr,
@@ -601,8 +625,7 @@ __device__ __forceinline__ void FinalizeSelector(
     const uint32_t candidate_index = threadIdx.x / kSelectorTransitionLanes;
     const uint32_t part = threadIdx.x % kSelectorTransitionLanes;
     if (candidate_index < selector_top_k) {
-      const uint32_t candidate = RemapSelectorTokenId(
-          shared_ids[candidate_index], head_rows, tail_base);
+      const uint32_t candidate = shared_ids[candidate_index];
       const hip_bfloat16* successor_row =
           successor_codebook + (uint64_t)candidate * selector_rank;
       float partial = 0.0F;
@@ -688,8 +711,7 @@ __device__ __forceinline__ void FinalizeSelector(
 
   if (candidate_ids != nullptr) {
     for (uint32_t index = 0; index < selector_top_k; ++index) {
-      candidate_ids[index] =
-          RemapSelectorTokenId(top_ids[index], head_rows, tail_base);
+      candidate_ids[index] = top_ids[index];
     }
   }
 
@@ -722,14 +744,12 @@ __device__ __forceinline__ void FinalizeSelector(
         selected = true;
       }
     }
-    *output_token =
-        RemapSelectorTokenId(top_ids[sampled_index], head_rows, tail_base);
+    *output_token = top_ids[sampled_index];
     if (output_confidence != nullptr) {
       *output_confidence = path_scores[sampled_index] * inverse_denominator;
     }
   } else {
-    *output_token =
-        RemapSelectorTokenId(top_ids[best_index], head_rows, tail_base);
+    *output_token = top_ids[best_index];
     if (candidate_probabilities != nullptr) {
       for (uint32_t index = 0; index < selector_top_k; ++index)
         candidate_probabilities[index] = index == best_index ? 1.0F : 0.0F;
@@ -751,21 +771,18 @@ __global__ void dflash_selector_finalize_kernel(
     uint32_t* output_token, float* output_confidence, float temperature,
     const float* sample_uniform, uint32_t* candidate_ids,
     float* candidate_probabilities, uint32_t partial_count,
-    uint32_t selector_rank, uint32_t selector_top_k, uint32_t head_rows,
-    uint32_t tail_base) {
+    uint32_t selector_rank, uint32_t selector_top_k) {
   FinalizeSelector(partial_scores, partial_ids, projected_hidden,
                    predecessor_codebook, successor_codebook, predecessor_token,
                    output_token, output_confidence, temperature, sample_uniform,
                    candidate_ids, candidate_probabilities, partial_count,
-                   selector_rank, selector_top_k, head_rows, tail_base);
+                   selector_rank, selector_top_k);
 }
 
 struct SelectorBatch {
   DFlashSelectorSequence sequences[8];
   uint32_t row_offsets[8];
   uint32_t token_offsets[8];
-  uint32_t head_rows;
-  uint32_t tail_base;
 };
 
 __global__ void dflash_selector_finalize_batch_kernel(
@@ -795,8 +812,7 @@ __global__ void dflash_selector_finalize_batch_kernel(
         candidate_ids != nullptr ? candidate_ids + candidate : nullptr,
         candidate_probabilities != nullptr ? candidate_probabilities + candidate
                                            : nullptr,
-        partial_count, selector_rank, selector_top_k, batch.head_rows,
-        batch.tail_base, sequence.sampling,
+        partial_count, selector_rank, selector_top_k, sequence.sampling,
         tokens + batch.token_offsets[blockIdx.x] + 1U, step);
     // Thread zero publishes the predecessor for this sequence's next step.
     // Other sequences own separate token, probability and partial buffers.
@@ -804,6 +820,32 @@ __global__ void dflash_selector_finalize_batch_kernel(
       predecessor = tokens[token + 1U];
     __syncthreads();
   }
+}
+
+__global__ void dflash_gather_rows_kernel(const uint32_t* __restrict__ source,
+                                          uint32_t row_words,
+                                          const int32_t* __restrict__ ids,
+                                          uint32_t* __restrict__ destination) {
+  const uint32_t* row =
+      source + uint64_t(uint32_t(ids[blockIdx.x])) * row_words;
+  uint32_t* out = destination + uint64_t(blockIdx.x) * row_words;
+  for (uint32_t word = threadIdx.x; word < row_words; word += blockDim.x)
+    out[word] = row[word];
+}
+
+__global__ void dflash_draft_table_logits_kernel(
+    const float* __restrict__ source, uint32_t stride,
+    const int32_t* __restrict__ ids, float* __restrict__ table_logits,
+    uint32_t table_rows) {
+  const uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
+  if (slot >= table_rows)
+    return;
+  const int32_t id = ids[slot];
+  float* out = table_logits + uint64_t(blockIdx.y) * table_rows + slot;
+  if (id < 0)
+    *out = -INFINITY;
+  else if (source != nullptr)
+    *out = source[uint64_t(blockIdx.y) * stride + uint32_t(id)];
 }
 
 void LaunchDFlashGroupedDynamicConv(
@@ -1044,15 +1086,14 @@ void LaunchDFlashSelectorStep(
       (vocab_size + kSelectorTokensPerBlock - 1U) / kSelectorTokensPerBlock;
   dflash_selector_partial_topk_kernel<<<partial_count, kSelectorThreads, 0,
                                         stream>>>(
-      logits, nullptr, partial_scores, partial_ids, vocab_size, 0,
-      partial_count, selector_top_k);
+      logits, partial_scores, partial_ids, vocab_size, selector_top_k);
   dflash_selector_finalize_kernel<<<1, kSelectorThreads, 0, stream>>>(
       partial_scores, partial_ids, projected_hidden,
       static_cast<const hip_bfloat16*>(predecessor_codebook_bf16),
       static_cast<const hip_bfloat16*>(successor_codebook_bf16),
       predecessor_token, output_token, output_confidence, temperature,
       sample_uniform, candidate_ids, candidate_probabilities, partial_count,
-      selector_rank, selector_top_k, 0, 0);
+      selector_rank, selector_top_k);
 }
 
 void LaunchDFlashSelectorBatch(
@@ -1063,8 +1104,7 @@ void LaunchDFlashSelectorBatch(
     std::uint32_t* candidate_ids, float* candidate_probabilities,
     std::span<const DFlashSelectorSequence> sequences, std::uint32_t vocab_size,
     std::uint32_t selector_rank, std::uint32_t selector_top_k,
-    hipStream_t stream, const float* tail_logits, std::uint32_t draft_head_rows,
-    std::uint32_t draft_tail_rows, std::uint32_t draft_tail_base) {
+    hipStream_t stream, std::uint32_t logits_stride) {
   if (sequences.empty() || sequences.size() > 8 || logits == nullptr ||
       projected_hidden == nullptr || predecessor_codebook_bf16 == nullptr ||
       successor_codebook_bf16 == nullptr || tokens == nullptr ||
@@ -1073,38 +1113,49 @@ void LaunchDFlashSelectorBatch(
       selector_top_k > kMaxSelectorTopK || selector_top_k > vocab_size)
     throw std::invalid_argument("invalid DFlash selector batch or scratch");
   SelectorBatch batch{};
-  batch.head_rows = draft_head_rows;
-  batch.tail_base = draft_tail_base;
+  SelectorVocabRows vocab_rows{};
   std::uint32_t rows = 0;
+  // The widest row decides the partial count; a draft-vocabulary row reads
+  // fewer columns, and its remaining partial lists stay empty.
+  std::uint32_t columns = 0;
   for (std::size_t index = 0; index < sequences.size(); ++index) {
     const auto sequence = sequences[index];
+    const auto& vocab = sequence.vocab;
     if (sequence.count == 0 ||
         sequence.count >
             std::numeric_limits<std::uint32_t>::max() - 8U - rows ||
         !std::isfinite(sequence.temperature) || sequence.temperature < 0.0F ||
-        (sequence.temperature > 0.0F && uniforms == nullptr))
+        (sequence.temperature > 0.0F && uniforms == nullptr) ||
+        (vocab.prefix != 0 &&
+         (vocab.prefix > vocab_size || vocab.logits == nullptr ||
+          vocab.ids == nullptr || vocab.rows == 0 ||
+          vocab.rows > vocab_size - vocab.prefix ||
+          vocab.prefix > (logits_stride != 0 ? logits_stride : vocab_size))))
       throw std::invalid_argument("invalid DFlash selector sequence");
     batch.sequences[index] = sequence;
     batch.row_offsets[index] = rows;
     batch.token_offsets[index] = rows + static_cast<std::uint32_t>(index);
+    if (vocab.prefix != 0) {
+      vocab_rows.vocab[vocab_rows.count] = vocab;
+      vocab_rows.row_begin[vocab_rows.count] = rows;
+      vocab_rows.row_end[vocab_rows.count] = rows + sequence.count;
+      ++vocab_rows.count;
+      columns = std::max(columns, vocab.prefix + vocab.rows);
+    } else {
+      columns = vocab_size;
+    }
     rows += sequence.count;
   }
-  const uint32_t effective_head_rows =
-      draft_head_rows != 0 ? draft_head_rows : vocab_size;
-  const auto head_partial_count = static_cast<std::uint32_t>(
-      (static_cast<std::uint64_t>(effective_head_rows) +
-       kSelectorTokensPerBlock - 1U) /
+  if (logits_stride != 0 && vocab_rows.count != sequences.size() &&
+      logits_stride < vocab_size)
+    throw std::invalid_argument("invalid DFlash selector logits stride");
+  const auto partial_count = static_cast<std::uint32_t>(
+      (static_cast<std::uint64_t>(columns) + kSelectorTokensPerBlock - 1U) /
       kSelectorTokensPerBlock);
-  const auto tail_partial_count = static_cast<std::uint32_t>(
-      draft_tail_rows != 0 ? (static_cast<std::uint64_t>(draft_tail_rows) +
-                              kSelectorTokensPerBlock - 1U) /
-                                 kSelectorTokensPerBlock
-                           : 0U);
-  const auto partial_count = head_partial_count + tail_partial_count;
   dflash_selector_partial_topk_kernel<<<dim3(partial_count, rows),
                                         kSelectorThreads, 0, stream>>>(
-      logits, tail_logits, partial_scores, partial_ids, effective_head_rows,
-      draft_tail_rows, head_partial_count, selector_top_k);
+      logits, partial_scores, partial_ids, vocab_size, selector_top_k,
+      logits_stride, vocab_rows);
   dflash_selector_finalize_batch_kernel<<<sequences.size(), kSelectorThreads, 0,
                                           stream>>>(
       partial_scores, partial_ids, projected_hidden,
@@ -1112,6 +1163,34 @@ void LaunchDFlashSelectorBatch(
       static_cast<const hip_bfloat16*>(successor_codebook_bf16), tokens,
       confidences, uniforms, candidate_ids, candidate_probabilities, batch,
       partial_count, selector_rank, selector_top_k);
+}
+
+void LaunchDFlashGatherRows(const void* source, std::size_t row_bytes,
+                            const std::int32_t* ids, void* destination,
+                            std::uint32_t count, hipStream_t stream) {
+  if (source == nullptr || ids == nullptr || destination == nullptr ||
+      row_bytes == 0 || row_bytes % sizeof(std::uint32_t) != 0 ||
+      row_bytes / sizeof(std::uint32_t) >
+          std::numeric_limits<std::uint32_t>::max())
+    throw std::invalid_argument("invalid DFlash row gather");
+  if (count == 0)
+    return;
+  dflash_gather_rows_kernel<<<count, 256, 0, stream>>>(
+      static_cast<const std::uint32_t*>(source),
+      static_cast<std::uint32_t>(row_bytes / sizeof(std::uint32_t)), ids,
+      static_cast<std::uint32_t*>(destination));
+}
+
+void LaunchDFlashDraftTableLogits(const float* source, std::uint32_t stride,
+                                  const std::int32_t* ids, float* table_logits,
+                                  std::uint32_t rows, std::uint32_t table_rows,
+                                  hipStream_t stream) {
+  if (ids == nullptr || table_logits == nullptr || rows == 0 || table_rows == 0)
+    throw std::invalid_argument("invalid DFlash draft table");
+  constexpr std::uint32_t kThreads = 256;
+  dflash_draft_table_logits_kernel<<<
+      dim3((table_rows + kThreads - 1U) / kThreads, rows), kThreads, 0,
+      stream>>>(source, stride, ids, table_logits, table_rows);
 }
 
 }  // namespace gufo::hip::kernels
