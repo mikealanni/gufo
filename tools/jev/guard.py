@@ -42,7 +42,9 @@ HEAVY = [re.compile(p) for p in (
     r"\bpytest\b",
     r"^(?:\S*/)?python3?\s+(?!-c\b)\S+.*\b(torch|hip|rocm)\b",
     r"run-gufo\.sh",
+    r"(?:^|\s)(?:\./)?build/[\w.-]+/(?:\S*/)?tests/\S*(?:_test|_tests|_bench|_probe)\b",
 )]
+LIGHT_SCRIPTS = {"chroma-helper.py"}
 LIGHT_WORDS = {
     "git", "ls", "cat", "rg", "grep", "sed", "head", "tail", "echo", "pwd", "cd",
     "find", "wc", "diff", "mkdir", "cp", "mv", "rm", "touch", "curl", "tr", "sort",
@@ -417,6 +419,8 @@ def classify(command):
         if LOOP_HEADER.match(seg) and "$(" not in seg and "`" not in seg:
             continue
         if first_word(seg) in LIGHT_WORDS:
+            continue
+        if any(os.path.basename(x) in LIGHT_SCRIPTS for x in executed_scripts(seg)):
             continue
         if detached and seg and not re.search(r"\s(--help|-h|--version)(\s|$)", seg):
             return "heavy", seg
