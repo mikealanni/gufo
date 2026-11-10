@@ -367,47 +367,62 @@ int RunJudge(std::span<const char* const> args) {
     const std::string dir = dir_env ? dir_env : "tools/npu";
     hipStream_t stream;
     (void)hipStreamCreate(&stream);
-    for (std::uint32_t m : {512u, 1024u, 2048u, 4096u}) {
+    struct Shape { std::uint32_t tile, k, n; };
+    for (const Shape sh : {Shape{128, 2048, 1024}, Shape{64, 2048, 1024},
+                           Shape{128, 2048, 6144}, Shape{64, 2048, 6144},
+                           Shape{128, 2048, 15360}, Shape{64, 2048, 15360},
+                           Shape{128, 7680, 2048}, Shape{64, 7680, 2048}}) {
+      const std::uint32_t m = 4 * sh.tile;
+      const std::string tag = std::to_string(sh.tile) + "x64x128";
+      auto insts = [&](std::uint32_t k, std::uint32_t n) {
+        return dir + "/runtime_mk/insts_" + std::to_string(m) + "x" +
+               std::to_string(k) + "x" + std::to_string(n) + "_" + tag + ".txt";
+      };
       models::qwen38_flash_next::rocm::NpuGemm::Config cfg;
-      cfg.xclbin = dir + "/runtime_mk/final_4096xKx1024_128x64x128.xclbin";
-      cfg.insts = dir + "/runtime_mk/insts_" + std::to_string(m) +
-                  "x2048x1024_128x64x128.txt";
+      cfg.xclbin = dir + "/runtime_mk/final_4096xKx1024_" + tag + ".xclbin";
+      cfg.insts = insts(2048, 1024);
       cfg.tokens = m;
       cfg.k = 2048;
       cfg.n = 1024;
       std::string e;
       auto gemm = models::qwen38_flash_next::rocm::NpuGemm::Create(cfg, &e);
       if (!gemm) {
-        std::printf("M=%u: %s\n", m, e.c_str());
+        std::printf("tile %u: %s\n", sh.tile, e.c_str());
         continue;
       }
-      const int a = gemm->NewBuffer(gemm->ABytes(), nullptr);
-      const int b = gemm->NewBuffer(gemm->BBytes(), nullptr);
-      const int c = gemm->NewBuffer(gemm->CBytes(), nullptr);
-      std::memset(gemm->Host(a), 0, gemm->ABytes());
-      std::memset(gemm->Host(b), 0, gemm->BBytes());
+      const int prog = gemm->AddProgram(insts(sh.k, sh.n), &e);
+      if (prog < 0) {
+        std::printf("tile %u K=%u N=%u: %s\n", sh.tile, sh.k, sh.n, e.c_str());
+        continue;
+      }
+      const int a = gemm->NewBuffer(std::size_t{m} * sh.k / 8 * 9, nullptr);
+      const int b = gemm->NewBuffer(std::size_t{sh.k} * sh.n / 8 * 9, nullptr);
+      const int c = gemm->NewBuffer(std::size_t{m} * sh.n / 8 * 9, nullptr);
+      std::memset(gemm->Host(a), 0, std::size_t{m} * sh.k / 8 * 9);
+      std::memset(gemm->Host(b), 0, std::size_t{sh.k} * sh.n / 8 * 9);
       gemm->FinalizeWeights(a);
       gemm->FinalizeWeights(b);
       const int bs[1] = {b};
       const int cs[1] = {c};
-      for (int i = 0; i < 5; ++i) {
-        gemm->Submit(stream, a, bs, cs, 1, 0);
+      for (int i = 0; i < 4; ++i) {
+        gemm->Submit(stream, a, bs, cs, 1, prog);
         gemm->Wait(stream);
         (void)hipStreamSynchronize(stream);
       }
-      const int reps = 40;
+      const int reps = 30;
       const auto t0 = std::chrono::steady_clock::now();
       for (int i = 0; i < reps; ++i) {
-        gemm->Submit(stream, a, bs, cs, 1, 0);
+        gemm->Submit(stream, a, bs, cs, 1, prog);
         gemm->Wait(stream);
         (void)hipStreamSynchronize(stream);
       }
       const double ms = std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - t0).count() /
                         reps;
-      const double flop = 2.0 * m * 2048.0 * 1024.0;
-      std::printf("M=%u K=2048 N=1024: %.3f ms/call  (%.2f TFLOP/s, weights %.1f MB)\n",
-                  m, ms, flop / ms / 1e9, gemm->BBytes() / 1e6);
+      const double mb = sh.k * sh.n / 8.0 * 9 / 1e6;
+      std::printf("tile %3u M=%u K=%u N=%u: %.3f ms  (%.1f TFLOP/s, weights %.1f MB = %.1f GB/s)\n",
+                  sh.tile, m, sh.k, sh.n, ms, 2.0 * m * sh.k * sh.n / ms / 1e9,
+                  mb, mb / ms);
     }
     return 0;
 #endif

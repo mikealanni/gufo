@@ -646,6 +646,7 @@ struct D1NpuModel::Impl {
   mutable double t_encode{0}, t_gemm{0}, t_half{0}, t_memset{0}, t_enckernel{0}, t_final{0};
   std::uint32_t tile_m{128};    // NPU program tile rows per core row (128 or 64)
   std::uint32_t pass_rows{512}; // rows the program computes per pass (4 * tile_m)
+  double step_layers_ms{0};
   bool prof_fine{false};
   bool sync_each{true};
   mutable int n_gemm{0};
@@ -808,6 +809,11 @@ std::unique_ptr<D1NpuModel> D1NpuModel::Create(const core::GgufReader& reader,
   const char* npu_dir = std::getenv("GUFO_NPU_DIR");
   const std::string dir = npu_dir ? npu_dir : "tools/npu";
   // GUFO_D1_TILE=64 selects the 256-row NPU program (m = 64 per core row).
+  // Default: the 256-row program when its XCLBIN and streams are installed.
+  impl->tile_m = std::ifstream(dir + "/runtime_mk/final_4096xKx1024_64x64x128.xclbin").good() &&
+                         std::ifstream(dir + "/runtime_mk/insts_256x2048x15360_64x64x128.txt").good()
+                     ? 64u
+                     : 128u;
   if (const char* tile_env = std::getenv("GUFO_D1_TILE"))
     impl->tile_m = std::atoi(tile_env) == 64 ? 64u : 128u;
   impl->pass_rows = 4 * impl->tile_m;
@@ -1438,10 +1444,16 @@ bool D1NpuModel::Step(std::span<const std::uint32_t> tokens,
       hipLaunchKernelGGL((D1EmbedKernel<0>), grid, dim3(256), 0, s.stream,
                          s.emb_table, s.ids, s.x, n, H, row_bytes, c.vocab, units);
   }
+  const auto step_t0 = std::chrono::steady_clock::now();
   s.stateful = true;
   s.pos0 = s.pos;
   const bool ok = s.Layers(n);
   s.stateful = false;
+  if (std::getenv("GUFO_D1_PROF2")) {
+    hipStreamSynchronize(s.stream);
+    s.step_layers_ms = std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - step_t0).count();
+  }
   if (!ok)
     return false;
   s.last_n = n;
@@ -1475,6 +1487,12 @@ bool D1NpuModel::Step(std::span<const std::uint32_t> tokens,
   hipStreamSynchronize(s.stream);
   for (std::uint32_t i = 0; i < want; ++i)
     next_tokens[i] = static_cast<std::uint32_t>(s.argmax_host[i]);
+  if (std::getenv("GUFO_D1_PROF2"))
+    std::fprintf(stderr, "[d1 step] n=%u layers %.1f ms, tail(logits+argmax) %.1f ms\n",
+                 n, s.step_layers_ms,
+                 std::chrono::duration<double, std::milli>(
+                     std::chrono::steady_clock::now() - step_t0).count() -
+                     s.step_layers_ms);
   return s.npu->Healthy();
 }
 
