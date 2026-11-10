@@ -154,6 +154,8 @@ struct Engine::Impl {
   std::vector<std::vector<float>> gate_w;
   std::vector<std::vector<float>> k_cache, v_cache, conv_hist;
   std::vector<std::uint32_t> capacity;
+  std::vector<std::vector<float>> comb_store;
+  std::uint32_t pending{0};
   double t_enc{0}, t_run{0}, t_dec{0}, t_cpu{0};
   int calls{0};
 
@@ -419,6 +421,63 @@ std::uint32_t Engine::Argmax(const float* hidden_row) {
   return best;
 }
 
+
+void Engine::ArgmaxRows(const float* hidden, std::uint32_t rows, std::uint32_t* out) {
+  Impl& s = *impl_;
+  const auto& e = s.w->embedding;
+  const std::uint32_t V = e.rows, nb = s.H / 32;
+  const std::size_t rb = std::size_t{nb} * 34;
+  std::vector<QRow> xs(rows);
+  for (std::uint32_t r = 0; r < rows; ++r)
+    xs[r] = QuantizeRow(hidden + std::size_t{r} * s.H, s.H);
+  std::vector<std::int16_t> x16(std::size_t{rows} * s.H);
+  for (std::uint32_t r = 0; r < rows; ++r)
+    for (std::uint32_t i = 0; i < s.H; ++i)
+      x16[std::size_t{r} * s.H + i] = xs[r].q[i];
+  const auto* base = static_cast<const std::uint8_t*>(e.data);
+  std::vector<float> best_v(rows, -INFINITY);
+  std::vector<std::uint32_t> best(rows, 0);
+#pragma omp parallel num_threads(16)
+  {
+    std::vector<float> lv(rows, -INFINITY);
+    std::vector<std::uint32_t> lb(rows, 0);
+#pragma omp for schedule(static) nowait
+    for (std::int64_t v = 0; v < V; ++v) {
+      const std::uint8_t* row = base + std::size_t(v) * rb;
+      __m512 acc[kMaxRows];
+      for (std::uint32_t r = 0; r < rows; ++r)
+        acc[r] = _mm512_setzero_ps();
+      for (std::uint32_t b = 0; b < nb; ++b) {
+        const std::uint8_t* blk = row + std::size_t{b} * 34;
+        std::uint16_t hd;
+        std::memcpy(&hd, blk, 2);
+        const float dw = _cvtsh_ss(hd);
+        const __m512i w16 = _mm512_cvtepi8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(blk + 2)));
+        for (std::uint32_t r = 0; r < rows; ++r) {
+          const __m512i xv = _mm512_loadu_si512(x16.data() + std::size_t{r} * s.H + b * 32);
+          acc[r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_madd_epi16(w16, xv)),
+                                   _mm512_set1_ps(dw * xs[r].d[b]), acc[r]);
+        }
+      }
+      for (std::uint32_t r = 0; r < rows; ++r) {
+        const float d = _mm512_reduce_add_ps(acc[r]);
+        if (d > lv[r]) {
+          lv[r] = d;
+          lb[r] = static_cast<std::uint32_t>(v);
+        }
+      }
+    }
+#pragma omp critical
+    for (std::uint32_t r = 0; r < rows; ++r)
+      if (lv[r] > best_v[r] || (lv[r] == best_v[r] && lb[r] < best[r])) {
+        best_v[r] = lv[r];
+        best[r] = lb[r];
+      }
+  }
+  for (std::uint32_t r = 0; r < rows; ++r)
+    out[r] = best[r];
+}
+
 Engine::Engine(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 Engine::~Engine() {
   if (!impl_)
@@ -476,6 +535,7 @@ std::unique_ptr<Engine> Engine::Create(const Options& options,
     s.v_cache.resize(L);
     s.conv_hist.resize(L);
     s.capacity.assign(L, 0);
+    s.comb_store.resize(L);
     std::vector<float> buf;
     for (std::size_t l = 0; l < L; ++l) {
       const auto& lw = s.w->layers[l];
@@ -502,7 +562,7 @@ std::unique_ptr<Engine> Engine::Create(const Options& options,
           DecodeRow(lw.attn_gate, h,
                     std::span<float>(s.gate_w[l].data() + std::size_t{h} * s.H, s.H));
         s.capacity[l] = c.layers[l] == LayerType::kSlidingAttention
-                            ? std::min(options.context, s.window)
+                            ? std::min(options.context, s.window + kRows)
                             : options.context;
         s.k_cache[l].assign(std::size_t{s.capacity[l]} * s.kvd, 0.0f);
         s.v_cache[l].assign(std::size_t{s.capacity[l]} * s.kvd, 0.0f);
@@ -579,8 +639,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens,
             sum += cw[std::size_t{ch} * T + j] * comb[(std::size_t(t) + j) * H + ch];
           conv_out[std::size_t(t) * H + ch] = sum * p[std::size_t(t) * 6144 + H + ch];
         }
-      std::memcpy(s.conv_hist[l].data(), comb.data() + std::size_t{n} * H,
-                  std::size_t{T - 1} * H * 4);
+      s.comb_store[l] = std::move(comb);
       s.t_cpu += Ms(cpu0);
       s.Gemm(s.p_h, s.m_out[l], conv_out.data(), n, branch.data());
     } else {
@@ -707,9 +766,21 @@ bool Engine::Step(std::span<const std::uint32_t> tokens,
     hidden->resize(std::size_t{n} * H);
     RmsNorm(x.data(), static_cast<const float*>(s.w->output_norm.data), hidden->data(), n, H, c.eps);
   }
-  s.pos += n;
+  s.pending = n;
   s.t_cpu += Ms(cpu0);
   return true;
+}
+
+void Engine::Commit(std::uint32_t k) {
+  Impl& s = *impl_;
+  const auto& c = s.w->config;
+  k = std::min(k, s.pending);
+  for (std::size_t l = 0; l < c.layers.size(); ++l)
+    if (c.layers[l] == LayerType::kConvolution)
+      std::memcpy(s.conv_hist[l].data(), s.comb_store[l].data() + std::size_t{k} * s.H,
+                  std::size_t{s.taps - 1} * s.H * 4);
+  s.pos += k;
+  s.pending = 0;
 }
 
 }  // namespace gufo::models::lfm3::npu

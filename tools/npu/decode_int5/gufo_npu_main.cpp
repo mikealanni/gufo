@@ -30,6 +30,7 @@ int main(int argc, char** argv) {
   std::string in, out;
   std::size_t maxtok = 512, maxnew = 128;
   std::string prompt;
+  bool spec = std::getenv("GUFO_NO_SPEC") == nullptr;
   for (int i = 2; i + 1 < argc; i += 2) {
     std::string k = argv[i];
     std::string v = argv[i + 1];
@@ -79,6 +80,7 @@ int main(int argc, char** argv) {
           __m128i hv = _mm_cvtps_ph(_mm_set_ss(h[i]), _MM_FROUND_TO_NEAREST_INT);
           half[at * 2048 + i] = static_cast<std::uint16_t>(_mm_extract_epi16(hv, 0));
         }
+        engine->Commit(n);
         at += n;
       }
       dofs.write(reinterpret_cast<const char*>(&total), 8);
@@ -123,18 +125,73 @@ int main(int argc, char** argv) {
       const std::size_t n = std::min<std::size_t>(Engine::kMaxRows, ids.size() - at);
       if (!engine->Step(std::span<const std::uint32_t>(ids.data() + at, n), &h))
         return 1;
+      engine->Commit(n);
       at += n;
     }
     const auto t1 = std::chrono::steady_clock::now();
     std::uint32_t next = engine->Argmax(h.data() + (h.size() - 2048));
-    for (std::size_t i = 0; i < maxnew; ++i) {
+    std::vector<std::uint32_t> hist = ids;
+    std::size_t passes = 0, drafted = 0, accepted = 0;
+    bool done = false;
+    while (!done && out.size() < maxnew) {
       out.push_back(next);
+      hist.push_back(next);
       if (next == eos || tokenizer->IsStop(next))
         break;
-      if (!engine->Step(std::span<const std::uint32_t>(&next, 1), &h))
+      std::vector<std::uint32_t> fed = {next};
+      if (spec) {
+        const std::size_t hn = hist.size();
+        for (std::size_t m = std::min<std::size_t>(5, hn - 1); m >= 2 && fed.size() == 1; --m) {
+          for (std::size_t p = hn - 1; p-- > m;) {
+            bool same = true;
+            for (std::size_t q = 0; q < m && same; ++q)
+              same = hist[p - q] == hist[hn - 1 - q];
+            if (same) {
+              for (std::size_t q = p + 1; q < hn - 1 + 1 && fed.size() < Engine::kMaxRows && q < hn; ++q)
+                fed.push_back(hist[q]);
+              break;
+            }
+          }
+        }
+      }
+      if (!engine->Step(std::span<const std::uint32_t>(fed.data(), fed.size()), &h))
         return 1;
-      next = engine->Argmax(h.data());
+      ++passes;
+      drafted += fed.size() - 1;
+      std::vector<std::uint32_t> pred(fed.size());
+      std::size_t have = 0, j = 0;
+      for (;;) {
+        const std::size_t want = std::min<std::size_t>(fed.size(), have == 0 ? 4 : fed.size());
+        if (want > have) {
+          engine->ArgmaxRows(h.data() + have * 2048, want - have, pred.data() + have);
+          have = want;
+        }
+        while (j + 1 < fed.size() && j < have && pred[j] == fed[j + 1])
+          ++j;
+        if (j >= have && have < fed.size())
+          continue;
+        break;
+      }
+      while (j + 1 < fed.size() && j >= have) {
+        break;
+      }
+      for (std::size_t q = 1; q <= j; ++q) {
+        out.push_back(fed[q]);
+        hist.push_back(fed[q]);
+        if (fed[q] == eos || tokenizer->IsStop(fed[q]))
+          done = true;
+      }
+      accepted += j;
+      engine->Commit(static_cast<std::uint32_t>(j + 1));
+      if (j >= have)
+        pred[j] = 0;
+      next = pred[j];
     }
+    if (out.size() > maxnew)
+      out.resize(maxnew);
+    if (spec)
+      std::fprintf(stderr, "speculation: %zu passes, %zu drafted, %zu accepted, %.2f tokens/pass\n", passes,
+                   drafted, accepted, passes ? double(out.size()) / passes : 0.0);
     const auto t2 = std::chrono::steady_clock::now();
     std::printf("%s\n", tokenizer->Decode(out).c_str());
     const double pre = std::chrono::duration<double>(t1 - t0).count();

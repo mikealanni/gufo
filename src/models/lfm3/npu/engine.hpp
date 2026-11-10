@@ -32,6 +32,10 @@ class Engine {
   void Logits(const float* hidden_row, std::vector<float>* logits);
   /// Index of the largest logit (greedy token), without storing all logits.
   std::uint32_t Argmax(const float* hidden_row);
+  /// Greedy token per hidden row in one sweep over the embedding.
+  void ArgmaxRows(const float* hidden, std::uint32_t rows, std::uint32_t* out);
+  /// Accepts the first k rows of the last Step (conv history and position).
+  void Commit(std::uint32_t k);
   struct Impl;
 
  private:
