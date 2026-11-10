@@ -131,6 +131,7 @@ struct Prog {
   std::uint8_t *ah{}, *ch{};
 };
 struct Mat {
+  xrt::run run;
   xrt::bo bo;
   std::uint8_t* host{};
   std::size_t bytes{};
@@ -273,6 +274,16 @@ struct Engine::Impl {
     return m;
   }
 
+  void Attach(Mat& m, Prog& p) {
+    m.run = xrt::run(kern);
+    m.run.set_arg(0, 3u);
+    m.run.set_arg(1, p.insts);
+    m.run.set_arg(2, static_cast<unsigned>(p.words));
+    m.run.set_arg(3, p.a);
+    m.run.set_arg(4, m.bo);
+    m.run.set_arg(5, p.c);
+  }
+
   void EncodeA(const float* x, std::uint32_t n, std::uint32_t K, Prog& p) {
     const std::uint32_t tk = K / kTileK;
 #pragma omp parallel for
@@ -317,7 +328,8 @@ struct Engine::Impl {
     p.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     t_syncA += Ms(t0);
     t0 = Clock::now();
-    auto run = kern(3, p.insts, static_cast<unsigned>(p.words), p.a, m.bo, p.c);
+    auto& run = const_cast<Mat&>(m).run;
+    run.start();
     t_submit += Ms(t0);
     t0 = Clock::now();
     {
@@ -663,9 +675,9 @@ std::unique_ptr<Engine> Engine::Create(const Options& options,
       if (c.layers[l] == LayerType::kConvolution) {
         buf.resize(std::size_t{6144} * 2048);
         s.LoadRows(pre + "conv.in_proj.weight", lw.in_proj, buf.data(), 6144, 2048);
-        s.m_in[l] = s.Pack(buf.data(), 6144, 2048);
+        s.m_in[l] = s.Pack(buf.data(), 6144, 2048); s.Attach(s.m_in[l], s.p_in);
         s.LoadRows(pre + "conv.out_proj.weight", lw.out_proj, buf.data(), 2048, 2048);
-        s.m_out[l] = s.Pack(buf.data(), 2048, 2048);
+        s.m_out[l] = s.Pack(buf.data(), 2048, 2048); s.Attach(s.m_out[l], s.p_h);
         s.conv_hist[l].assign(std::size_t{s.taps - 1} * s.H, 0.0f);
       } else {
         buf.resize(std::size_t{3072} * 2048);
@@ -674,9 +686,9 @@ std::unique_ptr<Engine> Engine::Create(const Options& options,
                    buf.data() + std::size_t{2048} * 2048, 512, 2048);
         s.LoadRows(pre + "self_attn.v_proj.weight", lw.v,
                    buf.data() + std::size_t{2560} * 2048, 512, 2048);
-        s.m_qkv[l] = s.Pack(buf.data(), 3072, 2048);
+        s.m_qkv[l] = s.Pack(buf.data(), 3072, 2048); s.Attach(s.m_qkv[l], s.p_qkv);
         s.LoadRows(pre + "self_attn.o_proj.weight", lw.attn_out, buf.data(), 2048, 2048);
-        s.m_out[l] = s.Pack(buf.data(), 2048, 2048);
+        s.m_out[l] = s.Pack(buf.data(), 2048, 2048); s.Attach(s.m_out[l], s.p_h);
         s.gate_w[l].resize(std::size_t{s.heads} * s.H);
         for (std::uint32_t h = 0; h < s.heads; ++h)
           DecodeRow(lw.attn_gate, h,
@@ -691,10 +703,10 @@ std::unique_ptr<Engine> Engine::Create(const Options& options,
       s.LoadRows(pre + "feed_forward.w1.weight", lw.gate, buf.data(), 7680, 2048);
       s.LoadRows(pre + "feed_forward.w3.weight", lw.up,
                  buf.data() + std::size_t{7680} * 2048, 7680, 2048);
-      s.m_gu[l] = s.Pack(buf.data(), 15360, 2048);
+      s.m_gu[l] = s.Pack(buf.data(), 15360, 2048); s.Attach(s.m_gu[l], s.p_gu);
       buf.resize(std::size_t{2048} * 7680);
       s.LoadRows(pre + "feed_forward.w2.weight", lw.down, buf.data(), 2048, 7680);
-      s.m_down[l] = s.Pack(buf.data(), 2048, 7680);
+      s.m_down[l] = s.Pack(buf.data(), 2048, 7680); s.Attach(s.m_down[l], s.p_down);
     }
     std::fprintf(stderr, "npu engine: packed %zu layers in %.1f s\n", L,
                  Ms(t0) / 1000.0);
