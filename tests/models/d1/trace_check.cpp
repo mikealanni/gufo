@@ -15,13 +15,22 @@ int main(int argc, char** argv) {
   if (!weights) { std::cerr << error << '\n'; return 1; }
   auto judge = models::d1::Judge::Create(
       *reader,
-      [&](auto tokens, auto groups, auto slots, auto vocabulary, auto logits) {
-        std::cerr << "tokens " << tokens.size() << " first";
-        for (std::size_t i = 0; i < 6 && i < tokens.size(); ++i) std::cerr << ' ' << tokens[i];
-        std::cerr << " slot " << slots[0] << '\n';
-        const auto out = models::lfm3::DecisionForward(*weights, tokens, groups, slots, vocabulary);
-        std::copy(out.begin(), out.end(), logits.begin());
-        std::cerr << "logits " << out[0] << ' ' << out[1] << '\n';
+      [&](auto tokens, auto groups, auto sequences, auto slots, auto vocabulary, auto logits) {
+        // Oracle: run every packed sequence on its own, then concatenate.
+        const std::size_t seq_count = sequences.empty() ? 1 : sequences.size();
+        std::size_t slot_at = 0;
+        for (std::size_t q = 0; q < seq_count; ++q) {
+          const std::size_t lo = sequences.empty() ? 0 : sequences[q];
+          const std::size_t hi = (!sequences.empty() && q + 1 < seq_count) ? sequences[q + 1] : tokens.size();
+          std::vector<std::uint32_t> own_slots;
+          while (slot_at + own_slots.size() < slots.size() && slots[slot_at + own_slots.size()] < hi)
+            own_slots.push_back(slots[slot_at + own_slots.size()] - lo);
+          const auto out = models::lfm3::DecisionForward(
+              *weights, tokens.subspan(lo, hi - lo),
+              groups.empty() ? groups : groups.subspan(lo, hi - lo), own_slots, vocabulary);
+          std::copy(out.begin(), out.end(), logits.begin() + slot_at * vocabulary.size());
+          slot_at += own_slots.size();
+        }
         return true;
       }, 512, &error);
   const std::pair<std::string_view, std::string_view> item{argv[2], argv[3]};

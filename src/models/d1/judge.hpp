@@ -20,14 +20,19 @@ struct JudgeVerdict {
 };
 /// Yes/no judge over a d1 decision model: each (question, context) pair is a
 /// `noul` question over the context as its state. Pairs with the same context
-/// share one forward pass, packed up to 16 at a time. The forward itself is
+/// share one sequence (up to 16 questions); sequences from different contexts
+/// are packed into one forward pass while they fit the token limit. The forward is
 /// injected (NPU backbone in serving, the FP32 host oracle in tests).
 class Judge {
 public:
   /// Logits for `slots` over `vocabulary`, row-major slots x vocabulary.
+  /// `sequences` are ascending start offsets of the independent sequences
+  /// packed into the pass (empty = one); `groups` is empty only for a lone
+  /// question in a single sequence.
   using ForwardFn = std::function<bool(
       std::span<const std::uint32_t> tokens,
       std::span<const std::int32_t> groups,
+      std::span<const std::uint32_t> sequences,
       std::span<const std::uint32_t> slots,
       std::span<const std::uint32_t> vocabulary, std::span<float> logits)>;
 

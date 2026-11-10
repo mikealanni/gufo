@@ -1313,10 +1313,12 @@ std::unique_ptr<JevNpuModel> JevNpuModel::LoadFromGguf(
         reader,
         [backbone](std::span<const std::uint32_t> tokens,
                    std::span<const std::int32_t> groups,
+                   std::span<const std::uint32_t> sequences,
                    std::span<const std::uint32_t> slots,
                    std::span<const std::uint32_t> vocabulary,
                    std::span<float> logits) {
-          return backbone->Forward(tokens, groups, slots, vocabulary, logits);
+          return backbone->Forward(tokens, groups, sequences, slots,
+                                   vocabulary, logits);
         },
         M, error_msg);
     if (!impl->d1_judge)

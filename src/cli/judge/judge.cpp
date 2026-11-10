@@ -278,6 +278,7 @@ int RunJudge(std::span<const char* const> args) {
   bool use_gpu = false;
   bool code = false;
   bool batched = false;
+  bool pack_test = false;
   bool finish_verbose = false;
   std::string finish_replay;
   std::string goal_replay;
@@ -302,6 +303,9 @@ int RunJudge(std::span<const char* const> args) {
                  &code);
   parser.AddFlag("", "--gpu", "Use the GPU judge instead of the NPU", "Model",
                  &use_gpu);
+  parser.AddFlag("", "--pack-test",
+                 "Compare four different-context decisions: one by one vs one packed pass",
+                 "Battery", &pack_test);
   parser.AddFlag(
       "", "--batched",
       "Run --battery/--code through AnswerBatch (4 questions/NPU pass)",
@@ -336,7 +340,7 @@ int RunJudge(std::span<const char* const> args) {
     std::fprintf(stderr, "judge: --model is required\n");
     return 2;
   }
-  if (!stdio && !battery && !code && question.empty()) {
+  if (!stdio && !battery && !code && !pack_test && question.empty()) {
     std::fprintf(stderr, "judge: --question, --battery or --code required\n");
     return 2;
   }
@@ -368,6 +372,37 @@ int RunJudge(std::span<const char* const> args) {
         std::printf("%s yes=%.3f no=%.3f  %.1f ms\n",
                     verdict.yes >= verdict.no ? "Yes" : "No", verdict.yes,
                     verdict.no, ms);
+      }
+    }
+    if (pack_test) {
+      const std::vector<std::pair<std::string, std::string>> owned = {
+          {"Will this command use the GPU or most of the machine's RAM?",
+           "The agent is about to run: python train.py --epochs 50 on a 20GB model."},
+          {"Is this a quick read-only shell command?",
+           "The agent is about to run: ls -la /tmp"},
+          {"Will this command use the GPU or most of the machine's RAM?",
+           "The agent is about to run: cargo build --release for a large workspace."},
+          {"Is this a quick read-only shell command?",
+           "The agent is about to run: git status"}};
+      std::vector<std::pair<std::string_view, std::string_view>> items;
+      for (const auto& [q, c] : owned)
+        items.emplace_back(q, c);
+      for (int round = 0; round < 3; ++round) {
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<models::qwen38_flash_next::JevBinaryVerdict> single;
+        for (const auto& item : items)
+          single.push_back(model->Answer(item.first, item.second));
+        const auto t1 = std::chrono::steady_clock::now();
+        const auto packed = model->AnswerBatch(items);
+        const auto t2 = std::chrono::steady_clock::now();
+        std::printf("round %d: singles %.1f ms, packed %.1f ms\n", round,
+                    std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                    std::chrono::duration<double, std::milli>(t2 - t1).count());
+        if (round == 2)
+          for (std::size_t i = 0; i < items.size(); ++i)
+            std::printf("  %zu single yes=%.4f packed yes=%.4f\n", i,
+                        single[i].yes,
+                        i < packed.size() ? packed[i].yes : -1.0F);
       }
     }
     if (battery)

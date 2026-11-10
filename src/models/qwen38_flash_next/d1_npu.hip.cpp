@@ -181,9 +181,11 @@ __global__ void D1SwigluKernel(const float* __restrict__ gu,
 }
 
 /// Gated short convolution: P rows are [B | C | x] (3*hidden). out[t][c] =
-/// C[t][c] * sum_j w[c][j] * (B*x)[t-(L-1)+j][c], zero history before t=0.
+/// C[t][c] * sum_j w[c][j] * (B*x)[t-(L-1)+j][c], zero history before the
+/// token's sequence start.
 __global__ void D1ConvKernel(const float* __restrict__ p,
                              const float* __restrict__ w,
+                             const std::int32_t* __restrict__ seq_lo,
                              float* __restrict__ out, std::uint32_t n,
                              std::uint32_t hidden, std::uint32_t taps) {
   const std::uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -191,11 +193,12 @@ __global__ void D1ConvKernel(const float* __restrict__ p,
   if (c >= hidden || t >= n)
     return;
   const std::size_t pitch = 3ull * hidden;
+  const int lo = seq_lo[t];
   float sum = 0.0F;
   for (std::uint32_t j = 0; j < taps; ++j) {
     const int s = static_cast<int>(t) - static_cast<int>(taps - 1) +
                   static_cast<int>(j);
-    if (s < 0)
+    if (s < lo)
       continue;
     sum += w[static_cast<std::size_t>(c) * taps + j] * p[s * pitch + c] *
            p[s * pitch + 2ull * hidden + c];
@@ -249,6 +252,7 @@ __global__ void D1GateKernel(const float* __restrict__ z,
 /// Half-split (NEOX) rotary embedding at position = row; `factors` (global
 /// layers) divide the angle per frequency index.
 __global__ void D1RopeKernel(float* q, float* k, const float* __restrict__ factors,
+                             const std::int32_t* __restrict__ seq_lo,
                              std::uint32_t n, std::uint32_t heads,
                              std::uint32_t kv_heads, std::uint32_t hd,
                              float theta) {
@@ -266,7 +270,7 @@ __global__ void D1RopeKernel(float* q, float* k, const float* __restrict__ facto
       return;
     base = k + (static_cast<std::size_t>(row) * kv_heads + kh) * hd;
   }
-  float angle = static_cast<float>(row) *
+  float angle = static_cast<float>(row - static_cast<std::uint32_t>(seq_lo[row])) *
                 powf(theta, -2.0F * static_cast<float>(dd) /
                                 static_cast<float>(hd));
   if (factors != nullptr)
@@ -277,14 +281,17 @@ __global__ void D1RopeKernel(float* q, float* k, const float* __restrict__ facto
   base[dd + hd / 2] = b * c + a * sn;
 }
 
-/// One block per (token, head). window > 0: causal sliding layer. Otherwise a
-/// global layer: every key, restricted by `groups` when given (state tokens
-/// are -1; a token sees keys that are state or in its own question).
+/// One block per (token, head). Tokens only see their own sequence
+/// [seq_lo, seq_hi). window > 0: causal sliding layer. Otherwise a global
+/// layer: every key of the sequence, restricted by `groups` (state tokens are
+/// -1; a token sees keys that are state or in its own question).
 __global__ void D1AttnKernel(const float* __restrict__ q,
                              const float* __restrict__ k,
                              const float* __restrict__ v,
                              const float* __restrict__ gate,
                              const std::int32_t* __restrict__ groups,
+                             const std::int32_t* __restrict__ seq_lo,
+                             const std::int32_t* __restrict__ seq_hi,
                              float* __restrict__ out, std::uint32_t n,
                              std::uint32_t heads, std::uint32_t kv_heads,
                              std::uint32_t hd, float scale,
@@ -297,13 +304,17 @@ __global__ void D1AttnKernel(const float* __restrict__ q,
   __shared__ float red[kThreads];
   qs[threadIdx.x] = q[(static_cast<std::size_t>(t) * heads + h) * hd + threadIdx.x];
   __syncthreads();
-  const std::uint32_t first =
-      window > 0 && t + 1 > window ? t + 1 - window : 0;
-  const std::uint32_t last = window > 0 ? t : n - 1;
+  std::uint32_t first = static_cast<std::uint32_t>(seq_lo[t]);
+  std::uint32_t last = static_cast<std::uint32_t>(seq_hi[t]) - 1;
+  if (window > 0) {
+    last = t;
+    if (t + 1 > window && t + 1 - window > first)
+      first = t + 1 - window;
+  }
   float local_max = -INFINITY;
   for (std::uint32_t s = threadIdx.x; s < n; s += blockDim.x) {
     bool valid = s >= first && s <= last;
-    if (valid && window == 0 && groups != nullptr) {
+    if (valid && window == 0) {
       const std::int32_t own = groups[t], key = groups[s];
       valid = own < 0 || key < 0 || own == key;
     }
@@ -343,7 +354,7 @@ __global__ void D1AttnKernel(const float* __restrict__ q,
   const float inv = 1.0F / red[0];
   const float g = 1.0F / (1.0F + __expf(-gate[static_cast<std::size_t>(t) * heads + h]));
   float acc = 0.0F;
-  for (std::uint32_t s = 0; s < n; ++s) {
+  for (std::uint32_t s = first; s <= last; ++s) {
     const float p = sc[s];
     if (p != 0.0F)
       acc += p * v[static_cast<std::size_t>(s) * kv_dim + kh * hd + threadIdx.x];
@@ -389,6 +400,8 @@ struct D1NpuModel::Impl {
       *sel_norm{nullptr}, *logit_buf{nullptr};
   __half* half_buf{nullptr};
   std::int32_t *ids{nullptr}, *group_buf{nullptr}, *vocab_ids{nullptr};
+  std::int32_t *seq_lo_h{nullptr}, *seq_hi_h{nullptr};  // pinned, per token
+  std::int32_t *seq_lo{nullptr}, *seq_hi{nullptr};      // device copies
   mutable std::int32_t vocab_capacity{0};
 
   mutable double t_encode{0}, t_gemm{0}, t_half{0}, t_memset{0}, t_enckernel{0}, t_final{0};
@@ -596,9 +609,13 @@ std::unique_ptr<D1NpuModel> D1NpuModel::Create(const core::GgufReader& reader,
                 std::getenv("GUFO_D1_SYNC") != nullptr;
   s.ids = PinnedAlloc<std::int32_t>(M);
   s.group_buf = PinnedAlloc<std::int32_t>(M);
+  s.seq_lo_h = PinnedAlloc<std::int32_t>(M);
+  s.seq_hi_h = PinnedAlloc<std::int32_t>(M);
+  s.seq_lo = DeviceAlloc<std::int32_t>(M);
+  s.seq_hi = DeviceAlloc<std::int32_t>(M);
   if (!s.x || !s.z || !s.z2 || !s.branch || !s.p_buf || !s.conv_out ||
       !s.qkv_buf || !s.q || !s.k || !s.v || !s.qn || !s.kn || !s.gate_buf ||
-      !s.attn || !s.gu_buf || !s.act || !s.half_buf || !s.ids || !s.group_buf)
+      !s.attn || !s.gu_buf || !s.act || !s.half_buf || !s.ids || !s.group_buf || !s.seq_lo_h || !s.seq_hi_h || !s.seq_lo || !s.seq_hi)
     return fail("scratch allocation failed");
 
   // GGUF tensors are mmap'd file pages the GPU cannot fault on: copy what
@@ -731,6 +748,7 @@ std::unique_ptr<D1NpuModel> D1NpuModel::Create(const core::GgufReader& reader,
 
 bool D1NpuModel::Forward(std::span<const std::uint32_t> tokens,
                          std::span<const std::int32_t> groups,
+                         std::span<const std::uint32_t> sequences,
                          std::span<const std::uint32_t> slots,
                          std::span<const std::uint32_t> vocabulary,
                          std::span<float> logits) const {
@@ -767,7 +785,35 @@ bool D1NpuModel::Forward(std::span<const std::uint32_t> tokens,
 
   for (std::uint32_t i = 0; i < n; ++i)
     s.ids[i] = static_cast<std::int32_t>(tokens[i]);
-  if (!groups.empty())
+  // Sequences: ascending start offsets (first 0); empty means one sequence.
+  {
+    std::uint32_t begin = 0;
+    const std::size_t count = sequences.empty() ? 1 : sequences.size();
+    if (!sequences.empty() && sequences[0] != 0)
+      return false;
+    for (std::size_t i = 0; i < count; ++i) {
+      const std::uint32_t lo = sequences.empty() ? 0 : sequences[i];
+      const std::uint32_t hi =
+          (!sequences.empty() && i + 1 < count) ? sequences[i + 1] : n;
+      if (lo < begin || hi <= lo || hi > n)
+        return false;
+      for (std::uint32_t t = lo; t < hi; ++t) {
+        s.seq_lo_h[t] = static_cast<std::int32_t>(lo);
+        s.seq_hi_h[t] = static_cast<std::int32_t>(hi);
+      }
+      begin = hi;
+    }
+    if (begin != n)
+      return false;
+    hipMemcpyAsync(s.seq_lo, s.seq_lo_h, n * sizeof(std::int32_t),
+                   hipMemcpyHostToDevice, s.stream);
+    hipMemcpyAsync(s.seq_hi, s.seq_hi_h, n * sizeof(std::int32_t),
+                   hipMemcpyHostToDevice, s.stream);
+  }
+  if (groups.empty())
+    for (std::uint32_t t = 0; t < n; ++t)
+      s.group_buf[t] = -1;
+  else
     std::memcpy(s.group_buf, groups.data(), groups.size_bytes());
   const int kind = s.w.embedding.type == GgmlType::kQ6_K   ? 1
                    : s.w.embedding.type == GgmlType::kQ8_0 ? 2
@@ -825,7 +871,7 @@ bool D1NpuModel::Forward(std::span<const std::uint32_t> tokens,
       hipLaunchKernelGGL(D1ConvKernel, dim3((H + 127) / 128, n), dim3(128), 0,
                          s.stream, s.p_buf,
                          s.g_conv + static_cast<std::size_t>(l) * H * s.taps,
-                         s.conv_out, n, H, s.taps);
+                         s.seq_lo, s.conv_out, n, H, s.taps);
       s.EncodeA(s.conv_out, n, H, s.a_h);
       if (!s.Gemm(s.prog_h, s.a_h, s.w_out[l], s.c_h))
         return false;
@@ -855,13 +901,11 @@ bool D1NpuModel::Forward(std::span<const std::uint32_t> tokens,
       hipLaunchKernelGGL(D1RopeKernel, dim3(n, heads + kv_heads), dim3(hd / 2),
                          0, s.stream, s.qn, s.kn,
                          swa ? static_cast<const float*>(nullptr) : s.g_factors,
-                         n, heads, kv_heads, hd, swa ? c.theta_swa : c.theta);
+                         s.seq_lo, n, heads, kv_heads, hd,
+                         swa ? c.theta_swa : c.theta);
       hipLaunchKernelGGL(D1AttnKernel, dim3(n, heads), dim3(hd), 0, s.stream,
-                         s.qn, s.kn, s.v, s.gate_buf,
-                         groups.empty()
-                             ? static_cast<const std::int32_t*>(nullptr)
-                             : s.group_buf,
-                         s.attn, n, heads, kv_heads, hd, scale,
+                         s.qn, s.kn, s.v, s.gate_buf, s.group_buf, s.seq_lo,
+                         s.seq_hi, s.attn, n, heads, kv_heads, hd, scale,
                          swa ? c.window : 0u);
       s.EncodeA(s.attn, n, q_dim, s.a_h);
       if (!s.Gemm(s.prog_h, s.a_h, s.w_out[l], s.c_h))

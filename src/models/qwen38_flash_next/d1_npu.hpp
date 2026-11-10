@@ -32,9 +32,13 @@ public:
 
   /// `groups` is empty for a lone question (full bidirectional global
   /// attention) or one tag per token (-1 state, 1.. question ids).
+  /// `sequences` lists ascending start offsets of independent sequences
+  /// packed into the one pass (empty = a single sequence); tokens never see,
+  /// convolve with or rotate relative to another sequence.
   /// `logits` receives slots.size() * vocabulary.size() floats.
   [[nodiscard]] bool Forward(std::span<const std::uint32_t> tokens,
                              std::span<const std::int32_t> groups,
+                             std::span<const std::uint32_t> sequences,
                              std::span<const std::uint32_t> slots,
                              std::span<const std::uint32_t> vocabulary,
                              std::span<float> logits) const;
