@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -23,7 +24,10 @@
 #include "src/models/qwen38_flash_next/jev_finish.hpp"
 
 #if defined(GUFO_NPU)
+#include <hip/hip_runtime.h>
+
 #include "src/models/lfm3/tokenizer.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/npu_gemm.hpp"
 #include "src/models/qwen38_flash_next/d1_npu.hpp"
 #include "src/models/qwen38_flash_next/jev_npu.hpp"
 #endif
@@ -281,6 +285,7 @@ int RunJudge(std::span<const char* const> args) {
   bool code = false;
   bool batched = false;
   bool pack_test = false;
+  bool npu_scale_bench = false;
   std::string generate_prompt;
   int max_new = 64;
   int draft_len = 15;
@@ -316,6 +321,9 @@ int RunJudge(std::span<const char* const> args) {
   parser.AddOption("", "--draft", "N",
                    "Prompt-lookup draft tokens per pass, 0 = off (default 15)",
                    "Generate", &draft_len);
+  parser.AddFlag("", "--npu-scale-bench",
+                 "Time the K=2048,N=1024 NPU GEMM at M=512..4096 (compute vs overhead)",
+                 "Battery", &npu_scale_bench);
   parser.AddFlag("", "--pack-test",
                  "Compare four different-context decisions: one by one vs one packed pass",
                  "Battery", &pack_test);
@@ -352,6 +360,57 @@ int RunJudge(std::span<const char* const> args) {
   if (model_path.empty()) {
     std::fprintf(stderr, "judge: --model is required\n");
     return 2;
+  }
+  if (npu_scale_bench) {
+#if defined(GUFO_NPU)
+    const char* dir_env = std::getenv("GUFO_NPU_DIR");
+    const std::string dir = dir_env ? dir_env : "tools/npu";
+    hipStream_t stream;
+    (void)hipStreamCreate(&stream);
+    for (std::uint32_t m : {512u, 1024u, 2048u, 4096u}) {
+      models::qwen38_flash_next::rocm::NpuGemm::Config cfg;
+      cfg.xclbin = dir + "/runtime_mk/final_4096xKx1024_128x64x128.xclbin";
+      cfg.insts = dir + "/runtime_mk/insts_" + std::to_string(m) +
+                  "x2048x1024_128x64x128.txt";
+      cfg.tokens = m;
+      cfg.k = 2048;
+      cfg.n = 1024;
+      std::string e;
+      auto gemm = models::qwen38_flash_next::rocm::NpuGemm::Create(cfg, &e);
+      if (!gemm) {
+        std::printf("M=%u: %s\n", m, e.c_str());
+        continue;
+      }
+      const int a = gemm->NewBuffer(gemm->ABytes(), nullptr);
+      const int b = gemm->NewBuffer(gemm->BBytes(), nullptr);
+      const int c = gemm->NewBuffer(gemm->CBytes(), nullptr);
+      std::memset(gemm->Host(a), 0, gemm->ABytes());
+      std::memset(gemm->Host(b), 0, gemm->BBytes());
+      gemm->FinalizeWeights(a);
+      gemm->FinalizeWeights(b);
+      const int bs[1] = {b};
+      const int cs[1] = {c};
+      for (int i = 0; i < 5; ++i) {
+        gemm->Submit(stream, a, bs, cs, 1, 0);
+        gemm->Wait(stream);
+        (void)hipStreamSynchronize(stream);
+      }
+      const int reps = 40;
+      const auto t0 = std::chrono::steady_clock::now();
+      for (int i = 0; i < reps; ++i) {
+        gemm->Submit(stream, a, bs, cs, 1, 0);
+        gemm->Wait(stream);
+        (void)hipStreamSynchronize(stream);
+      }
+      const double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0).count() /
+                        reps;
+      const double flop = 2.0 * m * 2048.0 * 1024.0;
+      std::printf("M=%u K=2048 N=1024: %.3f ms/call  (%.2f TFLOP/s, weights %.1f MB)\n",
+                  m, ms, flop / ms / 1e9, gemm->BBytes() / 1e6);
+    }
+    return 0;
+#endif
   }
   if (!stdio && !battery && !code && !pack_test && question.empty() &&
       generate_prompt.empty()) {
