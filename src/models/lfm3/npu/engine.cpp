@@ -148,8 +148,8 @@ struct Engine::Impl {
   xrt::device dev;
   xrt::hw_context ctx;
   xrt::kernel kern;
-  Prog p_in, p_h, p_qkv, p_gu, p_down;
-  std::vector<Mat> m_in, m_out, m_qkv, m_gu, m_down;
+  Prog p_in, p_h, p_qkv, p_ffn;
+  std::vector<Mat> m_in, m_out, m_qkv, m_ffn;
   std::uint32_t H{}, I{}, heads{}, hd{}, kvh{}, qd{}, kvd{}, taps{}, window{};
   std::uint32_t pos{0};
   std::vector<std::vector<float>> gate_w;
@@ -166,12 +166,11 @@ struct Engine::Impl {
   double t_gu_dec{0}, t_gu_enc{0}, t_swi{0}, t_dn_enc{0}, t_gu_wait{0}, t_dn_wait{0};
   int calls{0};
 
-  Prog MakeProg(std::uint32_t K, std::uint32_t N, std::string* err) {
+  Prog MakeProg(std::uint32_t K, std::uint32_t N, const std::string& file, std::size_t c_override, std::string* err) {
     Prog p;
     p.K = K;
     p.N = N;
-    const std::string path = opt.programs + "/insts_16x" + std::to_string(K) +
-                             "x" + std::to_string(N) + "_16x64x128.txt";
+    const std::string path = opt.programs + "/" + file;
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f)
       throw std::runtime_error("missing " + path);
@@ -184,7 +183,7 @@ struct Engine::Impl {
     std::memcpy(p.insts.map<void*>(), buf.data(), sz);
     p.insts.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     const std::size_t ab = std::size_t{kRows} * K / 8 * 9;
-    const std::size_t cb = std::size_t{kRows} * N / 8 * 9;
+    const std::size_t cb = c_override ? c_override : std::size_t{kRows} * N / 8 * 9;
     p.a = xrt::bo(dev, ab, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(3));
     p.c = xrt::bo(dev, cb, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(3));
     p.ah = p.a.map<std::uint8_t*>();
@@ -216,12 +215,18 @@ struct Engine::Impl {
   }
 
   Mat Pack(const float* W, std::uint32_t N, std::uint32_t K) {
-    const std::uint32_t strips = N / kStrip, tk = K / kTileK;
     Mat m;
-    m.bytes = std::size_t{strips} * tk * 4 * kQuarterBytes;
+    m.bytes = std::size_t{N / kStrip} * (K / kTileK) * 4 * kQuarterBytes;
     m.bo = xrt::bo(dev, m.bytes, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(3));
     m.host = m.bo.map<std::uint8_t*>();
     std::memset(m.host, 0, m.bytes);
+    PackInto(W, N, K, m.host);
+    m.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    return m;
+  }
+
+  void PackInto(const float* W, std::uint32_t N, std::uint32_t K, std::uint8_t* dst) {
+    const std::uint32_t strips = N / kStrip, tk = K / kTileK;
     std::vector<std::int8_t> q(std::size_t{N} * K);
     std::vector<std::uint16_t> sc(std::size_t{N} * (K / 32));
 #pragma omp parallel for
@@ -247,7 +252,7 @@ struct Engine::Impl {
       for (std::int64_t t = 0; t < tk; ++t)
         for (int r = 0; r < 4; ++r) {
           std::uint8_t* base =
-              m.host + ((std::size_t(s2) * tk + t) * 4 + r) * kQuarterBytes;
+              dst + ((std::size_t(s2) * tk + t) * 4 + r) * kQuarterBytes;
           auto* words = reinterpret_cast<std::uint16_t*>(base);
           auto* scl = reinterpret_cast<std::uint16_t*>(base + kWordBytes);
           for (int p = 0; p < 32; ++p) {
@@ -271,8 +276,6 @@ struct Engine::Impl {
                       sc[n * (K / 32) + t * 2 + qq];
                 }
         }
-    m.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    return m;
   }
 
   void Attach(Mat& m, Prog& p) {
@@ -304,8 +307,12 @@ struct Engine::Impl {
       }
   }
 
-  void DecodeC(float* y, std::uint32_t n, Prog& p) {
-    const std::uint32_t strips = p.N / kStrip;
+  void DecodeC(float* y, std::uint32_t n, Prog& p, const std::uint8_t* base = nullptr, std::uint32_t N = 0) {
+    if (!base) {
+      base = p.ch;
+      N = p.N;
+    }
+    const std::uint32_t strips = N / kStrip;
 #pragma omp parallel for
     for (std::int64_t s = 0; s < strips; ++s)
       for (int r = 0; r < 4; ++r)
@@ -316,15 +323,47 @@ struct Engine::Impl {
             continue;
           const std::size_t col = std::size_t(s) * 128 + r * 32 + sb * 16 +
                                   (acc & 1) * 8;
-          DecGroup(p.ch + ((std::size_t(s) * 256) + r * 64 + G) * 9,
-                   y + std::size_t(row) * p.N + col);
+          DecGroup(base + ((std::size_t(s) * 256) + r * 64 + G) * 9,
+                   y + std::size_t(row) * N + col);
         }
+  }
+
+  void Ffn(const Mat& m, const float* x, std::uint32_t n, float* y) {
+    Prog& p = p_ffn;
+    auto t0 = Clock::now();
+    EncodeA(x, n, p.K, p);
+    t_enc += Ms(t0);
+    t0 = Clock::now();
+    p.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    t_syncA += Ms(t0);
+    t0 = Clock::now();
+    auto& run = const_cast<Mat&>(m).run;
+    run.start();
+    t_submit += Ms(t0);
+    t0 = Clock::now();
+    for (;;) {
+      const auto st = run.state();
+      if (st == ERT_CMD_STATE_COMPLETED)
+        break;
+      if (st != ERT_CMD_STATE_NEW && st != ERT_CMD_STATE_QUEUED && st != ERT_CMD_STATE_RUNNING &&
+          st != ERT_CMD_STATE_SUBMITTED)
+        break;
+    }
+    run.wait();
+    t_wait += Ms(t0);
+    t0 = Clock::now();
+    p.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    t_syncC += Ms(t0);
+    t0 = Clock::now();
+    DecodeC(y, n, p, p.ch + std::size_t{120} * 256 * 9, 2048);
+    t_dec += Ms(t0);
+    calls += 1;
   }
 
   void Gemm(Prog& p, const Mat& m, const float* x, std::uint32_t n, float* y) {
     auto t0 = Clock::now();
     EncodeA(x, n, p.K, p);
-    { const double d = Ms(t0); t_enc += d; if (&p == &p_gu) t_gu_enc += d; if (&p == &p_down) t_dn_enc += d; }
+    { const double d = Ms(t0); t_enc += d; }
     t0 = Clock::now();
     p.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     t_syncA += Ms(t0);
@@ -347,14 +386,14 @@ struct Engine::Impl {
       }
       run.wait();
     }
-    { const double d = Ms(t0); t_wait += d; if (&p == &p_gu) t_gu_wait += d; if (&p == &p_down) t_dn_wait += d; }
+    { const double d = Ms(t0); t_wait += d; }
     t0 = Clock::now();
     p.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
     t_syncC += Ms(t0);
     t_run += t_submit * 0;
     t0 = Clock::now();
     DecodeC(y, n, p);
-    { const double d = Ms(t0); t_dec += d; if (&p == &p_gu) t_gu_dec += d; }
+    { const double d = Ms(t0); t_dec += d; }
     ++calls;
   }
 };
@@ -649,22 +688,20 @@ std::unique_ptr<Engine> Engine::Create(const Options& options,
     if (!options.bf16.empty())
       s.have_st = s.st.Open(options.bf16);
     s.dev = xrt::device(0u);
-    const xrt::xclbin xb{options.programs + "/final_16x2048x1024_16x64x128.xclbin"};
+    const xrt::xclbin xb{options.programs + "/final_16x64x128_ffn.xclbin"};
     s.dev.register_xclbin(xb);
     s.ctx = xrt::hw_context(s.dev, xb.get_uuid());
     s.kern = xrt::kernel(s.ctx, xb.get_kernels().at(0).get_name());
-    s.p_in = s.MakeProg(2048, 6144, error);
-    s.p_h = s.MakeProg(2048, 2048, error);
-    s.p_qkv = s.MakeProg(2048, 3072, error);
-    s.p_gu = s.MakeProg(2048, 15360, error);
-    s.p_down = s.MakeProg(7680, 2048, error);
+    s.p_in = s.MakeProg(2048, 6144, "insts_plain_2048x6144.txt", 0, error);
+    s.p_h = s.MakeProg(2048, 2048, "insts_plain_2048x2048.txt", 0, error);
+    s.p_qkv = s.MakeProg(2048, 3072, "insts_plain_2048x3072.txt", 0, error);
+    s.p_ffn = s.MakeProg(2048, 2048, "insts_ffn.txt", (std::size_t{120} * 256 + 16 * 256) * 9, error);
     const auto t0 = Clock::now();
     const std::size_t L = c.layers.size();
     s.m_in.resize(L);
     s.m_out.resize(L);
     s.m_qkv.resize(L);
-    s.m_gu.resize(L);
-    s.m_down.resize(L);
+    s.m_ffn.resize(L);
     s.gate_w.resize(L);
     s.k_cache.resize(L);
     s.v_cache.resize(L);
@@ -702,14 +739,31 @@ std::unique_ptr<Engine> Engine::Create(const Options& options,
         s.k_cache[l].assign(std::size_t{s.capacity[l]} * s.kvd, 0.0f);
         s.v_cache[l].assign(std::size_t{s.capacity[l]} * s.kvd, 0.0f);
       }
-      buf.resize(std::size_t{15360} * 2048);
-      s.LoadRows(pre + "feed_forward.w1.weight", lw.gate, buf.data(), 7680, 2048);
-      s.LoadRows(pre + "feed_forward.w3.weight", lw.up,
-                 buf.data() + std::size_t{7680} * 2048, 7680, 2048);
-      s.m_gu[l] = s.Pack(buf.data(), 15360, 2048); s.Attach(s.m_gu[l], s.p_gu);
-      buf.resize(std::size_t{2048} * 7680);
-      s.LoadRows(pre + "feed_forward.w2.weight", lw.down, buf.data(), 2048, 7680);
-      s.m_down[l] = s.Pack(buf.data(), 2048, 7680); s.Attach(s.m_down[l], s.p_down);
+      {
+        std::vector<float> gate(std::size_t{7680} * 2048), up(std::size_t{7680} * 2048);
+        s.LoadRows(pre + "feed_forward.w1.weight", lw.gate, gate.data(), 7680, 2048);
+        s.LoadRows(pre + "feed_forward.w3.weight", lw.up, up.data(), 7680, 2048);
+        buf.resize(std::size_t{15360} * 2048);
+        for (std::size_t f = 0; f < 7680 / 8; ++f)
+          for (std::size_t i = 0; i < 8; ++i) {
+            std::memcpy(&buf[(f * 16 + i) * 2048], &gate[(f * 8 + i) * 2048], 2048 * 4);
+            std::memcpy(&buf[(f * 16 + 8 + i) * 2048], &up[(f * 8 + i) * 2048], 2048 * 4);
+          }
+        const std::size_t gu_bytes = std::size_t{120} * 32 * 4 * kQuarterBytes;
+        const std::size_t dn_bytes = std::size_t{16} * 120 * 4 * kQuarterBytes;
+        Mat m;
+        m.bytes = gu_bytes + dn_bytes;
+        m.bo = xrt::bo(s.dev, m.bytes, XRT_BO_FLAGS_HOST_ONLY, s.kern.group_id(3));
+        m.host = m.bo.map<std::uint8_t*>();
+        std::memset(m.host, 0, m.bytes);
+        s.PackInto(buf.data(), 15360, 2048, m.host);
+        buf.resize(std::size_t{2048} * 7680);
+        s.LoadRows(pre + "feed_forward.w2.weight", lw.down, buf.data(), 2048, 7680);
+        s.PackInto(buf.data(), 2048, 7680, m.host + gu_bytes);
+        m.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        s.m_ffn[l] = std::move(m);
+        s.Attach(s.m_ffn[l], s.p_ffn);
+      }
     }
     std::fprintf(stderr, "npu engine: packed %zu layers in %.1f s\n", L,
                  Ms(t0) / 1000.0);
@@ -885,23 +939,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens,
     }
     RmsNorm(x.data(), static_cast<const float*>(lw.ffn_norm.data), z.data(), n, H, c.eps);
     s.t_cpu += Ms(cpu0);
-    s.Gemm(s.p_gu, s.m_gu[l], z.data(), n, gu.data());
-    cpu0 = Clock::now();
-    const auto swi0 = Clock::now();
-    for (std::uint32_t t = 0; t < n; ++t) {
-      const float* g = &gu[std::size_t{t} * 15360];
-      const float* u = g + I;
-      float* o = &act[std::size_t{t} * I];
-#pragma omp parallel for schedule(static) num_threads(8)
-      for (std::int64_t c0 = 0; c0 < I; c0 += 960) {
-#pragma omp simd
-        for (std::int64_t i = c0; i < c0 + 960; ++i)
-          o[i] = g[i] / (1.0f + std::exp(-g[i])) * u[i];
-      }
-    }
-    s.t_swi += Ms(swi0);
-    s.t_cpu += Ms(cpu0);
-    s.Gemm(s.p_down, s.m_down[l], act.data(), n, branch.data());
+    s.Ffn(s.m_ffn[l], z.data(), n, branch.data());
     cpu0 = Clock::now();
     if (lw.post_ffn_norm.data) {
       RmsNorm(branch.data(), static_cast<const float*>(lw.post_ffn_norm.data), z2.data(), n, H, c.eps);
