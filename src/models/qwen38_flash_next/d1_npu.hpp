@@ -54,6 +54,8 @@ public:
   void ResetState() const;
   [[nodiscard]] std::uint32_t Position() const;
   [[nodiscard]] std::uint32_t MaxContext() const;
+  /// Rows one NPU pass computes (4 x the program tile: 512 or 256).
+  [[nodiscard]] std::uint32_t PassRows() const;
   [[nodiscard]] bool Step(std::span<const std::uint32_t> tokens,
                           std::span<std::uint32_t> next_tokens) const;
   void Commit(std::uint32_t accepted) const;

@@ -92,6 +92,104 @@ __device__ void D1DequantUnit(const std::uint8_t* b, float* o) {
   }
 }
 
+/// Block-float group: one shared exponent byte, eight signed 8-bit mantissas
+/// (value = q * 2^(e - 127) / 64). Same encoding as the shared NPU staging.
+__device__ inline void D1EncodeGroup(const float* v, std::uint8_t* out) {
+  unsigned max_exp = 0;
+#pragma unroll
+  for (int i = 0; i < 8; ++i)
+    max_exp = max(max_exp, (__float_as_uint(v[i]) >> 23) & 0xFFu);
+  const float inv = __uint_as_float(max_exp >= 7 ? (260u - max_exp) << 23 : 0u);
+  out[0] = static_cast<std::uint8_t>(max_exp);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const float q = fminf(127.0F, fmaxf(-128.0F, rintf(v[i] * inv)));
+    out[1 + i] = static_cast<std::uint8_t>(static_cast<std::int8_t>(q));
+  }
+}
+
+/// A tiles of TileM rows x 64 K for an NPU program built with m = TileM.
+template<int TileM>
+__global__ void __launch_bounds__(256)
+    D1EncodeActKernel(const __half* __restrict__ x, std::uint8_t* __restrict__ out,
+                      std::uint32_t k_slice, std::size_t ldx,
+                      std::uint32_t valid_rows) {
+  __shared__ __align__(16) __half tile[TileM * 64];
+  __shared__ __align__(16) std::uint8_t staged[TileM * 64 / 8 * 9];
+  const std::uint32_t tiles_k = k_slice / 64;
+  const std::uint32_t tile_row = blockIdx.x / tiles_k;
+  const std::uint32_t tile_col = blockIdx.x % tiles_k;
+  const std::uint32_t t = threadIdx.x;
+#pragma unroll
+  for (int j = 0; j < TileM / 32; ++j) {
+    const std::uint32_t row = (t >> 3) + 32 * j;
+    const std::uint32_t vec = t & 7;
+    const std::uint32_t col = tile_col * 64 + vec * 8;
+    uint4 raw = make_uint4(0, 0, 0, 0);
+    const std::size_t abs_row = std::size_t{tile_row} * TileM + row;
+    if (abs_row < valid_rows)
+      raw = *reinterpret_cast<const uint4*>(&x[abs_row * ldx + col]);
+    *reinterpret_cast<uint4*>(&tile[row * 64 + vec * 8]) = raw;
+  }
+  __syncthreads();
+#pragma unroll
+  for (int j = 0; j < TileM / 32; ++j) {
+    const std::uint32_t gi = t + 256 * j;
+    const std::uint32_t rib = gi & 7;
+    const std::uint32_t block = (gi >> 3) & 1;
+    const std::uint32_t sc = (gi >> 4) & 7;
+    const std::uint32_t sr = gi >> 7;
+    const std::uint32_t row = sr * 16 + block * 8 + rib;
+    const uint4 raw = *reinterpret_cast<const uint4*>(&tile[row * 64 + sc * 8]);
+    const __half* h = reinterpret_cast<const __half*>(&raw);
+    float v[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+      v[i] = __half2float(h[i]);
+    D1EncodeGroup(v, staged + gi * 9);
+  }
+  __syncthreads();
+  const uint4* src = reinterpret_cast<const uint4*>(staged);
+  uint4* dst = reinterpret_cast<uint4*>(
+      out + static_cast<std::size_t>(blockIdx.x) * (TileM * 64 / 8 * 9));
+  for (std::uint32_t i = t; i < TileM * 64 / 8 * 9 / 16; i += 256)
+    dst[i] = src[i];
+}
+
+/// C tiles of (4 * TileM) rows x 128 columns -> row-major floats.
+template<int TileM>
+__global__ void D1DecodeOutKernel(const std::uint8_t* __restrict__ in,
+                                  float* __restrict__ out, std::uint32_t tokens,
+                                  std::uint32_t cols, std::size_t out_pitch,
+                                  std::uint32_t valid_cols) {
+  constexpr std::uint32_t kRows = 4 * TileM;
+  const std::uint32_t padded = (tokens + kRows - 1) / kRows * kRows;
+  const std::size_t g = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
+  if (g >= std::size_t{padded} * cols / 8)
+    return;
+  constexpr std::uint32_t kGroupsPerTile = kRows * 128 / 8;
+  const std::size_t tile = g / kGroupsPerTile;
+  const std::uint32_t gi = static_cast<std::uint32_t>(g % kGroupsPerTile);
+  const std::uint32_t tiles_n = cols / 128;
+  const std::uint32_t tile_row = static_cast<std::uint32_t>(tile / tiles_n);
+  const std::uint32_t tile_col = static_cast<std::uint32_t>(tile % tiles_n);
+  const std::uint32_t rib = gi & 7;
+  const std::uint32_t bc = (gi >> 3) & 1;
+  const std::uint32_t br = (gi >> 4) & 1;
+  const std::uint32_t sc = (gi >> 5) & 7;
+  const std::uint32_t sr = gi >> 8;
+  const std::size_t row = std::size_t{tile_row} * kRows + (sr * 2 + br) * 8 + rib;
+  const std::uint32_t col = tile_col * 128 + (sc * 2 + bc) * 8;
+  if (row >= tokens || (valid_cols != 0 && col >= valid_cols))
+    return;
+  const std::uint8_t* p = in + g * 9;
+  const float mult = ldexpf(1.0F, static_cast<int>(p[0]) - 127) / 64.0F;
+  float* dst = out + row * out_pitch + col;
+#pragma unroll
+  for (int i = 0; i < 8; ++i)
+    dst[i] = static_cast<float>(static_cast<std::int8_t>(p[1 + i])) * mult;
+}
+
 template<int Kind>
 __global__ void D1EmbedKernel(const std::uint8_t* __restrict__ table,
                               const std::int32_t* __restrict__ ids,
@@ -546,6 +644,8 @@ struct D1NpuModel::Impl {
   std::int32_t* argmax_host{nullptr};
   bool Layers(std::uint32_t n);
   mutable double t_encode{0}, t_gemm{0}, t_half{0}, t_memset{0}, t_enckernel{0}, t_final{0};
+  std::uint32_t tile_m{128};    // NPU program tile rows per core row (128 or 64)
+  std::uint32_t pass_rows{512}; // rows the program computes per pass (4 * tile_m)
   bool prof_fine{false};
   bool sync_each{true};
   mutable int n_gemm{0};
@@ -566,7 +666,7 @@ struct D1NpuModel::Impl {
                               std::chrono::steady_clock::now() - t0).count();
       }
     } done{this, t0};
-    const std::uint32_t enc_rows = (n + 127u) / 128u * 128u;
+    const std::uint32_t enc_rows = (n + tile_m - 1) / tile_m * tile_m;
     const bool fine = prof_fine;
     auto lap = [&](double& acc, std::chrono::steady_clock::time_point& t) {
       if (!fine)
@@ -587,8 +687,15 @@ struct D1NpuModel::Impl {
                    static_cast<std::size_t>(enc_rows - n) * cols * sizeof(__half),
                    stream);
     lap(t_memset, t);
-    rocm::NpuEncodeActivations(half_buf, cols, enc_rows, cols, 0, cols,
-                               npu->Device(buf), stream);
+    if (tile_m == 128)
+      rocm::NpuEncodeActivations(half_buf, cols, enc_rows, cols, 0, cols,
+                                 npu->Device(buf), stream);
+    else
+      hipLaunchKernelGGL(D1EncodeActKernel<64>,
+                         dim3(enc_rows / 64 * (cols / 64)), dim3(256), 0,
+                         stream, half_buf,
+                         static_cast<std::uint8_t*>(npu->Device(buf)), cols,
+                         static_cast<std::size_t>(cols), enc_rows);
     lap(t_enckernel, t);
     // FinalizeWeights only copies in isolate mode (the GPU must be done then);
     // otherwise the stream already orders the encode before the NPU run.
@@ -626,6 +733,23 @@ struct D1NpuModel::Impl {
     if (sync_each)
       hipStreamSynchronize(stream);
     return npu->Healthy();
+  }
+
+  // Block-float C stream -> row-major floats (first valid_cols columns).
+  void Decode(int c_buf, float* out, std::uint32_t n, std::uint32_t cols,
+              std::size_t pitch, std::uint32_t valid_cols) const {
+    if (tile_m == 128) {
+      rocm::NpuDecodeOutput(npu->Staged(stream, c_buf), out, n, cols, pitch, 0,
+                            false, stream, valid_cols);
+      return;
+    }
+    const std::uint32_t rows = (n + 255u) / 256u * 256u;
+    const std::size_t groups = std::size_t{rows} * cols / 8;
+    hipLaunchKernelGGL(D1DecodeOutKernel<64>,
+                       dim3(static_cast<std::uint32_t>((groups + 255) / 256)),
+                       dim3(256), 0, stream,
+                       static_cast<const std::uint8_t*>(npu->Staged(stream, c_buf)),
+                       out, n, cols, pitch, valid_cols);
   }
 
   void Add(float* dst, const float* src, std::uint32_t n) const {
@@ -683,9 +807,15 @@ std::unique_ptr<D1NpuModel> D1NpuModel::Create(const core::GgufReader& reader,
 
   const char* npu_dir = std::getenv("GUFO_NPU_DIR");
   const std::string dir = npu_dir ? npu_dir : "tools/npu";
+  // GUFO_D1_TILE=64 selects the 256-row NPU program (m = 64 per core row).
+  if (const char* tile_env = std::getenv("GUFO_D1_TILE"))
+    impl->tile_m = std::atoi(tile_env) == 64 ? 64u : 128u;
+  impl->pass_rows = 4 * impl->tile_m;
+  const std::string tile_tag = std::to_string(impl->tile_m) + "x64x128";
+  const std::uint32_t pass_rows = impl->pass_rows;
   auto insts = [&](std::uint32_t k, std::uint32_t n) {
-    return dir + "/runtime_mk/insts_" + std::to_string(M) + "x" +
-           std::to_string(k) + "x" + std::to_string(n) + "_128x64x128.txt";
+    return dir + "/runtime_mk/insts_" + std::to_string(pass_rows) + "x" +
+           std::to_string(k) + "x" + std::to_string(n) + "_" + tile_tag + ".txt";
   };
   const std::pair<std::uint32_t, std::uint32_t> shapes[] = {
       {2048, 1024}, {2048, 2048}, {2048, 3072},
@@ -695,9 +825,9 @@ std::unique_ptr<D1NpuModel> D1NpuModel::Create(const core::GgufReader& reader,
       return fail("missing instruction file " + insts(k, n));
 
   rocm::NpuGemm::Config cfg;
-  cfg.xclbin = dir + "/runtime_mk/final_4096xKx1024_128x64x128.xclbin";
+  cfg.xclbin = dir + "/runtime_mk/final_4096xKx1024_" + tile_tag + ".xclbin";
   cfg.insts = insts(2048, 1024);
-  cfg.tokens = M;
+  cfg.tokens = pass_rows;
   cfg.k = 2048;
   cfg.n = 1024;
   impl->npu = rocm::NpuGemm::Create(cfg, &err);
@@ -713,7 +843,7 @@ std::unique_ptr<D1NpuModel> D1NpuModel::Create(const core::GgufReader& reader,
     return fail("program load failed: " + err);
 
   hipStreamCreate(&impl->stream);
-  auto a_bytes = [](std::size_t cols) { return std::size_t{M} * cols / 8 * 9; };
+  auto a_bytes = [&](std::size_t cols) { return std::size_t{pass_rows} * cols / 8 * 9; };
   impl->a_h = impl->npu->NewBuffer(a_bytes(H), nullptr);
   impl->a_i = impl->npu->NewBuffer(a_bytes(I), nullptr);
   impl->c_in = impl->npu->NewBuffer(a_bytes(Impl::kInPitch), nullptr);
@@ -926,8 +1056,7 @@ bool D1NpuModel::Impl::Layers(std::uint32_t n) {
       s.EncodeA(s.z, n, H, s.a_h);
       if (!s.Gemm(s.prog_in, s.a_h, s.w_in[l], s.c_in))
         return false;
-      rocm::NpuDecodeOutput(s.npu->Staged(s.stream, s.c_in), s.p_buf, n,
-                            Impl::kInPitch, Impl::kInPitch, 0, false, s.stream);
+      s.Decode(s.c_in, s.p_buf, n, Impl::kInPitch, Impl::kInPitch, 0);
       stat("p", l, s.p_buf, static_cast<std::size_t>(n) * Impl::kInPitch);
       if (s.stateful)
         hipMemcpyAsync(s.conv_bx[l], s.conv_hist[l],
@@ -943,17 +1072,14 @@ bool D1NpuModel::Impl::Layers(std::uint32_t n) {
       s.EncodeA(s.conv_out, n, H, s.a_h);
       if (!s.Gemm(s.prog_h, s.a_h, s.w_out[l], s.c_h))
         return false;
-      rocm::NpuDecodeOutput(s.npu->Staged(s.stream, s.c_h), s.branch, n, H, H,
-                            0, false, s.stream, H);
+      s.Decode(s.c_h, s.branch, n, H, H, H);
       stat("conv", l, s.conv_out, static_cast<std::size_t>(n) * H);
       stat("branch", l, s.branch, static_cast<std::size_t>(n) * H);
     } else {
       s.EncodeA(s.z, n, H, s.a_h);
       if (!s.Gemm(s.prog_qkv, s.a_h, s.w_qkv[l], s.c_qkv))
         return false;
-      rocm::NpuDecodeOutput(s.npu->Staged(s.stream, s.c_qkv), s.qkv_buf, n,
-                            Impl::kQkvPitch, Impl::kQkvPitch, 0, false,
-                            s.stream);
+      s.Decode(s.c_qkv, s.qkv_buf, n, Impl::kQkvPitch, Impl::kQkvPitch, 0);
       hipLaunchKernelGGL(D1SplitQkvKernel, dim3(n), dim3(128), 0, s.stream,
                          s.qkv_buf, s.q, s.k, s.v, n, q_dim, kv_dim,
                          Impl::kQkvPitch);
@@ -995,8 +1121,7 @@ bool D1NpuModel::Impl::Layers(std::uint32_t n) {
       s.EncodeA(s.attn, n, q_dim, s.a_h);
       if (!s.Gemm(s.prog_h, s.a_h, s.w_out[l], s.c_h))
         return false;
-      rocm::NpuDecodeOutput(s.npu->Staged(s.stream, s.c_h), s.branch, n, H, H,
-                            0, false, s.stream, H);
+      s.Decode(s.c_h, s.branch, n, H, H, H);
     }
     rocm::RmsNormRows(s.branch, s.g_post + static_cast<std::size_t>(l) * H,
                       s.z2, n, H, 1, c.eps, s.stream);
@@ -1008,8 +1133,7 @@ bool D1NpuModel::Impl::Layers(std::uint32_t n) {
     s.EncodeA(s.z, n, H, s.a_h);
     if (!s.Gemm(s.prog_gu, s.a_h, s.w_gu[l], s.c_gu))
       return false;
-    rocm::NpuDecodeOutput(s.npu->Staged(s.stream, s.c_gu), s.gu_buf, n,
-                          Impl::kGuPitch, Impl::kGuPitch, 0, false, s.stream);
+    s.Decode(s.c_gu, s.gu_buf, n, Impl::kGuPitch, Impl::kGuPitch, 0);
     hipLaunchKernelGGL(
         D1SwigluKernel,
         dim3(static_cast<std::uint32_t>(
@@ -1019,8 +1143,7 @@ bool D1NpuModel::Impl::Layers(std::uint32_t n) {
     s.EncodeA(s.act, n, I, s.a_i);
     if (!s.Gemm(s.prog_down, s.a_i, s.w_down[l], s.c_h))
       return false;
-    rocm::NpuDecodeOutput(s.npu->Staged(s.stream, s.c_h), s.branch, n, H, H, 0,
-                          false, s.stream, H);
+    s.Decode(s.c_h, s.branch, n, H, H, H);
     rocm::RmsNormRows(s.branch, s.g_post_ffn + static_cast<std::size_t>(l) * H,
                       s.z2, n, H, 1, c.eps, s.stream);
     s.Add(s.x, s.z2, n);
@@ -1062,7 +1185,7 @@ bool D1NpuModel::Forward(std::span<const std::uint32_t> tokens,
   const std::uint32_t kv_dim = kv_heads * hd;
   const std::uint32_t q_dim = static_cast<std::uint32_t>(s.q_dim);
   const std::uint32_t cols = static_cast<std::uint32_t>(vocabulary.size());
-  if (n == 0 || n > M || slots.empty() || cols == 0 ||
+  if (n == 0 || n > s.pass_rows || slots.empty() || cols == 0 ||
       logits.size() != slots.size() * cols ||
       (!groups.empty() && groups.size() != n) || !s.npu->Healthy())
     return false;
@@ -1271,6 +1394,7 @@ void D1NpuModel::ResetState() const {
 }
 
 std::uint32_t D1NpuModel::Position() const { return impl_->pos; }
+std::uint32_t D1NpuModel::PassRows() const { return impl_->pass_rows; }
 std::uint32_t D1NpuModel::MaxContext() const { return impl_->max_ctx; }
 
 bool D1NpuModel::Step(std::span<const std::uint32_t> tokens,
@@ -1280,7 +1404,7 @@ bool D1NpuModel::Step(std::span<const std::uint32_t> tokens,
   const std::uint32_t n = static_cast<std::uint32_t>(tokens.size());
   const std::uint32_t want = static_cast<std::uint32_t>(next_tokens.size());
   const std::uint32_t H = static_cast<std::uint32_t>(s.hidden);
-  if (s.max_ctx == 0 || n == 0 || n > M || want == 0 || want > n ||
+  if (s.max_ctx == 0 || n == 0 || n > s.pass_rows || want == 0 || want > n ||
       want > kMaxRows || s.pos + n > s.max_ctx || !s.npu->Healthy())
     return false;
   for (auto id : tokens)
@@ -1381,7 +1505,7 @@ bool D1NpuModel::Generate(std::span<const std::uint32_t> prompt,
   std::vector<std::uint32_t> history(prompt.begin(), prompt.end());
   std::uint32_t pending = 0;
   for (std::size_t at = 0; at < prompt.size();) {
-    const std::size_t take = std::min<std::size_t>(M, prompt.size() - at);
+    const std::size_t take = std::min<std::size_t>(PassRows(), prompt.size() - at);
     std::uint32_t next = 0;
     if (!Step(prompt.subspan(at, take), std::span(&next, 1)))
       return false;

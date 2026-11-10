@@ -1320,7 +1320,7 @@ std::unique_ptr<JevNpuModel> JevNpuModel::LoadFromGguf(
           return backbone->Forward(tokens, groups, sequences, slots,
                                    vocabulary, logits);
         },
-        M, error_msg);
+        backbone->PassRows(), error_msg);
     if (!impl->d1_judge)
       return nullptr;
     return std::unique_ptr<JevNpuModel>(new JevNpuModel(std::move(impl)));
