@@ -6,6 +6,8 @@
 #include <limits>
 #include <stdexcept>
 #include <thread>
+#include <cstdio>
+#include <cstdlib>
 namespace gufo::models::lfm3 {
 namespace {
 using Matrix = std::vector<float>;
@@ -188,6 +190,14 @@ std::vector<float> DecisionForward(const Weights& w,
       NormRows(out, n, H, l.post_ffn_norm, c.eps);
     for (std::size_t i = 0; i < n * H; ++i)
       x[i] += out[i];
+    if (std::getenv("GUFO_D1_TRACE")) {
+      double mean = 0;
+      for (float v : x)
+        mean += std::abs(v);
+      std::fprintf(stderr, "[d1 host] layer %zu mean|x| %.5f last %.4f %.4f %.4f %.4f\n",
+                   il, mean / x.size(), x[(n - 1) * H], x[(n - 1) * H + 1],
+                   x[(n - 1) * H + 2], x[(n - 1) * H + 3]);
+    }
   }
   Matrix hidden(slots.size() * H);
   for (std::size_t s = 0; s < slots.size(); ++s) {

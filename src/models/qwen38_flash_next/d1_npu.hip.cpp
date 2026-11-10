@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -30,15 +31,24 @@ std::size_t RowBytes(GgmlType type, std::size_t columns) {
     return columns / 32 * 18;
   case GgmlType::kQ6_K:
     return columns / 256 * 210;
+  case GgmlType::kQ8_0:
+    return columns / 32 * 34;
   default:
     return 0;
   }
 }
 
 // Same Q6_K / Q4_0 unit decoders as the jev judge (jev_npu.hip.cpp).
-template<bool Q6>
+// Kind: 0 = Q4_0, 1 = Q6_K, 2 = Q8_0.
+template<int Kind>
 __device__ void D1DequantUnit(const std::uint8_t* b, float* o) {
-  if constexpr (Q6) {
+  constexpr bool Q6 = Kind == 1;
+  if constexpr (Kind == 2) {
+    const float d = __half2float(*reinterpret_cast<const __half*>(b));
+#pragma unroll
+    for (int j = 0; j < 32; ++j)
+      o[j] = d * static_cast<float>(static_cast<std::int8_t>(b[2 + j]));
+  } else if constexpr (Q6) {
     const float fd = __half2float(*reinterpret_cast<const __half*>(b + 208));
     const std::uint8_t* ql = b;
     const std::uint8_t* qh = b + 128;
@@ -80,7 +90,7 @@ __device__ void D1DequantUnit(const std::uint8_t* b, float* o) {
   }
 }
 
-template<bool Q6>
+template<int Kind>
 __global__ void D1EmbedKernel(const std::uint8_t* __restrict__ table,
                               const std::int32_t* __restrict__ ids,
                               float* __restrict__ out, std::uint32_t n,
@@ -90,7 +100,7 @@ __global__ void D1EmbedKernel(const std::uint8_t* __restrict__ table,
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (g >= units)
     return;
-  constexpr std::uint32_t kUnit = Q6 ? 256u : 32u;
+  constexpr std::uint32_t kUnit = Kind == 1 ? 256u : 32u;
   const std::uint32_t per_row = hidden / kUnit;
   const std::uint32_t row = static_cast<std::uint32_t>(g / per_row);
   const std::uint32_t unit = static_cast<std::uint32_t>(g % per_row);
@@ -98,9 +108,9 @@ __global__ void D1EmbedKernel(const std::uint8_t* __restrict__ table,
   if (row < n) {
     const std::int32_t id = ids[row];
     if (id >= 0 && static_cast<std::uint32_t>(id) < vocab) {
-      D1DequantUnit<Q6>(
+      D1DequantUnit<Kind>(
           table + static_cast<std::size_t>(id) * row_bytes +
-              unit * (Q6 ? 210u : 18u),
+              unit * (Kind == 1 ? 210u : Kind == 2 ? 34u : 18u),
           o);
       return;
     }
@@ -110,13 +120,13 @@ __global__ void D1EmbedKernel(const std::uint8_t* __restrict__ table,
 }
 
 /// Logit of vocabulary entry `ids[blockIdx.x]` for slot row `blockIdx.y`.
-template<bool Q6>
+template<int Kind>
 __global__ void D1LogitKernel(const std::uint8_t* __restrict__ table,
                               const std::int32_t* __restrict__ ids,
                               const float* __restrict__ hidden_rows,
                               float* __restrict__ out, std::uint32_t hidden,
                               std::uint64_t row_bytes, std::uint32_t cols) {
-  constexpr int kUnit = Q6 ? 256 : 32;
+  constexpr int kUnit = Kind == 1 ? 256 : 32;
   const std::uint32_t j = blockIdx.x, s = blockIdx.y;
   const std::uint8_t* row =
       table + static_cast<std::size_t>(ids[j]) * row_bytes;
@@ -125,7 +135,7 @@ __global__ void D1LogitKernel(const std::uint8_t* __restrict__ table,
   for (std::uint32_t unit = threadIdx.x; unit < hidden / kUnit;
        unit += blockDim.x) {
     float v[kUnit];
-    D1DequantUnit<Q6>(row + unit * (Q6 ? 210u : 18u), v);
+    D1DequantUnit<Kind>(row + unit * (Kind == 1 ? 210u : Kind == 2 ? 34u : 18u), v);
     const float* vv = vec + static_cast<std::size_t>(unit) * kUnit;
     for (int e = 0; e < kUnit; ++e)
       partial += v[e] * vv[e];
@@ -393,6 +403,14 @@ struct D1NpuModel::Impl {
                                npu->Device(buf), stream);
     hipStreamSynchronize(stream);
     npu->FinalizeWeights(buf);
+    if (std::getenv("GUFO_D1_TRACE")) {
+      const auto* b = static_cast<const std::uint8_t*>(npu->Host(buf));
+      const std::size_t bytes = std::size_t{enc_rows} * cols / 8 * 9;
+      std::size_t nz = 0;
+      for (std::size_t i = 0; i < bytes; ++i)
+        nz += b[i] != 0;
+      std::fprintf(stderr, "[d1 npu ] act buf %d rows %u cols %u bytes %zu nonzero %zu\n", buf, enc_rows, cols, bytes, nz);
+    }
   }
 
   bool Gemm(int program, int a, int weight, int c) const {
@@ -447,13 +465,17 @@ std::unique_ptr<D1NpuModel> D1NpuModel::Create(const core::GgufReader& reader,
     for (const auto* t :
          {&l.gate, &l.up, &l.down, &l.in_proj, &l.out_proj, &l.q, &l.k, &l.v,
           &l.attn_out}) {
-      if (t->data && t->type != GgmlType::kQ4_0)
-        return fail("projection matrices must be Q4_0");
+      if (t->data && t->type != GgmlType::kQ8_0 && t->type != GgmlType::kQ4_K &&
+          t->type != GgmlType::kQ5_K && t->type != GgmlType::kQ6_K)
+        return fail(
+            "projection matrices must be Q8_0, Q4_K, Q5_K or Q6_K (the NPU "
+            "weight encoder does not read Q4_0)");
     }
   }
   const auto emb_type = impl->w.embedding.type;
-  if (emb_type != GgmlType::kQ4_0 && emb_type != GgmlType::kQ6_K)
-    return fail("embedding must be Q4_0 or Q6_K");
+  if (emb_type != GgmlType::kQ4_0 && emb_type != GgmlType::kQ6_K &&
+      emb_type != GgmlType::kQ8_0)
+    return fail("embedding must be Q4_0, Q6_K or Q8_0");
 
   const char* npu_dir = std::getenv("GUFO_NPU_DIR");
   const std::string dir = npu_dir ? npu_dir : "tools/npu";
@@ -581,7 +603,7 @@ std::unique_ptr<D1NpuModel> D1NpuModel::Create(const core::GgufReader& reader,
     std::memset(s.npu->Host(buf), 0, tb);
     std::uint32_t col0 = 0;
     for (const auto* t : srcs) {
-      const std::size_t bytes = RowBytes(t->type, k_total) * t->rows;
+      const std::size_t bytes = t->bytes;
       void* pin = nullptr;
       if (hipHostMalloc(&pin, bytes) != hipSuccess)
         return false;
@@ -597,6 +619,13 @@ std::unique_ptr<D1NpuModel> D1NpuModel::Create(const core::GgufReader& reader,
       col0 += t->rows;
     }
     s.npu->FinalizeWeights(buf);
+    if (std::getenv("GUFO_D1_TRACE") && out_ids.empty()) {
+      const auto* b = static_cast<const std::uint8_t*>(s.npu->Host(buf));
+      std::size_t nz = 0;
+      for (std::size_t i = 0; i < tb; ++i)
+        nz += b[i] != 0;
+      std::fprintf(stderr, "[d1 npu ] weight buf %d bytes %zu nonzero %zu\n", buf, tb, nz);
+    }
     out_ids.push_back(buf);
     return true;
   };
@@ -668,30 +697,56 @@ bool D1NpuModel::Forward(std::span<const std::uint32_t> tokens,
     s.ids[i] = static_cast<std::int32_t>(tokens[i]);
   if (!groups.empty())
     std::memcpy(s.group_buf, groups.data(), groups.size_bytes());
-  const bool q6 = s.w.embedding.type == GgmlType::kQ6_K;
+  const int kind = s.w.embedding.type == GgmlType::kQ6_K   ? 1
+                   : s.w.embedding.type == GgmlType::kQ8_0 ? 2
+                                                           : 0;
   {
-    const std::size_t units = static_cast<std::size_t>(n) * (H / (q6 ? 256u : 32u));
+    const std::size_t units =
+        static_cast<std::size_t>(n) * (H / (kind == 1 ? 256u : 32u));
     const std::uint64_t row_bytes = RowBytes(s.w.embedding.type, H);
     const dim3 grid(static_cast<std::uint32_t>((units + 255) / 256));
-    if (q6)
-      hipLaunchKernelGGL((D1EmbedKernel<true>), grid, dim3(256), 0, s.stream,
+    if (kind == 1)
+      hipLaunchKernelGGL((D1EmbedKernel<1>), grid, dim3(256), 0, s.stream,
+                         s.emb_table, s.ids, s.x, n, H, row_bytes, c.vocab,
+                         units);
+    else if (kind == 2)
+      hipLaunchKernelGGL((D1EmbedKernel<2>), grid, dim3(256), 0, s.stream,
                          s.emb_table, s.ids, s.x, n, H, row_bytes, c.vocab,
                          units);
     else
-      hipLaunchKernelGGL((D1EmbedKernel<false>), grid, dim3(256), 0, s.stream,
+      hipLaunchKernelGGL((D1EmbedKernel<0>), grid, dim3(256), 0, s.stream,
                          s.emb_table, s.ids, s.x, n, H, row_bytes, c.vocab,
                          units);
   }
   const float scale = 1.0F / std::sqrt(static_cast<float>(hd));
+  const bool trace = std::getenv("GUFO_D1_TRACE") != nullptr;
+  const auto stat = [&](const char* name, std::uint32_t l, const float* p,
+                        std::size_t count) {
+    if (!trace || l > 1)
+      return;
+    hipStreamSynchronize(s.stream);
+    double mean = 0;
+    std::size_t zeros = 0, bad = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+      mean += std::abs(p[i]);
+      zeros += p[i] == 0.0F;
+      bad += !std::isfinite(p[i]);
+    }
+    std::fprintf(stderr, "[d1 npu ] L%u %-8s mean|.| %.5f zeros %zu/%zu bad %zu first %.4f %.4f\n",
+                 l, name, mean / count, zeros, count, bad, p[0], p[1]);
+  };
   for (std::uint32_t l = 0; l < c.layers.size(); ++l) {
+    stat("x_in", l, s.x, static_cast<std::size_t>(n) * H);
     rocm::RmsNormRows(s.x, s.g_op + static_cast<std::size_t>(l) * H, s.z, n, H,
                       1, c.eps, s.stream);
+    stat("z", l, s.z, static_cast<std::size_t>(n) * H);
     if (c.layers[l] == lfm3::LayerType::kConvolution) {
       s.EncodeA(s.z, n, H, s.a_h);
       if (!s.Gemm(s.prog_in, s.a_h, s.w_in[l], s.c_in))
         return false;
       rocm::NpuDecodeOutput(s.npu->Staged(s.stream, s.c_in), s.p_buf, n,
                             Impl::kInPitch, Impl::kInPitch, 0, false, s.stream);
+      stat("p", l, s.p_buf, static_cast<std::size_t>(n) * Impl::kInPitch);
       hipLaunchKernelGGL(D1ConvKernel, dim3((H + 127) / 128, n), dim3(128), 0,
                          s.stream, s.p_buf,
                          s.g_conv + static_cast<std::size_t>(l) * H * s.taps,
@@ -701,6 +756,8 @@ bool D1NpuModel::Forward(std::span<const std::uint32_t> tokens,
         return false;
       rocm::NpuDecodeOutput(s.npu->Staged(s.stream, s.c_h), s.branch, n, H, H,
                             0, false, s.stream, H);
+      stat("conv", l, s.conv_out, static_cast<std::size_t>(n) * H);
+      stat("branch", l, s.branch, static_cast<std::size_t>(n) * H);
     } else {
       s.EncodeA(s.z, n, H, s.a_h);
       if (!s.Gemm(s.prog_qkv, s.a_h, s.w_qkv[l], s.c_qkv))
@@ -739,6 +796,7 @@ bool D1NpuModel::Forward(std::span<const std::uint32_t> tokens,
     }
     rocm::RmsNormRows(s.branch, s.g_post + static_cast<std::size_t>(l) * H,
                       s.z2, n, H, 1, c.eps, s.stream);
+    stat("z2", l, s.z2, static_cast<std::size_t>(n) * H);
     s.Add(s.x, s.z2, n);
 
     rocm::RmsNormRows(s.x, s.g_ffn + static_cast<std::size_t>(l) * H, s.z, n, H,
@@ -762,6 +820,18 @@ bool D1NpuModel::Forward(std::span<const std::uint32_t> tokens,
     rocm::RmsNormRows(s.branch, s.g_post_ffn + static_cast<std::size_t>(l) * H,
                       s.z2, n, H, 1, c.eps, s.stream);
     s.Add(s.x, s.z2, n);
+    if (trace) {
+      hipStreamSynchronize(s.stream);
+      double mean = 0;
+      for (std::size_t i = 0; i < static_cast<std::size_t>(n) * H; ++i)
+        mean += std::abs(s.x[i]);
+      std::fprintf(stderr, "[d1 npu ] layer %u mean|x| %.5f last %.4f %.4f %.4f %.4f\n",
+                   l, mean / (static_cast<double>(n) * H),
+                   s.x[static_cast<std::size_t>(n - 1) * H],
+                   s.x[static_cast<std::size_t>(n - 1) * H + 1],
+                   s.x[static_cast<std::size_t>(n - 1) * H + 2],
+                   s.x[static_cast<std::size_t>(n - 1) * H + 3]);
+    }
   }
 
   // Answer slots: gather rows, final norm, then dot with the chosen
@@ -795,12 +865,16 @@ bool D1NpuModel::Forward(std::span<const std::uint32_t> tokens,
   for (std::uint32_t j = 0; j < cols; ++j)
     s.vocab_ids[j] = static_cast<std::int32_t>(vocabulary[j]);
   const std::uint64_t row_bytes = RowBytes(s.w.embedding.type, H);
-  if (q6)
-    hipLaunchKernelGGL((D1LogitKernel<true>), dim3(cols, slot_count),
+  if (kind == 1)
+    hipLaunchKernelGGL((D1LogitKernel<1>), dim3(cols, slot_count),
+                       dim3(kThreads), 0, s.stream, s.emb_table, s.vocab_ids,
+                       s.sel_norm, s.logit_buf, H, row_bytes, cols);
+  else if (kind == 2)
+    hipLaunchKernelGGL((D1LogitKernel<2>), dim3(cols, slot_count),
                        dim3(kThreads), 0, s.stream, s.emb_table, s.vocab_ids,
                        s.sel_norm, s.logit_buf, H, row_bytes, cols);
   else
-    hipLaunchKernelGGL((D1LogitKernel<false>), dim3(cols, slot_count),
+    hipLaunchKernelGGL((D1LogitKernel<0>), dim3(cols, slot_count),
                        dim3(kThreads), 0, s.stream, s.emb_table, s.vocab_ids,
                        s.sel_norm, s.logit_buf, H, row_bytes, cols);
   hipStreamSynchronize(s.stream);

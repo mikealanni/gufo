@@ -7,3 +7,6 @@ target_link_libraries(gufo_d1_decide_check PRIVATE gufo_d1_prompt gufo_lfm3_refe
 add_executable(gufo_d1_judge_check EXCLUDE_FROM_ALL
   ${PROJECT_SOURCE_DIR}/tests/models/d1/judge_check.cpp)
 target_link_libraries(gufo_d1_judge_check PRIVATE gufo_d1_prompt gufo_lfm3_reference)
+add_executable(gufo_d1_trace_check EXCLUDE_FROM_ALL
+  ${PROJECT_SOURCE_DIR}/tests/models/d1/trace_check.cpp)
+target_link_libraries(gufo_d1_trace_check PRIVATE gufo_d1_prompt gufo_lfm3_reference)

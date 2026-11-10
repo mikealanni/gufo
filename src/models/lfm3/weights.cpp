@@ -35,6 +35,8 @@ std::optional<Weights> Weights::Bind(const core::GgufReader& r,
         case GgmlType::kBF16:
         case GgmlType::kQ8_0:
         case GgmlType::kQ4_0:
+        case GgmlType::kQ4_K:
+        case GgmlType::kQ5_K:
         case GgmlType::kQ6_K:
           break;
         default:
@@ -137,6 +139,12 @@ void DecodeRow(const Tensor& t, std::uint32_t row, std::span<float> out) {
           out[b * 32 + j + 16] = d * (int(qs[j] >> 4) - 8);
         }
       }
+      break;
+    case GgmlType::kQ4_K:
+      quant::DequantizeQ4_K(data, out.data(), t.cols);
+      break;
+    case GgmlType::kQ5_K:
+      quant::DequantizeQ5_K(data, out.data(), t.cols);
       break;
     case GgmlType::kQ6_K:
       quant::DequantizeQ6_K(data, out.data(), t.cols);
