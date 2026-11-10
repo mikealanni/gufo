@@ -1,5 +1,8 @@
 #include "src/models/qwen38_flash_next/jev_npu.hpp"
 
+#include "src/models/d1/judge.hpp"
+#include "src/models/qwen38_flash_next/d1_npu.hpp"
+
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -513,6 +516,10 @@ __global__ void JevToHalfKernel(const float* x, __half* y, std::size_t cnt) {
 }  // namespace
 
 struct JevNpuModel::Impl {
+  // A d1 decision GGUF (architecture lfm3) answers through the d1 backbone;
+  // every other field below is then unused.
+  std::unique_ptr<D1NpuModel> d1_backbone;
+  std::unique_ptr<d1::Judge> d1_judge;
   JevConfig config;
   JevTensor token_embd, output_norm, output;
   std::vector<JevLayer> layers;
@@ -1296,6 +1303,26 @@ JevNpuModel::~JevNpuModel() = default;
 std::unique_ptr<JevNpuModel> JevNpuModel::LoadFromGguf(
     const core::GgufReader& reader, std::string* error_msg) {
   const auto architecture = reader.GetMetadataString("general.architecture");
+  if (architecture.has_value() && *architecture == "lfm3") {
+    auto impl = std::make_unique<Impl>();
+    impl->d1_backbone = D1NpuModel::Create(reader, error_msg);
+    if (!impl->d1_backbone)
+      return nullptr;
+    D1NpuModel* backbone = impl->d1_backbone.get();
+    impl->d1_judge = d1::Judge::Create(
+        reader,
+        [backbone](std::span<const std::uint32_t> tokens,
+                   std::span<const std::int32_t> groups,
+                   std::span<const std::uint32_t> slots,
+                   std::span<const std::uint32_t> vocabulary,
+                   std::span<float> logits) {
+          return backbone->Forward(tokens, groups, slots, vocabulary, logits);
+        },
+        M, error_msg);
+    if (!impl->d1_judge)
+      return nullptr;
+    return std::unique_ptr<JevNpuModel>(new JevNpuModel(std::move(impl)));
+  }
   // "llama" covers MiniCPM5 (exported as plain Llama arch: RMSNorm + RoPE +
   // GQA + SwiGLU, the same family this loader already reads generically
   // via the architecture-derived metadata prefix below). It lacks Qwen3's
@@ -1587,7 +1614,15 @@ std::unique_ptr<JevNpuModel> JevNpuModel::LoadFromGguf(
 JevBinaryVerdict JevNpuModel::Answer(std::string_view question,
                                      std::string_view context) const {
   const auto t0 = std::chrono::steady_clock::now();
-  auto v = impl_->Run(question, context);
+  JevBinaryVerdict v;
+  if (impl_->d1_judge) {
+    const std::pair<std::string_view, std::string_view> item{question, context};
+    const auto out = impl_->d1_judge->Answer(std::span(&item, 1));
+    if (!out.empty())
+      v = {out[0].yes, out[0].no};
+  } else {
+    v = impl_->Run(question, context);
+  }
   const double ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - t0)
                         .count();
@@ -1601,7 +1636,13 @@ std::vector<JevBinaryVerdict> JevNpuModel::AnswerBatch(
     std::span<const std::pair<std::string_view, std::string_view>> items)
     const {
   const auto t0 = std::chrono::steady_clock::now();
-  auto v = impl_->RunBatch(items);
+  std::vector<JevBinaryVerdict> v;
+  if (impl_->d1_judge) {
+    for (const auto& r : impl_->d1_judge->Answer(items))
+      v.push_back({r.yes, r.no});
+  } else {
+    v = impl_->RunBatch(items);
+  }
   const double ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - t0)
                         .count();

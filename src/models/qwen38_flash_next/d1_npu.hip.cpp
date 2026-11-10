@@ -74,8 +74,8 @@ __device__ void D1DequantUnit(const std::uint8_t* b, float* o) {
     const float d = __half2float(*reinterpret_cast<const __half*>(b));
 #pragma unroll
     for (int j = 0; j < 16; ++j) {
-      o[2 * j] = d * static_cast<float>((b[2 + j] & 0x0FU) - 8);
-      o[2 * j + 1] = d * static_cast<float>((b[2 + j] >> 4U) - 8);
+      o[j] = d * static_cast<float>(static_cast<int>(b[2 + j] & 0x0FU) - 8);
+      o[j + 16] = d * static_cast<float>(static_cast<int>(b[2 + j] >> 4U) - 8);
     }
   }
 }

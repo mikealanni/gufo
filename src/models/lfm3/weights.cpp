@@ -6,6 +6,7 @@
 #include <stdexcept>
 
 #include "src/core/quant/ggml_dequant.hpp"
+#include "src/core/quant/ggml_gemm.hpp"
 namespace gufo::models::lfm3 {
 using core::GgmlType;
 std::optional<Weights> Weights::Bind(const core::GgufReader& r,
@@ -33,6 +34,8 @@ std::optional<Weights> Weights::Bind(const core::GgufReader& r,
         case GgmlType::kF16:
         case GgmlType::kBF16:
         case GgmlType::kQ8_0:
+        case GgmlType::kQ4_0:
+        case GgmlType::kQ6_K:
           break;
         default:
           throw std::runtime_error("unsupported tensor format: " + name);
@@ -120,6 +123,23 @@ void DecodeRow(const Tensor& t, std::uint32_t row, std::span<float> out) {
       break;
     case GgmlType::kQ8_0:
       quant::DequantizeQ8_0(data, out.data(), t.cols);
+      break;
+    case GgmlType::kQ4_0:
+      // 18-byte blocks: fp16 scale, 16 bytes of nibbles (low = elements
+      // 0-15, high = 16-31), values offset by 8.
+      for (std::size_t b = 0; b < t.cols / 32; ++b) {
+        std::uint16_t half;
+        std::memcpy(&half, data + b * 18, 2);
+        const float d = quant::Fp16ToFloat(half);
+        const auto* qs = data + b * 18 + 2;
+        for (std::size_t j = 0; j < 16; ++j) {
+          out[b * 32 + j] = d * (int(qs[j] & 0x0F) - 8);
+          out[b * 32 + j + 16] = d * (int(qs[j] >> 4) - 8);
+        }
+      }
+      break;
+    case GgmlType::kQ6_K:
+      quant::DequantizeQ6_K(data, out.data(), t.cols);
       break;
     default:
       throw std::invalid_argument("unsupported LFM3 row");

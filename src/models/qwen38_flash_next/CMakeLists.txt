@@ -70,7 +70,7 @@ if (ENGINE_ENABLE_HIP)
   set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/jev_npu.hip.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/d1_npu.hip.cpp
     PROPERTIES LANGUAGE HIP)
-  target_link_libraries(gufo_qwen38_flash_next PUBLIC gufo_lfm3)
+  target_link_libraries(gufo_qwen38_flash_next PUBLIC gufo_lfm3 gufo_d1_prompt)
 
   # Optional: offload part of the wide-batch dense projections to the XDNA2
   # NPU through XRT (see kernels/rocm/npu_gemm.hpp). Needs the XRT headers.
