@@ -338,6 +338,87 @@ void RmsNorm(const float* x, const float* w, float* out, std::uint32_t n,
 }
 }  // namespace
 
+
+namespace {
+struct QRow {
+  std::vector<std::int8_t> q;
+  std::vector<float> d;
+};
+QRow QuantizeRow(const float* x, std::uint32_t n) {
+  QRow r;
+  r.q.resize(n);
+  r.d.resize(n / 32);
+  for (std::uint32_t b = 0; b < n / 32; ++b) {
+    float amax = 0;
+    for (int i = 0; i < 32; ++i)
+      amax = std::max(amax, std::fabs(x[b * 32 + i]));
+    const float d = amax / 127.0f;
+    const float inv = d ? 1.0f / d : 0.0f;
+    r.d[b] = d;
+    for (int i = 0; i < 32; ++i)
+      r.q[b * 32 + i] = static_cast<std::int8_t>(std::nearbyint(x[b * 32 + i] * inv));
+  }
+  return r;
+}
+inline float DotRowQ8(const std::uint8_t* row, const QRow& x, std::uint32_t nb) {
+  __m512 acc = _mm512_setzero_ps();
+  for (std::uint32_t b = 0; b < nb; ++b) {
+    const std::uint8_t* blk = row + std::size_t{b} * 34;
+    std::uint16_t hd;
+    std::memcpy(&hd, blk, 2);
+    const float dw = _cvtsh_ss(hd);
+    const __m512i w16 = _mm512_cvtepi8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(blk + 2)));
+    const __m512i x16 = _mm512_cvtepi8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(x.q.data() + b * 32)));
+    const __m512i prod = _mm512_madd_epi16(w16, x16);
+    acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(prod), _mm512_set1_ps(dw * x.d[b]), acc);
+  }
+  return _mm512_reduce_add_ps(acc);
+}
+}  // namespace
+
+void Engine::Logits(const float* hidden_row, std::vector<float>* logits) {
+  Impl& s = *impl_;
+  const auto& e = s.w->embedding;
+  const std::uint32_t V = e.rows, nb = s.H / 32;
+  const std::size_t rb = std::size_t{nb} * 34;
+  logits->resize(V);
+  const QRow x = QuantizeRow(hidden_row, s.H);
+  const auto* base = static_cast<const std::uint8_t*>(e.data);
+#pragma omp parallel for num_threads(16) schedule(static)
+  for (std::int64_t v = 0; v < V; ++v)
+    (*logits)[v] = DotRowQ8(base + std::size_t(v) * rb, x, nb);
+}
+
+std::uint32_t Engine::Argmax(const float* hidden_row) {
+  Impl& s = *impl_;
+  const auto& e = s.w->embedding;
+  const std::uint32_t V = e.rows, nb = s.H / 32;
+  const std::size_t rb = std::size_t{nb} * 34;
+  const QRow x = QuantizeRow(hidden_row, s.H);
+  const auto* base = static_cast<const std::uint8_t*>(e.data);
+  std::uint32_t best = 0;
+  float best_v = -INFINITY;
+#pragma omp parallel num_threads(16)
+  {
+    std::uint32_t lb = 0;
+    float lv = -INFINITY;
+#pragma omp for schedule(static) nowait
+    for (std::int64_t v = 0; v < V; ++v) {
+      const float d = DotRowQ8(base + std::size_t(v) * rb, x, nb);
+      if (d > lv) {
+        lv = d;
+        lb = static_cast<std::uint32_t>(v);
+      }
+    }
+#pragma omp critical
+    if (lv > best_v || (lv == best_v && lb < best)) {
+      best_v = lv;
+      best = lb;
+    }
+  }
+  return best;
+}
+
 Engine::Engine(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 Engine::~Engine() {
   if (!impl_)

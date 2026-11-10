@@ -1,4 +1,5 @@
 #include <immintrin.h>
+#include <iterator>
 #include <omp.h>
 #include <chrono>
 #include <algorithm>
@@ -9,7 +10,9 @@
 #include <string>
 #include <vector>
 
+#include "src/core/gguf_reader.hpp"
 #include "src/models/lfm3/npu/engine.hpp"
+#include "src/models/lfm3/tokenizer.hpp"
 
 using gufo::models::lfm3::npu::Engine;
 
@@ -25,7 +28,8 @@ int main(int argc, char** argv) {
   std::string cmd = argc > 1 ? argv[1] : "";
   gufo::models::lfm3::npu::Options opt;
   std::string in, out;
-  std::size_t maxtok = 512;
+  std::size_t maxtok = 512, maxnew = 128;
+  std::string prompt;
   for (int i = 2; i + 1 < argc; i += 2) {
     std::string k = argv[i];
     std::string v = argv[i + 1];
@@ -35,6 +39,8 @@ int main(int argc, char** argv) {
     else if (k == "--tokens") in = v;
     else if (k == "--out") out = v;
     else if (k == "--maxtok") maxtok = std::stoul(v);
+    else if (k == "--max-new") maxnew = std::stoul(v);
+    else if (k == "--prompt") prompt = v;
     else if (k == "--context") opt.context = std::stoul(v);
   }
   if (!std::getenv("OMP_NUM_THREADS"))
@@ -87,6 +93,59 @@ int main(int argc, char** argv) {
     std::printf("captured %llu tokens\n", (unsigned long long)total);
     return 0;
   }
-  std::fprintf(stderr, "usage: gufo-npu capture ...\n");
+  if (cmd == "generate") {
+    auto reader = gufo::core::GgufReader::OpenFile(opt.gguf, &err);
+    auto tokenizer = gufo::models::lfm3::Tokenizer::Load(*reader, &err);
+    if (!tokenizer) {
+      std::fprintf(stderr, "tokenizer: %s\n", err.c_str());
+      return 1;
+    }
+    std::string text = prompt;
+    if (!text.empty() && text[0] == '@') {
+      std::ifstream f(text.substr(1));
+      text.assign(std::istreambuf_iterator<char>(f), {});
+    }
+    std::vector<std::uint32_t> ids;
+    if (std::getenv("GUFO_RAW_PROMPT")) {
+      ids = tokenizer->Encode(text);
+    } else {
+      const std::vector<std::pair<std::string, std::string>> messages = {{"user", text}};
+      ids = tokenizer->Encode(gufo::models::lfm3::Tokenizer::Render(messages, false));
+    }
+    std::uint32_t eos = 7;
+    if (auto e = reader->GetMetadataUint32("tokenizer.ggml.eos_token_id"))
+      eos = *e;
+    std::vector<std::uint32_t> out;
+    std::vector<float> h;
+    engine->Reset();
+    const auto t0 = std::chrono::steady_clock::now();
+    for (std::size_t at = 0; at < ids.size();) {
+      const std::size_t n = std::min<std::size_t>(Engine::kMaxRows, ids.size() - at);
+      if (!engine->Step(std::span<const std::uint32_t>(ids.data() + at, n), &h))
+        return 1;
+      at += n;
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    std::uint32_t next = engine->Argmax(h.data() + (h.size() - 2048));
+    for (std::size_t i = 0; i < maxnew; ++i) {
+      out.push_back(next);
+      if (next == eos || tokenizer->IsStop(next))
+        break;
+      if (!engine->Step(std::span<const std::uint32_t>(&next, 1), &h))
+        return 1;
+      next = engine->Argmax(h.data());
+    }
+    const auto t2 = std::chrono::steady_clock::now();
+    std::printf("%s\n", tokenizer->Decode(out).c_str());
+    const double pre = std::chrono::duration<double>(t1 - t0).count();
+    const double dec = std::chrono::duration<double>(t2 - t1).count();
+    std::fprintf(stderr, "prompt %zu tokens in %.3f s (%.0f tok/s); %zu new tokens in %.3f s (%.2f tok/s)\n",
+                 ids.size(), pre, ids.size() / pre, out.size(), dec, out.size() / dec);
+    std::printf("ids:");
+    for (auto t : out) std::printf(" %u", t);
+    std::printf("\n");
+    return 0;
+  }
+  std::fprintf(stderr, "usage: gufo-npu capture|generate ...\n");
   return 2;
 }

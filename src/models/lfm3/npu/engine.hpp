@@ -28,6 +28,10 @@ class Engine {
   /// Runs up to kMaxRows tokens from the current position. `hidden` (optional)
   /// receives the final-norm rows, tokens.size() x hidden floats.
   bool Step(std::span<const std::uint32_t> tokens, std::vector<float>* hidden);
+  /// Logits for one final-norm row against the tied Q8_0 embedding.
+  void Logits(const float* hidden_row, std::vector<float>* logits);
+  /// Index of the largest logit (greedy token), without storing all logits.
+  std::uint32_t Argmax(const float* hidden_row);
   struct Impl;
 
  private:
