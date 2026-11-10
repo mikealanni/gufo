@@ -311,7 +311,7 @@ QwenDFlashGpuModel::QwenDFlashGpuModel(
   const auto& head = weights_.output;
   const std::size_t row_bytes =
       quant::EncodedSizeBytes(head.type, config.hidden_size);
-  if (head.data == nullptr ||
+  if (head.data == nullptr || target_model_ == nullptr ||
       config.vocab_size <= speculative::kDraftVocabPrefix || row_bytes == 0 ||
       row_bytes % sizeof(std::uint32_t) != 0 ||
       quant::EncodedSizeBytes(head.type, head.num_elements) !=
