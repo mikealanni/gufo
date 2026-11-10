@@ -11,12 +11,14 @@ namespace gufo::models::lfm3::npu {
 struct Options {
   std::string gguf;
   std::string bf16;
-  std::string programs;
+  std::string programs;  // directory with xclbin + insts
+  std::string spec;      // optional: JSON model spec (defaults to built-in LFM3)
   std::uint32_t context{8192};
 };
 
 /// LFM3 engine with every dense projection on the NPU (16-row int5 split-B
 /// GEMV programs) and all other work on the host CPU. No GPU is touched.
+/// Refactored (WP6): model-neutral runtime + spec-driven layer loop.
 class Engine {
  public:
   static constexpr std::uint32_t kMaxRows = 16;

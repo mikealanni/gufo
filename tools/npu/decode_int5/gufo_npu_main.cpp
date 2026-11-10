@@ -38,6 +38,7 @@ int main(int argc, char** argv) {
     if (k == "--gguf") opt.gguf = v;
     else if (k == "--bf16") opt.bf16 = v;
     else if (k == "--programs") opt.programs = v;
+    else if (k == "--spec") opt.spec = v;
     else if (k == "--tokens") in = v;
     else if (k == "--out") out = v;
     else if (k == "--maxtok") maxtok = std::stoul(v);

@@ -27,20 +27,26 @@ def main():
         prog="AIE Matrix Multiplication MLIR Design (32 Cores, 8x4 grid) with bfp16ebs8 weights and bf16 input/output",
         description="Emits MLIR code for a matrix multiplication design of the given input size using 32 cores (8 columns x 4 rows). Only supported in NPU2 devices.",
     )
-    argparser.add_argument("-M", type=int, default=0)
+    argparser.add_argument("-M", type=int, default=16)
     argparser.add_argument("-K", type=int, default=0)
     argparser.add_argument("-N", type=int, default=0)
-    argparser.add_argument("-m", type=int, default=0)
-    argparser.add_argument("-k", type=int, default=0)
-    argparser.add_argument("-n", type=int, default=0)
+    argparser.add_argument("-m", type=int, default=16)
+    argparser.add_argument("-k", type=int, default=64)
+    argparser.add_argument("-n", type=int, default=128)
     argparser.add_argument("--mode", default="ffn")
+    # Shape params for fused-ffn / plain programs (remove hardcoded literals).
+    argparser.add_argument("--k1", type=int, default=None, help="Phase 1 K (ffn: gate_up K)")
+    argparser.add_argument("--n1", type=int, default=None, help="Phase 1 N (ffn: gate_up N)")
+    argparser.add_argument("--k2", type=int, default=None, help="Phase 2 K (ffn: down K, plain: K)")
+    argparser.add_argument("--n2", type=int, default=None, help="Phase 2 N (ffn: down N, plain: N)")
     args = argparser.parse_args()
     with mlir_mod_ctx() as ctx:
-        my_matmul(args.M, args.K, args.N, args.m, args.k, args.n, args.mode)
+        my_matmul(args.M, args.K, args.N, args.m, args.k, args.n, args.mode,
+                  args.k1, args.n1, args.k2, args.n2)
         print(ctx.module)
 
 
-def my_matmul(M, K, N, m, k, n, mode="ffn"):
+def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None):
     n_aie_cols = 8
     n_aie_rows = 4
     nq = n // n_aie_rows
@@ -159,9 +165,17 @@ def my_matmul(M, K, N, m, k, n, mode="ffn"):
                             C_l1l2[row][col].release(ObjectFifoPort.Produce, 1)
 
         if mode == "ffn":
-            K1, K2, N1, N2 = K, 7680, 15360, 2048
+            # Defaults preserve LFM3 fused FFN: gate_up (K=2048,N=15360) + down (K=7680,N=2048)
+            K1 = k1 if k1 is not None else K
+            N1 = n1 if n1 is not None else 15360
+            K2 = k2 if k2 is not None else 7680
+            N2 = n2 if n2 is not None else 2048
         else:
             K1, K2, N1, N2 = k, K, 0, N
+            if k2 is not None:
+                K2 = k2
+            if n2 is not None:
+                N2 = n2
         BQ_ = BQ
         gu_bytes = (K1 // k) * (N1 // n) * n_aie_rows * BQ_ if N1 else 0
         dn_bytes = (K2 // k) * (N2 // n) * n_aie_rows * BQ_

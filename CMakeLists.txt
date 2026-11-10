@@ -274,7 +274,10 @@ if (GUFO_BUILD_NPU_ENGINE)
   find_package(OpenMP REQUIRED COMPONENTS CXX)
   set(GUFO_XRT_INCLUDE_DIR "" CACHE PATH "Directory holding xrt/xrt_bo.h")
   set(GUFO_XRT_LIB_DIR "/opt/xilinx/xrt/lib" CACHE PATH "XRT runtime libraries")
-  add_executable(gufo-npu src/models/lfm3/npu/engine.cpp
+  add_executable(gufo-npu
+    src/models/lfm3/npu/engine.cpp
+    src/npu/runtime/runtime.cpp
+    src/npu/model_spec.cpp
     tools/npu/decode_int5/gufo_npu_main.cpp)
   target_include_directories(gufo-npu PRIVATE ${PROJECT_SOURCE_DIR} ${GUFO_XRT_INCLUDE_DIR})
   target_compile_options(gufo-npu PRIVATE -O3 -march=native -ffast-math -fno-finite-math-only)
