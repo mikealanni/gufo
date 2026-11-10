@@ -7,3 +7,6 @@ target_compile_options(gufo_lfm3_reference PRIVATE -O2)
 add_executable(gufo_lfm3_decision_forward_check EXCLUDE_FROM_ALL
   ${PROJECT_SOURCE_DIR}/tests/models/lfm3/decision_forward_check.cpp)
 target_link_libraries(gufo_lfm3_decision_forward_check PRIVATE gufo_lfm3_reference)
+add_executable(gufo_lfm3_generate_check EXCLUDE_FROM_ALL
+  ${PROJECT_SOURCE_DIR}/tests/models/lfm3/generate_check.cpp)
+target_link_libraries(gufo_lfm3_generate_check PRIVATE gufo_lfm3_reference)

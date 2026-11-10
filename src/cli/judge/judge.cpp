@@ -23,6 +23,8 @@
 #include "src/models/qwen38_flash_next/jev_finish.hpp"
 
 #if defined(GUFO_NPU)
+#include "src/models/lfm3/tokenizer.hpp"
+#include "src/models/qwen38_flash_next/d1_npu.hpp"
 #include "src/models/qwen38_flash_next/jev_npu.hpp"
 #endif
 #if defined(ENGINE_ENABLE_HIP)
@@ -279,6 +281,9 @@ int RunJudge(std::span<const char* const> args) {
   bool code = false;
   bool batched = false;
   bool pack_test = false;
+  std::string generate_prompt;
+  int max_new = 64;
+  int draft_len = 15;
   bool finish_verbose = false;
   std::string finish_replay;
   std::string goal_replay;
@@ -303,6 +308,14 @@ int RunJudge(std::span<const char* const> args) {
                  &code);
   parser.AddFlag("", "--gpu", "Use the GPU judge instead of the NPU", "Model",
                  &use_gpu);
+  parser.AddOption("", "--generate", "TEXT",
+                   "Greedy chat reply on the NPU (LFM3 causal models)",
+                   "Generate", &generate_prompt);
+  parser.AddOption("", "--max-new", "N", "Tokens to generate (default 64)",
+                   "Generate", &max_new);
+  parser.AddOption("", "--draft", "N",
+                   "Prompt-lookup draft tokens per pass, 0 = off (default 15)",
+                   "Generate", &draft_len);
   parser.AddFlag("", "--pack-test",
                  "Compare four different-context decisions: one by one vs one packed pass",
                  "Battery", &pack_test);
@@ -340,7 +353,8 @@ int RunJudge(std::span<const char* const> args) {
     std::fprintf(stderr, "judge: --model is required\n");
     return 2;
   }
-  if (!stdio && !battery && !code && !pack_test && question.empty()) {
+  if (!stdio && !battery && !code && !pack_test && question.empty() &&
+      generate_prompt.empty()) {
     std::fprintf(stderr, "judge: --question, --battery or --code required\n");
     return 2;
   }
@@ -353,6 +367,46 @@ int RunJudge(std::span<const char* const> args) {
   }
 
 #if defined(GUFO_NPU)
+  if (!use_gpu && !generate_prompt.empty()) {
+    auto model = models::qwen38_flash_next::D1NpuModel::Create(*reader, &err);
+    auto tokenizer = models::lfm3::Tokenizer::Load(*reader, &err);
+    if (!model || !tokenizer || !model->EnableGeneration(8192, &err)) {
+      std::fprintf(stderr, "judge: %s\n", err.c_str());
+      return 1;
+    }
+    const std::vector<std::pair<std::string, std::string>> messages = {
+        {"user", generate_prompt}};
+    const auto ids = tokenizer->Encode(
+        models::lfm3::Tokenizer::Render(messages, false));
+    models::qwen38_flash_next::D1NpuModel::GenerateOptions options;
+    options.max_new = static_cast<std::uint32_t>(max_new);
+    options.draft_max = static_cast<std::uint32_t>(std::max(0, draft_len));
+    if (auto eos = reader->GetMetadataUint32("tokenizer.ggml.eos_token_id"))
+      options.stop.push_back(*eos);
+    for (int i = 0; i < repeat; ++i) {
+      std::vector<std::uint32_t> out;
+      models::qwen38_flash_next::D1NpuModel::GenerateStats stats;
+      if (!model->Generate(ids, options, &out, &stats)) {
+        std::fprintf(stderr, "judge: generation failed\n");
+        return 1;
+      }
+      if (i == 0) {
+        std::printf("%s\n", tokenizer->Decode(out).c_str());
+        std::printf("ids:");
+        for (auto id : out)
+          std::printf(" %u", id);
+        std::printf("\n");
+      }
+      std::printf(
+          "pp %u tok %.1f ms (%.0f tok/s) | tg %u tok %.1f ms (%.1f tok/s) | "
+          "passes %u drafted %u accepted %u\n",
+          stats.prompt_tokens, stats.prefill_ms,
+          stats.prompt_tokens * 1000.0 / stats.prefill_ms, stats.new_tokens,
+          stats.decode_ms, stats.new_tokens * 1000.0 / stats.decode_ms,
+          stats.passes, stats.drafted, stats.accepted);
+    }
+    return 0;
+  }
   if (!use_gpu) {
     auto model =
         models::qwen38_flash_next::JevNpuModel::LoadFromGguf(*reader, &err);

@@ -5,6 +5,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <vector>
 
 #include "src/models/lfm3/weights.hpp"
 
@@ -42,6 +43,37 @@ public:
                              std::span<const std::uint32_t> slots,
                              std::span<const std::uint32_t> vocabulary,
                              std::span<float> logits) const;
+
+  /// Greedy generation on the NPU (causal LFM3 models). EnableGeneration
+  /// allocates the K/V caches and conv state; Step runs one pass of at most
+  /// 512 tokens continuing the stream and returns the greedy next token after
+  /// each of its last next_tokens.size() rows; Commit keeps the first
+  /// `accepted` tokens of that pass (the rest are rolled back).
+  [[nodiscard]] bool EnableGeneration(std::uint32_t max_context,
+                                      std::string* error = nullptr);
+  void ResetState() const;
+  [[nodiscard]] std::uint32_t Position() const;
+  [[nodiscard]] std::uint32_t MaxContext() const;
+  [[nodiscard]] bool Step(std::span<const std::uint32_t> tokens,
+                          std::span<std::uint32_t> next_tokens) const;
+  void Commit(std::uint32_t accepted) const;
+
+  struct GenerateOptions {
+    std::uint32_t max_new{128};
+    std::vector<std::uint32_t> stop;  // token ids that end generation
+    std::uint32_t draft_max{15};      // prompt-lookup draft length per pass
+    std::uint32_t ngram{3};           // match length for prompt lookup
+  };
+  struct GenerateStats {
+    std::uint32_t passes{0}, prompt_tokens{0}, new_tokens{0}, drafted{0},
+        accepted{0};
+    double prefill_ms{0}, decode_ms{0};
+  };
+  /// Prefill `prompt` then decode greedily with prompt-lookup speculation.
+  [[nodiscard]] bool Generate(std::span<const std::uint32_t> prompt,
+                              const GenerateOptions& options,
+                              std::vector<std::uint32_t>* output,
+                              GenerateStats* stats = nullptr) const;
 
 private:
   struct Impl;

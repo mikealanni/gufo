@@ -181,11 +181,15 @@ __global__ void D1SwigluKernel(const float* __restrict__ gu,
 }
 
 /// Gated short convolution: P rows are [B | C | x] (3*hidden). out[t][c] =
-/// C[t][c] * sum_j w[c][j] * (B*x)[t-(L-1)+j][c], zero history before the
-/// token's sequence start.
+/// C[t][c] * sum_j w[c][j] * (B*x)[t-(L-1)+j][c]. Before the token's sequence
+/// start the history is zero, or `hist` ((taps-1) x hidden, oldest first)
+/// when continuing a stream. With `bx_all` the combined (history + new) B*x
+/// stream is recorded so a speculative pass can commit any accepted prefix.
 __global__ void D1ConvKernel(const float* __restrict__ p,
                              const float* __restrict__ w,
                              const std::int32_t* __restrict__ seq_lo,
+                             const float* __restrict__ hist,
+                             float* __restrict__ bx_all,
                              float* __restrict__ out, std::uint32_t n,
                              std::uint32_t hidden, std::uint32_t taps) {
   const std::uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -198,12 +202,38 @@ __global__ void D1ConvKernel(const float* __restrict__ p,
   for (std::uint32_t j = 0; j < taps; ++j) {
     const int s = static_cast<int>(t) - static_cast<int>(taps - 1) +
                   static_cast<int>(j);
-    if (s < lo)
+    float bx;
+    if (s >= lo && s >= 0)
+      bx = p[s * pitch + c] * p[s * pitch + 2ull * hidden + c];
+    else if (s < 0 && hist != nullptr)
+      bx = hist[static_cast<std::size_t>(static_cast<int>(taps - 1) + s) *
+                    hidden + c];
+    else
       continue;
-    sum += w[static_cast<std::size_t>(c) * taps + j] * p[s * pitch + c] *
-           p[s * pitch + 2ull * hidden + c];
+    sum += w[static_cast<std::size_t>(c) * taps + j] * bx;
   }
   out[static_cast<std::size_t>(t) * hidden + c] = sum * p[t * pitch + hidden + c];
+  if (bx_all != nullptr) {
+    bx_all[(static_cast<std::size_t>(taps - 1) + t) * hidden + c] =
+        p[t * pitch + c] * p[t * pitch + 2ull * hidden + c];
+    if (t < taps - 1 && hist != nullptr)
+      bx_all[static_cast<std::size_t>(t) * hidden + c] =
+          hist[static_cast<std::size_t>(t) * hidden + c];
+  }
+}
+
+/// New history = the (taps-1) entries of the combined stream that end at the
+/// last accepted token.
+__global__ void D1ConvCommitKernel(const float* __restrict__ bx_all,
+                                   float* __restrict__ hist,
+                                   std::uint32_t accepted,
+                                   std::uint32_t hidden, std::uint32_t taps) {
+  const std::uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= hidden)
+    return;
+  for (std::uint32_t i = 0; i + 1 < taps; ++i)
+    hist[static_cast<std::size_t>(i) * hidden + c] =
+        bx_all[static_cast<std::size_t>(accepted + i) * hidden + c];
 }
 
 __global__ void D1SplitQkvKernel(const float* qkv, float* q, float* k, float* v,
@@ -253,9 +283,9 @@ __global__ void D1GateKernel(const float* __restrict__ z,
 /// layers) divide the angle per frequency index.
 __global__ void D1RopeKernel(float* q, float* k, const float* __restrict__ factors,
                              const std::int32_t* __restrict__ seq_lo,
-                             std::uint32_t n, std::uint32_t heads,
-                             std::uint32_t kv_heads, std::uint32_t hd,
-                             float theta) {
+                             std::uint32_t pos_base, std::uint32_t n,
+                             std::uint32_t heads, std::uint32_t kv_heads,
+                             std::uint32_t hd, float theta) {
   const std::uint32_t row = blockIdx.x;
   const std::uint32_t h = blockIdx.y;
   const std::uint32_t dd = threadIdx.x;
@@ -270,7 +300,8 @@ __global__ void D1RopeKernel(float* q, float* k, const float* __restrict__ facto
       return;
     base = k + (static_cast<std::size_t>(row) * kv_heads + kh) * hd;
   }
-  float angle = static_cast<float>(row - static_cast<std::uint32_t>(seq_lo[row])) *
+  float angle = static_cast<float>(
+                    row - static_cast<std::uint32_t>(seq_lo[row]) + pos_base) *
                 powf(theta, -2.0F * static_cast<float>(dd) /
                                 static_cast<float>(hd));
   if (factors != nullptr)
@@ -281,10 +312,11 @@ __global__ void D1RopeKernel(float* q, float* k, const float* __restrict__ facto
   base[dd + hd / 2] = b * c + a * sn;
 }
 
-/// One block per (token, head). Tokens only see their own sequence
-/// [seq_lo, seq_hi). window > 0: causal sliding layer. Otherwise a global
-/// layer: every key of the sequence, restricted by `groups` (state tokens are
-/// -1; a token sees keys that are state or in its own question).
+/// One block per (token, head), online softmax over key chunks. Stateless:
+/// tokens see their own sequence [seq_lo, seq_hi) of the current buffers
+/// (global layers bidirectional, restricted by `groups`; window > 0 causal).
+/// Stateful: keys are absolute positions in the K/V cache, the query sits at
+/// pos0 + t, and every layer is causal (window > 0 also limits the span).
 __global__ void D1AttnKernel(const float* __restrict__ q,
                              const float* __restrict__ k,
                              const float* __restrict__ v,
@@ -295,7 +327,8 @@ __global__ void D1AttnKernel(const float* __restrict__ q,
                              float* __restrict__ out, std::uint32_t n,
                              std::uint32_t heads, std::uint32_t kv_heads,
                              std::uint32_t hd, float scale,
-                             std::uint32_t window) {
+                             std::uint32_t window, std::uint32_t stateful,
+                             std::uint32_t pos0) {
   const std::uint32_t t = blockIdx.x, h = blockIdx.y;
   const std::uint32_t kh = h / (heads / kv_heads);
   const std::uint32_t kv_dim = kv_heads * hd;
@@ -304,62 +337,159 @@ __global__ void D1AttnKernel(const float* __restrict__ q,
   __shared__ float red[kThreads];
   qs[threadIdx.x] = q[(static_cast<std::size_t>(t) * heads + h) * hd + threadIdx.x];
   __syncthreads();
-  std::uint32_t first = static_cast<std::uint32_t>(seq_lo[t]);
-  std::uint32_t last = static_cast<std::uint32_t>(seq_hi[t]) - 1;
-  if (window > 0) {
-    last = t;
-    if (t + 1 > window && t + 1 - window > first)
-      first = t + 1 - window;
-  }
-  float local_max = -INFINITY;
-  for (std::uint32_t s = threadIdx.x; s < n; s += blockDim.x) {
-    bool valid = s >= first && s <= last;
-    if (valid && window == 0) {
-      const std::int32_t own = groups[t], key = groups[s];
-      valid = own < 0 || key < 0 || own == key;
+  std::uint32_t first, last;
+  if (stateful) {
+    const std::uint32_t qa = pos0 + t;
+    last = qa;
+    first = window > 0 && qa + 1 > window ? qa + 1 - window : 0;
+  } else {
+    first = static_cast<std::uint32_t>(seq_lo[t]);
+    last = static_cast<std::uint32_t>(seq_hi[t]) - 1;
+    if (window > 0) {
+      last = t;
+      if (t + 1 > window && t + 1 - window > first)
+        first = t + 1 - window;
     }
-    float score = -INFINITY;
-    if (valid) {
-      const float* kr = k + static_cast<std::size_t>(s) * kv_dim + kh * hd;
-      float dot = 0.0F;
-      for (std::uint32_t d = 0; d < hd; ++d)
-        dot += qs[d] * kr[d];
-      score = dot * scale;
-    }
-    sc[s] = score;
-    local_max = fmaxf(local_max, score);
   }
-  red[threadIdx.x] = local_max;
-  __syncthreads();
-  for (unsigned stride = blockDim.x / 2; stride > 0; stride /= 2) {
-    if (threadIdx.x < stride)
-      red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + stride]);
+  float m = -INFINITY, l = 0.0F, acc = 0.0F;
+  for (std::uint32_t s0 = first; s0 <= last; s0 += M) {
+    const std::uint32_t chunk = min(static_cast<std::uint32_t>(M), last - s0 + 1);
+    float local_max = -INFINITY;
+    for (std::uint32_t i = threadIdx.x; i < chunk; i += blockDim.x) {
+      const std::uint32_t s = s0 + i;
+      bool valid = true;
+      if (!stateful && window == 0) {
+        const std::int32_t own = groups[t], key = groups[s];
+        valid = own < 0 || key < 0 || own == key;
+      }
+      float score = -INFINITY;
+      if (valid) {
+        const float* kr = k + static_cast<std::size_t>(s) * kv_dim + kh * hd;
+        float dot = 0.0F;
+        for (std::uint32_t d = 0; d < hd; ++d)
+          dot += qs[d] * kr[d];
+        score = dot * scale;
+      }
+      sc[i] = score;
+      local_max = fmaxf(local_max, score);
+    }
+    red[threadIdx.x] = local_max;
+    __syncthreads();
+    for (unsigned stride = blockDim.x / 2; stride > 0; stride /= 2) {
+      if (threadIdx.x < stride)
+        red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + stride]);
+      __syncthreads();
+    }
+    const float chunk_max = red[0];
+    __syncthreads();
+    const float new_m = fmaxf(m, chunk_max);
+    const float alpha = m == -INFINITY ? 0.0F : __expf(m - new_m);
+    float local_sum = 0.0F;
+    for (std::uint32_t i = threadIdx.x; i < chunk; i += blockDim.x) {
+      const float e = sc[i] == -INFINITY ? 0.0F : __expf(sc[i] - new_m);
+      sc[i] = e;
+      local_sum += e;
+    }
+    red[threadIdx.x] = local_sum;
+    __syncthreads();
+    for (unsigned stride = blockDim.x / 2; stride > 0; stride /= 2) {
+      if (threadIdx.x < stride)
+        red[threadIdx.x] += red[threadIdx.x + stride];
+      __syncthreads();
+    }
+    l = l * alpha + red[0];
+    __syncthreads();
+    acc *= alpha;
+    for (std::uint32_t i = 0; i < chunk; ++i) {
+      const float p = sc[i];
+      if (p != 0.0F)
+        acc += p * v[static_cast<std::size_t>(s0 + i) * kv_dim + kh * hd +
+                     threadIdx.x];
+    }
+    m = new_m;
     __syncthreads();
   }
-  const float maximum = red[0];
-  __syncthreads();
-  float local_sum = 0.0F;
-  for (std::uint32_t s = threadIdx.x; s < n; s += blockDim.x) {
-    const float e = sc[s] == -INFINITY ? 0.0F : __expf(sc[s] - maximum);
-    sc[s] = e;
-    local_sum += e;
-  }
-  red[threadIdx.x] = local_sum;
-  __syncthreads();
-  for (unsigned stride = blockDim.x / 2; stride > 0; stride /= 2) {
-    if (threadIdx.x < stride)
-      red[threadIdx.x] += red[threadIdx.x + stride];
-    __syncthreads();
-  }
-  const float inv = 1.0F / red[0];
   const float g = 1.0F / (1.0F + __expf(-gate[static_cast<std::size_t>(t) * heads + h]));
-  float acc = 0.0F;
-  for (std::uint32_t s = first; s <= last; ++s) {
-    const float p = sc[s];
-    if (p != 0.0F)
-      acc += p * v[static_cast<std::size_t>(s) * kv_dim + kh * hd + threadIdx.x];
+  out[(static_cast<std::size_t>(t) * heads + h) * hd + threadIdx.x] = acc / l * g;
+}
+
+/// logits[r][v] = dot(embedding row v, hidden_rows[r]) for every vocabulary
+/// row v and up to kMaxRows hidden vectors. One block per vocabulary row.
+constexpr int kMaxRows = 32;
+template<int Kind>
+__global__ void D1LogitAllKernel(const std::uint8_t* __restrict__ table,
+                                 const float* __restrict__ hidden_rows,
+                                 float* __restrict__ out, std::uint32_t hidden,
+                                 std::uint64_t row_bytes, std::uint32_t vocab,
+                                 std::uint32_t rows) {
+  constexpr int kUnit = Kind == 1 ? 256 : 32;
+  const std::uint32_t v = blockIdx.x;
+  const std::uint8_t* row = table + static_cast<std::size_t>(v) * row_bytes;
+  float partial[kMaxRows];
+#pragma unroll
+  for (int r = 0; r < kMaxRows; ++r)
+    partial[r] = 0.0F;
+  for (std::uint32_t unit = threadIdx.x; unit < hidden / kUnit;
+       unit += blockDim.x) {
+    float w[kUnit];
+    D1DequantUnit<Kind>(row + unit * (Kind == 1 ? 210u : Kind == 2 ? 34u : 18u), w);
+#pragma unroll
+    for (int r = 0; r < kMaxRows; ++r) {
+      if (static_cast<std::uint32_t>(r) >= rows)
+        break;
+      const float* hv = hidden_rows + static_cast<std::size_t>(r) * hidden +
+                        static_cast<std::size_t>(unit) * kUnit;
+      float dot = 0.0F;
+      for (int e = 0; e < kUnit; ++e)
+        dot += w[e] * hv[e];
+      partial[r] += dot;
+    }
   }
-  out[(static_cast<std::size_t>(t) * heads + h) * hd + threadIdx.x] = acc * inv * g;
+  __shared__ float red[kMaxRows][64];
+#pragma unroll
+  for (int r = 0; r < kMaxRows; ++r)
+    red[r][threadIdx.x] = partial[r];
+  __syncthreads();
+  for (unsigned stride = 32; stride > 0; stride /= 2) {
+    if (threadIdx.x < stride)
+#pragma unroll
+      for (int r = 0; r < kMaxRows; ++r)
+        red[r][threadIdx.x] += red[r][threadIdx.x + stride];
+    __syncthreads();
+  }
+  if (threadIdx.x < kMaxRows && threadIdx.x < rows)
+    out[static_cast<std::size_t>(threadIdx.x) * vocab + v] = red[threadIdx.x][0];
+}
+
+/// argmax over `vocab` logits per row; one block of 1024 threads per row.
+__global__ void D1ArgmaxKernel(const float* __restrict__ logits,
+                               std::uint32_t vocab,
+                               std::int32_t* __restrict__ out) {
+  const float* row = logits + static_cast<std::size_t>(blockIdx.x) * vocab;
+  float best = -INFINITY;
+  std::int32_t best_id = 0;
+  for (std::uint32_t i = threadIdx.x; i < vocab; i += blockDim.x)
+    if (row[i] > best) {
+      best = row[i];
+      best_id = static_cast<std::int32_t>(i);
+    }
+  __shared__ float vals[1024];
+  __shared__ std::int32_t ids[1024];
+  vals[threadIdx.x] = best;
+  ids[threadIdx.x] = best_id;
+  __syncthreads();
+  for (unsigned stride = 512; stride > 0; stride /= 2) {
+    if (threadIdx.x < stride &&
+        (vals[threadIdx.x + stride] > vals[threadIdx.x] ||
+         (vals[threadIdx.x + stride] == vals[threadIdx.x] &&
+          ids[threadIdx.x + stride] < ids[threadIdx.x]))) {
+      vals[threadIdx.x] = vals[threadIdx.x + stride];
+      ids[threadIdx.x] = ids[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0)
+    out[blockIdx.x] = ids[0];
 }
 
 template<typename T>
@@ -404,6 +534,15 @@ struct D1NpuModel::Impl {
   std::int32_t *seq_lo{nullptr}, *seq_hi{nullptr};      // device copies
   mutable std::int32_t vocab_capacity{0};
 
+  // Generation state (EnableGeneration): K/V caches for the attention layers,
+  // conv history and the combined B*x stream of the last pass per conv layer.
+  bool stateful{false};
+  std::uint32_t pos0{0}, pos{0}, max_ctx{0}, last_n{0};
+  std::vector<float*> k_cache, v_cache, conv_hist, conv_bx;
+  float* logit_all{nullptr};
+  std::int32_t* argmax_dev{nullptr};
+  std::int32_t* argmax_host{nullptr};
+  bool Layers(std::uint32_t n);
   mutable double t_encode{0}, t_gemm{0}, t_half{0}, t_memset{0}, t_enckernel{0}, t_final{0};
   bool prof_fine{false};
   bool sync_each{true};
@@ -746,6 +885,154 @@ std::unique_ptr<D1NpuModel> D1NpuModel::Create(const core::GgufReader& reader,
   return std::unique_ptr<D1NpuModel>(new D1NpuModel(std::move(impl)));
 }
 
+bool D1NpuModel::Impl::Layers(std::uint32_t n) {
+  Impl& s = *this;
+  const auto& c = s.w.config;
+  const std::uint32_t H = static_cast<std::uint32_t>(s.hidden);
+  const std::uint32_t I = static_cast<std::uint32_t>(s.inter);
+  const std::uint32_t heads = static_cast<std::uint32_t>(s.heads);
+  const std::uint32_t hd = static_cast<std::uint32_t>(s.hd);
+  const std::uint32_t kv_heads = 4;
+  const std::uint32_t kv_dim = kv_heads * hd;
+  const std::uint32_t q_dim = static_cast<std::uint32_t>(s.q_dim);
+  const float scale = 1.0F / std::sqrt(static_cast<float>(hd));
+  const bool trace = std::getenv("GUFO_D1_TRACE") != nullptr;
+  const auto stat = [&](const char* name, std::uint32_t l, const float* p,
+                        std::size_t count) {
+    if (!trace || l > 1)
+      return;
+    std::vector<float> h(count);
+    hipMemcpyAsync(h.data(), p, count * sizeof(float), hipMemcpyDeviceToHost,
+                   s.stream);
+    hipStreamSynchronize(s.stream);
+    double mean = 0;
+    std::size_t zeros = 0, bad = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+      mean += std::abs(h[i]);
+      zeros += h[i] == 0.0F;
+      bad += !std::isfinite(h[i]);
+    }
+    std::fprintf(stderr, "[d1 npu ] L%u %-8s mean|.| %.5f zeros %zu/%zu bad %zu first %.4f %.4f\n",
+                 l, name, mean / count, zeros, count, bad, h[0], h[1]);
+  };
+  for (std::uint32_t l = 0; l < c.layers.size(); ++l) {
+    stat("x_in", l, s.x, static_cast<std::size_t>(n) * H);
+    rocm::RmsNormRows(s.x, s.g_op + static_cast<std::size_t>(l) * H, s.z, n, H,
+                      1, c.eps, s.stream);
+    stat("z", l, s.z, static_cast<std::size_t>(n) * H);
+    if (c.layers[l] == lfm3::LayerType::kConvolution) {
+      s.EncodeA(s.z, n, H, s.a_h);
+      if (!s.Gemm(s.prog_in, s.a_h, s.w_in[l], s.c_in))
+        return false;
+      rocm::NpuDecodeOutput(s.npu->Staged(s.stream, s.c_in), s.p_buf, n,
+                            Impl::kInPitch, Impl::kInPitch, 0, false, s.stream);
+      stat("p", l, s.p_buf, static_cast<std::size_t>(n) * Impl::kInPitch);
+      if (s.stateful)
+        hipMemcpyAsync(s.conv_bx[l], s.conv_hist[l],
+                       static_cast<std::size_t>(s.taps - 1) * H * sizeof(float),
+                       hipMemcpyDeviceToDevice, s.stream);
+      hipLaunchKernelGGL(D1ConvKernel, dim3((H + 127) / 128, n), dim3(128), 0,
+                         s.stream, s.p_buf,
+                         s.g_conv + static_cast<std::size_t>(l) * H * s.taps,
+                         s.seq_lo,
+                         s.stateful ? s.conv_hist[l] : nullptr,
+                         s.stateful ? s.conv_bx[l] : nullptr, s.conv_out, n, H,
+                         s.taps);
+      s.EncodeA(s.conv_out, n, H, s.a_h);
+      if (!s.Gemm(s.prog_h, s.a_h, s.w_out[l], s.c_h))
+        return false;
+      rocm::NpuDecodeOutput(s.npu->Staged(s.stream, s.c_h), s.branch, n, H, H,
+                            0, false, s.stream, H);
+      stat("conv", l, s.conv_out, static_cast<std::size_t>(n) * H);
+      stat("branch", l, s.branch, static_cast<std::size_t>(n) * H);
+    } else {
+      s.EncodeA(s.z, n, H, s.a_h);
+      if (!s.Gemm(s.prog_qkv, s.a_h, s.w_qkv[l], s.c_qkv))
+        return false;
+      rocm::NpuDecodeOutput(s.npu->Staged(s.stream, s.c_qkv), s.qkv_buf, n,
+                            Impl::kQkvPitch, Impl::kQkvPitch, 0, false,
+                            s.stream);
+      hipLaunchKernelGGL(D1SplitQkvKernel, dim3(n), dim3(128), 0, s.stream,
+                         s.qkv_buf, s.q, s.k, s.v, n, q_dim, kv_dim,
+                         Impl::kQkvPitch);
+      hipLaunchKernelGGL(D1GateKernel, dim3(n), dim3(kThreads), 0, s.stream,
+                         s.z,
+                         s.g_gate + static_cast<std::size_t>(l) * heads * H,
+                         s.gate_buf, H, heads);
+      rocm::RmsNormRows(s.q, s.g_qn + static_cast<std::size_t>(l) * hd, s.qn,
+                        n * heads, hd, 1, c.eps, s.stream);
+      rocm::RmsNormRows(s.k, s.g_kn + static_cast<std::size_t>(l) * hd, s.kn,
+                        n * kv_heads, hd, 1, c.eps, s.stream);
+      const bool swa = c.layers[l] == lfm3::LayerType::kSlidingAttention;
+      hipLaunchKernelGGL(D1RopeKernel, dim3(n, heads + kv_heads), dim3(hd / 2),
+                         0, s.stream, s.qn, s.kn,
+                         swa ? static_cast<const float*>(nullptr) : s.g_factors,
+                         s.seq_lo, s.stateful ? s.pos0 : 0u, n, heads,
+                         kv_heads, hd, swa ? c.theta_swa : c.theta);
+      if (s.stateful) {
+        hipMemcpyAsync(s.k_cache[l] + static_cast<std::size_t>(s.pos0) * kv_dim,
+                       s.kn, static_cast<std::size_t>(n) * kv_dim * 4,
+                       hipMemcpyDeviceToDevice, s.stream);
+        hipMemcpyAsync(s.v_cache[l] + static_cast<std::size_t>(s.pos0) * kv_dim,
+                       s.v, static_cast<std::size_t>(n) * kv_dim * 4,
+                       hipMemcpyDeviceToDevice, s.stream);
+      }
+      hipLaunchKernelGGL(D1AttnKernel, dim3(n, heads), dim3(hd), 0, s.stream,
+                         s.qn, s.stateful ? s.k_cache[l] : s.kn,
+                         s.stateful ? s.v_cache[l] : s.v, s.gate_buf,
+                         s.group_buf, s.seq_lo, s.seq_hi, s.attn, n, heads,
+                         kv_heads, hd, scale, swa ? c.window : 0u,
+                         s.stateful ? 1u : 0u, s.pos0);
+      s.EncodeA(s.attn, n, q_dim, s.a_h);
+      if (!s.Gemm(s.prog_h, s.a_h, s.w_out[l], s.c_h))
+        return false;
+      rocm::NpuDecodeOutput(s.npu->Staged(s.stream, s.c_h), s.branch, n, H, H,
+                            0, false, s.stream, H);
+    }
+    rocm::RmsNormRows(s.branch, s.g_post + static_cast<std::size_t>(l) * H,
+                      s.z2, n, H, 1, c.eps, s.stream);
+    stat("z2", l, s.z2, static_cast<std::size_t>(n) * H);
+    s.Add(s.x, s.z2, n);
+
+    rocm::RmsNormRows(s.x, s.g_ffn + static_cast<std::size_t>(l) * H, s.z, n, H,
+                      1, c.eps, s.stream);
+    s.EncodeA(s.z, n, H, s.a_h);
+    if (!s.Gemm(s.prog_gu, s.a_h, s.w_gu[l], s.c_gu))
+      return false;
+    rocm::NpuDecodeOutput(s.npu->Staged(s.stream, s.c_gu), s.gu_buf, n,
+                          Impl::kGuPitch, Impl::kGuPitch, 0, false, s.stream);
+    hipLaunchKernelGGL(
+        D1SwigluKernel,
+        dim3(static_cast<std::uint32_t>(
+            (static_cast<std::size_t>(n) * I + 255) / 256)),
+        dim3(256), 0, s.stream, s.gu_buf, s.act, I, Impl::kGuPitch,
+        static_cast<std::size_t>(n) * I);
+    s.EncodeA(s.act, n, I, s.a_i);
+    if (!s.Gemm(s.prog_down, s.a_i, s.w_down[l], s.c_h))
+      return false;
+    rocm::NpuDecodeOutput(s.npu->Staged(s.stream, s.c_h), s.branch, n, H, H, 0,
+                          false, s.stream, H);
+    rocm::RmsNormRows(s.branch, s.g_post_ffn + static_cast<std::size_t>(l) * H,
+                      s.z2, n, H, 1, c.eps, s.stream);
+    s.Add(s.x, s.z2, n);
+    if (trace) {
+      std::vector<float> h(static_cast<std::size_t>(n) * H);
+      hipMemcpyAsync(h.data(), s.x, h.size() * sizeof(float),
+                     hipMemcpyDeviceToHost, s.stream);
+      hipStreamSynchronize(s.stream);
+      double mean = 0;
+      for (float v : h)
+        mean += std::abs(v);
+      const std::size_t last = static_cast<std::size_t>(n - 1) * H;
+      std::fprintf(stderr, "[d1 npu ] layer %u mean|x| %.5f last %.4f %.4f %.4f %.4f\n",
+                   l, mean / h.size(), h[last], h[last + 1], h[last + 2],
+                   h[last + 3]);
+    }
+  }
+
+  return true;
+}
+
 bool D1NpuModel::Forward(std::span<const std::uint32_t> tokens,
                          std::span<const std::int32_t> groups,
                          std::span<const std::uint32_t> sequences,
@@ -836,123 +1123,8 @@ bool D1NpuModel::Forward(std::span<const std::uint32_t> tokens,
                          s.emb_table, s.ids, s.x, n, H, row_bytes, c.vocab,
                          units);
   }
-  const float scale = 1.0F / std::sqrt(static_cast<float>(hd));
-  const bool trace = std::getenv("GUFO_D1_TRACE") != nullptr;
-  const auto stat = [&](const char* name, std::uint32_t l, const float* p,
-                        std::size_t count) {
-    if (!trace || l > 1)
-      return;
-    std::vector<float> h(count);
-    hipMemcpyAsync(h.data(), p, count * sizeof(float), hipMemcpyDeviceToHost,
-                   s.stream);
-    hipStreamSynchronize(s.stream);
-    double mean = 0;
-    std::size_t zeros = 0, bad = 0;
-    for (std::size_t i = 0; i < count; ++i) {
-      mean += std::abs(h[i]);
-      zeros += h[i] == 0.0F;
-      bad += !std::isfinite(h[i]);
-    }
-    std::fprintf(stderr, "[d1 npu ] L%u %-8s mean|.| %.5f zeros %zu/%zu bad %zu first %.4f %.4f\n",
-                 l, name, mean / count, zeros, count, bad, h[0], h[1]);
-  };
-  for (std::uint32_t l = 0; l < c.layers.size(); ++l) {
-    stat("x_in", l, s.x, static_cast<std::size_t>(n) * H);
-    rocm::RmsNormRows(s.x, s.g_op + static_cast<std::size_t>(l) * H, s.z, n, H,
-                      1, c.eps, s.stream);
-    stat("z", l, s.z, static_cast<std::size_t>(n) * H);
-    if (c.layers[l] == lfm3::LayerType::kConvolution) {
-      s.EncodeA(s.z, n, H, s.a_h);
-      if (!s.Gemm(s.prog_in, s.a_h, s.w_in[l], s.c_in))
-        return false;
-      rocm::NpuDecodeOutput(s.npu->Staged(s.stream, s.c_in), s.p_buf, n,
-                            Impl::kInPitch, Impl::kInPitch, 0, false, s.stream);
-      stat("p", l, s.p_buf, static_cast<std::size_t>(n) * Impl::kInPitch);
-      hipLaunchKernelGGL(D1ConvKernel, dim3((H + 127) / 128, n), dim3(128), 0,
-                         s.stream, s.p_buf,
-                         s.g_conv + static_cast<std::size_t>(l) * H * s.taps,
-                         s.seq_lo, s.conv_out, n, H, s.taps);
-      s.EncodeA(s.conv_out, n, H, s.a_h);
-      if (!s.Gemm(s.prog_h, s.a_h, s.w_out[l], s.c_h))
-        return false;
-      rocm::NpuDecodeOutput(s.npu->Staged(s.stream, s.c_h), s.branch, n, H, H,
-                            0, false, s.stream, H);
-      stat("conv", l, s.conv_out, static_cast<std::size_t>(n) * H);
-      stat("branch", l, s.branch, static_cast<std::size_t>(n) * H);
-    } else {
-      s.EncodeA(s.z, n, H, s.a_h);
-      if (!s.Gemm(s.prog_qkv, s.a_h, s.w_qkv[l], s.c_qkv))
-        return false;
-      rocm::NpuDecodeOutput(s.npu->Staged(s.stream, s.c_qkv), s.qkv_buf, n,
-                            Impl::kQkvPitch, Impl::kQkvPitch, 0, false,
-                            s.stream);
-      hipLaunchKernelGGL(D1SplitQkvKernel, dim3(n), dim3(128), 0, s.stream,
-                         s.qkv_buf, s.q, s.k, s.v, n, q_dim, kv_dim,
-                         Impl::kQkvPitch);
-      hipLaunchKernelGGL(D1GateKernel, dim3(n), dim3(kThreads), 0, s.stream,
-                         s.z,
-                         s.g_gate + static_cast<std::size_t>(l) * heads * H,
-                         s.gate_buf, H, heads);
-      rocm::RmsNormRows(s.q, s.g_qn + static_cast<std::size_t>(l) * hd, s.qn,
-                        n * heads, hd, 1, c.eps, s.stream);
-      rocm::RmsNormRows(s.k, s.g_kn + static_cast<std::size_t>(l) * hd, s.kn,
-                        n * kv_heads, hd, 1, c.eps, s.stream);
-      const bool swa = c.layers[l] == lfm3::LayerType::kSlidingAttention;
-      hipLaunchKernelGGL(D1RopeKernel, dim3(n, heads + kv_heads), dim3(hd / 2),
-                         0, s.stream, s.qn, s.kn,
-                         swa ? static_cast<const float*>(nullptr) : s.g_factors,
-                         s.seq_lo, n, heads, kv_heads, hd,
-                         swa ? c.theta_swa : c.theta);
-      hipLaunchKernelGGL(D1AttnKernel, dim3(n, heads), dim3(hd), 0, s.stream,
-                         s.qn, s.kn, s.v, s.gate_buf, s.group_buf, s.seq_lo,
-                         s.seq_hi, s.attn, n, heads, kv_heads, hd, scale,
-                         swa ? c.window : 0u);
-      s.EncodeA(s.attn, n, q_dim, s.a_h);
-      if (!s.Gemm(s.prog_h, s.a_h, s.w_out[l], s.c_h))
-        return false;
-      rocm::NpuDecodeOutput(s.npu->Staged(s.stream, s.c_h), s.branch, n, H, H,
-                            0, false, s.stream, H);
-    }
-    rocm::RmsNormRows(s.branch, s.g_post + static_cast<std::size_t>(l) * H,
-                      s.z2, n, H, 1, c.eps, s.stream);
-    stat("z2", l, s.z2, static_cast<std::size_t>(n) * H);
-    s.Add(s.x, s.z2, n);
-
-    rocm::RmsNormRows(s.x, s.g_ffn + static_cast<std::size_t>(l) * H, s.z, n, H,
-                      1, c.eps, s.stream);
-    s.EncodeA(s.z, n, H, s.a_h);
-    if (!s.Gemm(s.prog_gu, s.a_h, s.w_gu[l], s.c_gu))
-      return false;
-    rocm::NpuDecodeOutput(s.npu->Staged(s.stream, s.c_gu), s.gu_buf, n,
-                          Impl::kGuPitch, Impl::kGuPitch, 0, false, s.stream);
-    hipLaunchKernelGGL(
-        D1SwigluKernel,
-        dim3(static_cast<std::uint32_t>(
-            (static_cast<std::size_t>(n) * I + 255) / 256)),
-        dim3(256), 0, s.stream, s.gu_buf, s.act, I, Impl::kGuPitch,
-        static_cast<std::size_t>(n) * I);
-    s.EncodeA(s.act, n, I, s.a_i);
-    if (!s.Gemm(s.prog_down, s.a_i, s.w_down[l], s.c_h))
-      return false;
-    rocm::NpuDecodeOutput(s.npu->Staged(s.stream, s.c_h), s.branch, n, H, H, 0,
-                          false, s.stream, H);
-    rocm::RmsNormRows(s.branch, s.g_post_ffn + static_cast<std::size_t>(l) * H,
-                      s.z2, n, H, 1, c.eps, s.stream);
-    s.Add(s.x, s.z2, n);
-    if (trace) {
-      std::vector<float> h(static_cast<std::size_t>(n) * H);
-      hipMemcpyAsync(h.data(), s.x, h.size() * sizeof(float),
-                     hipMemcpyDeviceToHost, s.stream);
-      hipStreamSynchronize(s.stream);
-      double mean = 0;
-      for (float v : h)
-        mean += std::abs(v);
-      const std::size_t last = static_cast<std::size_t>(n - 1) * H;
-      std::fprintf(stderr, "[d1 npu ] layer %u mean|x| %.5f last %.4f %.4f %.4f %.4f\n",
-                   l, mean / h.size(), h[last], h[last + 1], h[last + 2],
-                   h[last + 3]);
-    }
-  }
+  if (!s.Layers(n))
+    return false;
 
   // Answer slots: gather rows, final norm, then dot with the chosen
   // vocabulary entries (the embedding table is tied to the output head).
@@ -1013,6 +1185,250 @@ bool D1NpuModel::Forward(std::span<const std::uint32_t> tokens,
                    s.t_half, s.t_memset, s.t_enckernel, s.t_final);
   }
   return s.npu->Healthy();
+}
+
+namespace {
+bool s_pos_would_overflow(const D1NpuModel& model, std::size_t more) {
+  return model.Position() + more + 1 > model.MaxContext();
+}
+}  // namespace
+
+
+bool D1NpuModel::EnableGeneration(std::uint32_t max_context, std::string* error) {
+  auto& s = *impl_;
+  if (s.max_ctx != 0)
+    return true;
+  const auto& c = s.w.config;
+  const std::size_t layers = c.layers.size();
+  const std::size_t H = s.hidden;
+  const std::size_t kv_dim = 4 * s.hd;
+  s.k_cache.assign(layers, nullptr);
+  s.v_cache.assign(layers, nullptr);
+  s.conv_hist.assign(layers, nullptr);
+  s.conv_bx.assign(layers, nullptr);
+  for (std::size_t l = 0; l < layers; ++l) {
+    if (c.layers[l] == lfm3::LayerType::kConvolution) {
+      s.conv_hist[l] = DeviceAlloc<float>((s.taps - 1) * H);
+      s.conv_bx[l] = DeviceAlloc<float>((s.taps - 1 + M) * H);
+      if (!s.conv_hist[l] || !s.conv_bx[l]) {
+        if (error)
+          *error = "d1 npu: conv state allocation failed";
+        return false;
+      }
+    } else {
+      s.k_cache[l] = DeviceAlloc<float>(std::size_t{max_context} * kv_dim);
+      s.v_cache[l] = DeviceAlloc<float>(std::size_t{max_context} * kv_dim);
+      if (!s.k_cache[l] || !s.v_cache[l]) {
+        if (error)
+          *error = "d1 npu: K/V cache allocation failed (context too large)";
+        return false;
+      }
+    }
+  }
+  s.logit_all = DeviceAlloc<float>(std::size_t{kMaxRows} * c.vocab);
+  s.argmax_dev = DeviceAlloc<std::int32_t>(kMaxRows);
+  s.argmax_host = PinnedAlloc<std::int32_t>(kMaxRows);
+  if (!s.logit_all || !s.argmax_dev || !s.argmax_host) {
+    if (error)
+      *error = "d1 npu: logit buffer allocation failed";
+    return false;
+  }
+  s.max_ctx = max_context;
+  ResetState();
+  return true;
+}
+
+void D1NpuModel::ResetState() const {
+  auto& s = *impl_;
+  s.pos = 0;
+  for (std::size_t l = 0; l < s.conv_hist.size(); ++l)
+    if (s.conv_hist[l])
+      hipMemsetAsync(s.conv_hist[l], 0, (s.taps - 1) * s.hidden * sizeof(float),
+                     s.stream);
+  hipStreamSynchronize(s.stream);
+}
+
+std::uint32_t D1NpuModel::Position() const { return impl_->pos; }
+std::uint32_t D1NpuModel::MaxContext() const { return impl_->max_ctx; }
+
+bool D1NpuModel::Step(std::span<const std::uint32_t> tokens,
+                      std::span<std::uint32_t> next_tokens) const {
+  auto& s = *impl_;
+  const auto& c = s.w.config;
+  const std::uint32_t n = static_cast<std::uint32_t>(tokens.size());
+  const std::uint32_t want = static_cast<std::uint32_t>(next_tokens.size());
+  const std::uint32_t H = static_cast<std::uint32_t>(s.hidden);
+  if (s.max_ctx == 0 || n == 0 || n > M || want == 0 || want > n ||
+      want > kMaxRows || s.pos + n > s.max_ctx || !s.npu->Healthy())
+    return false;
+  for (auto id : tokens)
+    if (id >= c.vocab)
+      return false;
+  for (std::uint32_t i = 0; i < n; ++i) {
+    s.ids[i] = static_cast<std::int32_t>(tokens[i]);
+    s.seq_lo_h[i] = 0;
+    s.seq_hi_h[i] = static_cast<std::int32_t>(n);
+    s.group_buf[i] = -1;
+  }
+  hipMemcpyAsync(s.seq_lo, s.seq_lo_h, n * sizeof(std::int32_t),
+                 hipMemcpyHostToDevice, s.stream);
+  hipMemcpyAsync(s.seq_hi, s.seq_hi_h, n * sizeof(std::int32_t),
+                 hipMemcpyHostToDevice, s.stream);
+  const int kind = s.w.embedding.type == GgmlType::kQ6_K   ? 1
+                   : s.w.embedding.type == GgmlType::kQ8_0 ? 2
+                                                           : 0;
+  {
+    const std::size_t units =
+        static_cast<std::size_t>(n) * (H / (kind == 1 ? 256u : 32u));
+    const std::uint64_t row_bytes = RowBytes(s.w.embedding.type, H);
+    const dim3 grid(static_cast<std::uint32_t>((units + 255) / 256));
+    if (kind == 1)
+      hipLaunchKernelGGL((D1EmbedKernel<1>), grid, dim3(256), 0, s.stream,
+                         s.emb_table, s.ids, s.x, n, H, row_bytes, c.vocab, units);
+    else if (kind == 2)
+      hipLaunchKernelGGL((D1EmbedKernel<2>), grid, dim3(256), 0, s.stream,
+                         s.emb_table, s.ids, s.x, n, H, row_bytes, c.vocab, units);
+    else
+      hipLaunchKernelGGL((D1EmbedKernel<0>), grid, dim3(256), 0, s.stream,
+                         s.emb_table, s.ids, s.x, n, H, row_bytes, c.vocab, units);
+  }
+  s.stateful = true;
+  s.pos0 = s.pos;
+  const bool ok = s.Layers(n);
+  s.stateful = false;
+  if (!ok)
+    return false;
+  s.last_n = n;
+  if (!s.sel) {
+    s.sel = DeviceAlloc<float>(std::size_t{128} * H);
+    s.sel_norm = DeviceAlloc<float>(std::size_t{128} * H);
+    if (!s.sel || !s.sel_norm)
+      return false;
+  }
+  hipMemcpyAsync(s.sel, s.x + static_cast<std::size_t>(n - want) * H,
+                 static_cast<std::size_t>(want) * H * sizeof(float),
+                 hipMemcpyDeviceToDevice, s.stream);
+  rocm::RmsNormRows(s.sel, s.g_out, s.sel_norm, want, H, 1, c.eps, s.stream);
+  const std::uint64_t row_bytes = RowBytes(s.w.embedding.type, H);
+  if (kind == 1)
+    hipLaunchKernelGGL((D1LogitAllKernel<1>), dim3(c.vocab), dim3(64), 0,
+                       s.stream, s.emb_table, s.sel_norm, s.logit_all, H,
+                       row_bytes, c.vocab, want);
+  else if (kind == 2)
+    hipLaunchKernelGGL((D1LogitAllKernel<2>), dim3(c.vocab), dim3(64), 0,
+                       s.stream, s.emb_table, s.sel_norm, s.logit_all, H,
+                       row_bytes, c.vocab, want);
+  else
+    hipLaunchKernelGGL((D1LogitAllKernel<0>), dim3(c.vocab), dim3(64), 0,
+                       s.stream, s.emb_table, s.sel_norm, s.logit_all, H,
+                       row_bytes, c.vocab, want);
+  hipLaunchKernelGGL(D1ArgmaxKernel, dim3(want), dim3(1024), 0, s.stream,
+                     s.logit_all, c.vocab, s.argmax_dev);
+  hipMemcpyAsync(s.argmax_host, s.argmax_dev, want * sizeof(std::int32_t),
+                 hipMemcpyDeviceToHost, s.stream);
+  hipStreamSynchronize(s.stream);
+  for (std::uint32_t i = 0; i < want; ++i)
+    next_tokens[i] = static_cast<std::uint32_t>(s.argmax_host[i]);
+  return s.npu->Healthy();
+}
+
+void D1NpuModel::Commit(std::uint32_t accepted) const {
+  auto& s = *impl_;
+  if (accepted > s.last_n)
+    accepted = s.last_n;
+  for (std::size_t l = 0; l < s.conv_hist.size(); ++l)
+    if (s.conv_hist[l])
+      hipLaunchKernelGGL(D1ConvCommitKernel,
+                         dim3(static_cast<std::uint32_t>((s.hidden + 127) / 128)),
+                         dim3(128), 0, s.stream, s.conv_bx[l], s.conv_hist[l],
+                         accepted, static_cast<std::uint32_t>(s.hidden), s.taps);
+  hipStreamSynchronize(s.stream);
+  s.pos += accepted;
+}
+
+bool D1NpuModel::Generate(std::span<const std::uint32_t> prompt,
+                          const GenerateOptions& options,
+                          std::vector<std::uint32_t>* output,
+                          GenerateStats* stats) const {
+  if (prompt.empty() || output == nullptr)
+    return false;
+  const auto start = std::chrono::steady_clock::now();
+  ResetState();
+  GenerateStats st;
+  st.prompt_tokens = static_cast<std::uint32_t>(prompt.size());
+  std::vector<std::uint32_t> history(prompt.begin(), prompt.end());
+  std::uint32_t pending = 0;
+  for (std::size_t at = 0; at < prompt.size();) {
+    const std::size_t take = std::min<std::size_t>(M, prompt.size() - at);
+    std::uint32_t next = 0;
+    if (!Step(prompt.subspan(at, take), std::span(&next, 1)))
+      return false;
+    Commit(static_cast<std::uint32_t>(take));
+    pending = next;
+    at += take;
+    ++st.passes;
+  }
+  const auto decode_start = std::chrono::steady_clock::now();
+  st.prefill_ms =
+      std::chrono::duration<double, std::milli>(decode_start - start).count();
+  const auto is_stop = [&](std::uint32_t id) {
+    return std::find(options.stop.begin(), options.stop.end(), id) !=
+           options.stop.end();
+  };
+  while (output->size() < options.max_new) {
+    // pending is the model's next token, not yet in the state.
+    output->push_back(pending);
+    history.push_back(pending);
+    if (is_stop(pending) || output->size() >= options.max_new)
+      break;
+    // Prompt lookup: continue the most recent earlier occurrence of the tail.
+    std::vector<std::uint32_t> draft;
+    if (options.draft_max > 0 && history.size() > options.ngram) {
+      const std::size_t tail = history.size() - options.ngram;
+      for (std::size_t from = tail; from-- > 0;) {
+        if (std::equal(history.begin() + from, history.begin() + from + options.ngram,
+                       history.begin() + tail)) {
+          for (std::size_t k = from + options.ngram;
+               k < tail && draft.size() < options.draft_max; ++k)
+            draft.push_back(history[k]);
+          break;
+        }
+      }
+    }
+    if (s_pos_would_overflow(*this, 1 + draft.size()))
+      break;
+    std::vector<std::uint32_t> tokens;
+    tokens.push_back(pending);
+    tokens.insert(tokens.end(), draft.begin(), draft.end());
+    std::vector<std::uint32_t> next(tokens.size());
+    if (!Step(tokens, next))
+      return false;
+    ++st.passes;
+    std::size_t good = 0;
+    while (good < draft.size() && draft[good] == next[good])
+      ++good;
+    Commit(static_cast<std::uint32_t>(1 + good));
+    st.drafted += static_cast<std::uint32_t>(draft.size());
+    st.accepted += static_cast<std::uint32_t>(good);
+    bool stopped = false;
+    for (std::size_t i = 0; i < good && output->size() < options.max_new; ++i) {
+      output->push_back(draft[i]);
+      history.push_back(draft[i]);
+      if (is_stop(draft[i])) {
+        stopped = true;
+        break;
+      }
+    }
+    if (stopped)
+      break;
+    pending = next[good];
+  }
+  st.new_tokens = static_cast<std::uint32_t>(output->size());
+  st.decode_ms = std::chrono::duration<double, std::milli>(
+                     std::chrono::steady_clock::now() - decode_start).count();
+  if (stats)
+    *stats = st;
+  return true;
 }
 
 }  // namespace gufo::models::qwen38_flash_next
