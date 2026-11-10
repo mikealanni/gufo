@@ -370,9 +370,15 @@ int RunJudge(std::span<const char* const> args) {
   if (!use_gpu && !generate_prompt.empty()) {
     auto model = models::qwen38_flash_next::D1NpuModel::Create(*reader, &err);
     auto tokenizer = models::lfm3::Tokenizer::Load(*reader, &err);
-    if (!model || !tokenizer || !model->EnableGeneration(8192, &err)) {
+    if (!model || !tokenizer || !model->EnableGeneration(std::getenv("GUFO_D1_CTX") ? static_cast<std::uint32_t>(std::atoi(std::getenv("GUFO_D1_CTX"))) : 8192u, &err)) {
       std::fprintf(stderr, "judge: %s\n", err.c_str());
       return 1;
+    }
+    if (!generate_prompt.empty() && generate_prompt[0] == '@') {
+      std::ifstream file(generate_prompt.substr(1));
+      std::stringstream buffer;
+      buffer << file.rdbuf();
+      generate_prompt = buffer.str();
     }
     const std::vector<std::pair<std::string, std::string>> messages = {
         {"user", generate_prompt}};

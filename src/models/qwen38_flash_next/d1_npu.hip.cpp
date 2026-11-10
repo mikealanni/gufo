@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/models/lfm3/hip/ops.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/npu_gemm.hpp"
 
@@ -540,6 +541,7 @@ struct D1NpuModel::Impl {
   std::uint32_t pos0{0}, pos{0}, max_ctx{0}, last_n{0};
   std::vector<float*> k_cache, v_cache, conv_hist, conv_bx;
   float* logit_all{nullptr};
+  float* attn_scratch{nullptr};
   std::int32_t* argmax_dev{nullptr};
   std::int32_t* argmax_host{nullptr};
   bool Layers(std::uint32_t n);
@@ -970,19 +972,26 @@ bool D1NpuModel::Impl::Layers(std::uint32_t n) {
                          s.seq_lo, s.stateful ? s.pos0 : 0u, n, heads,
                          kv_heads, hd, swa ? c.theta_swa : c.theta);
       if (s.stateful) {
-        hipMemcpyAsync(s.k_cache[l] + static_cast<std::size_t>(s.pos0) * kv_dim,
-                       s.kn, static_cast<std::size_t>(n) * kv_dim * 4,
-                       hipMemcpyDeviceToDevice, s.stream);
-        hipMemcpyAsync(s.v_cache[l] + static_cast<std::size_t>(s.pos0) * kv_dim,
-                       s.v, static_cast<std::size_t>(n) * kv_dim * 4,
-                       hipMemcpyDeviceToDevice, s.stream);
+        // Tiled / split-K attention over the cache plus this chunk, then the
+        // chunk joins the cache (writes follow the read, as the kernels need).
+        lfm3::gpu::Attention(s.qn, s.kn, s.v, s.gate_buf, s.k_cache[l],
+                             s.v_cache[l], s.attn, static_cast<int>(n),
+                             static_cast<int>(heads),
+                             static_cast<int>(kv_heads),
+                             static_cast<int>(hd), static_cast<int>(s.pos0),
+                             static_cast<int>(s.max_ctx),
+                             swa ? static_cast<int>(c.window) : 0, s.stream,
+                             s.attn_scratch);
+        lfm3::gpu::StoreKV(s.kn, s.v, s.k_cache[l], s.v_cache[l],
+                           static_cast<int>(n), static_cast<int>(kv_dim),
+                           static_cast<int>(s.pos0),
+                           static_cast<int>(s.max_ctx), s.stream);
+      } else {
+        hipLaunchKernelGGL(D1AttnKernel, dim3(n, heads), dim3(hd), 0, s.stream,
+                           s.qn, s.kn, s.v, s.gate_buf, s.group_buf, s.seq_lo,
+                           s.seq_hi, s.attn, n, heads, kv_heads, hd, scale,
+                           swa ? c.window : 0u, 0u, 0u);
       }
-      hipLaunchKernelGGL(D1AttnKernel, dim3(n, heads), dim3(hd), 0, s.stream,
-                         s.qn, s.stateful ? s.k_cache[l] : s.kn,
-                         s.stateful ? s.v_cache[l] : s.v, s.gate_buf,
-                         s.group_buf, s.seq_lo, s.seq_hi, s.attn, n, heads,
-                         kv_heads, hd, scale, swa ? c.window : 0u,
-                         s.stateful ? 1u : 0u, s.pos0);
       s.EncodeA(s.attn, n, q_dim, s.a_h);
       if (!s.Gemm(s.prog_h, s.a_h, s.w_out[l], s.c_h))
         return false;
@@ -1224,6 +1233,19 @@ bool D1NpuModel::EnableGeneration(std::uint32_t max_context, std::string* error)
         return false;
       }
     }
+  }
+  s.attn_scratch = static_cast<float*>(nullptr);
+  {
+    const std::size_t bytes = lfm3::gpu::AttentionScratchBytes(
+        static_cast<int>(s.heads), static_cast<int>(s.hd),
+        static_cast<int>(max_context), static_cast<int>(M));
+    void* scratch = nullptr;
+    if (hipMalloc(&scratch, bytes) != hipSuccess) {
+      if (error)
+        *error = "d1 npu: attention scratch allocation failed";
+      return false;
+    }
+    s.attn_scratch = static_cast<float*>(scratch);
   }
   s.logit_all = DeviceAlloc<float>(std::size_t{kMaxRows} * c.vocab);
   s.argmax_dev = DeviceAlloc<std::int32_t>(kMaxRows);
