@@ -189,6 +189,7 @@ target_link_libraries(gufo_core PUBLIC ICU::uc ICU::i18n Threads::Threads
   PNG::PNG JPEG::JPEG PkgConfig::WEBP CURL::libcurl OpenSSL::Crypto)
 
 add_subdirectory(src/models/qwen)
+add_subdirectory(src/models/lfm3)
 add_subdirectory(src/models/qwen_image_21)
 
 target_link_libraries(gufo_qwen3_tts PUBLIC gufo_core)
