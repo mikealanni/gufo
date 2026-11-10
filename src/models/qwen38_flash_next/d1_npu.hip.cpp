@@ -3,6 +3,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -382,6 +383,8 @@ struct D1NpuModel::Impl {
   std::int32_t *ids{nullptr}, *group_buf{nullptr}, *vocab_ids{nullptr};
   mutable std::int32_t vocab_capacity{0};
 
+  mutable double t_encode{0}, t_gemm{0};
+  mutable int n_gemm{0};
   std::size_t hidden{0}, inter{0}, heads{0}, hd{0}, q_dim{0};
   std::uint32_t taps{0};
 
@@ -390,6 +393,15 @@ struct D1NpuModel::Impl {
 
   // Writes `rows` x cols of `src` (float) to a block-float A buffer.
   void EncodeA(const float* src, std::uint32_t n, std::uint32_t cols, int buf) const {
+    const auto t0 = std::chrono::steady_clock::now();
+    struct Done {
+      const Impl* self;
+      std::chrono::steady_clock::time_point t0;
+      ~Done() {
+        self->t_encode += std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - t0).count();
+      }
+    } done{this, t0};
     const std::uint32_t enc_rows = (n + 127u) / 128u * 128u;
     hipLaunchKernelGGL(D1ToHalfKernel,
                        dim3(static_cast<std::uint32_t>(
@@ -414,6 +426,16 @@ struct D1NpuModel::Impl {
   }
 
   bool Gemm(int program, int a, int weight, int c) const {
+    const auto t0 = std::chrono::steady_clock::now();
+    struct Done {
+      const Impl* self;
+      std::chrono::steady_clock::time_point t0;
+      ~Done() {
+        self->t_gemm += std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0).count();
+        ++self->n_gemm;
+      }
+    } done{this, t0};
     const int bs[1] = {weight};
     const int cs[1] = {c};
     if (!npu->Submit(stream, a, bs, cs, 1, program))
@@ -666,6 +688,10 @@ bool D1NpuModel::Forward(std::span<const std::uint32_t> tokens,
                          std::span<const std::uint32_t> vocabulary,
                          std::span<float> logits) const {
   auto& s = *impl_;
+  const auto t_start = std::chrono::steady_clock::now();
+  s.t_encode = 0;
+  s.t_gemm = 0;
+  s.n_gemm = 0;
   const auto& c = s.w.config;
   const std::uint32_t n = static_cast<std::uint32_t>(tokens.size());
   const std::uint32_t H = static_cast<std::uint32_t>(s.hidden);
@@ -878,6 +904,14 @@ bool D1NpuModel::Forward(std::span<const std::uint32_t> tokens,
                        dim3(kThreads), 0, s.stream, s.emb_table, s.vocab_ids,
                        s.sel_norm, s.logit_buf, H, row_bytes, cols);
   hipStreamSynchronize(s.stream);
+  if (std::getenv("GUFO_D1_PROF")) {
+    const double total = std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - t_start).count();
+    std::fprintf(stderr,
+                 "[d1 prof] n=%u total %.1f ms: encode %.1f gemm %.1f (%d calls) other %.1f\n",
+                 n, total, s.t_encode, s.t_gemm, s.n_gemm,
+                 total - s.t_encode - s.t_gemm);
+  }
   std::memcpy(logits.data(), s.logit_buf, logits.size_bytes());
   return s.npu->Healthy();
 }
