@@ -59,12 +59,42 @@ public:
   [[nodiscard]] bool Step(std::span<const std::uint32_t> tokens,
                           std::span<std::uint32_t> next_tokens) const;
   void Commit(std::uint32_t accepted) const;
+  /// Debug: the final-norm hidden rows of the last Step (rows x hidden floats).
+  [[nodiscard]] bool LastHidden(std::vector<float>* out, std::uint32_t rows) const;
+
+  /// Teacher-forced pass over `tokens` (any length, chunked): the final-norm
+  /// hidden state of every row as fp16 bits (n x hidden), for drafter
+  /// training. Resets and leaves the stream state at the end of `tokens`.
+  [[nodiscard]] bool CaptureHidden(std::span<const std::uint32_t> tokens,
+                                   std::vector<std::uint16_t>* hidden) const;
+
+  /// Batched greedy decode for data generation and concurrent serving: up to
+  /// `streams` independent streams (one row each) share every NPU pass. A
+  /// stream's state is loaded from the single-stream state (after Step +
+  /// Commit of its prompt); BatchStep feeds one token per stream.
+  [[nodiscard]] bool EnableBatch(std::uint32_t streams, std::uint32_t ctx,
+                                 std::string* error = nullptr);
+  [[nodiscard]] bool BatchLoad(std::uint32_t stream, std::uint32_t length) const;
+  [[nodiscard]] bool BatchStep(std::span<const std::uint32_t> tokens,
+                               std::span<std::uint32_t> next) const;
+
+  /// Medusa-style drafter heads (K residual-SiLU blocks over the final-norm
+  /// hidden, tied to the embedding head) written by the training script:
+  /// u32 K, u32 hidden, then K x hidden x hidden fp16 weights [out][in].
+  [[nodiscard]] bool LoadDrafter(const std::string& path,
+                                 std::string* error = nullptr);
+  [[nodiscard]] std::uint32_t DrafterHeads() const;
+  /// Tokens that follow the model's own next token, from the final-norm hidden
+  /// of row `row` among the rows returned by the last Step.
+  [[nodiscard]] bool Draft(std::uint32_t row,
+                           std::vector<std::uint32_t>* drafts) const;
 
   struct GenerateOptions {
     std::uint32_t max_new{128};
     std::vector<std::uint32_t> stop;  // token ids that end generation
     std::uint32_t draft_max{15};      // prompt-lookup draft length per pass
     std::uint32_t ngram{3};           // match length for prompt lookup
+    bool use_heads{true};             // drafter heads when loaded
   };
   struct GenerateStats {
     std::uint32_t passes{0}, prompt_tokens{0}, new_tokens{0}, drafted{0},

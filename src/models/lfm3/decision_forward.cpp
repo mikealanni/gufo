@@ -80,7 +80,8 @@ std::vector<float> DecisionForward(const Weights& w,
                                    std::span<const std::int32_t> groups,
                                    std::span<const std::uint32_t> slots,
                                    std::span<const std::uint32_t> vocabulary,
-                                   bool causal, unsigned threads) {
+                                   bool causal, unsigned threads,
+                                   std::vector<float>* final_hidden) {
   const auto& c = w.config;
   const std::size_t n = tokens.size(), H = c.hidden;
   if (!n || slots.empty() || (!groups.empty() && groups.size() != n))
@@ -204,6 +205,8 @@ std::vector<float> DecisionForward(const Weights& w,
     std::copy_n(x.begin() + slots[s] * H, H, hidden.begin() + s * H);
     Norm(hidden.data() + s * H, H, w.output_norm, c.eps);
   }
+  if (final_hidden != nullptr)
+    *final_hidden = hidden;
   const std::size_t cols = vocabulary.empty() ? c.vocab : vocabulary.size();
   std::vector<float> logits(slots.size() * cols);
   ParallelFor(cols, threads, [&](std::size_t j) {

@@ -17,6 +17,7 @@ std::vector<float> DecisionForward(const Weights& weights,
                                    std::span<const std::uint32_t> slots,
                                    std::span<const std::uint32_t> vocabulary,
                                    bool causal = false,
-                                   unsigned threads = 4);
+                                   unsigned threads = 4,
+                                   std::vector<float>* final_hidden = nullptr);
 }  // namespace gufo::models::lfm3
 #endif

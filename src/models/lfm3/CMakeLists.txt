@@ -16,3 +16,6 @@ target_link_libraries(gufo_lfm3_decision_forward_check PRIVATE gufo_lfm3_referen
 add_executable(gufo_lfm3_generate_check EXCLUDE_FROM_ALL
   ${PROJECT_SOURCE_DIR}/tests/models/lfm3/generate_check.cpp)
 target_link_libraries(gufo_lfm3_generate_check PRIVATE gufo_lfm3_reference)
+add_executable(gufo_lfm3_rowcheck EXCLUDE_FROM_ALL
+  ${PROJECT_SOURCE_DIR}/tests/models/lfm3/rowcheck.cpp)
+target_link_libraries(gufo_lfm3_rowcheck PRIVATE gufo_lfm3_reference)

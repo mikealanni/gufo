@@ -382,6 +382,7 @@ __global__ void D1GateKernel(const float* __restrict__ z,
 /// layers) divide the angle per frequency index.
 __global__ void D1RopeKernel(float* q, float* k, const float* __restrict__ factors,
                              const std::int32_t* __restrict__ seq_lo,
+                             const std::int32_t* __restrict__ pos_arr,
                              std::uint32_t pos_base, std::uint32_t n,
                              std::uint32_t heads, std::uint32_t kv_heads,
                              std::uint32_t hd, float theta) {
@@ -399,8 +400,12 @@ __global__ void D1RopeKernel(float* q, float* k, const float* __restrict__ facto
       return;
     base = k + (static_cast<std::size_t>(row) * kv_heads + kh) * hd;
   }
-  float angle = static_cast<float>(
-                    row - static_cast<std::uint32_t>(seq_lo[row]) + pos_base) *
+  const float position =
+      pos_arr != nullptr
+          ? static_cast<float>(pos_arr[row])
+          : static_cast<float>(row - static_cast<std::uint32_t>(seq_lo[row]) +
+                               pos_base);
+  float angle = position *
                 powf(theta, -2.0F * static_cast<float>(dd) /
                                 static_cast<float>(hd));
   if (factors != nullptr)
@@ -427,8 +432,14 @@ __global__ void D1AttnKernel(const float* __restrict__ q,
                              std::uint32_t heads, std::uint32_t kv_heads,
                              std::uint32_t hd, float scale,
                              std::uint32_t window, std::uint32_t stateful,
-                             std::uint32_t pos0) {
+                             std::uint32_t pos0,
+                             const std::int32_t* __restrict__ pos_arr,
+                             std::size_t stream_stride) {
   const std::uint32_t t = blockIdx.x, h = blockIdx.y;
+  if (stream_stride != 0) {
+    k += static_cast<std::size_t>(t) * stream_stride;
+    v += static_cast<std::size_t>(t) * stream_stride;
+  }
   const std::uint32_t kh = h / (heads / kv_heads);
   const std::uint32_t kv_dim = kv_heads * hd;
   __shared__ float qs[128];
@@ -438,7 +449,9 @@ __global__ void D1AttnKernel(const float* __restrict__ q,
   __syncthreads();
   std::uint32_t first, last;
   if (stateful) {
-    const std::uint32_t qa = pos0 + t;
+    const std::uint32_t qa = pos_arr != nullptr
+                                 ? static_cast<std::uint32_t>(pos_arr[t])
+                                 : pos0 + t;
     last = qa;
     first = window > 0 && qa + 1 > window ? qa + 1 - window : 0;
   } else {
@@ -591,6 +604,73 @@ __global__ void D1ArgmaxKernel(const float* __restrict__ logits,
     out[blockIdx.x] = ids[0];
 }
 
+/// z[j] = h + silu(W[j] h) for every drafter head j; one block per output.
+__global__ void D1DraftHeadKernel(const __half* __restrict__ w,
+                                  const float* __restrict__ h,
+                                  float* __restrict__ z, std::uint32_t hidden) {
+  const std::uint32_t j = blockIdx.y, o = blockIdx.x;
+  const __half* row = w + (static_cast<std::size_t>(j) * hidden + o) * hidden;
+  float partial = 0.0F;
+  for (std::uint32_t i = threadIdx.x; i < hidden; i += blockDim.x)
+    partial += __half2float(row[i]) * h[i];
+  __shared__ float red[kThreads];
+  red[threadIdx.x] = partial;
+  __syncthreads();
+  for (unsigned stride = blockDim.x / 2; stride > 0; stride /= 2) {
+    if (threadIdx.x < stride)
+      red[threadIdx.x] += red[threadIdx.x + stride];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    const float v = red[0];
+    z[static_cast<std::size_t>(j) * hidden + o] = h[o] + v / (1.0F + __expf(-v));
+  }
+}
+
+/// Batched decode: row t is stream t with its own conv history
+/// ((taps-1) x hidden, oldest first), updated in place.
+__global__ void D1ConvBatchKernel(const float* __restrict__ p,
+                                  const float* __restrict__ w,
+                                  float* __restrict__ hist_all,
+                                  float* __restrict__ out, std::uint32_t n,
+                                  std::uint32_t hidden, std::uint32_t taps) {
+  const std::uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t t = blockIdx.y;
+  if (c >= hidden || t >= n)
+    return;
+  const std::size_t pitch = 3ull * hidden;
+  float* hist = hist_all + static_cast<std::size_t>(t) * (taps - 1) * hidden;
+  const float bx = p[t * pitch + c] * p[t * pitch + 2ull * hidden + c];
+  float sum = w[static_cast<std::size_t>(c) * taps + taps - 1] * bx;
+  for (std::uint32_t j = 0; j + 1 < taps; ++j)
+    sum += w[static_cast<std::size_t>(c) * taps + j] *
+           hist[static_cast<std::size_t>(j) * hidden + c];
+  out[static_cast<std::size_t>(t) * hidden + c] = sum * p[t * pitch + hidden + c];
+  for (std::uint32_t j = 0; j + 2 < taps; ++j)
+    hist[static_cast<std::size_t>(j) * hidden + c] =
+        hist[static_cast<std::size_t>(j + 1) * hidden + c];
+  hist[static_cast<std::size_t>(taps - 2) * hidden + c] = bx;
+}
+
+/// Writes row t's K and V at its stream's current position.
+__global__ void D1StoreKvBatchKernel(const float* __restrict__ k,
+                                     const float* __restrict__ v,
+                                     float* __restrict__ ck,
+                                     float* __restrict__ cv,
+                                     const std::int32_t* __restrict__ pos,
+                                     std::size_t stream_stride,
+                                     std::uint32_t kv_dim, std::uint32_t n) {
+  const std::uint32_t t = blockIdx.x;
+  if (t >= n)
+    return;
+  const std::size_t base = static_cast<std::size_t>(t) * stream_stride +
+                           static_cast<std::size_t>(pos[t]) * kv_dim;
+  for (std::uint32_t i = threadIdx.x; i < kv_dim; i += blockDim.x) {
+    ck[base + i] = k[static_cast<std::size_t>(t) * kv_dim + i];
+    cv[base + i] = v[static_cast<std::size_t>(t) * kv_dim + i];
+  }
+}
+
 template<typename T>
 T* DeviceAlloc(std::size_t count) {
   void* p = nullptr;
@@ -640,6 +720,15 @@ struct D1NpuModel::Impl {
   std::vector<float*> k_cache, v_cache, conv_hist, conv_bx;
   float* logit_all{nullptr};
   float* attn_scratch{nullptr};
+  __half* draft_w{nullptr};
+  float* draft_z{nullptr};
+  std::uint32_t draft_k{0};
+  // Batched decode: up to batch_streams independent streams, one row each.
+  bool batch{false};
+  std::uint32_t batch_streams{0}, batch_ctx{0};
+  std::int32_t* pos_dev{nullptr};
+  std::int32_t* pos_host{nullptr};
+  std::vector<float*> bk_cache, bv_cache, bconv_hist;
   std::int32_t* argmax_dev{nullptr};
   std::int32_t* argmax_host{nullptr};
   bool Layers(std::uint32_t n);
@@ -649,6 +738,7 @@ struct D1NpuModel::Impl {
   double step_layers_ms{0};
   bool prof_fine{false};
   bool sync_each{true};
+  bool use_runsync{true};
   mutable int n_gemm{0};
   std::size_t hidden{0}, inter{0}, heads{0}, hd{0}, q_dim{0};
   std::uint32_t taps{0};
@@ -725,12 +815,17 @@ struct D1NpuModel::Impl {
         ++self->n_gemm;
       }
     } done{this, t0};
-    const int bs[1] = {weight};
-    const int cs[1] = {c};
-    if (!npu->Submit(stream, a, bs, cs, 1, program))
-      return false;
-    if (!npu->Wait(stream))
-      return false;
+    if (use_runsync) {
+      if (!npu->RunSync(stream, a, weight, c, program))
+        return false;
+    } else {
+      const int bs[1] = {weight};
+      const int cs[1] = {c};
+      if (!npu->Submit(stream, a, bs, cs, 1, program))
+        return false;
+      if (!npu->Wait(stream))
+        return false;
+    }
     if (sync_each)
       hipStreamSynchronize(stream);
     return npu->Healthy();
@@ -881,6 +976,7 @@ std::unique_ptr<D1NpuModel> D1NpuModel::Create(const core::GgufReader& reader,
   s.gu_buf = DeviceAlloc<float>(std::size_t{M} * Impl::kGuPitch);
   s.act = DeviceAlloc<float>(M * I);
   s.half_buf = DeviceAlloc<__half>(M * std::max<std::size_t>(I, std::max(H, Q)));
+  s.use_runsync = std::getenv("GUFO_D1_NO_RUNSYNC") == nullptr;
   s.prof_fine = std::getenv("GUFO_D1_PROF2") != nullptr;
   s.sync_each = std::getenv("GUFO_NPU_ISOLATE") != nullptr || s.prof_fine ||
                 std::getenv("GUFO_D1_SYNC") != nullptr;
@@ -1064,17 +1160,24 @@ bool D1NpuModel::Impl::Layers(std::uint32_t n) {
         return false;
       s.Decode(s.c_in, s.p_buf, n, Impl::kInPitch, Impl::kInPitch, 0);
       stat("p", l, s.p_buf, static_cast<std::size_t>(n) * Impl::kInPitch);
-      if (s.stateful)
-        hipMemcpyAsync(s.conv_bx[l], s.conv_hist[l],
-                       static_cast<std::size_t>(s.taps - 1) * H * sizeof(float),
-                       hipMemcpyDeviceToDevice, s.stream);
-      hipLaunchKernelGGL(D1ConvKernel, dim3((H + 127) / 128, n), dim3(128), 0,
-                         s.stream, s.p_buf,
-                         s.g_conv + static_cast<std::size_t>(l) * H * s.taps,
-                         s.seq_lo,
-                         s.stateful ? s.conv_hist[l] : nullptr,
-                         s.stateful ? s.conv_bx[l] : nullptr, s.conv_out, n, H,
-                         s.taps);
+      if (s.batch) {
+        hipLaunchKernelGGL(D1ConvBatchKernel, dim3((H + 127) / 128, n),
+                           dim3(128), 0, s.stream, s.p_buf,
+                           s.g_conv + static_cast<std::size_t>(l) * H * s.taps,
+                           s.bconv_hist[l], s.conv_out, n, H, s.taps);
+      } else {
+        if (s.stateful)
+          hipMemcpyAsync(s.conv_bx[l], s.conv_hist[l],
+                         static_cast<std::size_t>(s.taps - 1) * H * sizeof(float),
+                         hipMemcpyDeviceToDevice, s.stream);
+        hipLaunchKernelGGL(D1ConvKernel, dim3((H + 127) / 128, n), dim3(128), 0,
+                           s.stream, s.p_buf,
+                           s.g_conv + static_cast<std::size_t>(l) * H * s.taps,
+                           s.seq_lo,
+                           s.stateful ? s.conv_hist[l] : nullptr,
+                           s.stateful ? s.conv_bx[l] : nullptr, s.conv_out, n, H,
+                           s.taps);
+      }
       s.EncodeA(s.conv_out, n, H, s.a_h);
       if (!s.Gemm(s.prog_h, s.a_h, s.w_out[l], s.c_h))
         return false;
@@ -1101,9 +1204,20 @@ bool D1NpuModel::Impl::Layers(std::uint32_t n) {
       hipLaunchKernelGGL(D1RopeKernel, dim3(n, heads + kv_heads), dim3(hd / 2),
                          0, s.stream, s.qn, s.kn,
                          swa ? static_cast<const float*>(nullptr) : s.g_factors,
-                         s.seq_lo, s.stateful ? s.pos0 : 0u, n, heads,
-                         kv_heads, hd, swa ? c.theta_swa : c.theta);
-      if (s.stateful) {
+                         s.seq_lo, s.batch ? s.pos_dev : nullptr,
+                         s.stateful ? s.pos0 : 0u, n, heads, kv_heads, hd,
+                         swa ? c.theta_swa : c.theta);
+      if (s.batch) {
+        const std::size_t stride = static_cast<std::size_t>(s.batch_ctx) * kv_dim;
+        hipLaunchKernelGGL(D1StoreKvBatchKernel, dim3(n), dim3(128), 0, s.stream,
+                           s.kn, s.v, s.bk_cache[l], s.bv_cache[l], s.pos_dev,
+                           stride, kv_dim, n);
+        hipLaunchKernelGGL(D1AttnKernel, dim3(n, heads), dim3(hd), 0, s.stream,
+                           s.qn, s.bk_cache[l], s.bv_cache[l], s.gate_buf,
+                           s.group_buf, s.seq_lo, s.seq_hi, s.attn, n, heads,
+                           kv_heads, hd, scale, swa ? c.window : 0u, 1u, 0u,
+                           s.pos_dev, stride);
+      } else if (s.stateful) {
         // Tiled / split-K attention over the cache plus this chunk, then the
         // chunk joins the cache (writes follow the read, as the kernels need).
         lfm3::gpu::Attention(s.qn, s.kn, s.v, s.gate_buf, s.k_cache[l],
@@ -1122,7 +1236,7 @@ bool D1NpuModel::Impl::Layers(std::uint32_t n) {
         hipLaunchKernelGGL(D1AttnKernel, dim3(n, heads), dim3(hd), 0, s.stream,
                            s.qn, s.kn, s.v, s.gate_buf, s.group_buf, s.seq_lo,
                            s.seq_hi, s.attn, n, heads, kv_heads, hd, scale,
-                           swa ? c.window : 0u, 0u, 0u);
+                           swa ? c.window : 0u, 0u, 0u, nullptr, 0);
       }
       s.EncodeA(s.attn, n, q_dim, s.a_h);
       if (!s.Gemm(s.prog_h, s.a_h, s.w_out[l], s.c_h))
@@ -1377,8 +1491,8 @@ bool D1NpuModel::EnableGeneration(std::uint32_t max_context, std::string* error)
     s.attn_scratch = static_cast<float*>(scratch);
   }
   s.logit_all = DeviceAlloc<float>(std::size_t{kMaxRows} * c.vocab);
-  s.argmax_dev = DeviceAlloc<std::int32_t>(kMaxRows);
-  s.argmax_host = PinnedAlloc<std::int32_t>(kMaxRows);
+  s.argmax_dev = DeviceAlloc<std::int32_t>(128);
+  s.argmax_host = PinnedAlloc<std::int32_t>(128);
   if (!s.logit_all || !s.argmax_dev || !s.argmax_host) {
     if (error)
       *error = "d1 npu: logit buffer allocation failed";
@@ -1496,6 +1610,15 @@ bool D1NpuModel::Step(std::span<const std::uint32_t> tokens,
   return s.npu->Healthy();
 }
 
+bool D1NpuModel::LastHidden(std::vector<float>* out, std::uint32_t rows) const {
+  auto& s = *impl_;
+  if (!s.sel_norm || rows == 0 || rows > 128)
+    return false;
+  out->resize(std::size_t{rows} * s.hidden);
+  hipMemcpy(out->data(), s.sel_norm, out->size() * sizeof(float), hipMemcpyDeviceToHost);
+  return true;
+}
+
 void D1NpuModel::Commit(std::uint32_t accepted) const {
   auto& s = *impl_;
   if (accepted > s.last_n)
@@ -1510,6 +1633,294 @@ void D1NpuModel::Commit(std::uint32_t accepted) const {
   s.pos += accepted;
 }
 
+bool D1NpuModel::EnableBatch(std::uint32_t streams, std::uint32_t ctx,
+                             std::string* error) {
+  auto& s = *impl_;
+  const auto& c = s.w.config;
+  if (s.max_ctx == 0 || streams == 0 || streams > 128 || s.batch_streams != 0) {
+    if (error)
+      *error = "d1 npu: EnableGeneration first; batch is 1..128 streams, once";
+    return false;
+  }
+  const std::size_t layers = c.layers.size();
+  const std::size_t H = s.hidden;
+  const std::size_t kv_dim = 4 * s.hd;
+  s.bk_cache.assign(layers, nullptr);
+  s.bv_cache.assign(layers, nullptr);
+  s.bconv_hist.assign(layers, nullptr);
+  for (std::size_t l = 0; l < layers; ++l) {
+    if (c.layers[l] == lfm3::LayerType::kConvolution) {
+      s.bconv_hist[l] = DeviceAlloc<float>(std::size_t{streams} * (s.taps - 1) * H);
+      if (!s.bconv_hist[l])
+        return false;
+      hipMemset(s.bconv_hist[l], 0, std::size_t{streams} * (s.taps - 1) * H * 4);
+    } else {
+      s.bk_cache[l] = DeviceAlloc<float>(std::size_t{streams} * ctx * kv_dim);
+      s.bv_cache[l] = DeviceAlloc<float>(std::size_t{streams} * ctx * kv_dim);
+      if (!s.bk_cache[l] || !s.bv_cache[l]) {
+        if (error)
+          *error = "d1 npu: batch K/V allocation failed";
+        return false;
+      }
+    }
+  }
+  s.pos_dev = DeviceAlloc<std::int32_t>(streams);
+  s.pos_host = PinnedAlloc<std::int32_t>(streams);
+  if (!s.pos_dev || !s.pos_host)
+    return false;
+  std::memset(s.pos_host, 0, streams * sizeof(std::int32_t));
+  s.batch_streams = streams;
+  s.batch_ctx = ctx;
+  return true;
+}
+
+bool D1NpuModel::BatchLoad(std::uint32_t stream, std::uint32_t length) const {
+  auto& s = *impl_;
+  const auto& c = s.w.config;
+  if (s.batch_streams == 0 || stream >= s.batch_streams || length > s.batch_ctx ||
+      length > s.pos)
+    return false;
+  const std::size_t H = s.hidden, kv_dim = 4 * s.hd;
+  hipStreamSynchronize(s.stream);
+  for (std::size_t l = 0; l < c.layers.size(); ++l) {
+    if (c.layers[l] == lfm3::LayerType::kConvolution) {
+      hipMemcpyAsync(s.bconv_hist[l] + std::size_t{stream} * (s.taps - 1) * H,
+                     s.conv_hist[l], (s.taps - 1) * H * sizeof(float),
+                     hipMemcpyDeviceToDevice, s.stream);
+    } else {
+      hipMemcpyAsync(s.bk_cache[l] + std::size_t{stream} * s.batch_ctx * kv_dim,
+                     s.k_cache[l], std::size_t{length} * kv_dim * 4,
+                     hipMemcpyDeviceToDevice, s.stream);
+      hipMemcpyAsync(s.bv_cache[l] + std::size_t{stream} * s.batch_ctx * kv_dim,
+                     s.v_cache[l], std::size_t{length} * kv_dim * 4,
+                     hipMemcpyDeviceToDevice, s.stream);
+    }
+  }
+  hipStreamSynchronize(s.stream);
+  s.pos_host[stream] = static_cast<std::int32_t>(length);
+  return true;
+}
+
+bool D1NpuModel::BatchStep(std::span<const std::uint32_t> tokens,
+                           std::span<std::uint32_t> next) const {
+  auto& s = *impl_;
+  const auto& c = s.w.config;
+  const std::uint32_t n = static_cast<std::uint32_t>(tokens.size());
+  const std::uint32_t H = static_cast<std::uint32_t>(s.hidden);
+  if (s.batch_streams == 0 || n == 0 || n > s.batch_streams || n > s.pass_rows ||
+      next.size() != n || !s.npu->Healthy())
+    return false;
+  for (std::uint32_t i = 0; i < n; ++i) {
+    if (tokens[i] >= c.vocab || s.pos_host[i] + 1 >= static_cast<std::int32_t>(s.batch_ctx))
+      return false;
+    s.ids[i] = static_cast<std::int32_t>(tokens[i]);
+    s.seq_lo_h[i] = 0;
+    s.seq_hi_h[i] = 1;
+    s.group_buf[i] = -1;
+  }
+  hipMemcpyAsync(s.pos_dev, s.pos_host, n * sizeof(std::int32_t),
+                 hipMemcpyHostToDevice, s.stream);
+  hipMemcpyAsync(s.seq_lo, s.seq_lo_h, n * sizeof(std::int32_t),
+                 hipMemcpyHostToDevice, s.stream);
+  hipMemcpyAsync(s.seq_hi, s.seq_hi_h, n * sizeof(std::int32_t),
+                 hipMemcpyHostToDevice, s.stream);
+  const int kind = s.w.embedding.type == GgmlType::kQ6_K   ? 1
+                   : s.w.embedding.type == GgmlType::kQ8_0 ? 2
+                                                           : 0;
+  {
+    const std::size_t units =
+        static_cast<std::size_t>(n) * (H / (kind == 1 ? 256u : 32u));
+    const std::uint64_t row_bytes = RowBytes(s.w.embedding.type, H);
+    const dim3 grid(static_cast<std::uint32_t>((units + 255) / 256));
+    if (kind == 1)
+      hipLaunchKernelGGL((D1EmbedKernel<1>), grid, dim3(256), 0, s.stream,
+                         s.emb_table, s.ids, s.x, n, H, row_bytes, c.vocab, units);
+    else if (kind == 2)
+      hipLaunchKernelGGL((D1EmbedKernel<2>), grid, dim3(256), 0, s.stream,
+                         s.emb_table, s.ids, s.x, n, H, row_bytes, c.vocab, units);
+    else
+      hipLaunchKernelGGL((D1EmbedKernel<0>), grid, dim3(256), 0, s.stream,
+                         s.emb_table, s.ids, s.x, n, H, row_bytes, c.vocab, units);
+  }
+  s.stateful = true;
+  s.batch = true;
+  const bool ok = s.Layers(n);
+  s.stateful = false;
+  s.batch = false;
+  if (!ok)
+    return false;
+  if (!s.sel) {
+    s.sel = DeviceAlloc<float>(std::size_t{128} * H);
+    s.sel_norm = DeviceAlloc<float>(std::size_t{128} * H);
+    if (!s.sel || !s.sel_norm)
+      return false;
+  }
+  rocm::RmsNormRows(s.x, s.g_out, s.sel_norm, n, H, 1, c.eps, s.stream);
+  const std::uint64_t row_bytes = RowBytes(s.w.embedding.type, H);
+  for (std::uint32_t r0 = 0; r0 < n; r0 += kMaxRows) {
+    const std::uint32_t rows = std::min<std::uint32_t>(kMaxRows, n - r0);
+    const float* hv = s.sel_norm + static_cast<std::size_t>(r0) * H;
+    if (kind == 1)
+      hipLaunchKernelGGL((D1LogitAllKernel<1>), dim3(c.vocab), dim3(64), 0,
+                         s.stream, s.emb_table, hv, s.logit_all, H, row_bytes,
+                         c.vocab, rows);
+    else if (kind == 2)
+      hipLaunchKernelGGL((D1LogitAllKernel<2>), dim3(c.vocab), dim3(64), 0,
+                         s.stream, s.emb_table, hv, s.logit_all, H, row_bytes,
+                         c.vocab, rows);
+    else
+      hipLaunchKernelGGL((D1LogitAllKernel<0>), dim3(c.vocab), dim3(64), 0,
+                         s.stream, s.emb_table, hv, s.logit_all, H, row_bytes,
+                         c.vocab, rows);
+    hipLaunchKernelGGL(D1ArgmaxKernel, dim3(rows), dim3(1024), 0, s.stream,
+                       s.logit_all, c.vocab, s.argmax_dev + r0);
+  }
+  hipMemcpyAsync(s.argmax_host, s.argmax_dev, n * sizeof(std::int32_t),
+                 hipMemcpyDeviceToHost, s.stream);
+  hipStreamSynchronize(s.stream);
+  for (std::uint32_t i = 0; i < n; ++i) {
+    next[i] = static_cast<std::uint32_t>(s.argmax_host[i]);
+    s.pos_host[i] += 1;
+  }
+  return s.npu->Healthy();
+}
+
+bool D1NpuModel::CaptureHidden(std::span<const std::uint32_t> tokens,
+                               std::vector<std::uint16_t>* hidden) const {
+  auto& s = *impl_;
+  const auto& c = s.w.config;
+  const std::uint32_t H = static_cast<std::uint32_t>(s.hidden);
+  if (s.max_ctx == 0 || hidden == nullptr || tokens.empty() ||
+      tokens.size() > s.max_ctx)
+    return false;
+  ResetState();
+  hidden->assign(tokens.size() * static_cast<std::size_t>(H), 0);
+  __half* host_half = nullptr;
+  if (hipHostMalloc(reinterpret_cast<void**>(&host_half),
+                    std::size_t{s.pass_rows} * H * sizeof(__half)) != hipSuccess)
+    return false;
+  for (std::size_t at = 0; at < tokens.size();) {
+    const std::uint32_t n = static_cast<std::uint32_t>(
+        std::min<std::size_t>(s.pass_rows, tokens.size() - at));
+    for (std::uint32_t i = 0; i < n; ++i) {
+      s.ids[i] = static_cast<std::int32_t>(tokens[at + i]);
+      s.seq_lo_h[i] = 0;
+      s.seq_hi_h[i] = static_cast<std::int32_t>(n);
+      s.group_buf[i] = -1;
+    }
+    hipMemcpyAsync(s.seq_lo, s.seq_lo_h, n * sizeof(std::int32_t),
+                   hipMemcpyHostToDevice, s.stream);
+    hipMemcpyAsync(s.seq_hi, s.seq_hi_h, n * sizeof(std::int32_t),
+                   hipMemcpyHostToDevice, s.stream);
+    const int kind = s.w.embedding.type == GgmlType::kQ6_K   ? 1
+                     : s.w.embedding.type == GgmlType::kQ8_0 ? 2
+                                                             : 0;
+    const std::size_t units =
+        static_cast<std::size_t>(n) * (H / (kind == 1 ? 256u : 32u));
+    const std::uint64_t row_bytes = RowBytes(s.w.embedding.type, H);
+    const dim3 grid(static_cast<std::uint32_t>((units + 255) / 256));
+    if (kind == 1)
+      hipLaunchKernelGGL((D1EmbedKernel<1>), grid, dim3(256), 0, s.stream,
+                         s.emb_table, s.ids, s.x, n, H, row_bytes, c.vocab, units);
+    else if (kind == 2)
+      hipLaunchKernelGGL((D1EmbedKernel<2>), grid, dim3(256), 0, s.stream,
+                         s.emb_table, s.ids, s.x, n, H, row_bytes, c.vocab, units);
+    else
+      hipLaunchKernelGGL((D1EmbedKernel<0>), grid, dim3(256), 0, s.stream,
+                         s.emb_table, s.ids, s.x, n, H, row_bytes, c.vocab, units);
+    s.stateful = true;
+    s.pos0 = s.pos;
+    const bool ok = s.Layers(n);
+    s.stateful = false;
+    if (!ok) {
+      hipHostFree(host_half);
+      return false;
+    }
+    s.last_n = n;
+    rocm::RmsNormRows(s.x, s.g_out, s.z, n, H, 1, c.eps, s.stream);
+    hipLaunchKernelGGL(D1ToHalfKernel,
+                       dim3(static_cast<std::uint32_t>((std::size_t{n} * H + 255) / 256)),
+                       dim3(256), 0, s.stream, s.z, s.half_buf,
+                       std::size_t{n} * H);
+    hipMemcpyAsync(host_half, s.half_buf, std::size_t{n} * H * sizeof(__half),
+                   hipMemcpyDeviceToHost, s.stream);
+    hipStreamSynchronize(s.stream);
+    std::memcpy(hidden->data() + at * H, host_half,
+                std::size_t{n} * H * sizeof(__half));
+    Commit(n);
+    at += n;
+  }
+  hipHostFree(host_half);
+  return s.npu->Healthy();
+}
+
+bool D1NpuModel::LoadDrafter(const std::string& path, std::string* error) {
+  auto& s = *impl_;
+  std::ifstream file(path, std::ios::binary);
+  std::uint32_t k = 0, hidden = 0;
+  file.read(reinterpret_cast<char*>(&k), 4);
+  file.read(reinterpret_cast<char*>(&hidden), 4);
+  if (!file || k == 0 || k > kMaxRows || hidden != s.hidden) {
+    if (error)
+      *error = "d1 npu: bad drafter file";
+    return false;
+  }
+  std::vector<__half> host(std::size_t{k} * hidden * hidden);
+  file.read(reinterpret_cast<char*>(host.data()), host.size() * sizeof(__half));
+  if (!file) {
+    if (error)
+      *error = "d1 npu: truncated drafter file";
+    return false;
+  }
+  s.draft_w = DeviceAlloc<__half>(host.size());
+  s.draft_z = DeviceAlloc<float>(std::size_t{k} * hidden);
+  if (!s.draft_w || !s.draft_z ||
+      hipMemcpy(s.draft_w, host.data(), host.size() * sizeof(__half),
+                hipMemcpyHostToDevice) != hipSuccess) {
+    if (error)
+      *error = "d1 npu: drafter upload failed";
+    return false;
+  }
+  s.draft_k = k;
+  return true;
+}
+
+std::uint32_t D1NpuModel::DrafterHeads() const { return impl_->draft_k; }
+
+bool D1NpuModel::Draft(std::uint32_t row, std::vector<std::uint32_t>* drafts) const {
+  auto& s = *impl_;
+  const auto& c = s.w.config;
+  const std::uint32_t H = static_cast<std::uint32_t>(s.hidden);
+  if (s.draft_k == 0 || drafts == nullptr || !s.sel_norm)
+    return false;
+  const int kind = s.w.embedding.type == GgmlType::kQ6_K   ? 1
+                   : s.w.embedding.type == GgmlType::kQ8_0 ? 2
+                                                           : 0;
+  hipLaunchKernelGGL(D1DraftHeadKernel, dim3(H, s.draft_k), dim3(kThreads), 0,
+                     s.stream, s.draft_w, s.sel_norm + static_cast<std::size_t>(row) * H,
+                     s.draft_z, H);
+  const std::uint64_t row_bytes = RowBytes(s.w.embedding.type, H);
+  if (kind == 1)
+    hipLaunchKernelGGL((D1LogitAllKernel<1>), dim3(c.vocab), dim3(64), 0,
+                       s.stream, s.emb_table, s.draft_z, s.logit_all, H,
+                       row_bytes, c.vocab, s.draft_k);
+  else if (kind == 2)
+    hipLaunchKernelGGL((D1LogitAllKernel<2>), dim3(c.vocab), dim3(64), 0,
+                       s.stream, s.emb_table, s.draft_z, s.logit_all, H,
+                       row_bytes, c.vocab, s.draft_k);
+  else
+    hipLaunchKernelGGL((D1LogitAllKernel<0>), dim3(c.vocab), dim3(64), 0,
+                       s.stream, s.emb_table, s.draft_z, s.logit_all, H,
+                       row_bytes, c.vocab, s.draft_k);
+  hipLaunchKernelGGL(D1ArgmaxKernel, dim3(s.draft_k), dim3(1024), 0, s.stream,
+                     s.logit_all, c.vocab, s.argmax_dev);
+  hipMemcpyAsync(s.argmax_host, s.argmax_dev, s.draft_k * sizeof(std::int32_t),
+                 hipMemcpyDeviceToHost, s.stream);
+  hipStreamSynchronize(s.stream);
+  drafts->assign(s.argmax_host, s.argmax_host + s.draft_k);
+  return true;
+}
+
 bool D1NpuModel::Generate(std::span<const std::uint32_t> prompt,
                           const GenerateOptions& options,
                           std::vector<std::uint32_t>* output,
@@ -1522,6 +1933,7 @@ bool D1NpuModel::Generate(std::span<const std::uint32_t> prompt,
   st.prompt_tokens = static_cast<std::uint32_t>(prompt.size());
   std::vector<std::uint32_t> history(prompt.begin(), prompt.end());
   std::uint32_t pending = 0;
+  std::vector<std::uint32_t> head_draft;
   for (std::size_t at = 0; at < prompt.size();) {
     const std::size_t take = std::min<std::size_t>(PassRows(), prompt.size() - at);
     std::uint32_t next = 0;
@@ -1529,6 +1941,9 @@ bool D1NpuModel::Generate(std::span<const std::uint32_t> prompt,
       return false;
     Commit(static_cast<std::uint32_t>(take));
     pending = next;
+    head_draft.clear();
+    if (options.use_heads && DrafterHeads() > 0)
+      (void)Draft(0, &head_draft);
     at += take;
     ++st.passes;
   }
@@ -1559,6 +1974,15 @@ bool D1NpuModel::Generate(std::span<const std::uint32_t> prompt,
         }
       }
     }
+    if (draft.size() < 2 && !head_draft.empty()) {
+      // No useful prompt match: use the drafter heads' chain.
+      draft.assign(head_draft.begin(),
+                   head_draft.begin() + std::min<std::size_t>(head_draft.size(),
+                                                              options.draft_max));
+    }
+    if (const char* force = std::getenv("GUFO_D1_FORCE_DRAFT"))
+      while (draft.size() < static_cast<std::size_t>(std::atoi(force)))
+        draft.push_back(1);  // junk drafts: verification width without acceptance
     if (s_pos_would_overflow(*this, 1 + draft.size()))
       break;
     std::vector<std::uint32_t> tokens;
@@ -1568,6 +1992,15 @@ bool D1NpuModel::Generate(std::span<const std::uint32_t> prompt,
     if (!Step(tokens, next))
       return false;
     ++st.passes;
+    if (std::getenv("GUFO_D1_DRAFT_TRACE") && st.passes < 14) {
+      std::fprintf(stderr, "[draft] pending %u | draft", pending);
+      for (auto d : draft)
+        std::fprintf(stderr, " %u", d);
+      std::fprintf(stderr, " | next");
+      for (auto t : next)
+        std::fprintf(stderr, " %u", t);
+      std::fprintf(stderr, "\n");
+    }
     std::size_t good = 0;
     while (good < draft.size() && draft[good] == next[good])
       ++good;
@@ -1586,6 +2019,9 @@ bool D1NpuModel::Generate(std::span<const std::uint32_t> prompt,
     if (stopped)
       break;
     pending = next[good];
+    head_draft.clear();
+    if (options.use_heads && DrafterHeads() > 0)
+      (void)Draft(static_cast<std::uint32_t>(good), &head_draft);
   }
   st.new_tokens = static_cast<std::uint32_t>(output->size());
   st.decode_ms = std::chrono::duration<double, std::milli>(
