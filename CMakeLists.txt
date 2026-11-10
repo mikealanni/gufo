@@ -269,6 +269,19 @@ add_library(gufo_http STATIC
 target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_qwen3_tts
   gufo_qwen3_asr gufo_qwen_image_21 gufo_qwen38_flash_next)
 
+option(GUFO_BUILD_NPU_ENGINE "Build gufo-npu, the GPU-free NPU engine" OFF)
+if (GUFO_BUILD_NPU_ENGINE)
+  find_package(OpenMP REQUIRED COMPONENTS CXX)
+  set(GUFO_XRT_INCLUDE_DIR "" CACHE PATH "Directory holding xrt/xrt_bo.h")
+  set(GUFO_XRT_LIB_DIR "/opt/xilinx/xrt/lib" CACHE PATH "XRT runtime libraries")
+  add_executable(gufo-npu src/models/lfm3/npu/engine.cpp
+    tools/npu/decode_int5/gufo_npu_main.cpp)
+  target_include_directories(gufo-npu PRIVATE ${PROJECT_SOURCE_DIR} ${GUFO_XRT_INCLUDE_DIR})
+  target_compile_options(gufo-npu PRIVATE -O3 -march=native -ffast-math -fno-finite-math-only)
+  target_link_libraries(gufo-npu PRIVATE gufo_lfm3 OpenMP::OpenMP_CXX
+    ${GUFO_XRT_LIB_DIR}/libxrt_coreutil.so.2 ${GUFO_XRT_LIB_DIR}/libxrt_core.so.2)
+endif()
+
 add_executable(gufo
   src/cli/main.cpp
   src/cli/banner.cpp

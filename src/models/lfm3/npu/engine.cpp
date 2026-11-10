@@ -1,0 +1,634 @@
+#include "src/models/lfm3/npu/engine.hpp"
+
+#include <immintrin.h>
+#include <omp.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <xrt/xrt_bo.h>
+#include <xrt/xrt_device.h>
+#include <xrt/xrt_kernel.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <stdexcept>
+
+#include "src/core/gguf_reader.hpp"
+#include "src/models/lfm3/weights.hpp"
+
+namespace gufo::models::lfm3::npu {
+namespace {
+
+using Clock = std::chrono::steady_clock;
+double Ms(Clock::time_point a) {
+  return std::chrono::duration<double, std::milli>(Clock::now() - a).count();
+}
+
+constexpr std::uint32_t kRows = 16;
+constexpr std::uint32_t kTileK = 64;
+constexpr std::uint32_t kStrip = 128;
+constexpr std::uint32_t kQuarterBytes = 1536;
+constexpr std::uint32_t kWordBytes = 1408;
+
+inline float RoundHalf(float v) {
+  return _cvtsh_ss(_cvtss_sh(v, _MM_FROUND_TO_NEAREST_INT));
+}
+
+inline void EncGroup(const float* v, std::uint8_t* out) {
+  const __m256 f = _mm256_loadu_ps(v);
+  const __m256i bits = _mm256_castps_si256(f);
+  const __m256i ex = _mm256_and_si256(_mm256_srli_epi32(bits, 23), _mm256_set1_epi32(0xFF));
+  __m128i m = _mm_max_epu32(_mm256_castsi256_si128(ex), _mm256_extracti128_si256(ex, 1));
+  m = _mm_max_epu32(m, _mm_shuffle_epi32(m, 0x4E));
+  m = _mm_max_epu32(m, _mm_shuffle_epi32(m, 0xB1));
+  const unsigned max_exp = static_cast<unsigned>(_mm_cvtsi128_si32(m));
+  const std::uint32_t ib = max_exp >= 7 ? (260u - max_exp) << 23 : 0u;
+  float inv;
+  std::memcpy(&inv, &ib, 4);
+  const __m256i qi = _mm256_cvtps_epi32(_mm256_mul_ps(f, _mm256_set1_ps(inv)));
+  const __m128i p16 = _mm_packs_epi32(_mm256_castsi256_si128(qi), _mm256_extracti128_si256(qi, 1));
+  const __m128i p8 = _mm_packs_epi16(p16, p16);
+  out[0] = static_cast<std::uint8_t>(max_exp);
+  _mm_storel_epi64(reinterpret_cast<__m128i*>(out + 1), p8);
+}
+
+inline void DecGroup(const std::uint8_t* p, float* v) {
+  const int e = p[0];
+  const std::uint32_t mb = e > 6 ? static_cast<std::uint32_t>(e - 6) << 23 : 0u;
+  float mult;
+  std::memcpy(&mult, &mb, 4);
+  const __m128i b8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p + 1));
+  const __m256i i32 = _mm256_cvtepi8_epi32(b8);
+  _mm256_storeu_ps(v, _mm256_mul_ps(_mm256_cvtepi32_ps(i32), _mm256_set1_ps(mult)));
+}
+
+inline std::uint16_t Bf16Bits(float f) {
+  std::uint32_t u;
+  std::memcpy(&u, &f, 4);
+  u += 0x7FFFu + ((u >> 16) & 1u);
+  return static_cast<std::uint16_t>(u >> 16);
+}
+inline float Bf16Float(std::uint16_t b) {
+  const std::uint32_t u = static_cast<std::uint32_t>(b) << 16;
+  float f;
+  std::memcpy(&f, &u, 4);
+  return f;
+}
+
+struct Safetensors {
+  void* map{nullptr};
+  std::size_t size{0};
+  std::string header;
+  std::size_t data0{0};
+  ~Safetensors() {
+    if (map)
+      munmap(map, size);
+  }
+  bool Open(const std::string& path) {
+    const int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0)
+      return false;
+    struct stat st;
+    fstat(fd, &st);
+    size = static_cast<std::size_t>(st.st_size);
+    map = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (map == MAP_FAILED) {
+      map = nullptr;
+      return false;
+    }
+    std::uint64_t n;
+    std::memcpy(&n, map, 8);
+    header.assign(static_cast<const char*>(map) + 8, n);
+    data0 = 8 + n;
+    return true;
+  }
+  const std::uint16_t* Find(const std::string& name, std::size_t* count) const {
+    const std::string key = "\"" + name + "\"";
+    auto at = header.find(key);
+    if (at == std::string::npos)
+      return nullptr;
+    auto off = header.find("\"data_offsets\"", at);
+    auto lb = header.find('[', off);
+    std::size_t a = 0, b = 0;
+    std::sscanf(header.c_str() + lb, "[%zu,%zu]", &a, &b);
+    *count = (b - a) / 2;
+    return reinterpret_cast<const std::uint16_t*>(
+        static_cast<const char*>(map) + data0 + a);
+  }
+};
+
+struct Prog {
+  std::uint32_t K{}, N{};
+  xrt::bo insts, a, c;
+  std::size_t words{};
+  std::uint8_t *ah{}, *ch{};
+};
+struct Mat {
+  xrt::bo bo;
+  std::uint8_t* host{};
+  std::size_t bytes{};
+};
+
+}  // namespace
+
+struct Engine::Impl {
+  std::unique_ptr<core::GgufReader> reader;
+  std::optional<Weights> w;
+  Safetensors st;
+  bool have_st{false};
+  Options opt;
+  xrt::device dev;
+  xrt::hw_context ctx;
+  xrt::kernel kern;
+  Prog p_in, p_h, p_qkv, p_gu, p_down;
+  std::vector<Mat> m_in, m_out, m_qkv, m_gu, m_down;
+  std::uint32_t H{}, I{}, heads{}, hd{}, kvh{}, qd{}, kvd{}, taps{}, window{};
+  std::uint32_t pos{0};
+  std::vector<std::vector<float>> gate_w;
+  std::vector<std::vector<float>> k_cache, v_cache, conv_hist;
+  std::vector<std::uint32_t> capacity;
+  double t_enc{0}, t_run{0}, t_dec{0}, t_cpu{0};
+  int calls{0};
+
+  Prog MakeProg(std::uint32_t K, std::uint32_t N, std::string* err) {
+    Prog p;
+    p.K = K;
+    p.N = N;
+    const std::string path = opt.programs + "/insts_16x" + std::to_string(K) +
+                             "x" + std::to_string(N) + "_16x64x128.txt";
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f)
+      throw std::runtime_error("missing " + path);
+    const std::size_t sz = static_cast<std::size_t>(f.tellg());
+    f.seekg(0);
+    std::vector<char> buf(sz);
+    f.read(buf.data(), sz);
+    p.words = sz / 4;
+    p.insts = xrt::bo(dev, sz, XCL_BO_FLAGS_CACHEABLE, kern.group_id(1));
+    std::memcpy(p.insts.map<void*>(), buf.data(), sz);
+    p.insts.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    const std::size_t ab = std::size_t{kRows} * K / 8 * 9;
+    const std::size_t cb = std::size_t{kRows} * N / 8 * 9;
+    p.a = xrt::bo(dev, ab, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(3));
+    p.c = xrt::bo(dev, cb, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(3));
+    p.ah = p.a.map<std::uint8_t*>();
+    p.ch = p.c.map<std::uint8_t*>();
+    std::memset(p.ah, 0, ab);
+    std::memset(p.ch, 0, cb);
+    (void)err;
+    return p;
+  }
+
+  // rows of a weight (safetensors BF16 when present, else the GGUF tensor).
+  void LoadRows(const std::string& st_name, const Tensor& t, float* dst,
+                std::uint32_t rows, std::uint32_t K) {
+    std::size_t count = 0;
+    const std::uint16_t* src = have_st ? st.Find(st_name, &count) : nullptr;
+    if (src) {
+      if (count != std::size_t{rows} * K)
+        throw std::runtime_error("safetensors shape mismatch " + st_name);
+#pragma omp parallel for
+      for (std::int64_t r = 0; r < rows; ++r)
+        for (std::uint32_t k = 0; k < K; ++k)
+          dst[std::size_t(r) * K + k] = Bf16Float(src[std::size_t(r) * K + k]);
+      return;
+    }
+#pragma omp parallel for
+    for (std::int64_t r = 0; r < rows; ++r)
+      DecodeRow(t, static_cast<std::uint32_t>(r),
+                std::span<float>(dst + std::size_t(r) * K, K));
+  }
+
+  Mat Pack(const float* W, std::uint32_t N, std::uint32_t K) {
+    const std::uint32_t strips = N / kStrip, tk = K / kTileK;
+    Mat m;
+    m.bytes = std::size_t{strips} * tk * 4 * kQuarterBytes;
+    m.bo = xrt::bo(dev, m.bytes, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(3));
+    m.host = m.bo.map<std::uint8_t*>();
+    std::memset(m.host, 0, m.bytes);
+    std::vector<std::int8_t> q(std::size_t{N} * K);
+    std::vector<std::uint16_t> sc(std::size_t{N} * (K / 32));
+#pragma omp parallel for
+    for (std::int64_t n = 0; n < N; ++n)
+      for (std::uint32_t kg = 0; kg < K / 32; ++kg) {
+        const float* row = W + std::size_t(n) * K + kg * 32;
+        float amax = 0;
+        for (int i = 0; i < 32; ++i)
+          amax = std::max(amax, std::fabs(row[i]));
+        std::uint16_t sb = Bf16Bits(amax / 15.0f);
+        float s = Bf16Float(sb);
+        if (s == 0) {
+          sb = Bf16Bits(1.0f);
+          s = 1.0f;
+        }
+        sc[std::size_t(n) * (K / 32) + kg] = sb;
+        for (int i = 0; i < 32; ++i)
+          q[std::size_t(n) * K + kg * 32 + i] = static_cast<std::int8_t>(
+              std::fmin(15.f, std::fmax(-15.f, std::nearbyint(row[i] / s))));
+      }
+#pragma omp parallel for collapse(2)
+    for (std::int64_t s2 = 0; s2 < strips; ++s2)
+      for (std::int64_t t = 0; t < tk; ++t)
+        for (int r = 0; r < 4; ++r) {
+          std::uint8_t* base =
+              m.host + ((std::size_t(s2) * tk + t) * 4 + r) * kQuarterBytes;
+          auto* words = reinterpret_cast<std::uint16_t*>(base);
+          auto* scl = reinterpret_cast<std::uint16_t*>(base + kWordBytes);
+          for (int p = 0; p < 32; ++p) {
+            const int sb = p >> 4, sr = (p >> 1) & 7, blk = p & 1;
+            for (int lane = 0; lane < 64; ++lane) {
+              const int cib = lane >> 3, kk = lane & 7;
+              const std::size_t n = std::size_t(s2) * 128 + r * 32 + sb * 16 +
+                                    blk * 8 + cib;
+              const int x = q[n * K + t * 64 + sr * 8 + kk] + 16;
+              words[(p / 3) * 64 + lane] |=
+                  static_cast<std::uint16_t>(x << (5 * (p % 3)));
+            }
+          }
+          for (int sb = 0; sb < 2; ++sb)
+            for (int blk = 0; blk < 2; ++blk)
+              for (int qq = 0; qq < 2; ++qq)
+                for (int cib = 0; cib < 8; ++cib) {
+                  const std::size_t n = std::size_t(s2) * 128 + r * 32 +
+                                        sb * 16 + blk * 8 + cib;
+                  scl[((sb * 2 + blk) * 2 + qq) * 8 + cib] =
+                      sc[n * (K / 32) + t * 2 + qq];
+                }
+        }
+    m.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    return m;
+  }
+
+  void EncodeA(const float* x, std::uint32_t n, std::uint32_t K, Prog& p) {
+    const std::uint32_t tk = K / kTileK;
+#pragma omp parallel for
+    for (std::int64_t t = 0; t < tk; ++t)
+      for (int gi = 0; gi < 128; ++gi) {
+        const int rib = gi & 7, block = (gi >> 3) & 1, sc = gi >> 4;
+        const int row = block * 8 + rib;
+        std::uint8_t* o = p.ah + (std::size_t(t) * 128 + gi) * 9;
+        if (row >= static_cast<int>(n)) {
+          std::memset(o, 0, 9);
+          continue;
+        }
+        const float* src = x + std::size_t(row) * K + t * 64 + sc * 8;
+        float v[8];
+        _mm256_storeu_ps(v, _mm256_cvtph_ps(_mm256_cvtps_ph(_mm256_loadu_ps(src), _MM_FROUND_TO_NEAREST_INT)));
+        EncGroup(v, o);
+      }
+  }
+
+  void DecodeC(float* y, std::uint32_t n, Prog& p) {
+    const std::uint32_t strips = p.N / kStrip;
+#pragma omp parallel for
+    for (std::int64_t s = 0; s < strips; ++s)
+      for (int r = 0; r < 4; ++r)
+        for (int G = 0; G < 64; ++G) {
+          const int sb = G >> 5, acc = (G >> 3) & 3, rib = G & 7;
+          const int row = (acc >> 1) * 8 + rib;
+          if (row >= static_cast<int>(n))
+            continue;
+          const std::size_t col = std::size_t(s) * 128 + r * 32 + sb * 16 +
+                                  (acc & 1) * 8;
+          DecGroup(p.ch + ((std::size_t(s) * 256) + r * 64 + G) * 9,
+                   y + std::size_t(row) * p.N + col);
+        }
+  }
+
+  void Gemm(Prog& p, const Mat& m, const float* x, std::uint32_t n, float* y) {
+    auto t0 = Clock::now();
+    EncodeA(x, n, p.K, p);
+    p.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    t_enc += Ms(t0);
+    t0 = Clock::now();
+    auto run = kern(3, p.insts, static_cast<unsigned>(p.words), p.a, m.bo, p.c);
+    run.wait();
+    p.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    t_run += Ms(t0);
+    t0 = Clock::now();
+    DecodeC(y, n, p);
+    t_dec += Ms(t0);
+    ++calls;
+  }
+};
+
+namespace {
+void RmsNorm(const float* x, const float* w, float* out, std::uint32_t n,
+             std::uint32_t d, float eps, std::size_t stride_in = 0) {
+  if (!stride_in)
+    stride_in = d;
+#pragma omp parallel for
+  for (std::int64_t r = 0; r < n; ++r) {
+    const float* xr = x + r * stride_in;
+    float sum = 0;
+    for (std::uint32_t i = 0; i < d; ++i)
+      sum += xr[i] * xr[i];
+    const float scale = 1.0f / std::sqrt(sum / d + eps);
+    float* o = out + std::size_t(r) * d;
+    for (std::uint32_t i = 0; i < d; ++i)
+      o[i] = xr[i] * scale * w[i];
+  }
+}
+}  // namespace
+
+Engine::Engine(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+Engine::~Engine() {
+  if (!impl_)
+    return;
+  if (std::getenv("GUFO_NPU_STATS"))
+    std::fprintf(stderr,
+                 "npu engine: %d gemm calls: encode %.1f ms, run %.1f ms, decode %.1f ms, cpu %.1f ms\n",
+                 impl_->calls, impl_->t_enc, impl_->t_run, impl_->t_dec,
+                 impl_->t_cpu);
+}
+
+std::unique_ptr<Engine> Engine::Create(const Options& options,
+                                       std::string* error) {
+  try {
+    auto im = std::make_unique<Impl>();
+    Impl& s = *im;
+    s.opt = options;
+    s.reader = core::GgufReader::OpenFile(options.gguf, error);
+    if (!s.reader)
+      return nullptr;
+    s.w = Weights::Bind(*s.reader, error);
+    if (!s.w)
+      return nullptr;
+    const auto& c = s.w->config;
+    s.H = c.hidden;
+    s.I = c.intermediate;
+    s.heads = c.heads;
+    s.hd = c.head_dim;
+    s.kvh = 4;
+    s.qd = s.heads * s.hd;
+    s.kvd = s.kvh * s.hd;
+    s.taps = c.conv_width;
+    s.window = c.window;
+    if (!options.bf16.empty())
+      s.have_st = s.st.Open(options.bf16);
+    s.dev = xrt::device(0u);
+    const xrt::xclbin xb{options.programs + "/final_16x2048x1024_16x64x128.xclbin"};
+    s.dev.register_xclbin(xb);
+    s.ctx = xrt::hw_context(s.dev, xb.get_uuid());
+    s.kern = xrt::kernel(s.ctx, xb.get_kernels().at(0).get_name());
+    s.p_in = s.MakeProg(2048, 6144, error);
+    s.p_h = s.MakeProg(2048, 2048, error);
+    s.p_qkv = s.MakeProg(2048, 3072, error);
+    s.p_gu = s.MakeProg(2048, 15360, error);
+    s.p_down = s.MakeProg(7680, 2048, error);
+    const auto t0 = Clock::now();
+    const std::size_t L = c.layers.size();
+    s.m_in.resize(L);
+    s.m_out.resize(L);
+    s.m_qkv.resize(L);
+    s.m_gu.resize(L);
+    s.m_down.resize(L);
+    s.gate_w.resize(L);
+    s.k_cache.resize(L);
+    s.v_cache.resize(L);
+    s.conv_hist.resize(L);
+    s.capacity.assign(L, 0);
+    std::vector<float> buf;
+    for (std::size_t l = 0; l < L; ++l) {
+      const auto& lw = s.w->layers[l];
+      const std::string pre = "model.layers." + std::to_string(l) + ".";
+      if (c.layers[l] == LayerType::kConvolution) {
+        buf.resize(std::size_t{6144} * 2048);
+        s.LoadRows(pre + "conv.in_proj.weight", lw.in_proj, buf.data(), 6144, 2048);
+        s.m_in[l] = s.Pack(buf.data(), 6144, 2048);
+        s.LoadRows(pre + "conv.out_proj.weight", lw.out_proj, buf.data(), 2048, 2048);
+        s.m_out[l] = s.Pack(buf.data(), 2048, 2048);
+        s.conv_hist[l].assign(std::size_t{s.taps - 1} * s.H, 0.0f);
+      } else {
+        buf.resize(std::size_t{3072} * 2048);
+        s.LoadRows(pre + "self_attn.q_proj.weight", lw.q, buf.data(), 2048, 2048);
+        s.LoadRows(pre + "self_attn.k_proj.weight", lw.k,
+                   buf.data() + std::size_t{2048} * 2048, 512, 2048);
+        s.LoadRows(pre + "self_attn.v_proj.weight", lw.v,
+                   buf.data() + std::size_t{2560} * 2048, 512, 2048);
+        s.m_qkv[l] = s.Pack(buf.data(), 3072, 2048);
+        s.LoadRows(pre + "self_attn.o_proj.weight", lw.attn_out, buf.data(), 2048, 2048);
+        s.m_out[l] = s.Pack(buf.data(), 2048, 2048);
+        s.gate_w[l].resize(std::size_t{s.heads} * s.H);
+        for (std::uint32_t h = 0; h < s.heads; ++h)
+          DecodeRow(lw.attn_gate, h,
+                    std::span<float>(s.gate_w[l].data() + std::size_t{h} * s.H, s.H));
+        s.capacity[l] = c.layers[l] == LayerType::kSlidingAttention
+                            ? std::min(options.context, s.window)
+                            : options.context;
+        s.k_cache[l].assign(std::size_t{s.capacity[l]} * s.kvd, 0.0f);
+        s.v_cache[l].assign(std::size_t{s.capacity[l]} * s.kvd, 0.0f);
+      }
+      buf.resize(std::size_t{15360} * 2048);
+      s.LoadRows(pre + "feed_forward.w1.weight", lw.gate, buf.data(), 7680, 2048);
+      s.LoadRows(pre + "feed_forward.w3.weight", lw.up,
+                 buf.data() + std::size_t{7680} * 2048, 7680, 2048);
+      s.m_gu[l] = s.Pack(buf.data(), 15360, 2048);
+      buf.resize(std::size_t{2048} * 7680);
+      s.LoadRows(pre + "feed_forward.w2.weight", lw.down, buf.data(), 2048, 7680);
+      s.m_down[l] = s.Pack(buf.data(), 2048, 7680);
+    }
+    std::fprintf(stderr, "npu engine: packed %zu layers in %.1f s\n", L,
+                 Ms(t0) / 1000.0);
+    return std::unique_ptr<Engine>(new Engine(std::move(im)));
+  } catch (const std::exception& e) {
+    if (error)
+      *error = e.what();
+    return nullptr;
+  }
+}
+
+void Engine::Reset() {
+  Impl& s = *impl_;
+  s.pos = 0;
+  for (auto& v : s.conv_hist)
+    std::fill(v.begin(), v.end(), 0.0f);
+  for (auto& v : s.k_cache)
+    std::fill(v.begin(), v.end(), 0.0f);
+  for (auto& v : s.v_cache)
+    std::fill(v.begin(), v.end(), 0.0f);
+}
+
+std::uint32_t Engine::Position() const { return impl_->pos; }
+
+bool Engine::Step(std::span<const std::uint32_t> tokens,
+                  std::vector<float>* hidden) {
+  Impl& s = *impl_;
+  const auto& c = s.w->config;
+  const std::uint32_t n = static_cast<std::uint32_t>(tokens.size());
+  if (n == 0 || n > kMaxRows || s.pos + n > s.opt.context)
+    return false;
+  const std::uint32_t H = s.H, I = s.I, hd = s.hd, heads = s.heads,
+                      kvh = s.kvh, kvd = s.kvd, qd = s.qd;
+  std::vector<float> x(std::size_t{n} * H), z(x.size()), z2(x.size()),
+      branch(x.size()), p(std::size_t{n} * 6144), conv_out(x.size()),
+      qkv(std::size_t{n} * 3072), attn(std::size_t{n} * qd),
+      gu(std::size_t{n} * 15360), act(std::size_t{n} * I);
+  for (std::uint32_t i = 0; i < n; ++i)
+    DecodeRow(s.w->embedding, tokens[i], std::span<float>(&x[std::size_t{i} * H], H));
+  auto cpu0 = Clock::now();
+  for (std::size_t l = 0; l < c.layers.size(); ++l) {
+    const auto& lw = s.w->layers[l];
+    RmsNorm(x.data(), static_cast<const float*>(lw.norm.data), z.data(), n, H, c.eps);
+    s.t_cpu += Ms(cpu0);
+    if (c.layers[l] == LayerType::kConvolution) {
+      s.Gemm(s.p_in, s.m_in[l], z.data(), n, p.data());
+      cpu0 = Clock::now();
+      const auto* cw = static_cast<const float*>(lw.conv.data);
+      const std::uint32_t T = s.taps;
+      std::vector<float> comb(std::size_t{T - 1 + n} * H);
+      std::memcpy(comb.data(), s.conv_hist[l].data(), std::size_t{T - 1} * H * 4);
+#pragma omp parallel for
+      for (std::int64_t t = 0; t < n; ++t)
+        for (std::uint32_t ch = 0; ch < H; ++ch)
+          comb[(std::size_t(t) + T - 1) * H + ch] =
+              p[std::size_t(t) * 6144 + ch] * p[std::size_t(t) * 6144 + 2 * H + ch];
+#pragma omp parallel for
+      for (std::int64_t t = 0; t < n; ++t)
+        for (std::uint32_t ch = 0; ch < H; ++ch) {
+          float sum = 0;
+          for (std::uint32_t j = 0; j < T; ++j)
+            sum += cw[std::size_t{ch} * T + j] * comb[(std::size_t(t) + j) * H + ch];
+          conv_out[std::size_t(t) * H + ch] = sum * p[std::size_t(t) * 6144 + H + ch];
+        }
+      std::memcpy(s.conv_hist[l].data(), comb.data() + std::size_t{n} * H,
+                  std::size_t{T - 1} * H * 4);
+      s.t_cpu += Ms(cpu0);
+      s.Gemm(s.p_h, s.m_out[l], conv_out.data(), n, branch.data());
+    } else {
+      s.Gemm(s.p_qkv, s.m_qkv[l], z.data(), n, qkv.data());
+      cpu0 = Clock::now();
+      const bool swa = c.layers[l] == LayerType::kSlidingAttention;
+      const float theta = swa ? c.theta_swa : c.theta;
+      const auto* fac = static_cast<const float*>(s.w->rope_freqs.data);
+      const auto* qn = static_cast<const float*>(lw.q_norm.data);
+      const auto* kn = static_cast<const float*>(lw.k_norm.data);
+      std::vector<float> q(std::size_t{n} * qd), k(std::size_t{n} * kvd),
+          v(std::size_t{n} * kvd), gate(std::size_t{n} * heads);
+      for (std::uint32_t t = 0; t < n; ++t) {
+        std::memcpy(&q[std::size_t{t} * qd], &qkv[std::size_t{t} * 3072], qd * 4);
+        std::memcpy(&k[std::size_t{t} * kvd], &qkv[std::size_t{t} * 3072 + qd], kvd * 4);
+        std::memcpy(&v[std::size_t{t} * kvd], &qkv[std::size_t{t} * 3072 + qd + kvd], kvd * 4);
+      }
+#pragma omp parallel for collapse(2)
+      for (std::int64_t t = 0; t < n; ++t)
+        for (std::uint32_t h = 0; h < heads; ++h) {
+          float sum = 0;
+          const float* zr = &z[std::size_t(t) * H];
+          const float* gw = &s.gate_w[l][std::size_t{h} * H];
+          for (std::uint32_t i = 0; i < H; ++i)
+            sum += gw[i] * zr[i];
+          gate[std::size_t(t) * heads + h] = sum;
+        }
+      for (std::uint32_t t = 0; t < n; ++t) {
+        for (std::uint32_t h = 0; h < heads + kvh; ++h) {
+          float* base = h < heads ? &q[std::size_t{t} * qd + h * hd]
+                                  : &k[std::size_t{t} * kvd + (h - heads) * hd];
+          const float* nw = h < heads ? qn : kn;
+          float sum = 0;
+          for (std::uint32_t i = 0; i < hd; ++i)
+            sum += base[i] * base[i];
+          const float scale = 1.0f / std::sqrt(sum / hd + c.eps);
+          for (std::uint32_t i = 0; i < hd; ++i)
+            base[i] = base[i] * scale * nw[i];
+          const float position = static_cast<float>(s.pos + t);
+          for (std::uint32_t i = 0; i < hd / 2; ++i) {
+            float angle = position * std::pow(theta, -2.0f * static_cast<float>(i) / hd);
+            if (!swa)
+              angle /= fac[i];
+            const float cs = std::cos(angle), sn = std::sin(angle);
+            const float a = base[i], b = base[i + hd / 2];
+            base[i] = a * cs - b * sn;
+            base[i + hd / 2] = b * cs + a * sn;
+          }
+        }
+        const std::uint32_t P = s.pos + t;
+        const std::uint32_t slot = P % s.capacity[l];
+        std::memcpy(&s.k_cache[l][std::size_t{slot} * kvd], &k[std::size_t{t} * kvd], kvd * 4);
+        std::memcpy(&s.v_cache[l][std::size_t{slot} * kvd], &v[std::size_t{t} * kvd], kvd * 4);
+        const std::uint32_t first = swa && P + 1 > s.window ? P + 1 - s.window : 0;
+        const float inv_sqrt = 1.0f / std::sqrt(static_cast<float>(hd));
+#pragma omp parallel for
+        for (std::int64_t h = 0; h < heads; ++h) {
+          const std::uint32_t kh = h / (heads / kvh);
+          std::vector<float> sc(P + 1 - first);
+          float mx = -INFINITY;
+          const float* qh = &q[std::size_t{t} * qd + h * hd];
+          for (std::uint32_t u = first; u <= P; ++u) {
+            const float* kr = &s.k_cache[l][std::size_t{u % s.capacity[l]} * kvd + kh * hd];
+            float dot = 0;
+            for (std::uint32_t d = 0; d < hd; ++d)
+              dot += qh[d] * kr[d];
+            sc[u - first] = dot * inv_sqrt;
+            mx = std::max(mx, sc[u - first]);
+          }
+          float den = 0;
+          for (auto& e : sc) {
+            e = std::exp(e - mx);
+            den += e;
+          }
+          const float gsig = 1.0f / (1.0f + std::exp(-gate[std::size_t{t} * heads + h]));
+          float* o = &attn[std::size_t{t} * qd + h * hd];
+          for (std::uint32_t d = 0; d < hd; ++d)
+            o[d] = 0;
+          for (std::uint32_t u = first; u <= P; ++u) {
+            const float* vr = &s.v_cache[l][std::size_t{u % s.capacity[l]} * kvd + kh * hd];
+            const float wgt = sc[u - first] / den;
+            for (std::uint32_t d = 0; d < hd; ++d)
+              o[d] += wgt * vr[d];
+          }
+          for (std::uint32_t d = 0; d < hd; ++d)
+            o[d] *= gsig;
+        }
+      }
+      s.t_cpu += Ms(cpu0);
+      s.Gemm(s.p_h, s.m_out[l], attn.data(), n, branch.data());
+    }
+    cpu0 = Clock::now();
+    if (lw.post_norm.data) {
+      RmsNorm(branch.data(), static_cast<const float*>(lw.post_norm.data), z2.data(), n, H, c.eps);
+      for (std::size_t i = 0; i < x.size(); ++i)
+        x[i] += z2[i];
+    } else {
+      for (std::size_t i = 0; i < x.size(); ++i)
+        x[i] += branch[i];
+    }
+    RmsNorm(x.data(), static_cast<const float*>(lw.ffn_norm.data), z.data(), n, H, c.eps);
+    s.t_cpu += Ms(cpu0);
+    s.Gemm(s.p_gu, s.m_gu[l], z.data(), n, gu.data());
+    cpu0 = Clock::now();
+#pragma omp parallel for
+    for (std::int64_t t = 0; t < n; ++t)
+      for (std::uint32_t i = 0; i < I; ++i) {
+        const float g = gu[std::size_t(t) * 15360 + i];
+        act[std::size_t(t) * I + i] = g / (1.0f + std::exp(-g)) * gu[std::size_t(t) * 15360 + I + i];
+      }
+    s.t_cpu += Ms(cpu0);
+    s.Gemm(s.p_down, s.m_down[l], act.data(), n, branch.data());
+    cpu0 = Clock::now();
+    if (lw.post_ffn_norm.data) {
+      RmsNorm(branch.data(), static_cast<const float*>(lw.post_ffn_norm.data), z2.data(), n, H, c.eps);
+      for (std::size_t i = 0; i < x.size(); ++i)
+        x[i] += z2[i];
+    } else {
+      for (std::size_t i = 0; i < x.size(); ++i)
+        x[i] += branch[i];
+    }
+  }
+  if (hidden) {
+    hidden->resize(std::size_t{n} * H);
+    RmsNorm(x.data(), static_cast<const float*>(s.w->output_norm.data), hidden->data(), n, H, c.eps);
+  }
+  s.pos += n;
+  s.t_cpu += Ms(cpu0);
+  return true;
+}
+
+}  // namespace gufo::models::lfm3::npu
