@@ -163,6 +163,7 @@ struct Engine::Impl {
   std::vector<std::uint8_t> sub_table;
   double t_enc{0}, t_run{0}, t_dec{0}, t_cpu{0};
   double t_syncA{0}, t_submit{0}, t_wait{0}, t_syncC{0};
+  double t_gu_dec{0}, t_gu_enc{0}, t_swi{0}, t_dn_enc{0}, t_gu_wait{0}, t_dn_wait{0};
   int calls{0};
 
   Prog MakeProg(std::uint32_t K, std::uint32_t N, std::string* err) {
@@ -323,7 +324,7 @@ struct Engine::Impl {
   void Gemm(Prog& p, const Mat& m, const float* x, std::uint32_t n, float* y) {
     auto t0 = Clock::now();
     EncodeA(x, n, p.K, p);
-    t_enc += Ms(t0);
+    { const double d = Ms(t0); t_enc += d; if (&p == &p_gu) t_gu_enc += d; if (&p == &p_down) t_dn_enc += d; }
     t0 = Clock::now();
     p.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     t_syncA += Ms(t0);
@@ -346,14 +347,14 @@ struct Engine::Impl {
       }
       run.wait();
     }
-    t_wait += Ms(t0);
+    { const double d = Ms(t0); t_wait += d; if (&p == &p_gu) t_gu_wait += d; if (&p == &p_down) t_dn_wait += d; }
     t0 = Clock::now();
     p.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
     t_syncC += Ms(t0);
     t_run += t_submit * 0;
     t0 = Clock::now();
     DecodeC(y, n, p);
-    t_dec += Ms(t0);
+    { const double d = Ms(t0); t_dec += d; if (&p == &p_gu) t_gu_dec += d; }
     ++calls;
   }
 };
@@ -616,6 +617,8 @@ Engine::~Engine() {
                  "npu engine: %d gemm calls: encode %.1f ms, run %.1f ms, decode %.1f ms, cpu %.1f ms\n",
                  impl_->calls, impl_->t_enc, impl_->t_syncA + impl_->t_submit + impl_->t_wait + impl_->t_syncC, impl_->t_dec,
                  impl_->t_cpu);
+  if (std::getenv("GUFO_NPU_STATS"))
+    std::fprintf(stderr, "  ffn boundary: gu_enc %.1f gu_wait %.1f gu_dec %.1f swiglu %.1f dn_enc %.1f dn_wait %.1f ms\n", impl_->t_gu_enc, impl_->t_gu_wait, impl_->t_gu_dec, impl_->t_swi, impl_->t_dn_enc, impl_->t_dn_wait);
   if (std::getenv("GUFO_NPU_STATS"))
     std::fprintf(stderr, "  syncA %.1f ms, submit %.1f ms, wait %.1f ms, syncC %.1f ms\n", impl_->t_syncA,
                  impl_->t_submit, impl_->t_wait, impl_->t_syncC);
@@ -884,12 +887,19 @@ bool Engine::Step(std::span<const std::uint32_t> tokens,
     s.t_cpu += Ms(cpu0);
     s.Gemm(s.p_gu, s.m_gu[l], z.data(), n, gu.data());
     cpu0 = Clock::now();
-#pragma omp parallel for
-    for (std::int64_t t = 0; t < n; ++t)
-      for (std::uint32_t i = 0; i < I; ++i) {
-        const float g = gu[std::size_t(t) * 15360 + i];
-        act[std::size_t(t) * I + i] = g / (1.0f + std::exp(-g)) * gu[std::size_t(t) * 15360 + I + i];
+    const auto swi0 = Clock::now();
+    for (std::uint32_t t = 0; t < n; ++t) {
+      const float* g = &gu[std::size_t{t} * 15360];
+      const float* u = g + I;
+      float* o = &act[std::size_t{t} * I];
+#pragma omp parallel for schedule(static) num_threads(8)
+      for (std::int64_t c0 = 0; c0 < I; c0 += 960) {
+#pragma omp simd
+        for (std::int64_t i = c0; i < c0 + 960; ++i)
+          o[i] = g[i] / (1.0f + std::exp(-g[i])) * u[i];
       }
+    }
+    s.t_swi += Ms(swi0);
     s.t_cpu += Ms(cpu0);
     s.Gemm(s.p_down, s.m_down[l], act.data(), n, branch.data());
     cpu0 = Clock::now();
