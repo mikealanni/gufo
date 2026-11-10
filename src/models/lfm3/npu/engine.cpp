@@ -191,7 +191,9 @@ struct Engine::Impl {
   std::uint32_t H{}, I{}, heads{}, hd{}, kvh{}, qd{}, kvd{}, taps{}, window{};
   std::uint32_t pos{0};
   std::vector<std::vector<float>> gate_w;
-  std::vector<std::vector<float>> k_cache, v_cache, conv_hist;
+  // WP0: KV cache stored as bf16 to halve memory traffic (read as fp32 via AVX-512 upconvert in attention).
+  std::vector<std::vector<std::uint16_t>> k_cache, v_cache;
+  std::vector<std::vector<float>> conv_hist;
   std::vector<std::uint32_t> capacity;
   std::vector<std::vector<float>> comb_store;
   std::uint32_t pending{0};
@@ -300,8 +302,8 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
         s.capacity[l] = c.layers[l] == LayerType::kSlidingAttention
                             ? std::min(options.context, s.window + kRows)
                             : options.context;
-        s.k_cache[l].assign(std::size_t{s.capacity[l]} * s.kvd, 0.0f);
-        s.v_cache[l].assign(std::size_t{s.capacity[l]} * s.kvd, 0.0f);
+        s.k_cache[l].assign(std::size_t{s.capacity[l]} * s.kvd, 0);
+        s.v_cache[l].assign(std::size_t{s.capacity[l]} * s.kvd, 0);
       }
       {
         std::vector<float> gate(std::size_t{7680} * 2048), up(std::size_t{7680} * 2048);
@@ -341,8 +343,8 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
 void Engine::Reset() {
   Impl& s = *impl_; s.pos = 0;
   for (auto& v : s.conv_hist) std::fill(v.begin(), v.end(), 0.0f);
-  for (auto& v : s.k_cache) std::fill(v.begin(), v.end(), 0.0f);
-  for (auto& v : s.v_cache) std::fill(v.begin(), v.end(), 0.0f);
+  for (auto& v : s.k_cache) std::fill(v.begin(), v.end(), std::uint16_t{0});
+  for (auto& v : s.v_cache) std::fill(v.begin(), v.end(), std::uint16_t{0});
 }
 std::uint32_t Engine::Position() const { return impl_->pos; }
 
@@ -432,37 +434,78 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
         }
         const std::uint32_t P = s.pos + t;
         const std::uint32_t slot = P % s.capacity[l];
-        std::memcpy(&s.k_cache[l][std::size_t{slot} * kvd], &k[std::size_t{t} * kvd], kvd * 4);
-        std::memcpy(&s.v_cache[l][std::size_t{slot} * kvd], &v[std::size_t{t} * kvd], kvd * 4);
+        // WP0: store KV as bf16 (halves memory traffic).
+        for (std::uint32_t i = 0; i < kvd; ++i) {
+          s.k_cache[l][std::size_t{slot} * kvd + i] = Bf16Bits(k[std::size_t{t} * kvd + i]);
+          s.v_cache[l][std::size_t{slot} * kvd + i] = Bf16Bits(v[std::size_t{t} * kvd + i]);
+        }
       }
       const float inv_sqrt = 1.0f / std::sqrt(static_cast<float>(hd));
-#pragma omp parallel for collapse(2) schedule(dynamic, 1)
-      for (std::int64_t t = 0; t < n; ++t)
-        for (std::int64_t h = 0; h < heads; ++h) {
-          const std::uint32_t P = s.pos + static_cast<std::uint32_t>(t);
-          const std::uint32_t first = swa && P + 1 > s.window ? P + 1 - s.window : 0;
-          const std::uint32_t kh = h / (heads / kvh);
-          std::vector<float> sc(P + 1 - first);
-          float mx = -1e30f;
-          const float* qh = &q[std::size_t(t) * qd + h * hd];
-          for (std::uint32_t u = first; u <= P; ++u) {
-            const float* kr = &s.k_cache[l][std::size_t{u % s.capacity[l]} * kvd + kh * hd];
-            float dot = 0;
-            for (std::uint32_t d = 0; d < hd; ++d) dot += qh[d] * kr[d];
-            sc[u - first] = dot * inv_sqrt; mx = std::max(mx, sc[u - first]);
+      const std::uint32_t cap = s.capacity[l];
+      // WP0: bf16 KV + SIMD dot/accum, no per-(token,head) heap allocation.
+      // Score scratch: one buffer per parallel task (max context window length).
+#pragma omp parallel
+      {
+        std::vector<float> sc;  // reused across (t,h) iterations in this thread
+#pragma omp for collapse(2) schedule(dynamic, 1)
+        for (std::int64_t t = 0; t < n; ++t)
+          for (std::int64_t h = 0; h < heads; ++h) {
+            const std::uint32_t P = s.pos + static_cast<std::uint32_t>(t);
+            const std::uint32_t first = swa && P + 1 > s.window ? P + 1 - s.window : 0;
+            const std::uint32_t len = P + 1 - first;
+            if (sc.size() < len) sc.resize(len);
+            const std::uint32_t kh = h / (heads / kvh);
+            const float* qh = &q[std::size_t(t) * qd + h * hd];
+            // Pre-upconvert Q head to bf16 bits? keep as fp32 for dot with bf16 KV.
+            float mx = -1e30f;
+            for (std::uint32_t u = first; u <= P; ++u) {
+              const std::uint16_t* kr =
+                  &s.k_cache[l][std::size_t{u % cap} * kvd + kh * hd];
+              __m512 acc = _mm512_setzero_ps();
+              for (std::uint32_t d = 0; d < hd; d += 16) {
+                const __m512 qv = _mm512_loadu_ps(qh + d);
+                // Load 16 bf16 values and convert to fp32.
+                const __m256i kb = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i*>(kr + d));
+                const __m512 kv = _mm512_castsi512_ps(
+                    _mm512_slli_epi32(_mm512_cvtepu16_epi32(kb), 16));
+                acc = _mm512_fmadd_ps(qv, kv, acc);
+              }
+              const float dot = _mm512_reduce_add_ps(acc) * inv_sqrt;
+              sc[u - first] = dot;
+              if (dot > mx) mx = dot;
+            }
+            float den = 0;
+            for (std::uint32_t i = 0; i < len; ++i) {
+              sc[i] = std::exp(sc[i] - mx);
+              den += sc[i];
+            }
+            const float inv_den = 1.0f / den;
+            const float gsig =
+                1.0f / (1.0f + std::exp(-gate[std::size_t(t) * heads + h]));
+            float* o = &attn[std::size_t(t) * qd + h * hd];
+            // Accumulate output in fp32 (hd=128).
+            alignas(64) float acco[128] = {0};
+            for (std::uint32_t u = first; u <= P; ++u) {
+              const float wgt = sc[u - first] * inv_den;
+              const __m512 wv = _mm512_set1_ps(wgt);
+              const std::uint16_t* vr =
+                  &s.v_cache[l][std::size_t{u % cap} * kvd + kh * hd];
+              for (std::uint32_t d = 0; d < hd; d += 16) {
+                __m512 ov = _mm512_loadu_ps(acco + d);
+                const __m256i vb = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i*>(vr + d));
+                const __m512 vv = _mm512_castsi512_ps(
+                    _mm512_slli_epi32(_mm512_cvtepu16_epi32(vb), 16));
+                ov = _mm512_fmadd_ps(wv, vv, ov);
+                _mm512_storeu_ps(acco + d, ov);
+              }
+            }
+            const __m512 gv = _mm512_set1_ps(gsig);
+            for (std::uint32_t d = 0; d < hd; d += 16)
+              _mm512_storeu_ps(o + d, _mm512_mul_ps(_mm512_loadu_ps(acco + d), gv));
           }
-          float den = 0;
-          for (auto& e : sc) { e = std::exp(e - mx); den += e; }
-          const float gsig = 1.0f / (1.0f + std::exp(-gate[std::size_t(t) * heads + h]));
-          float* o = &attn[std::size_t(t) * qd + h * hd];
-          for (std::uint32_t d = 0; d < hd; ++d) o[d] = 0;
-          for (std::uint32_t u = first; u <= P; ++u) {
-            const float* vr = &s.v_cache[l][std::size_t{u % s.capacity[l]} * kvd + kh * hd];
-            const float wgt = sc[u - first] / den;
-            for (std::uint32_t d = 0; d < hd; ++d) o[d] += wgt * vr[d];
-          }
-          for (std::uint32_t d = 0; d < hd; ++d) o[d] *= gsig;
-        }
+      }
       s.t_cpu += Ms(cpu0);
       s.rt.Gemm(s.p_h, s.m_out[l], attn.data(), n, branch.data(), &s.tim);
     }
