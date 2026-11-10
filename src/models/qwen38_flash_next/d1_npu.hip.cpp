@@ -352,6 +352,14 @@ __global__ void D1AttnKernel(const float* __restrict__ q,
 }
 
 template<typename T>
+T* DeviceAlloc(std::size_t count) {
+  void* p = nullptr;
+  if (hipMalloc(&p, count * sizeof(T)) != hipSuccess)
+    return nullptr;
+  return static_cast<T*>(p);
+}
+
+template<typename T>
 T* PinnedAlloc(std::size_t count) {
   void* p = nullptr;
   if (hipHostMalloc(&p, count * sizeof(T)) != hipSuccess)
@@ -383,7 +391,9 @@ struct D1NpuModel::Impl {
   std::int32_t *ids{nullptr}, *group_buf{nullptr}, *vocab_ids{nullptr};
   mutable std::int32_t vocab_capacity{0};
 
-  mutable double t_encode{0}, t_gemm{0};
+  mutable double t_encode{0}, t_gemm{0}, t_half{0}, t_memset{0}, t_enckernel{0}, t_final{0};
+  bool prof_fine{false};
+  bool sync_each{true};
   mutable int n_gemm{0};
   std::size_t hidden{0}, inter{0}, heads{0}, hd{0}, q_dim{0};
   std::uint32_t taps{0};
@@ -403,18 +413,35 @@ struct D1NpuModel::Impl {
       }
     } done{this, t0};
     const std::uint32_t enc_rows = (n + 127u) / 128u * 128u;
+    const bool fine = prof_fine;
+    auto lap = [&](double& acc, std::chrono::steady_clock::time_point& t) {
+      if (!fine)
+        return;
+      hipStreamSynchronize(stream);
+      const auto now = std::chrono::steady_clock::now();
+      acc += std::chrono::duration<double, std::milli>(now - t).count();
+      t = now;
+    };
+    auto t = std::chrono::steady_clock::now();
     hipLaunchKernelGGL(D1ToHalfKernel,
                        dim3(static_cast<std::uint32_t>(
                            (static_cast<std::size_t>(n) * cols + 255) / 256)),
                        dim3(256), 0, stream, src, half_buf,
                        static_cast<std::size_t>(n) * cols);
+    lap(t_half, t);
     hipMemsetAsync(half_buf + static_cast<std::size_t>(n) * cols, 0,
                    static_cast<std::size_t>(enc_rows - n) * cols * sizeof(__half),
                    stream);
+    lap(t_memset, t);
     rocm::NpuEncodeActivations(half_buf, cols, enc_rows, cols, 0, cols,
                                npu->Device(buf), stream);
-    hipStreamSynchronize(stream);
+    lap(t_enckernel, t);
+    // FinalizeWeights only copies in isolate mode (the GPU must be done then);
+    // otherwise the stream already orders the encode before the NPU run.
+    if (sync_each)
+      hipStreamSynchronize(stream);
     npu->FinalizeWeights(buf);
+    lap(t_final, t);
     if (std::getenv("GUFO_D1_TRACE")) {
       const auto* b = static_cast<const std::uint8_t*>(npu->Host(buf));
       const std::size_t bytes = std::size_t{enc_rows} * cols / 8 * 9;
@@ -442,7 +469,8 @@ struct D1NpuModel::Impl {
       return false;
     if (!npu->Wait(stream))
       return false;
-    hipStreamSynchronize(stream);
+    if (sync_each)
+      hipStreamSynchronize(stream);
     return npu->Healthy();
   }
 
@@ -546,23 +574,26 @@ std::unique_ptr<D1NpuModel> D1NpuModel::Create(const core::GgufReader& reader,
 
   // Activation / scratch buffers (pinned, zero-copy for the GPU and host).
   auto& s = *impl;
-  s.x = PinnedAlloc<float>(M * H);
-  s.z = PinnedAlloc<float>(M * H);
-  s.z2 = PinnedAlloc<float>(M * H);
-  s.branch = PinnedAlloc<float>(M * H);
-  s.p_buf = PinnedAlloc<float>(std::size_t{M} * Impl::kInPitch);
-  s.conv_out = PinnedAlloc<float>(M * H);
-  s.qkv_buf = PinnedAlloc<float>(std::size_t{M} * Impl::kQkvPitch);
-  s.q = PinnedAlloc<float>(M * Q);
-  s.k = PinnedAlloc<float>(M * 512);
-  s.v = PinnedAlloc<float>(M * 512);
-  s.qn = PinnedAlloc<float>(M * Q);
-  s.kn = PinnedAlloc<float>(M * 512);
-  s.gate_buf = PinnedAlloc<float>(M * s.heads);
-  s.attn = PinnedAlloc<float>(M * Q);
-  s.gu_buf = PinnedAlloc<float>(std::size_t{M} * Impl::kGuPitch);
-  s.act = PinnedAlloc<float>(M * I);
-  s.half_buf = PinnedAlloc<__half>(M * std::max<std::size_t>(I, std::max(H, Q)));
+  s.x = DeviceAlloc<float>(M * H);
+  s.z = DeviceAlloc<float>(M * H);
+  s.z2 = DeviceAlloc<float>(M * H);
+  s.branch = DeviceAlloc<float>(M * H);
+  s.p_buf = DeviceAlloc<float>(std::size_t{M} * Impl::kInPitch);
+  s.conv_out = DeviceAlloc<float>(M * H);
+  s.qkv_buf = DeviceAlloc<float>(std::size_t{M} * Impl::kQkvPitch);
+  s.q = DeviceAlloc<float>(M * Q);
+  s.k = DeviceAlloc<float>(M * 512);
+  s.v = DeviceAlloc<float>(M * 512);
+  s.qn = DeviceAlloc<float>(M * Q);
+  s.kn = DeviceAlloc<float>(M * 512);
+  s.gate_buf = DeviceAlloc<float>(M * s.heads);
+  s.attn = DeviceAlloc<float>(M * Q);
+  s.gu_buf = DeviceAlloc<float>(std::size_t{M} * Impl::kGuPitch);
+  s.act = DeviceAlloc<float>(M * I);
+  s.half_buf = DeviceAlloc<__half>(M * std::max<std::size_t>(I, std::max(H, Q)));
+  s.prof_fine = std::getenv("GUFO_D1_PROF2") != nullptr;
+  s.sync_each = std::getenv("GUFO_NPU_ISOLATE") != nullptr || s.prof_fine ||
+                std::getenv("GUFO_D1_SYNC") != nullptr;
   s.ids = PinnedAlloc<std::int32_t>(M);
   s.group_buf = PinnedAlloc<std::int32_t>(M);
   if (!s.x || !s.z || !s.z2 || !s.branch || !s.p_buf || !s.conv_out ||
@@ -573,16 +604,21 @@ std::unique_ptr<D1NpuModel> D1NpuModel::Create(const core::GgufReader& reader,
   // GGUF tensors are mmap'd file pages the GPU cannot fault on: copy what
   // the kernels read into pinned memory.
   const std::size_t layers = c.layers.size();
-  s.g_op = PinnedAlloc<float>(layers * H);
-  s.g_ffn = PinnedAlloc<float>(layers * H);
-  s.g_post = PinnedAlloc<float>(layers * H);
-  s.g_post_ffn = PinnedAlloc<float>(layers * H);
-  s.g_qn = PinnedAlloc<float>(layers * s.hd);
-  s.g_kn = PinnedAlloc<float>(layers * s.hd);
-  s.g_out = PinnedAlloc<float>(H);
-  s.g_conv = PinnedAlloc<float>(layers * H * s.taps);
-  s.g_gate = PinnedAlloc<float>(layers * s.heads * H);
-  s.g_factors = PinnedAlloc<float>(s.hd / 2);
+  // Tables are filled on the host in pinned staging arrays, then uploaded.
+  std::vector<float> h_op(layers * H), h_ffn(layers * H), h_post(layers * H),
+      h_post_ffn(layers * H), h_qn(layers * s.hd), h_kn(layers * s.hd),
+      h_out(H), h_conv(layers * H * s.taps), h_gate(layers * s.heads * H),
+      h_factors(s.hd / 2);
+  s.g_op = DeviceAlloc<float>(layers * H);
+  s.g_ffn = DeviceAlloc<float>(layers * H);
+  s.g_post = DeviceAlloc<float>(layers * H);
+  s.g_post_ffn = DeviceAlloc<float>(layers * H);
+  s.g_qn = DeviceAlloc<float>(layers * s.hd);
+  s.g_kn = DeviceAlloc<float>(layers * s.hd);
+  s.g_out = DeviceAlloc<float>(H);
+  s.g_conv = DeviceAlloc<float>(layers * H * s.taps);
+  s.g_gate = DeviceAlloc<float>(layers * s.heads * H);
+  s.g_factors = DeviceAlloc<float>(s.hd / 2);
   if (!s.g_op || !s.g_ffn || !s.g_post || !s.g_post_ffn || !s.g_qn || !s.g_kn ||
       !s.g_out || !s.g_conv || !s.g_gate || !s.g_factors)
     return fail("norm table allocation failed");
@@ -592,26 +628,37 @@ std::unique_ptr<D1NpuModel> D1NpuModel::Create(const core::GgufReader& reader,
   };
   for (std::size_t l = 0; l < layers; ++l) {
     const auto& lw = s.w.layers[l];
-    copy_f32(lw.norm, s.g_op + l * H, H);
-    copy_f32(lw.ffn_norm, s.g_ffn + l * H, H);
-    copy_f32(lw.post_norm, s.g_post + l * H, H);
-    copy_f32(lw.post_ffn_norm, s.g_post_ffn + l * H, H);
-    copy_f32(lw.q_norm, s.g_qn + l * s.hd, s.hd);
-    copy_f32(lw.k_norm, s.g_kn + l * s.hd, s.hd);
-    copy_f32(lw.conv, s.g_conv + l * H * s.taps, H * s.taps);
+    copy_f32(lw.norm, h_op.data() + l * H, H);
+    copy_f32(lw.ffn_norm, h_ffn.data() + l * H, H);
+    copy_f32(lw.post_norm, h_post.data() + l * H, H);
+    copy_f32(lw.post_ffn_norm, h_post_ffn.data() + l * H, H);
+    copy_f32(lw.q_norm, h_qn.data() + l * s.hd, s.hd);
+    copy_f32(lw.k_norm, h_kn.data() + l * s.hd, s.hd);
+    copy_f32(lw.conv, h_conv.data() + l * H * s.taps, H * s.taps);
     if (lw.attn_gate.data)
       for (std::uint32_t r = 0; r < s.heads; ++r)
         lfm3::DecodeRow(lw.attn_gate, r,
-                        std::span<float>(s.g_gate + (l * s.heads + r) * H, H));
+                        std::span<float>(h_gate.data() + (l * s.heads + r) * H, H));
   }
-  copy_f32(s.w.output_norm, s.g_out, H);
-  copy_f32(s.w.rope_freqs, s.g_factors, s.hd / 2);
+  copy_f32(s.w.output_norm, h_out.data(), H);
+  copy_f32(s.w.rope_freqs, h_factors.data(), s.hd / 2);
+  hipMemcpy(s.g_op, h_op.data(), h_op.size() * 4, hipMemcpyHostToDevice);
+  hipMemcpy(s.g_ffn, h_ffn.data(), h_ffn.size() * 4, hipMemcpyHostToDevice);
+  hipMemcpy(s.g_post, h_post.data(), h_post.size() * 4, hipMemcpyHostToDevice);
+  hipMemcpy(s.g_post_ffn, h_post_ffn.data(), h_post_ffn.size() * 4, hipMemcpyHostToDevice);
+  hipMemcpy(s.g_qn, h_qn.data(), h_qn.size() * 4, hipMemcpyHostToDevice);
+  hipMemcpy(s.g_kn, h_kn.data(), h_kn.size() * 4, hipMemcpyHostToDevice);
+  hipMemcpy(s.g_out, h_out.data(), h_out.size() * 4, hipMemcpyHostToDevice);
+  hipMemcpy(s.g_conv, h_conv.data(), h_conv.size() * 4, hipMemcpyHostToDevice);
+  hipMemcpy(s.g_gate, h_gate.data(), h_gate.size() * 4, hipMemcpyHostToDevice);
+  hipMemcpy(s.g_factors, h_factors.data(), h_factors.size() * 4, hipMemcpyHostToDevice);
   {
     const std::size_t bytes = s.w.embedding.bytes;
-    s.emb_table = PinnedAlloc<std::uint8_t>(bytes);
-    if (!s.emb_table)
-      return fail("embedding copy failed");
-    std::memcpy(s.emb_table, s.w.embedding.data, bytes);
+    s.emb_table = DeviceAlloc<std::uint8_t>(bytes);
+    if (!s.emb_table ||
+        hipMemcpy(s.emb_table, s.w.embedding.data, bytes,
+                  hipMemcpyHostToDevice) != hipSuccess)
+      return fail("embedding upload failed");
   }
 
   // Weights -> block-float NPU buffers, one fused buffer per projection.
@@ -689,8 +736,7 @@ bool D1NpuModel::Forward(std::span<const std::uint32_t> tokens,
                          std::span<float> logits) const {
   auto& s = *impl_;
   const auto t_start = std::chrono::steady_clock::now();
-  s.t_encode = 0;
-  s.t_gemm = 0;
+  s.t_encode = s.t_gemm = s.t_half = s.t_memset = s.t_enckernel = s.t_final = 0;
   s.n_gemm = 0;
   const auto& c = s.w.config;
   const std::uint32_t n = static_cast<std::uint32_t>(tokens.size());
@@ -750,16 +796,19 @@ bool D1NpuModel::Forward(std::span<const std::uint32_t> tokens,
                         std::size_t count) {
     if (!trace || l > 1)
       return;
+    std::vector<float> h(count);
+    hipMemcpyAsync(h.data(), p, count * sizeof(float), hipMemcpyDeviceToHost,
+                   s.stream);
     hipStreamSynchronize(s.stream);
     double mean = 0;
     std::size_t zeros = 0, bad = 0;
     for (std::size_t i = 0; i < count; ++i) {
-      mean += std::abs(p[i]);
-      zeros += p[i] == 0.0F;
-      bad += !std::isfinite(p[i]);
+      mean += std::abs(h[i]);
+      zeros += h[i] == 0.0F;
+      bad += !std::isfinite(h[i]);
     }
     std::fprintf(stderr, "[d1 npu ] L%u %-8s mean|.| %.5f zeros %zu/%zu bad %zu first %.4f %.4f\n",
-                 l, name, mean / count, zeros, count, bad, p[0], p[1]);
+                 l, name, mean / count, zeros, count, bad, h[0], h[1]);
   };
   for (std::uint32_t l = 0; l < c.layers.size(); ++l) {
     stat("x_in", l, s.x, static_cast<std::size_t>(n) * H);
@@ -847,16 +896,17 @@ bool D1NpuModel::Forward(std::span<const std::uint32_t> tokens,
                       s.z2, n, H, 1, c.eps, s.stream);
     s.Add(s.x, s.z2, n);
     if (trace) {
+      std::vector<float> h(static_cast<std::size_t>(n) * H);
+      hipMemcpyAsync(h.data(), s.x, h.size() * sizeof(float),
+                     hipMemcpyDeviceToHost, s.stream);
       hipStreamSynchronize(s.stream);
       double mean = 0;
-      for (std::size_t i = 0; i < static_cast<std::size_t>(n) * H; ++i)
-        mean += std::abs(s.x[i]);
+      for (float v : h)
+        mean += std::abs(v);
+      const std::size_t last = static_cast<std::size_t>(n - 1) * H;
       std::fprintf(stderr, "[d1 npu ] layer %u mean|x| %.5f last %.4f %.4f %.4f %.4f\n",
-                   l, mean / (static_cast<double>(n) * H),
-                   s.x[static_cast<std::size_t>(n - 1) * H],
-                   s.x[static_cast<std::size_t>(n - 1) * H + 1],
-                   s.x[static_cast<std::size_t>(n - 1) * H + 2],
-                   s.x[static_cast<std::size_t>(n - 1) * H + 3]);
+                   l, mean / h.size(), h[last], h[last + 1], h[last + 2],
+                   h[last + 3]);
     }
   }
 
@@ -864,26 +914,26 @@ bool D1NpuModel::Forward(std::span<const std::uint32_t> tokens,
   // vocabulary entries (the embedding table is tied to the output head).
   const std::uint32_t slot_count = static_cast<std::uint32_t>(slots.size());
   if (!s.sel) {
-    s.sel = PinnedAlloc<float>(std::size_t{128} * H);
-    s.sel_norm = PinnedAlloc<float>(std::size_t{128} * H);
+    s.sel = DeviceAlloc<float>(std::size_t{128} * H);
+    s.sel_norm = DeviceAlloc<float>(std::size_t{128} * H);
     if (!s.sel || !s.sel_norm)
       return false;
   }
   if (slot_count > 128)
     return false;
-  hipStreamSynchronize(s.stream);
   for (std::uint32_t i = 0; i < slot_count; ++i)
-    std::memcpy(s.sel + static_cast<std::size_t>(i) * H,
-                s.x + static_cast<std::size_t>(slots[i]) * H, H * sizeof(float));
+    hipMemcpyAsync(s.sel + static_cast<std::size_t>(i) * H,
+                   s.x + static_cast<std::size_t>(slots[i]) * H,
+                   H * sizeof(float), hipMemcpyDeviceToDevice, s.stream);
   rocm::RmsNormRows(s.sel, s.g_out, s.sel_norm, slot_count, H, 1, c.eps,
                     s.stream);
   if (static_cast<std::int32_t>(cols) > s.vocab_capacity) {
     if (s.vocab_ids)
       hipHostFree(s.vocab_ids);
     if (s.logit_buf)
-      hipHostFree(s.logit_buf);
+      hipFree(s.logit_buf);
     s.vocab_ids = PinnedAlloc<std::int32_t>(cols);
-    s.logit_buf = PinnedAlloc<float>(std::size_t{128} * cols);
+    s.logit_buf = DeviceAlloc<float>(std::size_t{128} * cols);
     if (!s.vocab_ids || !s.logit_buf)
       return false;
     s.vocab_capacity = static_cast<std::int32_t>(cols);
@@ -903,6 +953,8 @@ bool D1NpuModel::Forward(std::span<const std::uint32_t> tokens,
     hipLaunchKernelGGL((D1LogitKernel<0>), dim3(cols, slot_count),
                        dim3(kThreads), 0, s.stream, s.emb_table, s.vocab_ids,
                        s.sel_norm, s.logit_buf, H, row_bytes, cols);
+  hipMemcpyAsync(logits.data(), s.logit_buf, logits.size_bytes(),
+                 hipMemcpyDeviceToHost, s.stream);
   hipStreamSynchronize(s.stream);
   if (std::getenv("GUFO_D1_PROF")) {
     const double total = std::chrono::duration<double, std::milli>(
@@ -911,8 +963,11 @@ bool D1NpuModel::Forward(std::span<const std::uint32_t> tokens,
                  "[d1 prof] n=%u total %.1f ms: encode %.1f gemm %.1f (%d calls) other %.1f\n",
                  n, total, s.t_encode, s.t_gemm, s.n_gemm,
                  total - s.t_encode - s.t_gemm);
+    if (s.prof_fine)
+      std::fprintf(stderr,
+                   "[d1 prof] encode parts: tohalf %.1f memset %.1f kernel %.1f finalize %.1f\n",
+                   s.t_half, s.t_memset, s.t_enckernel, s.t_final);
   }
-  std::memcpy(logits.data(), s.logit_buf, logits.size_bytes());
   return s.npu->Healthy();
 }
 
