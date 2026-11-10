@@ -36,6 +36,11 @@ class Engine {
   void ArgmaxRows(const float* hidden, std::uint32_t rows, std::uint32_t* out);
   /// Accepts the first k rows of the last Step (conv history and position).
   void Commit(std::uint32_t k);
+  bool LoadHeads(const std::string& path, std::string* error);
+  std::uint32_t HeadCount() const;
+  void LimitHeads(std::uint32_t k);
+  /// Greedy continuation tokens (after the token the hidden row predicts).
+  void Draft(const float* hidden_row, std::uint32_t* out);
   struct Impl;
 
  private:

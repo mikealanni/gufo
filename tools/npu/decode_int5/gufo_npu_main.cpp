@@ -29,7 +29,8 @@ int main(int argc, char** argv) {
   gufo::models::lfm3::npu::Options opt;
   std::string in, out;
   std::size_t maxtok = 512, maxnew = 128;
-  std::string prompt;
+  std::string prompt, heads_path;
+  std::size_t head_k = 2;
   bool spec = std::getenv("GUFO_NO_SPEC") == nullptr;
   for (int i = 2; i + 1 < argc; i += 2) {
     std::string k = argv[i];
@@ -42,6 +43,8 @@ int main(int argc, char** argv) {
     else if (k == "--maxtok") maxtok = std::stoul(v);
     else if (k == "--max-new") maxnew = std::stoul(v);
     else if (k == "--prompt") prompt = v;
+    else if (k == "--heads") heads_path = v;
+    else if (k == "--head-k") head_k = std::stoul(v);
     else if (k == "--context") opt.context = std::stoul(v);
   }
   if (!std::getenv("OMP_NUM_THREADS"))
@@ -119,6 +122,12 @@ int main(int argc, char** argv) {
       eos = *e;
     std::vector<std::uint32_t> out;
     std::vector<float> h;
+    if (!heads_path.empty() && !engine->LoadHeads(heads_path, &err)) {
+      std::fprintf(stderr, "%s\n", err.c_str());
+      return 1;
+    }
+    engine->LimitHeads(static_cast<std::uint32_t>(head_k));
+    std::vector<std::uint32_t> head_draft;
     engine->Reset();
     const auto t0 = std::chrono::steady_clock::now();
     for (std::size_t at = 0; at < ids.size();) {
@@ -132,6 +141,8 @@ int main(int argc, char** argv) {
     std::uint32_t next = engine->Argmax(h.data() + (h.size() - 2048));
     std::vector<std::uint32_t> hist = ids;
     std::size_t passes = 0, drafted = 0, accepted = 0;
+    double t_step = 0, t_arg = 0, t_draft = 0;
+    auto lap = [](std::chrono::steady_clock::time_point a) { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count(); };
     bool done = false;
     while (!done && out.size() < maxnew) {
       out.push_back(next);
@@ -154,8 +165,14 @@ int main(int argc, char** argv) {
           }
         }
       }
+      if (spec && fed.size() == 1)
+        for (auto t : head_draft)
+          if (fed.size() < Engine::kMaxRows)
+            fed.push_back(t);
+      auto ts = std::chrono::steady_clock::now();
       if (!engine->Step(std::span<const std::uint32_t>(fed.data(), fed.size()), &h))
         return 1;
+      t_step += lap(ts);
       ++passes;
       drafted += fed.size() - 1;
       std::vector<std::uint32_t> pred(fed.size());
@@ -163,7 +180,9 @@ int main(int argc, char** argv) {
       for (;;) {
         const std::size_t want = std::min<std::size_t>(fed.size(), have == 0 ? 4 : fed.size());
         if (want > have) {
+          auto ta = std::chrono::steady_clock::now();
           engine->ArgmaxRows(h.data() + have * 2048, want - have, pred.data() + have);
+          t_arg += lap(ta);
           have = want;
         }
         while (j + 1 < fed.size() && j < have && pred[j] == fed[j + 1])
@@ -186,9 +205,17 @@ int main(int argc, char** argv) {
       if (j >= have)
         pred[j] = 0;
       next = pred[j];
+      head_draft.clear();
+      if (spec && engine->HeadCount() && !done) {
+        head_draft.resize(engine->HeadCount());
+        auto td = std::chrono::steady_clock::now();
+        engine->Draft(h.data() + j * 2048, head_draft.data());
+        t_draft += lap(td);
+      }
     }
     if (out.size() > maxnew)
       out.resize(maxnew);
+    std::fprintf(stderr, "per pass: step %.1f ms, verify-argmax %.1f ms, draft %.1f ms\n", t_step / std::max<std::size_t>(passes, 1), t_arg / std::max<std::size_t>(passes, 1), t_draft / std::max<std::size_t>(passes, 1));
     if (spec)
       std::fprintf(stderr, "speculation: %zu passes, %zu drafted, %zu accepted, %.2f tokens/pass\n", passes,
                    drafted, accepted, passes ? double(out.size()) / passes : 0.0);
