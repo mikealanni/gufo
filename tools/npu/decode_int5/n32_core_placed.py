@@ -226,14 +226,23 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None):
                 a_task = shim_dma_single_bd_task(A_l3l2, A, tap=a_tap, issue_token=False)
                 dma_start_task(a_task)
                 b_tasks, c_tasks = [], []
-                for col in range(n_aie_cols):
-                    inner = min(mchunks, 512)
-                    b_tap = TensorAccessPattern(
-                        (1, b_total), col * chunk_bytes,
-                        [mchunks // inner, inner, chunk_bytes // 1024, 1024],
-                        [inner * n_aie_cols * chunk_bytes, n_aie_cols * chunk_bytes, 1024, 1])
-                    b_tasks.append(shim_dma_single_bd_task(B_l3l2[col], B, tap=b_tap, issue_token=False))
-                    dma_start_task(b_tasks[-1])
+                # Split each column's B stream into superblock BDs: BD dimension sizes
+                # are capped at 1023 and strides at 1 MB, one chain can hold 4 BDs, so
+                # 64k runs one BD per column, 128k four of 256 chunks, 256k four of 512.
+                per_bd = min(mchunks, 256)
+                while (mchunks + per_bd - 1) // per_bd > 4 and per_bd < 512:
+                    per_bd *= 2
+                assert (mchunks + per_bd - 1) // per_bd <= 4, "context beyond 256k unsupported"
+                n_bd = (mchunks + per_bd - 1) // per_bd
+                for bi in range(n_bd):
+                    inner = min(per_bd, mchunks - bi * per_bd)
+                    for col in range(n_aie_cols):
+                        b_tap = TensorAccessPattern(
+                            (1, b_total), (bi * per_bd * n_aie_cols + col) * chunk_bytes,
+                            [1, inner, chunk_bytes // 1024, 1024],
+                            [1, n_aie_cols * chunk_bytes, 1024, 1])
+                        b_tasks.append(shim_dma_single_bd_task(B_l3l2[col], B, tap=b_tap, issue_token=False))
+                        dma_start_task(b_tasks[-1])
                 for col in range(n_aie_cols):
                     c_tap = TensorAccessPattern((1, c_total), col * c_per_col, [1, 1, 1, c_per_col], [0, 0, 0, 1])
                     c_tasks.append(shim_dma_single_bd_task(C_l2l3[col], C, tap=c_tap, issue_token=True))
