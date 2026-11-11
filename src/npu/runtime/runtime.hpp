@@ -153,6 +153,11 @@ class NpuRuntime {
   void Ffn(Program& p, WeightBuffer& wb, const float* x, std::uint32_t n,
            float* y, Timings* t = nullptr);
 
+  /// Argmax GEMM over an int5 head: returns the greedy token id per row.
+  /// C must have been produced by an argmax-mode program (per-strip reduced).
+  void Argmax(Program& p, WeightBuffer& wb, const float* x, std::uint32_t n,
+              std::uint32_t* out, Timings* t = nullptr);
+
   /// `w_in`: [3*hidden][hidden] rows ordered B | C | x (hidden each).
   /// `conv_w`: [hidden][taps] depthwise taps. `tmpl`: conv program template
   /// (shares instructions and the A BO; gets its own C BO).

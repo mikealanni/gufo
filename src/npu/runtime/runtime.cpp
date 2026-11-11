@@ -249,6 +249,56 @@ void NpuRuntime::Ffn(Program& p, WeightBuffer& wb, const float* x,
   if (t) ++t->calls;
 }
 
+void NpuRuntime::Argmax(Program& p, WeightBuffer& wb, const float* x,
+                        std::uint32_t n, std::uint32_t* out, Timings* t) {
+  auto t0 = Clock::now();
+  EncodeA(x, n, p.K, p);
+  if (t) t->enc += Ms(t0);
+  t0 = Clock::now();
+  p.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  if (t) t->syncA += Ms(t0);
+  t0 = Clock::now();
+  wb.run.start();
+  if (t) t->submit += Ms(t0);
+  t0 = Clock::now();
+  for (;;) {
+    const auto st = wb.run.state();
+    if (st == ERT_CMD_STATE_COMPLETED)
+      break;
+    if (st != ERT_CMD_STATE_NEW && st != ERT_CMD_STATE_QUEUED &&
+        st != ERT_CMD_STATE_RUNNING && st != ERT_CMD_STATE_SUBMITTED)
+      break;
+  }
+  wb.run.wait();
+  if (t) t->wait += Ms(t0);
+  t0 = Clock::now();
+  p.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+  if (t) t->syncC += Ms(t0);
+  t0 = Clock::now();
+  const std::uint32_t strips = p.N / kStrip;
+  struct Cand { float v; std::uint32_t id; };
+  std::vector<Cand> best(n, {-INFINITY, 0});
+  for (std::uint32_t si = 0; si < strips; ++si) {
+    for (std::uint32_t cr = 0; cr < 4; ++cr) {
+      const std::uint8_t* base = p.ch + std::size_t{si} * kStripBytes + std::size_t{cr} * kRowBytes;
+      for (std::uint32_t r = 0; r < n; ++r) {
+        float v;
+        std::uint32_t lc;
+        std::memcpy(&v, base + r * 8, 4);
+        std::memcpy(&lc, base + r * 8 + 4, 4);
+        const std::uint32_t id = si * kStrip + cr * 32 + lc;
+        if (v > best[r].v || (v == best[r].v && id < best[r].id)) {
+          best[r].v = v;
+          best[r].id = id;
+        }
+      }
+    }
+  }
+  for (std::uint32_t r = 0; r < n; ++r) out[r] = best[r].id;
+  if (t) t->dec += Ms(t0);
+  if (t) ++t->calls;
+}
+
 namespace {
 // Partial BO syncs that start or end inside a page are not reliable: flush whole pages.
 void SyncToDevice(xrt::bo& bo, std::size_t offset, std::size_t size) {

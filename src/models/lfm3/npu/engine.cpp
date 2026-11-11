@@ -203,6 +203,10 @@ struct Engine::Impl {
   std::vector<std::uint16_t> head_w;
   std::vector<std::uint32_t> sub_ids;
   std::vector<std::uint8_t> sub_table;
+  // WP4: int5 head on NPU (argmax GEMM + per-strip reduce)
+  bool npu_argmax{false};
+  gufo::npu::runtime::Program p_argmax;
+  gufo::npu::runtime::WeightBuffer m_argmax;
   double t_cpu{0};
 
   void LoadRows(const std::string& st_name, const Tensor& t, float* dst,
@@ -337,6 +341,40 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
         m.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
         s.m_ffn[l] = std::move(m);
         s.rt.Attach(s.m_ffn[l], s.p_ffn);
+      }
+    }
+    // WP4: pack tied embedding as int5 head for NPU argmax, if program exists.
+    s.npu_argmax = false;
+    if (!std::getenv("GUFO_CPU_ARGMAX")) {
+      const std::string ainst = options.programs + "/insts_argmax_2048x128000.txt";
+      std::ifstream af(ainst, std::ios::binary);
+      if (af.good()) {
+        af.close();
+        try {
+          const std::uint32_t V = s.w->embedding.rows;
+          s.p_argmax = s.rt.MakeProgram(s.H, V, ainst, 0, error);
+          std::vector<float> emb(std::size_t{V} * s.H);
+          const std::uint32_t nb = s.H / 32;
+          const std::size_t rb = std::size_t{nb} * 34;
+          const auto* base = static_cast<const std::uint8_t*>(s.w->embedding.data);
+#pragma omp parallel for schedule(static)
+          for (std::int64_t v = 0; v < V; ++v) {
+            const std::uint8_t* row = base + std::size_t(v) * rb;
+            float* out = emb.data() + std::size_t(v) * s.H;
+            for (std::uint32_t b = 0; b < nb; ++b) {
+              std::uint16_t hd; std::memcpy(&hd, row + std::size_t{b} * 34, 2);
+              const float d = Bf16Float(hd);
+              for (int i = 0; i < 32; ++i)
+                out[b * 32 + i] = static_cast<float>(static_cast<int8_t>(row[b * 34 + 2 + i])) * d;
+            }
+          }
+          s.m_argmax = s.rt.PackWeight(emb.data(), V, s.H);
+          s.rt.Attach(s.m_argmax, s.p_argmax);
+          s.npu_argmax = true;
+          std::fprintf(stderr, "npu engine: packed int5 argmax head (%u x %u)\n", V, s.H);
+        } catch (...) {
+          s.npu_argmax = false;
+        }
       }
     }
     std::fprintf(stderr, "npu engine: packed %zu layers in %.1f s (spec: %s)\n", L,
@@ -661,6 +699,11 @@ void Engine::Logits(const float* hidden_row, std::vector<float>* logits) {
 
 std::uint32_t Engine::Argmax(const float* hidden_row) {
   Impl& s = *impl_;
+  if (s.npu_argmax) {
+    std::uint32_t out = 0;
+    s.rt.Argmax(s.p_argmax, s.m_argmax, hidden_row, 1, &out, &s.tim);
+    return out;
+  }
   const auto& e = s.w->embedding;
   const std::uint32_t V = e.rows, nb = s.H / 32;
   const std::size_t rb = std::size_t{nb} * 34;
@@ -683,6 +726,14 @@ std::uint32_t Engine::Argmax(const float* hidden_row) {
 
 void Engine::ArgmaxRows(const float* hidden, std::uint32_t rows, std::uint32_t* out) {
   Impl& s = *impl_;
+  if (s.npu_argmax) {
+    // Run in chunks of kMaxRows; each call does one NPU dispatch.
+    for (std::uint32_t off = 0; off < rows; off += kMaxRows) {
+      const std::uint32_t n = std::min(kMaxRows, rows - off);
+      s.rt.Argmax(s.p_argmax, s.m_argmax, hidden + std::size_t{off} * s.H, n, out + off, &s.tim);
+    }
+    return;
+  }
   Sweep(static_cast<const std::uint8_t*>(s.w->embedding.data), s.w->embedding.rows, s.H, hidden, rows, out);
 }
 
@@ -735,6 +786,7 @@ void Engine::Draft(const float* hidden_row, std::uint32_t* out) {
       xs[std::size_t(k) * H + o] = hidden_row[o] + y / (1.0f + std::exp(-y));
     }
   if (s.sub_ids.empty()) { ArgmaxRows(xs.data(), K, out); return; }
+  // Draft uses the reduced 16384-token vocabulary; use CPU sweep over sub_table.
   Sweep(s.sub_table.data(), static_cast<std::uint32_t>(s.sub_ids.size()), H, xs.data(), K, out);
   for (std::uint32_t k = 0; k < K; ++k) out[k] = s.sub_ids[out[k]];
 }

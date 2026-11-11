@@ -99,6 +99,36 @@ __attribute__((noinline)) static void FlushPlain(bfp16ebs8 *__restrict pC_bfp16)
   }
 }
 
+// Per-strip argmax reduce: for each batch row, max over this core's 32 columns.
+// c_stage layout: 512 bfloat16 = 2 sub-blocks * 4 accum-blocks * 64 (8 rows x 8 cols).
+//   sb in {0,1} (cols 0-15 / 16-31), acc in {0,1,2,3}: (rows 0-7 or 8-15, cols 0-7 or 8-15)
+// Output: 16 * (float value + uint32 local_col_index 0-31) = 128 bytes at pC.
+__attribute__((noinline)) static void FlushArgmax(uint8_t *__restrict pC) {
+  auto *out = reinterpret_cast<float *>(pC);
+  auto *outi = reinterpret_cast<uint32_t *>(pC);
+  for (int row = 0; row < kRows; ++row) {
+    const int rh = row < 8 ? 0 : 1;       // rows 0-7 -> acc0/1, rows 8-15 -> acc2/3
+    const int rr = row & 7;               // row within the 8-row block
+    float best = -3.4e38f;
+    uint32_t best_col = 0;
+    for (int sb = 0; sb < 2; ++sb) {
+      for (int blk = 0; blk < 2; ++blk) {  // cols 0-7 or 8-15 within sub-block
+        const int acc = rh * 2 + blk;
+        const bfloat16 *base = c_stage + sb * 256 + acc * 64 + rr * 8;
+        for (int c = 0; c < 8; ++c) {
+          const float v = (float)base[c];
+          if (v > best) {
+            best = v;
+            best_col = static_cast<uint32_t>(sb * 16 + blk * 8 + c);
+          }
+        }
+      }
+    }
+    out[row * 2] = best;
+    outi[row * 2 + 1] = best_col;
+  }
+}
+
 
 constexpr int kCombRows = 24;
 static bfloat16 *const comb = (bfloat16 *)(arena + 3456);
@@ -200,14 +230,16 @@ void matmul_p1(bfp16ebs8 *__restrict pA, uint8_t *__restrict pBp,
 }
 
 void matmul_dn(bfp16ebs8 *__restrict pA, uint8_t *__restrict pBp,
-               uint8_t *__restrict pC, int32_t kcnt) {
-  bfp16ebs8 *pC_bfp16 = (bfp16ebs8 *)pC;
+               uint8_t *__restrict pC, int32_t kcnt, int32_t mode) {
   ::aie::set_rounding(::aie::rounding_mode::conv_even);
   Unpack((const uint16_t *)pBp, (const bfloat16 *)(pBp + 1408));
   MacTile(pA);
   if (kc_dn == kcnt - 1) {
     kc_dn = 0;
-    FlushPlain(pC_bfp16);
+    if (mode == 2)
+      FlushArgmax(pC);
+    else
+      FlushPlain((bfp16ebs8 *)pC);
   } else {
     kc_dn += 1;
   }
