@@ -99,33 +99,29 @@ __attribute__((noinline)) static void FlushPlain(bfp16ebs8 *__restrict pC_bfp16)
   }
 }
 
-// Per-strip argmax reduce: for each batch row, max over this core's 32 columns.
-// c_stage layout: 512 bfloat16 = 2 sub-blocks * 4 accum-blocks * 64 (8 rows x 8 cols).
-//   sb in {0,1} (cols 0-15 / 16-31), acc in {0,1,2,3}: (rows 0-7 or 8-15, cols 0-7 or 8-15)
-// Output: 16 * (float value + uint32 local_col_index 0-31) = 128 bytes at pC.
+// Per-strip argmax reduce: 16 rows x 32 cols -> (float max, uint32 col) per row.
 __attribute__((noinline)) static void FlushArgmax(uint8_t *__restrict pC) {
-  auto *out = reinterpret_cast<float *>(pC);
-  auto *outi = reinterpret_cast<uint32_t *>(pC);
-  for (int row = 0; row < kRows; ++row) {
-    const int rh = row < 8 ? 0 : 1;       // rows 0-7 -> acc0/1, rows 8-15 -> acc2/3
-    const int rr = row & 7;               // row within the 8-row block
-    float best = -3.4e38f;
-    uint32_t best_col = 0;
-    for (int sb = 0; sb < 2; ++sb) {
-      for (int blk = 0; blk < 2; ++blk) {  // cols 0-7 or 8-15 within sub-block
-        const int acc = rh * 2 + blk;
-        const bfloat16 *base = c_stage + sb * 256 + acc * 64 + rr * 8;
+  float bv[kRows];
+  uint32_t bc[kRows];
+  for (int r = 0; r < kRows; ++r) { bv[r] = -3.4e38f; bc[r] = 0; }
+  for (int sb = 0; sb < 2; ++sb) {
+    for (int acc = 0; acc < 4; ++acc) {
+      const int rowbase = (acc >= 2) ? 8 : 0;
+      const uint32_t colbase = (uint32_t)(sb * 16 + (acc & 1) * 8);
+      const bfloat16 *p = c_stage + sb * 256 + acc * 64;
+      for (int rr = 0; rr < 8; ++rr) {
+        const int row = rowbase + rr;
+        const bfloat16 *pr = p + rr * 8;
         for (int c = 0; c < 8; ++c) {
-          const float v = (float)base[c];
-          if (v > best) {
-            best = v;
-            best_col = static_cast<uint32_t>(sb * 16 + blk * 8 + c);
-          }
+          float v = (float)pr[c];
+          if (v > bv[row]) { bv[row] = v; bc[row] = colbase + (uint32_t)c; }
         }
       }
     }
-    out[row * 2] = best;
-    outi[row * 2 + 1] = best_col;
+  }
+  for (int r = 0; r < kRows; ++r) {
+    ((float *)pC)[r * 2] = bv[r];
+    ((uint32_t *)pC)[r * 2 + 1] = bc[r];
   }
 }
 
