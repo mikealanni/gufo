@@ -59,8 +59,11 @@ gen_attn_all() {
 }
 
 gen_argmax() {
-  local K="$1" N="$2" out="${3:-insts_argmax_${K}x${N}.txt}"
-  python3 "$dir/n32_core_placed.py" -m 16 -k 64 -n 128 -M 16 -K "$K" -N "$K" --mode argmax     --k2 "$K" --n2 "$N" >"$work/a.mlir"
+  local K="$1"
+  local N="$2"
+  local out="${3:-insts_argmax_${K}x${N}.txt}"
+  python3 "$dir/n32_core_placed.py" -m 16 -k 64 -n 128 -M 16 -K "$K" -N "$K" --mode argmax \
+    --k2 "$K" --n2 "$N" >"$work/a.mlir"
   aiecc --aietools="${AIETOOLS:?}" --alloc-scheme=basic-sequential --no-compile --no-link     --no-xchesscc --aie-generate-npu-insts --unified --dynamic-objFifos     --npu-insts-name="$work/i.txt" "$work/a.mlir" >/dev/null
   mv "$work/i.txt" "$dir/runtime/$out"
   echo "generated $out (argmax ${K}x${N})"
