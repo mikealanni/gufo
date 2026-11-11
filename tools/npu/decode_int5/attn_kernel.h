@@ -12,6 +12,11 @@
 #ifndef GUFO_ATTN_KERNEL_H_
 #define GUFO_ATTN_KERNEL_H_
 
+// One shared copy loop keeps program memory (16 KB) in budget.
+__attribute__((noinline)) static void CopyBytes(uint8_t *dst, const uint8_t *src, int n) {
+  for (int i = 0; i < n; i += 64) aie::store_v(dst + i, aie::load_v<64>(src + i));
+}
+
 constexpr int kAttnRowBlocks = 8;   // 64 q rows = 8 blocks of 8
 constexpr int kAttnDimBlocks = 16;  // 128 dims
 
@@ -88,7 +93,7 @@ __attribute__((noinline)) static void AttnQ(const uint8_t *pA, int idx, int row_
   // element idx (0..31) of the Q stream; this core keeps elements row_id*8 .. row_id*8+7
   if (idx / 8 != row_id) return;
   uint8_t *dst = (uint8_t *)a_q + (idx % 8) * 1152;
-  for (int i = 0; i < 1152; i += 64) aie::store_v(dst + i, aie::load_v<64>(pA + i));
+  CopyBytes(dst, pA, 1152);
 }
 
 __attribute__((noinline)) static void AttnChunk(int tokbase) {
@@ -153,7 +158,7 @@ __attribute__((noinline)) static void AttnChunk(int tokbase) {
 // chunk q = local * 8 + col covers tokens q*16 .. q*16+15.
 __attribute__((noinline)) static void AttnFeed(const uint8_t *pB, int col) {
   uint8_t *dst = a_chunk + a_feed * 1536;
-  for (int i = 0; i < 1536; i += 64) aie::store_v(dst + i, aie::load_v<64>(pB + i));
+  CopyBytes(dst, pB, 1536);
   if (++a_feed < 3) return;
   a_feed = 0;
   const int s = a_chunk_idx * 8 + col;  // slot chunk this column just filled
@@ -222,14 +227,14 @@ __attribute__((noinline)) static void AttnTailFeed(const uint8_t *pA, int idx, i
   const int tb = idx / 12, r = (idx % 12) / 3, e = idx % 3;
   if (r != row_id || col_id != 0) return;
   uint8_t *dst = a_chunk + e * 1152;
-  for (int i = 0; i < 1152; i += 64) aie::store_v(dst + i, aie::load_v<64>(pA + i));
+  CopyBytes(dst, pA, 1152);
   if (e == 2) AttnTail(tb);
 }
 
 // Output element idx: 0..31 = a_o (32 KB), 32..33 = a_l (2 KB).
 __attribute__((noinline)) static void AttnOut(uint8_t *pC, int idx) {
   const uint8_t *src = idx < 32 ? (const uint8_t *)a_o + idx * 1024 : (const uint8_t *)a_l + (idx - 32) * 1024;
-  for (int i = 0; i < 1024; i += 64) aie::store_v(pC + i, aie::load_v<64>(src + i));
+  CopyBytes(pC, src, 1024);
 }
 
 #endif

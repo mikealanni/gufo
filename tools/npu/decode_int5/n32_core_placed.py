@@ -146,6 +146,7 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None):
                         i4 = arith.constant(T.index(), 4)
                         i5 = arith.constant(T.index(), 5)
                         i6 = arith.constant(T.index(), 6)
+                        i7 = arith.constant(T.index(), 7)
                         k1_i32 = memref.load(rtps[row][col], [i0])
                         t1_i32 = memref.load(rtps[row][col], [i1])
                         k2_i32 = memref.load(rtps[row][col], [i2])
@@ -153,6 +154,7 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None):
                         mode_i32 = memref.load(rtps[row][col], [i4])
                         attn_on_i32 = memref.load(rtps[row][col], [i5])
                         attn_feeds_i32 = memref.load(rtps[row][col], [i6])
+                        dn_mode_i32 = memref.load(rtps[row][col], [i7])
                         use_lock(rtp_locks[row][col], LockAction.Release, value=1)
                         k1 = arith.index_cast(T.index(), k1_i32)
                         t1 = arith.index_cast(T.index(), t1_i32)
@@ -174,7 +176,7 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None):
                             for _ in range_(k2):
                                 elem_b = B_l2l1[row][col].acquire(ObjectFifoPort.Consume, 1)
                                 elem_a = A_l2l1.acquire(ObjectFifoPort.Consume, 1)
-                                matmul_dn(elem_a, elem_b, elem_out, k2_i32, attn_on_i32)
+                                matmul_dn(elem_a, elem_b, elem_out, k2_i32, dn_mode_i32)
                                 A_l2l1.release(ObjectFifoPort.Consume, 1)
                                 B_l2l1[row][col].release(ObjectFifoPort.Consume, 1)
                             C_l1l2[row][col].release(ObjectFifoPort.Produce, 1)
@@ -219,7 +221,7 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None):
             def attn_sequence(A, B, C):
                 for row in range(n_aie_rows):
                     for col in range(n_aie_cols):
-                        for wi, wv in enumerate((0, 0, 0, 0, 0, 1, 3 * mchunks)):
+                        for wi, wv in enumerate((0, 0, 0, 0, 0, 1, 3 * mchunks, 0)):
                             npu_rtp_write(f"rtp_{row}_{col}", wi, wv)
                         set_lock_value(rtp_locks[row][col], 1)
                 a_tap = TensorAccessPattern((1, a_groups), 0, [1, 1, 1, a_groups], [0, 0, 0, 1])
@@ -293,8 +295,9 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None):
                     npu_rtp_write(f"rtp_{row}_{col}", 2, K2 // k)
                     npu_rtp_write(f"rtp_{row}_{col}", 3, N2 // n // n_aie_cols)
                     npu_rtp_write(f"rtp_{row}_{col}", 4, rtp_mode)
-                    npu_rtp_write(f"rtp_{row}_{col}", 5, 2 if mode == "argmax" else 0)
+                    npu_rtp_write(f"rtp_{row}_{col}", 5, 0)
                     npu_rtp_write(f"rtp_{row}_{col}", 6, 0)
+                    npu_rtp_write(f"rtp_{row}_{col}", 7, 2 if mode == "argmax" else 0)
                     set_lock_value(rtp_locks[row][col], 1)
             A_tap = TensorAccessPattern((1, a_groups), 0, [1, 1, 1, a_groups], [0, 0, 0, 1])
             tb_max = 4
