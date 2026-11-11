@@ -1,5 +1,14 @@
 // Decode attention for one kv head group (4 q heads x 16 rows) over a slice of the context.
 // Static softmax bound: p = exp2(s - M_row), M_row supplied by the host, so partials add.
+//
+// Structural constants (documented constraint, WP8): this kernel binds
+//   * head_dim = 128  (16 dim-blocks of 8 per k or V^T, one O tile per row-block x dim-block),
+//   * kv_heads = 4    (the 4 core rows = one kv head per row; kAttnKvh in the runtime),
+//   * 4 q heads per kv head and 16 rows per pass (heads*rows = 64 rows = 8 row-blocks),
+//   * 16-token chunks (3 stream elements: 2 x K + 1 x V^T) and 8 columns per chunk row.
+// Any change to these requires matching changes in n32_core_placed.py (mode attn), the
+// runtime Attn* layout, and the engine, which refuses other shapes (engine.cpp checks
+// kvh == 4 && hd == 128 && heads == 16 before enabling the NPU attention path).
 #ifndef GUFO_ATTN_KERNEL_H_
 #define GUFO_ATTN_KERNEL_H_
 
@@ -12,8 +21,11 @@ alignas(128) float a_o[kAttnRowBlocks * kAttnDimBlocks * 64];
 static float *const a_m = (float *)(arena + 0);       // 64 rows
 static int32_t *const a_hi = (int32_t *)(arena + 256);  // last token visible to the streamed (finalized-V) path
 static int32_t *const a_pp = (int32_t *)(arena + 512);  // row position (last token visible to the tail path)
+static int32_t *const a_lo = (int32_t *)(arena + 768);  // row window floor: first key valid for the row
 static float *const a_l = (float *)(arena + 4096);
 static int a_pos = 0, a_n = 0, a_feed = 0, a_chunk_idx = 0;
+static int a_qhi = 0, a_win = 0;      // ring: absolute chunk of newest tokens; sliding window size (0 = full ctx)
+static int a_tab[32];                 // ring: slot chunk -> qhi - absolute chunk (-1 = stale slot)
 
 template <typename T>
 static inline aie::vector<T, 64> RepEach8(const aie::vector<T, 8> &s) {
@@ -52,14 +64,20 @@ __attribute__((noinline)) static void AttnBegin(const uint8_t *hdr, int row_id) 
   const int32_t *ih = (const int32_t *)hdr;
   a_pos = ih[0];
   a_n = ih[1];
+  a_qhi = ih[2];
+  a_win = ih[3];
   a_feed = 0;
   a_chunk_idx = 0;
+  const int32_t *tab = ih + 4;  // ring slot->absolute map, 24 entries (unused when a_win==0)
+  for (int s = 0; s < 24; s++) a_tab[s] = tab[s];
   const float *mrow = (const float *)(hdr + 128 + row_id * 256);
   for (int i = 0; i < 64; i++) {
     const int t = i & 15;
     a_m[i] = mrow[i];
     a_pp[i] = t < a_n ? a_pos + t : -1;
     a_hi[i] = t < a_n ? ((a_pos + t) & ~7) - 1 : -1;
+    // window floor: first key this row may attend to = max(0, P - window + 1)
+    a_lo[i] = (a_win && t < a_n) ? (a_pos + t - a_win + 1 > 0 ? a_pos + t - a_win + 1 : 0) : 0;
   }
   const aie::vector<float, 64> z = aie::zeros<float, 64>();
   for (int i = 0; i < kAttnRowBlocks * kAttnDimBlocks; i++) aie::store_v(a_o + i * 64, z);
@@ -101,6 +119,13 @@ __attribute__((noinline)) static void AttnChunk(int tokbase) {
         aie::sub(RepEach8<int32>(aie::load_v<8>(a_hi + rb * 8)), aie::broadcast<int32, 64>(tokbase));
     p0 = aie::select(zero, p0, aie::ge(rel, col));
     p1 = aie::select(zero, p1, aie::ge(rel, aie::add(col, aie::broadcast<int32, 64>(8))));
+    // window floor: drop keys strictly before this row's window
+    if (a_win) {
+      const aie::vector<int32, 64> flo =
+          aie::sub(RepEach8<int32>(aie::load_v<8>(a_lo + rb * 8)), aie::broadcast<int32, 64>(tokbase));
+      p0 = aie::select(zero, p0, aie::ge(col, flo));
+      p1 = aie::select(zero, p1, aie::ge(aie::add(col, aie::broadcast<int32, 64>(8)), flo));
+    }
     aie::accum<accfloat, 64> la(aie::load_v<64>(a_l + rb * 64));
     la = aie::mac(la, p0, ones);
     la = aie::mac(la, p1, ones);
@@ -131,8 +156,16 @@ __attribute__((noinline)) static void AttnFeed(const uint8_t *pB, int col) {
   for (int i = 0; i < 1536; i += 64) aie::store_v(dst + i, aie::load_v<64>(pB + i));
   if (++a_feed < 3) return;
   a_feed = 0;
-  const int tokbase = (a_chunk_idx * 8 + col) * 16;
+  const int s = a_chunk_idx * 8 + col;  // slot chunk this column just filled
   a_chunk_idx++;
+  if (a_win) {
+    // Ring cache: physical slot s holds the most recent chunk with q % 24 == s % 24.
+    // a_tab maps slot -> qhi - absolute chunk; stale slots (d < 0) are skipped.
+    const int d = a_tab[s];
+    if (d >= 0) AttnChunk((a_qhi - d) * 16);
+    return;
+  }
+  const int tokbase = s * 16;
   if (tokbase <= a_pos + a_n - 1) AttnChunk(tokbase);
 }
 
@@ -165,6 +198,11 @@ __attribute__((noinline)) static void AttnTail(int tb) {
         aie::sub(RepEach8<int32>(aie::load_v<8>(a_pp + rb * 8)), aie::broadcast<int32, 64>(tokbase));
     p = aie::select(zero, p, aie::lt(rel_hi, col));
     p = aie::select(zero, p, aie::ge(rel_pp, col));
+    if (a_win) {
+      const aie::vector<int32, 64> flo =
+          aie::sub(RepEach8<int32>(aie::load_v<8>(a_lo + rb * 8)), aie::broadcast<int32, 64>(tokbase));
+      p = aie::select(zero, p, aie::ge(col, flo));
+    }
     aie::accum<accfloat, 64> la(aie::load_v<64>(a_l + rb * 64));
     la = aie::mac(la, p, ones);
     aie::store_v(a_l + rb * 64, la.template to_vector<float>());

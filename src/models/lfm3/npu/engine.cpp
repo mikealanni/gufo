@@ -305,11 +305,15 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
         s.gate_w[l].resize(std::size_t{s.heads} * s.H);
         for (std::uint32_t h = 0; h < s.heads; ++h)
           DecodeRow(lw.attn_gate, h, std::span<float>(s.gate_w[l].data() + std::size_t{h} * s.H, s.H));
-        s.capacity[l] = c.layers[l] == LayerType::kSlidingAttention
-                            ? std::min(options.context, s.window + kRows)
-                            : options.context;
-        if (s.npu_attn && c.layers[l] == LayerType::kFullAttention && s.kvh == 4 && s.hd == 128 && s.heads == 16)
-          s.m_attn[l] = s.rt.MakeAttnLayer(options.context);
+        const bool l_swa = c.layers[l] == LayerType::kSlidingAttention;
+        // Sliding layers run on the NPU with a 1.5x-window ring cache (384 tokens for window 256).
+        const std::uint32_t l_ring = l_swa ? s.window + s.window / 2 : 0;
+        s.capacity[l] = l_swa ? std::max(s.window + kRows, l_ring) : options.context;
+        if (s.npu_attn && s.kvh == 4 && s.hd == 128 && s.heads == 16 &&
+            (c.layers[l] == LayerType::kFullAttention ||
+             (l_ring && l_ring % 16 == 0 && options.context >= l_ring)))
+          s.m_attn[l] = l_swa ? s.rt.MakeAttnLayer(l_ring, l_ring, s.window)
+                              : s.rt.MakeAttnLayer(options.context);
         s.k_cache[l].assign(std::size_t{s.capacity[l]} * s.kvd, 0);
         s.v_cache[l].assign(std::size_t{s.capacity[l]} * s.kvd, 0);
       }
