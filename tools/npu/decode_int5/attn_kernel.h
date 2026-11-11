@@ -1,5 +1,14 @@
 // Decode attention for one kv head group (4 q heads x 16 rows) over a slice of the context.
 // Static softmax bound: p = exp2(s - M_row), M_row supplied by the host, so partials add.
+//
+// Structural constants (documented constraint, WP8): this kernel binds
+//   * head_dim = 128  (16 dim-blocks of 8 per k or V^T, one O tile per row-block x dim-block),
+//   * kv_heads = 4    (the 4 core rows = one kv head per row; kAttnKvh in the runtime),
+//   * 4 q heads per kv head and 16 rows per pass (heads*rows = 64 rows = 8 row-blocks),
+//   * 16-token chunks (3 stream elements: 2 x K + 1 x V^T) and 8 columns per chunk row.
+// Any change to these requires matching changes in n32_core_placed.py (mode attn), the
+// runtime Attn* layout, and the engine, which refuses other shapes (engine.cpp checks
+// kvh == 4 && hd == 128 && heads == 16 before enabling the NPU attention path).
 #ifndef GUFO_ATTN_KERNEL_H_
 #define GUFO_ATTN_KERNEL_H_
 
