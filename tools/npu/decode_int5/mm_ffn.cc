@@ -5,8 +5,10 @@ constexpr int kRows = 16;
 constexpr int kCols = 32;
 constexpr int kK = 64;
 
-alignas(aie::vector_decl_align) bfloat16 c_stage[kRows * kCols];
-alignas(aie::vector_decl_align) bfp16ebs8 b_scratch[kK * kCols / 8];
+// GEMM/conv scratch and attention state never live in the same dispatch: share one arena.
+alignas(128) uint8_t arena[6144];
+static bfloat16 *const c_stage = (bfloat16 *)(arena + 0);
+static bfp16ebs8 *const b_scratch = (bfp16ebs8 *)(arena + 1024);
 
 static inline aie::vector<bfloat16, 64> ExpandScales(const bfloat16 *p) {
   aie::vector<bfloat16, 8> s = aie::load_v<8>(p);
@@ -99,8 +101,8 @@ __attribute__((noinline)) static void FlushPlain(bfp16ebs8 *__restrict pC_bfp16)
 
 
 constexpr int kCombRows = 24;
-alignas(128) bfloat16 comb[4 * kCombRows * 8];
-alignas(128) bfloat16 bbuf[4 * 16 * 8];
+static bfloat16 *const comb = (bfloat16 *)(arena + 3456);
+static bfloat16 *const bbuf = (bfloat16 *)(arena + 4992);
 static int strip_ctr = 0;
 
 static inline aie::vector<bfloat16, 64> Rep8(const bfloat16 *p) {
@@ -161,7 +163,13 @@ __attribute__((noinline)) static void FlushConv(const uint8_t *__restrict ctl_b,
   }
 }
 
+#include "attn_kernel.h"
+
 extern "C" {
+void attn_begin(uint8_t *hdr, int32_t row_id) { AttnBegin(hdr, row_id); }
+void attn_q(uint8_t *pA, int32_t idx, int32_t row_id) { AttnQ(pA, idx, row_id); }
+void attn_feed(uint8_t *pB, int32_t col) { AttnFeed(pB, col); }
+void attn_out(uint8_t *pC, int32_t idx) { AttnOut(pC, idx); }
 
 static int kc_p1 = 0;
 static int kc_dn = 0;

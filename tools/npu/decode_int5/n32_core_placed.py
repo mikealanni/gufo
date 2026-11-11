@@ -74,6 +74,11 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None):
             link_with=f"mm_{m}x{k}x{n}.o",
         )
 
+        attn_begin = external_func("attn_begin", inputs=[A_ty, np.int32], link_with=f"mm_{m}x{k}x{n}.o")
+        attn_q = external_func("attn_q", inputs=[A_ty, np.int32, np.int32], link_with=f"mm_{m}x{k}x{n}.o")
+        attn_feed = external_func("attn_feed", inputs=[B_l1_ty, np.int32], link_with=f"mm_{m}x{k}x{n}.o")
+        attn_out = external_func("attn_out", inputs=[C_l1_ty, np.int32], link_with=f"mm_{m}x{k}x{n}.o")
+
         tiles = [[tile(col, row) for col in range(0, n_aie_cols)] for row in range(0, n_aie_rows + 2)]
         shim_tiles = tiles[0]
         mem_tiles = tiles[1]
@@ -116,6 +121,8 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None):
             )
 
         rtp_ty = np.ndarray[(8,), np.dtype[np.int32]]
+        ATTN_Q_ELEMS = 32
+        ATTN_OUT_ELEMS = 34
         rtps = [[None] * n_aie_cols for _ in range(n_aie_rows)]
         rtp_locks = [[None] * n_aie_cols for _ in range(n_aie_rows)]
         for row in range(n_aie_rows):
@@ -135,11 +142,15 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None):
                         i2 = arith.constant(T.index(), 2)
                         i3 = arith.constant(T.index(), 3)
                         i4 = arith.constant(T.index(), 4)
+                        i5 = arith.constant(T.index(), 5)
+                        i6 = arith.constant(T.index(), 6)
                         k1_i32 = memref.load(rtps[row][col], [i0])
                         t1_i32 = memref.load(rtps[row][col], [i1])
                         k2_i32 = memref.load(rtps[row][col], [i2])
                         t2_i32 = memref.load(rtps[row][col], [i3])
                         mode_i32 = memref.load(rtps[row][col], [i4])
+                        attn_on_i32 = memref.load(rtps[row][col], [i5])
+                        attn_feeds_i32 = memref.load(rtps[row][col], [i6])
                         use_lock(rtp_locks[row][col], LockAction.Release, value=1)
                         k1 = arith.index_cast(T.index(), k1_i32)
                         t1 = arith.index_cast(T.index(), t1_i32)
@@ -165,6 +176,65 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None):
                                 A_l2l1.release(ObjectFifoPort.Consume, 1)
                                 B_l2l1[row][col].release(ObjectFifoPort.Consume, 1)
                             C_l1l2[row][col].release(ObjectFifoPort.Produce, 1)
+                        attn_on = arith.index_cast(T.index(), attn_on_i32)
+                        attn_feeds = arith.index_cast(T.index(), attn_feeds_i32)
+                        row_c = arith.constant(T.i32(), row)
+                        col_c = arith.constant(T.i32(), col)
+                        for _ in range_(attn_on):
+                            elem_a = A_l2l1.acquire(ObjectFifoPort.Consume, 1)
+                            attn_begin(elem_a, row_c)
+                            A_l2l1.release(ObjectFifoPort.Consume, 1)
+                            for qi in range_(ATTN_Q_ELEMS):
+                                elem_a = A_l2l1.acquire(ObjectFifoPort.Consume, 1)
+                                attn_q(elem_a, arith.index_cast(T.i32(), qi), row_c)
+                                A_l2l1.release(ObjectFifoPort.Consume, 1)
+                            for _ in range_(attn_feeds):
+                                elem_b = B_l2l1[row][col].acquire(ObjectFifoPort.Consume, 1)
+                                attn_feed(elem_b, col_c)
+                                B_l2l1[row][col].release(ObjectFifoPort.Consume, 1)
+                            for oi in range_(ATTN_OUT_ELEMS):
+                                elem_out = C_l1l2[row][col].acquire(ObjectFifoPort.Produce, 1)
+                                attn_out(elem_out, arith.index_cast(T.i32(), oi))
+                                C_l1l2[row][col].release(ObjectFifoPort.Produce, 1)
+
+        if mode == "attn":
+            mchunks = k1 if k1 is not None else 4
+            a_groups = (1 + ATTN_Q_ELEMS) * 128
+            chunk_bytes = 3 * n_aie_rows * BQ
+            b_total = n_aie_cols * mchunks * chunk_bytes
+            c_per_col = ATTN_OUT_ELEMS * n_aie_rows * CB
+            c_total = n_aie_cols * c_per_col
+
+            @runtime_sequence(
+                np.ndarray[(a_groups,), np.dtype[dtype]],
+                np.ndarray[(b_total,), np.dtype[np.uint8]],
+                np.ndarray[(c_total,), np.dtype[np.uint8]],
+            )
+            def attn_sequence(A, B, C):
+                for row in range(n_aie_rows):
+                    for col in range(n_aie_cols):
+                        for wi, wv in enumerate((0, 0, 0, 0, 0, 1, 3 * mchunks)):
+                            npu_rtp_write(f"rtp_{row}_{col}", wi, wv)
+                        set_lock_value(rtp_locks[row][col], 1)
+                a_tap = TensorAccessPattern((1, a_groups), 0, [1, 1, 1, a_groups], [0, 0, 0, 1])
+                a_task = shim_dma_single_bd_task(A_l3l2, A, tap=a_tap, issue_token=False)
+                dma_start_task(a_task)
+                b_tasks, c_tasks = [], []
+                for col in range(n_aie_cols):
+                    inner = min(mchunks, 512)
+                    b_tap = TensorAccessPattern(
+                        (1, b_total), col * chunk_bytes,
+                        [mchunks // inner, inner, chunk_bytes // 1024, 1024],
+                        [inner * n_aie_cols * chunk_bytes, n_aie_cols * chunk_bytes, 1024, 1])
+                    b_tasks.append(shim_dma_single_bd_task(B_l3l2[col], B, tap=b_tap, issue_token=False))
+                    dma_start_task(b_tasks[-1])
+                for col in range(n_aie_cols):
+                    c_tap = TensorAccessPattern((1, c_total), col * c_per_col, [1, 1, 1, c_per_col], [0, 0, 0, 1])
+                    c_tasks.append(shim_dma_single_bd_task(C_l2l3[col], C, tap=c_tap, issue_token=True))
+                    dma_start_task(c_tasks[-1])
+                dma_await_task(*c_tasks)
+                dma_free_task(a_task, *b_tasks)
+            return
 
         if mode == "conv":
             K1 = k1 if k1 is not None else K
@@ -204,6 +274,8 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None):
                     npu_rtp_write(f"rtp_{row}_{col}", 2, K2 // k)
                     npu_rtp_write(f"rtp_{row}_{col}", 3, N2 // n // n_aie_cols)
                     npu_rtp_write(f"rtp_{row}_{col}", 4, rtp_mode)
+                    npu_rtp_write(f"rtp_{row}_{col}", 5, 0)
+                    npu_rtp_write(f"rtp_{row}_{col}", 6, 0)
                     set_lock_value(rtp_locks[row][col], 1)
             A_tap = TensorAccessPattern((1, a_groups), 0, [1, 1, 1, a_groups], [0, 0, 0, 1])
             tb_max = 4
