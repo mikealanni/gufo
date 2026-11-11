@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -19,6 +20,9 @@ constexpr std::uint32_t kTileK = 64;
 constexpr std::uint32_t kStrip = 128;
 constexpr std::uint32_t kQuarterBytes = 1536;
 constexpr std::uint32_t kWordBytes = 1408;
+// C staging: one 1024 B slot per core row and strip (576 B used by bfp16 tiles).
+constexpr std::uint32_t kRowBytes = 1024;
+constexpr std::uint32_t kStripBytes = 4 * kRowBytes;
 
 inline float RoundHalf(float v) {
   return _cvtsh_ss(_cvtss_sh(v, _MM_FROUND_TO_NEAREST_INT));
@@ -72,7 +76,7 @@ inline float Bf16Float(std::uint16_t b) {
 // Packer: int5 (3 values per 16-bit word, 11 words + 128B bf16 scales = 1536B
 // per core per k-tile of 64), laid out for the split-B 16-row decode GEMM.
 void PackMatInt5(const float* W, std::uint32_t N, std::uint32_t K,
-                 std::uint8_t* dst);
+                 std::uint8_t* dst, std::uint32_t extra_tiles = 0);
 
 // Instruction-stream program (one runtime sequence) with its A/C staging BOs.
 struct Program {
@@ -91,6 +95,16 @@ struct WeightBuffer {
   std::size_t bytes{};
 };
 
+// Short-conv layer fused as GEMM epilogue: in_proj (B|C|x co-located per core)
+// + 7-tap temporal conv + out_proj in one dispatch. Conv history lives in the
+// weight buffer's extra tile, so the device keeps no state across dispatches.
+struct ConvLayer {
+  WeightBuffer w;
+  Program prog;
+  std::uint32_t hidden{}, taps{};
+  std::uint32_t last_n{0};
+};
+
 class NpuRuntime {
  public:
   NpuRuntime() = default;
@@ -104,7 +118,7 @@ class NpuRuntime {
   /// `c_override` allows custom C size (e.g. fused FFN combined buffer).
   Program MakeProgram(std::uint32_t K, std::uint32_t N,
                       const std::string& insts_path, std::size_t c_override,
-                      std::string* error);
+                      std::string* error, std::uint32_t a_extra_k = 0);
 
   /// Allocate and pack a weight matrix (N rows x K cols, row-major float).
   WeightBuffer PackWeight(const float* W, std::uint32_t N, std::uint32_t K);
@@ -126,6 +140,18 @@ class NpuRuntime {
   // Fused FFN: decode down-output from combined C buffer (offset after 120 strips).
   void Ffn(Program& p, WeightBuffer& wb, const float* x, std::uint32_t n,
            float* y, Timings* t = nullptr);
+
+  /// `w_in`: [3*hidden][hidden] rows ordered B | C | x (hidden each).
+  /// `conv_w`: [hidden][taps] depthwise taps. `tmpl`: conv program template
+  /// (shares instructions and the A BO; gets its own C BO).
+  ConvLayer PackConv(const float* w_in, const float* conv_w, std::uint32_t taps,
+                     const float* w_out, std::uint32_t hidden, Program& tmpl);
+  void ConvStep(ConvLayer& cl, const float* z, std::uint32_t n, float* y,
+                Timings* t = nullptr);
+  /// Accept `k` of the `n` rows from the last ConvStep (history for next call).
+  void ConvCommit(ConvLayer& cl, std::uint32_t k);
+  void ConvReset(ConvLayer& cl);
+
 
  private:
   xrt::device dev_;

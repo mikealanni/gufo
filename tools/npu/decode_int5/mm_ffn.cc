@@ -97,26 +97,102 @@ __attribute__((noinline)) static void FlushPlain(bfp16ebs8 *__restrict pC_bfp16)
   }
 }
 
+
+constexpr int kCombRows = 24;
+alignas(128) bfloat16 comb[4 * kCombRows * 8];
+alignas(128) bfloat16 bbuf[4 * 16 * 8];
+static int strip_ctr = 0;
+
+static inline aie::vector<bfloat16, 64> Rep8(const bfloat16 *p) {
+  aie::vector<bfloat16, 8> v = aie::load_v<8>(p);
+  aie::vector<bfloat16, 16> v2 = aie::concat(v, v);
+  aie::vector<bfloat16, 32> v4 = aie::concat(v2, v2);
+  return aie::concat(v4, v4);
+}
+
+__attribute__((noinline)) static void FlushConv(const uint8_t *__restrict ctl_b,
+                                                uint8_t *__restrict pC) {
+  const int s = strip_ctr;
+  strip_ctr = (s == 5) ? 0 : s + 1;
+  const int role = s % 3;
+  if (role == 0) {
+    for (int cb = 0; cb < 4; cb++)
+      for (int rh = 0; rh < 2; rh++)
+        aie::store_v(bbuf + (cb * 16 + rh * 8) * 8,
+                     aie::load_v<64>(c_stage + (cb >> 1) * 256 + (rh * 2 + (cb & 1)) * 64));
+    return;
+  }
+  if (role == 1) {
+    const bfloat16 *hist = (const bfloat16 *)(ctl_b + 512);
+    for (int cb = 0; cb < 4; cb++) {
+      bfloat16 *cbp = comb + cb * kCombRows * 8;
+      for (int r = 0; r < 6; r++)
+        aie::store_v(cbp + (2 + r) * 8, aie::load_v<8>(hist + (cb * 6 + r) * 8));
+      for (int rh = 0; rh < 2; rh++) {
+        aie::vector<bfloat16, 64> bv = aie::load_v<64>(bbuf + (cb * 16 + rh * 8) * 8);
+        aie::vector<bfloat16, 64> xv =
+            aie::load_v<64>(c_stage + (cb >> 1) * 256 + (rh * 2 + (cb & 1)) * 64);
+        aie::accum<accfloat, 64> a = aie::mul(bv, xv);
+        aie::vector<bfloat16, 64> r64 = a.template to_vector<bfloat16>();
+        aie::store_v(cbp + (8 + rh * 8) * 8, r64);
+        aie::store_v((bfloat16 *)(pC + cb * 256) + rh * 64, r64);
+      }
+    }
+    return;
+  }
+  const bfloat16 *taps = (const bfloat16 *)(ctl_b + 64);
+  aie::block_vector_output_buffer_stream<bfp16ebs8, 64> out((bfp16ebs8 *)pC);
+  out.seek(0);
+  for (int cb = 0; cb < 4; cb++) {
+    const bfloat16 *cbp = comb + cb * kCombRows * 8;
+    for (int rh = 0; rh < 2; rh++) {
+      aie::accum<accfloat, 64> acc = aie::zeros<accfloat, 64>();
+      for (int t = 0; t < 7; t++) {
+        aie::vector<bfloat16, 64> wv = Rep8(taps + (t * 4 + cb) * 8);
+        aie::vector<bfloat16, 64> xv = aie::load_unaligned_v<64>(cbp + (rh * 8 + 2 + t) * 8);
+        acc = aie::mac(acc, wv, xv);
+      }
+      aie::vector<bfloat16, 64> sv = acc.template to_vector<bfloat16>();
+      aie::vector<bfloat16, 64> cv =
+          aie::load_v<64>(c_stage + (cb >> 1) * 256 + (rh * 2 + (cb & 1)) * 64);
+      aie::accum<accfloat, 64> y = aie::mul(cv, sv);
+      out.push(y.template to_vector<bfp16ebs8>());
+    }
+  }
+}
+
 extern "C" {
 
-static int kc_gu = 0;
+static int kc_p1 = 0;
 static int kc_dn = 0;
 
-void matmul_gu(bfp16ebs8 *__restrict pA, uint8_t *__restrict pBp,
-               bfp16ebs8 *__restrict pC_bfp16, int32_t kcnt) {
+void matmul_p1(bfp16ebs8 *__restrict pA, uint8_t *__restrict pBp,
+               uint8_t *__restrict pC, int32_t kcnt, int32_t mode) {
   ::aie::set_rounding(::aie::rounding_mode::conv_even);
+  if (mode == 1) {
+    if (kc_p1 < kcnt - 1) {
+      Unpack((const uint16_t *)pBp, (const bfloat16 *)(pBp + 1408));
+      MacTile(pA);
+      kc_p1 += 1;
+      return;
+    }
+    kc_p1 = 0;
+    FlushConv(pBp, pC);
+    return;
+  }
   Unpack((const uint16_t *)pBp, (const bfloat16 *)(pBp + 1408));
   MacTile(pA);
-  if (kc_gu == kcnt - 1) {
-    kc_gu = 0;
-    FlushSwiglu(pC_bfp16);
+  if (kc_p1 == kcnt - 1) {
+    kc_p1 = 0;
+    FlushSwiglu((bfp16ebs8 *)pC);
   } else {
-    kc_gu += 1;
+    kc_p1 += 1;
   }
 }
 
 void matmul_dn(bfp16ebs8 *__restrict pA, uint8_t *__restrict pBp,
-               bfp16ebs8 *__restrict pC_bfp16, int32_t kcnt) {
+               uint8_t *__restrict pC, int32_t kcnt) {
+  bfp16ebs8 *pC_bfp16 = (bfp16ebs8 *)pC;
   ::aie::set_rounding(::aie::rounding_mode::conv_even);
   Unpack((const uint16_t *)pBp, (const bfloat16 *)(pBp + 1408));
   MacTile(pA);
@@ -128,7 +204,7 @@ void matmul_dn(bfp16ebs8 *__restrict pA, uint8_t *__restrict pBp,
   }
 }
 
-void zero_kernel(bfp16ebs8 *__restrict cOut) {
+void zero_kernel(uint8_t *__restrict cOut) {
   const aie::vector<bfloat16, 64> zeros = aie::zeros<bfloat16, 64>();
   for (int i = 0; i < kRows * kCols / 64; i++)
     aie::store_v(c_stage + i * 64, zeros);

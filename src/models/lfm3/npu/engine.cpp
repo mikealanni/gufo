@@ -185,17 +185,16 @@ struct Engine::Impl {
   bool have_st{false};
   Options opt;
   gufo::npu::runtime::NpuRuntime rt;
-  gufo::npu::runtime::Program p_in, p_h, p_qkv, p_ffn;
-  std::vector<gufo::npu::runtime::WeightBuffer> m_in, m_out, m_qkv, m_ffn;
-  gufo::npu::runtime::Timings tim;
+  gufo::npu::runtime::Program p_conv, p_h, p_qkv, p_ffn;
+  std::vector<gufo::npu::runtime::WeightBuffer> m_out, m_qkv, m_ffn;
+  std::vector<gufo::npu::runtime::ConvLayer> m_conv;
+  gufo::npu::runtime::NpuRuntime::Timings tim;
   std::uint32_t H{}, I{}, heads{}, hd{}, kvh{}, qd{}, kvd{}, taps{}, window{};
   std::uint32_t pos{0};
   std::vector<std::vector<float>> gate_w;
   // WP0: KV cache stored as bf16 to halve memory traffic (read as fp32 via AVX-512 upconvert in attention).
   std::vector<std::vector<std::uint16_t>> k_cache, v_cache;
-  std::vector<std::vector<float>> conv_hist;
   std::vector<std::uint32_t> capacity;
-  std::vector<std::vector<float>> comb_store;
   std::uint32_t pending{0};
   std::uint32_t head_k{0};
   std::vector<std::uint16_t> head_w;
@@ -266,17 +265,17 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
     if (!s.rt.Init(xclbin, error)) return nullptr;
 
     // Programs needed (driven by spec/constraints; LFM3 uses these 4)
-    s.p_in = s.rt.MakeProgram(2048, 6144, options.programs + "/insts_plain_2048x6144.txt", 0, error);
+    s.p_conv = s.rt.MakeProgram(2048, 2048, options.programs + "/insts_conv.txt", std::size_t{64} * gufo::npu::runtime::kStripBytes, error, 64);
     s.p_h = s.rt.MakeProgram(2048, 2048, options.programs + "/insts_plain_2048x2048.txt", 0, error);
     s.p_qkv = s.rt.MakeProgram(2048, 3072, options.programs + "/insts_plain_2048x3072.txt", 0, error);
     s.p_ffn = s.rt.MakeProgram(2048, 2048, options.programs + "/insts_ffn.txt",
-                               (std::size_t{120} * 256 + 16 * 256) * 9, error);
+                               std::size_t{136} * gufo::npu::runtime::kStripBytes, error);
 
     const auto t0 = Clock::now();
     const std::size_t L = c.layers.size();
-    s.m_in.resize(L); s.m_out.resize(L); s.m_qkv.resize(L); s.m_ffn.resize(L);
+    s.m_conv.resize(L); s.m_out.resize(L); s.m_qkv.resize(L); s.m_ffn.resize(L);
     s.gate_w.resize(L); s.k_cache.resize(L); s.v_cache.resize(L);
-    s.conv_hist.resize(L); s.capacity.assign(L, 0); s.comb_store.resize(L);
+    s.capacity.assign(L, 0);
     std::vector<float> buf;
     for (std::size_t l = 0; l < L; ++l) {
       const auto& lw = s.w->layers[l];
@@ -284,10 +283,10 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
       if (c.layers[l] == LayerType::kConvolution) {
         buf.resize(std::size_t{6144} * 2048);
         s.LoadRows(pre + "conv.in_proj.weight", lw.in_proj, buf.data(), 6144, 2048);
-        s.m_in[l] = s.rt.PackWeight(buf.data(), 6144, 2048); s.rt.Attach(s.m_in[l], s.p_in);
-        s.LoadRows(pre + "conv.out_proj.weight", lw.out_proj, buf.data(), 2048, 2048);
-        s.m_out[l] = s.rt.PackWeight(buf.data(), 2048, 2048); s.rt.Attach(s.m_out[l], s.p_h);
-        s.conv_hist[l].assign(std::size_t{s.taps - 1} * s.H, 0.0f);
+        std::vector<float> wout(std::size_t{2048} * 2048);
+        s.LoadRows(pre + "conv.out_proj.weight", lw.out_proj, wout.data(), 2048, 2048);
+        s.m_conv[l] = s.rt.PackConv(buf.data(), static_cast<const float*>(lw.conv.data), s.taps,
+                                    wout.data(), 2048, s.p_conv);
       } else {
         buf.resize(std::size_t{3072} * 2048);
         s.LoadRows(pre + "self_attn.q_proj.weight", lw.q, buf.data(), 2048, 2048);
@@ -342,7 +341,7 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
 
 void Engine::Reset() {
   Impl& s = *impl_; s.pos = 0;
-  for (auto& v : s.conv_hist) std::fill(v.begin(), v.end(), 0.0f);
+  for (auto& cl : s.m_conv) if (cl.hidden) s.rt.ConvReset(cl);
   for (auto& v : s.k_cache) std::fill(v.begin(), v.end(), std::uint16_t{0});
   for (auto& v : s.v_cache) std::fill(v.begin(), v.end(), std::uint16_t{0});
 }
@@ -355,7 +354,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
   if (n == 0 || n > kMaxRows || s.pos + n > s.opt.context) return false;
   const std::uint32_t H = s.H, I = s.I, hd = s.hd, heads = s.heads, kvh = s.kvh, kvd = s.kvd, qd = s.qd;
   std::vector<float> x(std::size_t{n} * H), z(x.size()), z2(x.size()), branch(x.size()),
-      p(std::size_t{n} * 6144), conv_out(x.size()), qkv(std::size_t{n} * 3072), attn(std::size_t{n} * qd);
+      qkv(std::size_t{n} * 3072), attn(std::size_t{n} * qd);
   for (std::uint32_t i = 0; i < n; ++i)
     DecodeRow(s.w->embedding, tokens[i], std::span<float>(&x[std::size_t{i} * H], H));
   auto cpu0 = Clock::now();
@@ -364,28 +363,8 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     RmsNorm(x.data(), static_cast<const float*>(lw.norm.data), z.data(), n, H, c.eps);
     s.t_cpu += Ms(cpu0);
     if (c.layers[l] == LayerType::kConvolution) {
-      s.rt.Gemm(s.p_in, s.m_in[l], z.data(), n, p.data(), &s.tim);
+      s.rt.ConvStep(s.m_conv[l], z.data(), n, branch.data(), &s.tim);
       cpu0 = Clock::now();
-      const auto* cw = static_cast<const float*>(lw.conv.data);
-      const std::uint32_t T = s.taps;
-      std::vector<float> comb(std::size_t{T - 1 + n} * H);
-      std::memcpy(comb.data(), s.conv_hist[l].data(), std::size_t{T - 1} * H * 4);
-#pragma omp parallel for
-      for (std::int64_t t = 0; t < n; ++t)
-        for (std::uint32_t ch = 0; ch < H; ++ch)
-          comb[(std::size_t(t) + T - 1) * H + ch] =
-              p[std::size_t(t) * 6144 + ch] * p[std::size_t(t) * 6144 + 2 * H + ch];
-#pragma omp parallel for
-      for (std::int64_t t = 0; t < n; ++t)
-        for (std::uint32_t ch = 0; ch < H; ++ch) {
-          float sum = 0;
-          for (std::uint32_t j = 0; j < T; ++j)
-            sum += cw[std::size_t{ch} * T + j] * comb[(std::size_t(t) + j) * H + ch];
-          conv_out[std::size_t(t) * H + ch] = sum * p[std::size_t(t) * 6144 + H + ch];
-        }
-      s.comb_store[l] = std::move(comb);
-      s.t_cpu += Ms(cpu0);
-      s.rt.Gemm(s.p_h, s.m_out[l], conv_out.data(), n, branch.data(), &s.tim);
     } else {
       s.rt.Gemm(s.p_qkv, s.m_qkv[l], z.data(), n, qkv.data(), &s.tim);
       cpu0 = Clock::now();
@@ -625,8 +604,7 @@ void Engine::Commit(std::uint32_t k) {
   k = std::min(k, s.pending);
   for (std::size_t l = 0; l < c.layers.size(); ++l)
     if (c.layers[l] == LayerType::kConvolution)
-      std::memcpy(s.conv_hist[l].data(), s.comb_store[l].data() + std::size_t{k} * s.H,
-                  std::size_t{s.taps - 1} * s.H * 4);
+      s.rt.ConvCommit(s.m_conv[l], k);
   s.pos += k; s.pending = 0;
 }
 

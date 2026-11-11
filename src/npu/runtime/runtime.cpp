@@ -16,7 +16,7 @@ double Ms(Clock::time_point a) {
 }  // namespace
 
 void PackMatInt5(const float* W, std::uint32_t N, std::uint32_t K,
-                 std::uint8_t* dst) {
+                 std::uint8_t* dst, std::uint32_t extra_tiles) {
   const std::uint32_t strips = N / kStrip, tk = K / kTileK;
   std::vector<std::int8_t> q(std::size_t{N} * K);
   std::vector<std::uint16_t> sc(std::size_t{N} * (K / 32));
@@ -43,7 +43,7 @@ void PackMatInt5(const float* W, std::uint32_t N, std::uint32_t K,
     for (std::int64_t t = 0; t < tk; ++t)
       for (int r = 0; r < 4; ++r) {
         std::uint8_t* base =
-            dst + ((std::size_t(s2) * tk + t) * 4 + r) * kQuarterBytes;
+            dst + ((std::size_t(s2) * (tk + extra_tiles) + t) * 4 + r) * kQuarterBytes;
         auto* words = reinterpret_cast<std::uint16_t*>(base);
         auto* scl = reinterpret_cast<std::uint16_t*>(base + kWordBytes);
         for (int p = 0; p < 32; ++p) {
@@ -87,7 +87,8 @@ bool NpuRuntime::Init(const std::string& xclbin_path, std::string* error) {
 
 Program NpuRuntime::MakeProgram(std::uint32_t K, std::uint32_t N,
                                 const std::string& insts_path,
-                                std::size_t c_override, std::string* error) {
+                                std::size_t c_override, std::string* error,
+                                std::uint32_t a_extra_k) {
   Program p;
   p.K = K;
   p.N = N;
@@ -102,9 +103,8 @@ Program NpuRuntime::MakeProgram(std::uint32_t K, std::uint32_t N,
   p.insts = xrt::bo(dev_, sz, XCL_BO_FLAGS_CACHEABLE, kern_.group_id(1));
   std::memcpy(p.insts.map<void*>(), buf.data(), sz);
   p.insts.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-  const std::size_t ab = std::size_t{kMaxRows} * K / 8 * 9;
-  const std::size_t cb =
-      c_override ? c_override : std::size_t{kMaxRows} * N / 8 * 9;
+  const std::size_t ab = std::size_t{kMaxRows} * (K + a_extra_k) / 8 * 9;
+  const std::size_t cb = c_override ? c_override : std::size_t{N / kStrip} * kStripBytes;
   p.a = xrt::bo(dev_, ab, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(3));
   p.c = xrt::bo(dev_, cb, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(3));
   p.ah = p.a.map<std::uint8_t*>();
@@ -175,7 +175,8 @@ void NpuRuntime::DecodeC(float* y, std::uint32_t n, Program& p,
           continue;
         const std::size_t col = std::size_t(s) * 128 + r * 32 + sb * 16 +
                                 (acc & 1) * 8;
-        DecGroup(base + ((std::size_t(s) * 256) + r * 64 + G) * 9,
+        DecGroup(base + std::size_t(s) * kStripBytes + std::size_t(r) * kRowBytes +
+                     std::size_t(G) * 9,
                  y + std::size_t(row) * N + col);
       }
 }
@@ -242,10 +243,142 @@ void NpuRuntime::Ffn(Program& p, WeightBuffer& wb, const float* x,
   p.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
   if (t) t->syncC += Ms(t0);
   t0 = Clock::now();
-  // Fused FFN: down output at offset 120 strips * 256 groups * 9 bytes, width 2048.
-  DecodeC(y, n, p, p.ch + std::size_t{120} * 256 * 9, 2048);
+  DecodeC(y, n, p, p.ch + std::size_t{120} * kStripBytes, 2048);
   if (t) t->dec += Ms(t0);
   if (t) ++t->calls;
+}
+
+namespace {
+constexpr std::uint32_t kConvHistOffset = 512;
+constexpr std::uint32_t kConvTapOffset = 64;
+constexpr std::uint32_t kConvMaxTaps = 7;
+constexpr std::uint32_t kChanPerTriple = 1024;
+
+inline std::size_t ConvRow(std::uint32_t role, std::uint32_t chan) {
+  const std::uint32_t j = chan >> 10, col = (chan >> 7) & 7, r = (chan >> 5) & 3,
+                      c = chan & 31;
+  return (std::size_t{3 * j + role} * 8 + col) * 128 + r * 32 + c;
+}
+}  // namespace
+
+ConvLayer NpuRuntime::PackConv(const float* w_in, const float* conv_w,
+                               std::uint32_t taps, const float* w_out,
+                               std::uint32_t hidden, Program& tmpl) {
+  if (taps != kConvMaxTaps || hidden % kChanPerTriple != 0)
+    throw std::runtime_error("conv layer shape unsupported by the conv program");
+  ConvLayer cl;
+  cl.hidden = hidden;
+  cl.taps = taps;
+  cl.prog = tmpl;
+  const std::size_t cb = std::size_t{(3 * hidden + hidden) / kStrip} * kStripBytes;
+  cl.prog.c = xrt::bo(dev_, cb, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(3));
+  cl.prog.ch = cl.prog.c.map<std::uint8_t*>();
+  std::memset(cl.prog.ch, 0, cb);
+  const std::uint32_t K = hidden, tk = K / kTileK;
+  const std::size_t in_bytes = std::size_t{3 * hidden / kStrip} * (tk + 1) * 4 * kQuarterBytes;
+  const std::size_t out_bytes = std::size_t{hidden / kStrip} * tk * 4 * kQuarterBytes;
+  cl.w.bytes = in_bytes + out_bytes;
+  cl.w.bo = xrt::bo(dev_, cl.w.bytes, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(3));
+  cl.w.host = cl.w.bo.map<std::uint8_t*>();
+  std::memset(cl.w.host, 0, cl.w.bytes);
+  {
+    std::vector<float> perm(std::size_t{3 * hidden} * K);
+    const std::uint32_t src_base[3] = {0, 2 * hidden, hidden};  // B, x, C row blocks of [B|C|x]
+#pragma omp parallel for
+    for (std::int64_t ch = 0; ch < hidden; ++ch)
+      for (std::uint32_t role = 0; role < 3; ++role)
+        std::memcpy(&perm[ConvRow(role, ch) * K],
+                    w_in + (std::size_t{src_base[role]} + ch) * K, K * 4);
+    PackMatInt5(perm.data(), 3 * hidden, K, cl.w.host, 1);
+  }
+  PackMatInt5(w_out, hidden, K, cl.w.host + in_bytes, 0);
+  const std::uint32_t groups = 3 * hidden / kStrip / 8;
+  for (std::uint32_t g = 0; g < groups; ++g)
+    for (std::uint32_t col = 0; col < 8; ++col)
+      for (std::uint32_t r = 0; r < 4; ++r) {
+        const std::uint32_t s2 = g * 8 + col, j = g / 3;
+        std::uint8_t* tile = cl.w.host + ((std::size_t{s2} * (tk + 1) + tk) * 4 + r) * kQuarterBytes;
+        auto* tp = reinterpret_cast<std::uint16_t*>(tile + kConvTapOffset);
+        for (std::uint32_t t = 0; t < taps; ++t)
+          for (std::uint32_t cbk = 0; cbk < 4; ++cbk)
+            for (std::uint32_t i = 0; i < 8; ++i) {
+              const std::uint32_t chan = ((j * 8 + col) * 4 + r) * 32 + cbk * 8 + i;
+              tp[(t * 4 + cbk) * 8 + i] = Bf16Bits(conv_w[std::size_t{chan} * taps + t]);
+            }
+      }
+  cl.w.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  Attach(cl.w, cl.prog);
+  return cl;
+}
+
+void NpuRuntime::ConvReset(ConvLayer& cl) {
+  const std::uint32_t tk = cl.hidden / kTileK, groups = 3 * cl.hidden / kStrip / 8;
+  for (std::uint32_t g = 1; g < groups; g += 3)
+    for (std::uint32_t col = 0; col < 8; ++col)
+      for (std::uint32_t r = 0; r < 4; ++r)
+        std::memset(cl.w.host + ((std::size_t{g * 8 + col} * (tk + 1) + tk) * 4 + r) * kQuarterBytes +
+                        kConvHistOffset, 0, 4 * 6 * 16);
+}
+
+void NpuRuntime::ConvStep(ConvLayer& cl, const float* z, std::uint32_t n, float* y,
+                          Timings* t) {
+  auto t0 = Clock::now();
+  EncodeA(z, n, cl.hidden, cl.prog);
+  if (t) t->enc += Ms(t0);
+  t0 = Clock::now();
+  cl.prog.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  if (t) t->syncA += Ms(t0);
+  t0 = Clock::now();
+  cl.w.run.start();
+  if (t) t->submit += Ms(t0);
+  t0 = Clock::now();
+  for (;;) {
+    const auto st = cl.w.run.state();
+    if (st == ERT_CMD_STATE_COMPLETED)
+      break;
+    if (st != ERT_CMD_STATE_NEW && st != ERT_CMD_STATE_QUEUED &&
+        st != ERT_CMD_STATE_RUNNING && st != ERT_CMD_STATE_SUBMITTED)
+      break;
+  }
+  cl.w.run.wait();
+  if (t) t->wait += Ms(t0);
+  t0 = Clock::now();
+  cl.prog.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+  if (t) t->syncC += Ms(t0);
+  t0 = Clock::now();
+  DecodeC(y, n, cl.prog, cl.prog.ch + std::size_t{3 * cl.hidden / kStrip} * kStripBytes, cl.hidden);
+  if (t) t->dec += Ms(t0);
+  if (t) ++t->calls;
+  cl.last_n = n;
+}
+
+void NpuRuntime::ConvCommit(ConvLayer& cl, std::uint32_t k) {
+  const std::uint32_t tk = cl.hidden / kTileK, groups = 3 * cl.hidden / kStrip / 8;
+  const std::uint32_t hist = cl.taps - 1;
+  for (std::uint32_t g = 1; g < groups; g += 3) {
+    const std::uint32_t j = g / 3;
+    for (std::uint32_t col = 0; col < 8; ++col)
+      for (std::uint32_t r = 0; r < 4; ++r) {
+        const std::uint32_t s2 = g * 8 + col;
+        auto* dst = reinterpret_cast<std::uint16_t*>(
+            cl.w.host + ((std::size_t{s2} * (tk + 1) + tk) * 4 + r) * kQuarterBytes + kConvHistOffset);
+        const auto* src = reinterpret_cast<const std::uint16_t*>(
+            cl.prog.ch + std::size_t{16 + j * 8 + col} * kStripBytes + std::size_t{r} * kRowBytes);
+        for (std::uint32_t cbk = 0; cbk < 4; ++cbk) {
+          std::uint16_t nh[6][8];
+          for (std::uint32_t i = 0; i < hist; ++i) {
+            const std::uint32_t idx = k + i;
+            const std::uint16_t* row = idx < hist ? dst + (cbk * hist + idx) * 8
+                                                  : src + cbk * 128 + (idx - hist) * 8;
+            std::memcpy(nh[i], row, 16);
+          }
+          std::memcpy(dst + cbk * hist * 8, nh, hist * 16);
+        }
+      }
+    for (std::uint32_t col = 0; col < 8; ++col)
+      cl.w.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE, 4 * kQuarterBytes,
+                   (std::size_t{(g * 8 + col)} * (tk + 1) + tk) * 4 * kQuarterBytes);
+  }
 }
 
 }  // namespace gufo::npu::runtime
