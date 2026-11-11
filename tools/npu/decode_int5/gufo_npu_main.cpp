@@ -133,7 +133,8 @@ int main(int argc, char** argv) {
     engine->Reset();
     const auto t0 = std::chrono::steady_clock::now();
     for (std::size_t at = 0; at < ids.size();) {
-      static const std::size_t chunk = std::getenv("GUFO_PREFILL_ROWS") ? std::strtoul(std::getenv("GUFO_PREFILL_ROWS"), nullptr, 10) : Engine::kMaxRows;
+      // Without m64 the engine accepts 16-row steps only (see Engine::Step).
+      static const std::size_t chunk = std::getenv("GUFO_M64") ? Engine::kMaxRows : 16;
       const std::size_t n = std::min<std::size_t>(chunk, ids.size() - at);
       if (!engine->Step(std::span<const std::uint32_t>(ids.data() + at, n), &h))
         return 1;
