@@ -38,14 +38,17 @@ gen_ffn() {
 }
 
 gen_conv() {
-  local H="$1" N1="$2" out="${3:-insts_conv.txt}"
+  local H="$1" N1="$2" MR="${3:-1}" out="${4:-}"
+  if [[ -z "$out" ]]; then
+    if [[ "$MR" == 1 ]]; then out="insts_conv.txt"; else out="insts_conv_m64.txt"; fi
+  fi
   python3 "$dir/n32_core_placed.py" -m 16 -k 64 -n 128 -M 16 -K "$H" -N "$H" --mode conv \
-    --k1 "$H" --n1 "$N1" --k2 "$H" --n2 "$H" >"$work/a.mlir"
+    --k1 "$H" --n1 "$N1" --k2 "$H" --n2 "$H" --mrows "$MR" >"$work/a.mlir"
   aiecc --aietools="${AIETOOLS:?}" --alloc-scheme=basic-sequential --no-compile --no-link \
     --no-xchesscc --aie-generate-npu-insts --unified --dynamic-objFifos \
     --npu-insts-name="$work/i.txt" "$work/a.mlir" >/dev/null
   mv "$work/i.txt" "$dir/runtime/$out"
-  echo "generated $out (conv ${H}: in_proj ${N1} -> out_proj ${H})"
+  echo "generated $out (conv ${H}: in_proj ${N1} -> out_proj ${H}, mrows=${MR})"
 }
 
 gen_attn() {
@@ -81,7 +84,7 @@ case "${1:-default}" in
     gen_attn "$2"
     ;;
   conv)
-    gen_conv "$2" "$3" "${4:-}"
+    gen_conv "$2" "$3" "${4:-1}" "${5:-}"
     ;;
   plain)
     gen_plain "$2" "$3" "${4:-1}" "${5:-}"
