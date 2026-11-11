@@ -443,69 +443,152 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       const float inv_sqrt = 1.0f / std::sqrt(static_cast<float>(hd));
       const std::uint32_t cap = s.capacity[l];
       // WP0: bf16 KV + SIMD dot/accum, no per-(token,head) heap allocation.
-      // Score scratch: one buffer per parallel task (max context window length).
-#pragma omp parallel
-      {
-        std::vector<float> sc;  // reused across (t,h) iterations in this thread
-#pragma omp for collapse(2) schedule(dynamic, 1)
-        for (std::int64_t t = 0; t < n; ++t)
-          for (std::int64_t h = 0; h < heads; ++h) {
-            const std::uint32_t P = s.pos + static_cast<std::uint32_t>(t);
-            const std::uint32_t first = swa && P + 1 > s.window ? P + 1 - s.window : 0;
-            const std::uint32_t len = P + 1 - first;
-            if (sc.size() < len) sc.resize(len);
-            const std::uint32_t kh = h / (heads / kvh);
-            const float* qh = &q[std::size_t(t) * qd + h * hd];
-            // Pre-upconvert Q head to bf16 bits? keep as fp32 for dot with bf16 KV.
-            float mx = -1e30f;
-            for (std::uint32_t u = first; u <= P; ++u) {
-              const std::uint16_t* kr =
-                  &s.k_cache[l][std::size_t{u % cap} * kvd + kh * hd];
-              __m512 acc = _mm512_setzero_ps();
-              for (std::uint32_t d = 0; d < hd; d += 16) {
-                const __m512 qv = _mm512_loadu_ps(qh + d);
-                // Load 16 bf16 values and convert to fp32.
-                const __m256i kb = _mm256_loadu_si256(
-                    reinterpret_cast<const __m256i*>(kr + d));
-                const __m512 kv = _mm512_castsi512_ps(
-                    _mm512_slli_epi32(_mm512_cvtepu16_epi32(kb), 16));
-                acc = _mm512_fmadd_ps(qv, kv, acc);
-              }
-              const float dot = _mm512_reduce_add_ps(acc) * inv_sqrt;
-              sc[u - first] = dot;
-              if (dot > mx) mx = dot;
-            }
-            float den = 0;
-            for (std::uint32_t i = 0; i < len; ++i) {
-              sc[i] = std::exp(sc[i] - mx);
-              den += sc[i];
-            }
-            const float inv_den = 1.0f / den;
-            const float gsig =
-                1.0f / (1.0f + std::exp(-gate[std::size_t(t) * heads + h]));
-            float* o = &attn[std::size_t(t) * qd + h * hd];
-            // Accumulate output in fp32 (hd=128).
-            alignas(64) float acco[128] = {0};
-            for (std::uint32_t u = first; u <= P; ++u) {
-              const float wgt = sc[u - first] * inv_den;
-              const __m512 wv = _mm512_set1_ps(wgt);
-              const std::uint16_t* vr =
-                  &s.v_cache[l][std::size_t{u % cap} * kvd + kh * hd];
-              for (std::uint32_t d = 0; d < hd; d += 16) {
-                __m512 ov = _mm512_loadu_ps(acco + d);
-                const __m256i vb = _mm256_loadu_si256(
-                    reinterpret_cast<const __m256i*>(vr + d));
-                const __m512 vv = _mm512_castsi512_ps(
-                    _mm512_slli_epi32(_mm512_cvtepu16_epi32(vb), 16));
-                ov = _mm512_fmadd_ps(wv, vv, ov);
-                _mm512_storeu_ps(acco + d, ov);
-              }
-            }
-            const __m512 gv = _mm512_set1_ps(gsig);
-            for (std::uint32_t d = 0; d < hd; d += 16)
-              _mm512_storeu_ps(o + d, _mm512_mul_ps(_mm512_loadu_ps(acco + d), gv));
-          }
+      // Split-K over context for long contexts: chunked online-softmax partials + reduction.
+      struct AttnPartial { float m{-1e30f}; float s{0.0f}; alignas(64) float o[128]{}; };
+      constexpr std::uint32_t kSplitChunk = 1024;
+      constexpr std::uint32_t kSplitMinLen = 4096;
+      const std::uint32_t pairs = n * heads;
+      // Decide per-(t,h) whether to split.
+      std::vector<std::uint32_t> firsts(pairs), lens(pairs), chunk_counts(pairs), chunk_off(pairs);
+      std::uint32_t total_chunks = 0;
+      for (std::uint32_t t = 0; t < n; ++t) {
+        const std::uint32_t P = s.pos + t;
+        const std::uint32_t first = swa && P + 1 > s.window ? P + 1 - s.window : 0;
+        const std::uint32_t len = P + 1 - first;
+        for (std::uint32_t h = 0; h < heads; ++h) {
+          const std::uint32_t idx = t * heads + h;
+          firsts[idx] = first; lens[idx] = len;
+          const std::uint32_t cc = (len >= kSplitMinLen) ? (len + kSplitChunk - 1) / kSplitChunk : 1;
+          chunk_counts[idx] = cc;
+          chunk_off[idx] = total_chunks;
+          total_chunks += cc;
+        }
       }
+      std::vector<AttnPartial> partials(total_chunks);
+      std::vector<std::uint32_t> task_owner(total_chunks);
+      for (std::uint32_t idx = 0, tsk = 0; idx < pairs; ++idx)
+        for (std::uint32_t c = 0; c < chunk_counts[idx]; ++c) task_owner[tsk++] = idx;
+#pragma omp parallel for schedule(dynamic, 1)
+      for (std::int64_t task = 0; task < static_cast<std::int64_t>(total_chunks); ++task) {
+        const std::uint32_t idx = task_owner[static_cast<std::size_t>(task)];
+        const std::uint32_t t = idx / heads, h = idx % heads;
+        const std::uint32_t local = static_cast<std::uint32_t>(task) - chunk_off[idx];
+        const std::uint32_t first = firsts[idx], len = lens[idx];
+        const std::uint32_t ccount = chunk_counts[idx];
+        const std::uint32_t chunk_len = (len + ccount - 1) / ccount;
+        const std::uint32_t c0 = local * chunk_len;
+        const std::uint32_t c1 = std::min(len, c0 + chunk_len);
+        const std::uint32_t kh = h / (heads / kvh);
+        const float* qh = &q[std::size_t(t) * qd + h * hd];
+        AttnPartial& ptl = partials[static_cast<std::size_t>(task)];
+        if (ccount == 1) {
+          // Single-chunk fast path: one dot pass with score buffer (no recompute).
+          std::vector<float> sc(len);
+          float mx = -1e30f;
+          for (std::uint32_t i = 0; i < len; ++i) {
+            const std::uint32_t u = first + i;
+            const std::uint16_t* kr = &s.k_cache[l][std::size_t{u % cap} * kvd + kh * hd];
+            __m512 acc = _mm512_setzero_ps();
+            for (std::uint32_t d = 0; d < hd; d += 16) {
+              const __m512 qv = _mm512_loadu_ps(qh + d);
+              const __m256i kb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(kr + d));
+              const __m512 kv = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(kb), 16));
+              acc = _mm512_fmadd_ps(qv, kv, acc);
+            }
+            const float dot = _mm512_reduce_add_ps(acc) * inv_sqrt;
+            sc[i] = dot; if (dot > mx) mx = dot;
+          }
+          float sum = 0.0f;
+          for (std::uint32_t i = 0; i < len; ++i) { sc[i] = std::exp(sc[i] - mx); sum += sc[i]; }
+          alignas(64) float acco[128] = {0};
+          for (std::uint32_t i = 0; i < len; ++i) {
+            const float w = sc[i];
+            const std::uint32_t u = first + i;
+            const __m512 wv = _mm512_set1_ps(w);
+            const std::uint16_t* vr = &s.v_cache[l][std::size_t{u % cap} * kvd + kh * hd];
+            for (std::uint32_t d = 0; d < hd; d += 16) {
+              __m512 ov = _mm512_loadu_ps(acco + d);
+              const __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(vr + d));
+              const __m512 vv = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(vb), 16));
+              ov = _mm512_fmadd_ps(wv, vv, ov);
+              _mm512_storeu_ps(acco + d, ov);
+            }
+          }
+          ptl.m = mx; ptl.s = sum;
+          for (std::uint32_t d = 0; d < hd; ++d) ptl.o[d] = acco[d];
+        } else {
+          // Split-K chunk: two-pass (recompute dots) to avoid large score storage.
+          float mx = -1e30f;
+          for (std::uint32_t i = c0; i < c1; ++i) {
+            const std::uint32_t u = first + i;
+            const std::uint16_t* kr = &s.k_cache[l][std::size_t{u % cap} * kvd + kh * hd];
+            __m512 acc = _mm512_setzero_ps();
+            for (std::uint32_t d = 0; d < hd; d += 16) {
+              const __m512 qv = _mm512_loadu_ps(qh + d);
+              const __m256i kb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(kr + d));
+              const __m512 kv = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(kb), 16));
+              acc = _mm512_fmadd_ps(qv, kv, acc);
+            }
+            const float dot = _mm512_reduce_add_ps(acc) * inv_sqrt;
+            if (dot > mx) mx = dot;
+          }
+          ptl.m = mx;
+          float sum = 0.0f;
+          alignas(64) float acco[128] = {0};
+          for (std::uint32_t i = c0; i < c1; ++i) {
+            const std::uint32_t u = first + i;
+            const std::uint16_t* kr = &s.k_cache[l][std::size_t{u % cap} * kvd + kh * hd];
+            __m512 acc = _mm512_setzero_ps();
+            for (std::uint32_t d = 0; d < hd; d += 16) {
+              const __m512 qv = _mm512_loadu_ps(qh + d);
+              const __m256i kb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(kr + d));
+              const __m512 kv = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(kb), 16));
+              acc = _mm512_fmadd_ps(qv, kv, acc);
+            }
+            const float w = std::exp(_mm512_reduce_add_ps(acc) * inv_sqrt - mx);
+            sum += w;
+            const __m512 wv = _mm512_set1_ps(w);
+            const std::uint16_t* vr = &s.v_cache[l][std::size_t{u % cap} * kvd + kh * hd];
+            for (std::uint32_t d = 0; d < hd; d += 16) {
+              __m512 ov = _mm512_loadu_ps(acco + d);
+              const __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(vr + d));
+              const __m512 vv = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(vb), 16));
+              ov = _mm512_fmadd_ps(wv, vv, ov);
+              _mm512_storeu_ps(acco + d, ov);
+            }
+          }
+          ptl.s = sum;
+          for (std::uint32_t d = 0; d < hd; ++d) ptl.o[d] = acco[d];
+        }
+      }
+      // Reduce partials per (t,h) and apply gate.
+#pragma omp parallel for collapse(2) schedule(static)
+      for (std::int64_t t = 0; t < n; ++t)
+        for (std::int64_t h = 0; h < heads; ++h) {
+          const std::uint32_t idx = static_cast<std::uint32_t>(t) * heads + static_cast<std::uint32_t>(h);
+          const std::uint32_t base = chunk_off[idx], ccount = chunk_counts[idx];
+          float m = -1e30f;
+          for (std::uint32_t c = 0; c < ccount; ++c) m = std::max(m, partials[base + c].m);
+          float s = 0.0f;
+          alignas(64) float acco[128] = {0};
+          for (std::uint32_t c = 0; c < ccount; ++c) {
+            const auto& pt = partials[base + c];
+            const float scale = (pt.s == 0.0f) ? 0.0f : std::exp(pt.m - m);
+            s += pt.s * scale;
+            const __m512 sv = _mm512_set1_ps(scale);
+            for (std::uint32_t d = 0; d < hd; d += 16) {
+              __m512 ov = _mm512_loadu_ps(acco + d);
+              ov = _mm512_fmadd_ps(sv, _mm512_loadu_ps(pt.o + d), ov);
+              _mm512_storeu_ps(acco + d, ov);
+            }
+          }
+          const float inv_den = s ? 1.0f / s : 0.0f;
+          const float gsig = 1.0f / (1.0f + std::exp(-gate[std::size_t(t) * heads + h]));
+          float* o = &attn[std::size_t(t) * qd + h * hd];
+          const __m512 gv = _mm512_set1_ps(gsig * inv_den);
+          for (std::uint32_t d = 0; d < hd; d += 16)
+            _mm512_storeu_ps(o + d, _mm512_mul_ps(_mm512_loadu_ps(acco + d), gv));
+        }
       s.t_cpu += Ms(cpu0);
       s.rt.Gemm(s.p_h, s.m_out[l], attn.data(), n, branch.data(), &s.tim);
     }
