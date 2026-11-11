@@ -7,6 +7,7 @@
 #include <xrt/xrt_kernel.h>
 
 #include <cstddef>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -21,7 +22,7 @@ constexpr std::uint32_t kStrip = 128;
 constexpr std::uint32_t kQuarterBytes = 1536;
 constexpr std::uint32_t kWordBytes = 1408;
 // C staging: one 1024 B slot per core row and strip (576 B used by bfp16 tiles).
-constexpr std::uint32_t kRowBytes = 1024;
+constexpr std::uint32_t kRowBytes = 4096;  // C tap: 4 m64 row-block pieces (m16 uses its head)
 constexpr std::uint32_t kStripBytes = 4 * kRowBytes;
 
 inline float RoundHalf(float v) {
@@ -79,12 +80,16 @@ void PackMatInt5(const float* W, std::uint32_t N, std::uint32_t K,
                  std::uint8_t* dst, std::uint32_t extra_tiles = 0);
 
 // Instruction-stream program (one runtime sequence) with its A/C staging BOs.
+struct WeightBuffer;  // fwd: Program pins one via wpin (see NpuRuntime::WeightSlot)
 struct Program {
   std::uint32_t K{}, N{};
+  std::uint32_t mrows{1};  // A row-blocks per B tile (1 = 16 rows decode, 4 = m64 prefill)
   xrt::bo insts, a, c;
   std::size_t words{};
   std::uint8_t* ah{};
   std::uint8_t* ch{};
+  WeightBuffer* wpin{};  // first-bound weight buffer (see WeightSlot)
+  bool warmed{false};  // first dispatch is a throwaway (see WarmOnce in runtime.cpp)
 };
 
 // A packed weight buffer attached as a runnable kernel argument set.
@@ -120,6 +125,7 @@ struct AttnLayer {
   std::unordered_map<std::uint32_t, xrt::run> runs;
 };
 
+
 class NpuRuntime {
  public:
   NpuRuntime() = default;
@@ -131,14 +137,27 @@ class NpuRuntime {
 
   /// Load an instruction stream file and create A/C BOs sized for (K,N).
   /// `c_override` allows custom C size (e.g. fused FFN combined buffer).
+  /// `mrows` = A row-blocks per B tile (4 for m64 prefill streams).
   Program MakeProgram(std::uint32_t K, std::uint32_t N,
                       const std::string& insts_path, std::size_t c_override,
-                      std::string* error, std::uint32_t a_extra_k = 0);
+                      std::string* error, std::uint32_t a_extra_k = 0,
+                      std::uint32_t mrows = 1);
 
   /// Allocate and pack a weight matrix (N rows x K cols, row-major float).
   WeightBuffer PackWeight(const float* W, std::uint32_t N, std::uint32_t K);
   /// Bind a weight buffer to a program (sets kernel args 0-5).
   void Attach(WeightBuffer& wb, Program& prog);
+  /// WP10: this XRT/xdna stack keeps a program's FIRST weight buffer bound: later
+  /// set_arg of another BO on the same program silently runs stale weights (bisected
+  /// with sbtest-ffn64b: fresh-B bind + identical staged A => deterministic garbage;
+  /// in-place repacks of the pinned BO are always correct). WeightSlot pins wb on a
+  /// program's first use and copies later weights into it, so every dispatch sees
+  /// valid weights. Returns the buffer to dispatch with.
+  WeightBuffer& WeightSlot(WeightBuffer& wb, Program& prog);
+  /// Bind (insts, A, W, C) to an arbitrary run object (warm-up dispatches).
+  void AttachTo(xrt::run& run, WeightBuffer& wb, Program& prog);
+  /// Per-weight-buffer pooled run (slots are scarce on xdna; ~64 max).
+  xrt::run& SlotRun(WeightBuffer& wb);
 
   void EncodeA(const float* x, std::uint32_t n, std::uint32_t K, Program& p);
   void DecodeC(float* y, std::uint32_t n, Program& p,
@@ -158,6 +177,10 @@ class NpuRuntime {
   void Ffn(Program& p, WeightBuffer& wb, const float* x, std::uint32_t n,
            float* y, Timings* t = nullptr);
 
+  /// m64 prefill FFN: gu (swiglu flush) -> byte-shuffle into down's A -> plain down gemm.
+  void Ffn64(WeightBuffer& wb_gu, Program& p_gu, WeightBuffer& wb_dn, Program& p_dn,
+             const float* x, std::uint32_t n, float* y, Timings* t = nullptr);
+
   /// Argmax GEMM over an int5 head: returns the greedy token id per row.
   /// C must have been produced by an argmax-mode program (per-strip reduced).
   void Argmax(Program& p, WeightBuffer& wb, const float* x, std::uint32_t n,
@@ -171,7 +194,9 @@ class NpuRuntime {
   void ConvStep(ConvLayer& cl, const float* z, std::uint32_t n, float* y,
                 Timings* t = nullptr);
   /// Accept `k` of the `n` rows from the last ConvStep (history for next call).
-  void ConvCommit(ConvLayer& cl, std::uint32_t k);
+  /// `settle` waits for the history write to become visible to the next dispatch
+  /// (needed when one is issued immediately, i.e. inside an m64 step).
+  void ConvCommit(ConvLayer& cl, std::uint32_t k, bool settle = false);
   void ConvReset(ConvLayer& cl);
 
   // Attention on the NPU (4 kv heads x 4 q heads x 128 dims, up to 16 rows per pass).

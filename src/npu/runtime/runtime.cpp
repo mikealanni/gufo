@@ -3,12 +3,15 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <atomic>
 #include <cstring>
 #include <fstream>
 #include <omp.h>
 #include <stdexcept>
 
 namespace gufo::npu::runtime {
+
+
 namespace {
 using Clock = std::chrono::steady_clock;
 double Ms(Clock::time_point a) {
@@ -89,10 +92,11 @@ bool NpuRuntime::Init(const std::string& xclbin_path, std::string* error) {
 Program NpuRuntime::MakeProgram(std::uint32_t K, std::uint32_t N,
                                 const std::string& insts_path,
                                 std::size_t c_override, std::string* error,
-                                std::uint32_t a_extra_k) {
+                                std::uint32_t a_extra_k, std::uint32_t mrows) {
   Program p;
   p.K = K;
   p.N = N;
+  p.mrows = mrows;
   std::ifstream f(insts_path, std::ios::binary | std::ios::ate);
   if (!f)
     throw std::runtime_error("missing " + insts_path);
@@ -104,7 +108,7 @@ Program NpuRuntime::MakeProgram(std::uint32_t K, std::uint32_t N,
   p.insts = xrt::bo(dev_, sz, XCL_BO_FLAGS_CACHEABLE, kern_.group_id(1));
   std::memcpy(p.insts.map<void*>(), buf.data(), sz);
   p.insts.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-  const std::size_t ab = std::size_t{kMaxRows} * (K + a_extra_k) / 8 * 9;
+  const std::size_t ab = std::size_t{16 * mrows} * (K + a_extra_k) / 8 * 9;
   const std::size_t cb = c_override ? c_override : std::size_t{N / kStrip} * kStripBytes;
   p.a = xrt::bo(dev_, ab, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(3));
   p.c = xrt::bo(dev_, cb, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(3));
@@ -128,35 +132,134 @@ WeightBuffer NpuRuntime::PackWeight(const float* W, std::uint32_t N,
   return wb;
 }
 
-void NpuRuntime::Attach(WeightBuffer& wb, Program& prog) {
+void NpuRuntime::AttachTo(xrt::run& run, WeightBuffer& wb, Program& prog) {
+  run.set_arg(0, 3u);
+  run.set_arg(1, prog.insts);
+  run.set_arg(2, static_cast<unsigned>(prog.words));
+  run.set_arg(3, prog.a);
+  run.set_arg(4, wb.bo);
+  run.set_arg(5, prog.c);
+}
+
+// Run objects cannot be re-arg'd after a completed dispatch on this XRT/xdna
+// stack (set_arg silently keeps the old pointers -> stale-weight outputs, WP10).
+// Create a fresh run per dispatch; destruction after wait() is safe (m16 path).
+xrt::run& NpuRuntime::SlotRun(WeightBuffer& wb) {
   wb.run = xrt::run(kern_);
-  wb.run.set_arg(0, 3u);
-  wb.run.set_arg(1, prog.insts);
-  wb.run.set_arg(2, static_cast<unsigned>(prog.words));
-  wb.run.set_arg(3, prog.a);
-  wb.run.set_arg(4, wb.bo);
-  wb.run.set_arg(5, prog.c);
+  return wb.run;
+}
+
+void NpuRuntime::Attach(WeightBuffer& wb, Program& prog) { AttachTo(wb.run, wb, prog); }
+
+WeightBuffer& NpuRuntime::WeightSlot(WeightBuffer& wb, Program& prog) {
+  if (!prog.wpin) {
+    prog.wpin = &wb;  // first binding sticks; it is also the dispatch buffer.
+  } else if (prog.wpin != &wb) {
+    WeightBuffer& p0 = *prog.wpin;
+    if (p0.bytes != wb.bytes)
+      throw std::runtime_error("weight slot size mismatch for pinned program");
+    std::memcpy(p0.host, wb.host, wb.bytes);
+    p0.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);  // HOST_ONLY: no-op
+  }
+  WeightBuffer& w = *prog.wpin;
+  AttachTo(SlotRun(w), w, prog);
+  return w;
+}
+
+// m64 FFN (WP10 prefill): gu program (swiglu flush) -> swiglu C pieces byte-shuffle into
+// the down program's A staging (their layout matches: piece (s,t r) == A tap (t s) r-th),
+// then the plain 7680x2048 down gemm. No float round-trip, no requantization.
+void NpuRuntime::Ffn64(WeightBuffer& wb_gu, Program& p_gu,
+                       WeightBuffer& wb_dn, Program& p_dn,
+                       const float* x, std::uint32_t n, float* y, Timings* t) {
+  const std::uint32_t tk = p_gu.K / kTileK;  // 32 k-tiles; gu C strips = K2/k = 120
+  auto t0 = Clock::now();
+  WeightBuffer& w_gu = WeightSlot(wb_gu, p_gu);
+  EncodeA(x, n, p_gu.K, p_gu);
+  if (t) t->enc += Ms(t0);
+  t0 = Clock::now();
+  p_gu.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  if (t) t->syncA += Ms(t0);
+  t0 = Clock::now();
+  w_gu.run.start();
+  {
+    const auto spin0 = Clock::now();
+    for (;;) {
+      const auto st = w_gu.run.state();
+      if (st == ERT_CMD_STATE_COMPLETED) break;
+      if (st != ERT_CMD_STATE_NEW && st != ERT_CMD_STATE_QUEUED &&
+          st != ERT_CMD_STATE_RUNNING && st != ERT_CMD_STATE_SUBMITTED) break;
+      if (Ms(spin0) > 200.0) break;
+    }
+    w_gu.run.wait();
+    if (!p_gu.warmed) {  // WP10: a program's first C write is lost on this
+      p_gu.warmed = true;  // XRT/xdna stack; redo the dispatch so C is valid.
+      w_gu.run.start();
+      w_gu.run.wait();
+    }
+  }
+  if (t) t->wait += Ms(t0);
+  // gu C wire per (tap s, aie-row r) element: 4 swiglu row-blocks of 288 B at mb*288
+  // (matches the fused m16 down-A DMA pattern [1,ktile,mrows,rows,288] x [0,SB,288,CB,1]).
+  const std::uint8_t* cgu = p_gu.ch;
+  for (std::uint32_t s = 0; s < 120; ++s)
+    for (int r = 0; r < 4; ++r)
+      for (std::uint32_t mb = 0; mb < p_dn.mrows; ++mb)
+        std::memcpy(p_dn.ah + (std::size_t(s) * 4 + mb) * 1152 + std::size_t(r) * 288,
+                    cgu + std::size_t(s) * kStripBytes + std::size_t(r) * kRowBytes +
+                        std::size_t(mb) * 288,
+                    288);
+  (void)tk;
+  t0 = Clock::now();
+  WeightBuffer& w_dn = WeightSlot(wb_dn, p_dn);
+  p_dn.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  w_dn.run.start();
+  {
+    const auto spin0 = Clock::now();
+    for (;;) {
+      const auto st = w_dn.run.state();
+      if (st == ERT_CMD_STATE_COMPLETED) break;
+      if (st != ERT_CMD_STATE_NEW && st != ERT_CMD_STATE_QUEUED &&
+          st != ERT_CMD_STATE_RUNNING && st != ERT_CMD_STATE_SUBMITTED) break;
+      if (Ms(spin0) > 200.0) break;
+    }
+    w_dn.run.wait();
+    if (!p_dn.warmed) {  // WP10: a program's first C write is lost on this
+      p_dn.warmed = true;  // XRT/xdna stack; redo the dispatch so C is valid.
+      w_dn.run.start();
+      w_dn.run.wait();
+    }
+  }
+  if (t) t->wait += Ms(t0);
+  t0 = Clock::now();
+  p_dn.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+  if (t) t->syncC += Ms(t0);
+  t0 = Clock::now();
+  DecodeC(y, n, p_dn);
+  if (t) t->dec += Ms(t0);
+  if (t) t->calls += 2;
 }
 
 void NpuRuntime::EncodeA(const float* x, std::uint32_t n, std::uint32_t K,
                          Program& p) {
-  const std::uint32_t tk = K / kTileK;
+  const std::uint32_t tk = K / kTileK, mr = p.mrows;
 #pragma omp parallel for
   for (std::int64_t t = 0; t < tk; ++t)
-    for (int gi = 0; gi < 128; ++gi) {
-      const int rib = gi & 7, block = (gi >> 3) & 1, sc = gi >> 4;
-      const int row = block * 8 + rib;
-      std::uint8_t* o = p.ah + (std::size_t(t) * 128 + gi) * 9;
-      if (row >= static_cast<int>(n)) {
-        std::memset(o, 0, 9);
-        continue;
+    for (std::uint32_t mb = 0; mb < mr; ++mb)
+      for (int gi = 0; gi < 128; ++gi) {
+        const int rib = gi & 7, block = (gi >> 3) & 1, sc = gi >> 4;
+        const int row = int(mb * 16 + block * 8 + rib);
+        std::uint8_t* o = p.ah + (std::size_t(t) * mr + mb) * 1152 + std::size_t(gi) * 9;
+        if (row >= static_cast<int>(n)) {
+          std::memset(o, 0, 9);
+          continue;
+        }
+        const float* src = x + std::size_t(row) * K + t * 64 + sc * 8;
+        float v[8];
+        _mm256_storeu_ps(v, _mm256_cvtph_ps(_mm256_cvtps_ph(
+                                _mm256_loadu_ps(src), _MM_FROUND_TO_NEAREST_INT)));
+        EncGroup(v, o);
       }
-      const float* src = x + std::size_t(row) * K + t * 64 + sc * 8;
-      float v[8];
-      _mm256_storeu_ps(v, _mm256_cvtph_ps(_mm256_cvtps_ph(
-                              _mm256_loadu_ps(src), _MM_FROUND_TO_NEAREST_INT)));
-      EncGroup(v, o);
-    }
 }
 
 void NpuRuntime::DecodeC(float* y, std::uint32_t n, Program& p,
@@ -169,21 +272,23 @@ void NpuRuntime::DecodeC(float* y, std::uint32_t n, Program& p,
 #pragma omp parallel for
   for (std::int64_t s = 0; s < strips; ++s)
     for (int r = 0; r < 4; ++r)
+      for (std::uint32_t mb = 0; mb < p.mrows; ++mb)
       for (int G = 0; G < 64; ++G) {
         const int sb = G >> 5, acc = (G >> 3) & 3, rib = G & 7;
-        const int row = (acc >> 1) * 8 + rib;
+        const int row = int(mb * 16 + (acc >> 1) * 8 + rib);
         if (row >= static_cast<int>(n))
           continue;
         const std::size_t col = std::size_t(s) * 128 + r * 32 + sb * 16 +
                                 (acc & 1) * 8;
         DecGroup(base + std::size_t(s) * kStripBytes + std::size_t(r) * kRowBytes +
-                     std::size_t(G) * 9,
+                     std::size_t(mb) * 576 + std::size_t(G) * 9,
                  y + std::size_t(row) * N + col);
       }
 }
 
 void NpuRuntime::Gemm(Program& p, WeightBuffer& wb, const float* x,
                       std::uint32_t n, float* y, Timings* t) {
+  WeightBuffer& w = WeightSlot(wb, p);
   auto t0 = Clock::now();
   EncodeA(x, n, p.K, p);
   if (t) t->enc += Ms(t0);
@@ -191,22 +296,25 @@ void NpuRuntime::Gemm(Program& p, WeightBuffer& wb, const float* x,
   p.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
   if (t) t->syncA += Ms(t0);
   t0 = Clock::now();
-  wb.run.start();
+  w.run.start();
   if (t) t->submit += Ms(t0);
   t0 = Clock::now();
   {
     const auto spin0 = Clock::now();
     for (;;) {
-      const auto st = wb.run.state();
+      const auto st = w.run.state();
       if (st == ERT_CMD_STATE_COMPLETED)
         break;
       if (st != ERT_CMD_STATE_NEW && st != ERT_CMD_STATE_QUEUED &&
           st != ERT_CMD_STATE_RUNNING && st != ERT_CMD_STATE_SUBMITTED)
         break;
-      if (Ms(spin0) > 200.0)
-        break;
     }
-    wb.run.wait();
+    w.run.wait();
+    if (!p.warmed) {  // WP10: a program's first C write is lost on this
+      p.warmed = true;  // XRT/xdna stack; redo the dispatch so C is valid.
+      w.run.start();
+      w.run.wait();
+    }
   }
   if (t) t->wait += Ms(t0);
   t0 = Clock::now();
@@ -220,6 +328,7 @@ void NpuRuntime::Gemm(Program& p, WeightBuffer& wb, const float* x,
 
 void NpuRuntime::Ffn(Program& p, WeightBuffer& wb, const float* x,
                      std::uint32_t n, float* y, Timings* t) {
+  WeightBuffer& w = WeightSlot(wb, p);
   auto t0 = Clock::now();
   EncodeA(x, n, p.K, p);
   if (t) t->enc += Ms(t0);
@@ -227,18 +336,23 @@ void NpuRuntime::Ffn(Program& p, WeightBuffer& wb, const float* x,
   p.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
   if (t) t->syncA += Ms(t0);
   t0 = Clock::now();
-  wb.run.start();
+  w.run.start();
   if (t) t->submit += Ms(t0);
   t0 = Clock::now();
   for (;;) {
-    const auto st = wb.run.state();
+    const auto st = w.run.state();
     if (st == ERT_CMD_STATE_COMPLETED)
       break;
     if (st != ERT_CMD_STATE_NEW && st != ERT_CMD_STATE_QUEUED &&
         st != ERT_CMD_STATE_RUNNING && st != ERT_CMD_STATE_SUBMITTED)
       break;
   }
-  wb.run.wait();
+  w.run.wait();
+  if (!p.warmed) {  // WP10: a program's first C write is lost on this
+    p.warmed = true;  // XRT/xdna stack; redo the dispatch so C is valid.
+    w.run.start();
+    w.run.wait();
+  }
   if (t) t->wait += Ms(t0);
   t0 = Clock::now();
   p.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
@@ -251,6 +365,7 @@ void NpuRuntime::Ffn(Program& p, WeightBuffer& wb, const float* x,
 
 void NpuRuntime::Argmax(Program& p, WeightBuffer& wb, const float* x,
                         std::uint32_t n, std::uint32_t* out, Timings* t) {
+  WeightBuffer& w = WeightSlot(wb, p);
   auto t0 = Clock::now();
   EncodeA(x, n, p.K, p);
   if (t) t->enc += Ms(t0);
@@ -258,18 +373,23 @@ void NpuRuntime::Argmax(Program& p, WeightBuffer& wb, const float* x,
   p.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
   if (t) t->syncA += Ms(t0);
   t0 = Clock::now();
-  wb.run.start();
+  w.run.start();
   if (t) t->submit += Ms(t0);
   t0 = Clock::now();
   for (;;) {
-    const auto st = wb.run.state();
+    const auto st = w.run.state();
     if (st == ERT_CMD_STATE_COMPLETED)
       break;
     if (st != ERT_CMD_STATE_NEW && st != ERT_CMD_STATE_QUEUED &&
         st != ERT_CMD_STATE_RUNNING && st != ERT_CMD_STATE_SUBMITTED)
       break;
   }
-  wb.run.wait();
+  w.run.wait();
+  if (!p.warmed) {  // WP10: a program's first C write is lost on this
+    p.warmed = true;  // XRT/xdna stack; redo the dispatch so C is valid.
+    w.run.start();
+    w.run.wait();
+  }
   if (t) t->wait += Ms(t0);
   t0 = Clock::now();
   p.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
@@ -365,7 +485,7 @@ ConvLayer NpuRuntime::PackConv(const float* w_in, const float* conv_w,
             }
       }
   cl.w.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-  Attach(cl.w, cl.prog);
+  AttachTo(SlotRun(cl.w), cl.w, cl.prog);
   return cl;
 }
 
@@ -399,6 +519,11 @@ void NpuRuntime::ConvStep(ConvLayer& cl, const float* z, std::uint32_t n, float*
       break;
   }
   cl.w.run.wait();
+  if (!cl.prog.warmed) {  // WP10: a program's first C write is lost on this
+    cl.prog.warmed = true;  // XRT/xdna stack; redo the dispatch so C is valid.
+    cl.w.run.start();
+    cl.w.run.wait();
+  }
   if (t) t->wait += Ms(t0);
   t0 = Clock::now();
   cl.prog.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
@@ -410,7 +535,8 @@ void NpuRuntime::ConvStep(ConvLayer& cl, const float* z, std::uint32_t n, float*
   cl.last_n = n;
 }
 
-void NpuRuntime::ConvCommit(ConvLayer& cl, std::uint32_t k) {
+void NpuRuntime::ConvCommit(ConvLayer& cl, std::uint32_t k, bool settle) {
+  k = std::min(k, cl.last_n);  // m64 Step runs conv in 16-row sub-steps; C holds only the last
   const std::uint32_t tk = cl.hidden / kTileK, groups = 3 * cl.hidden / kStrip / 8;
   const std::uint32_t hist = cl.taps - 1;
   for (std::uint32_t g = 1; g < groups; g += 3) {
@@ -437,6 +563,19 @@ void NpuRuntime::ConvCommit(ConvLayer& cl, std::uint32_t k) {
       SyncToDevice(cl.w.bo, (std::size_t{(g * 8 + col)} * (tk + 1) + tk) * 4 * kQuarterBytes,
                    4 * kQuarterBytes);
   }
+      // WP10: weight-page TO_DEVICE syncs on this XRT/xdna stack become visible to
+  // the program's next dispatch only ~1 ms later, and no BO operation waits for
+  // it (measured: 500 us late, 2 ms clean; full-BO sync and FROM_DEVICE
+  // round-trips on the same pages do NOT help). When the caller dispatches this
+  // layer immediately (m64 sub-steps), the wait must be explicit.
+  if (settle) {
+    static const int kSettleUs = [] {
+      if (const char* e = std::getenv("GUFO_CONV_SETTLE_US")) return std::atoi(e);
+      return 2000;
+    }();
+    if (kSettleUs > 0) usleep(static_cast<useconds_t>(kSettleUs));
+  }
+  cl.last_n = 0;  // C rows now reflected in history; a repeat commit is a no-op.
 }
 
 namespace {
