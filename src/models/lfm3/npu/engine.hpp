@@ -21,7 +21,7 @@ struct Options {
 /// Refactored (WP6): model-neutral runtime + spec-driven layer loop.
 class Engine {
  public:
-  static constexpr std::uint32_t kMaxRows = 16;
+  static constexpr std::uint32_t kMaxRows = 64;  // m64 prefill (WP10); falls back to 16 without m64 programs
   ~Engine();
   static std::unique_ptr<Engine> Create(const Options& options,
                                         std::string* error);

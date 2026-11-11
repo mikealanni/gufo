@@ -74,7 +74,8 @@ int main(int argc, char** argv) {
       engine->Reset();
       std::vector<std::uint16_t> half(len * 2048);
       for (std::size_t at = 0; at < len;) {
-        std::size_t n = std::min<std::size_t>(Engine::kMaxRows, len - at);
+        const std::size_t chunk = std::getenv("GUFO_M64") ? Engine::kMaxRows : 16;
+        std::size_t n = std::min<std::size_t>(chunk, len - at);
         std::vector<float> h;
         if (!engine->Step(std::span<const std::uint32_t>(t32 + lo + at, n), &h)) {
           std::fprintf(stderr, "step failed\n");

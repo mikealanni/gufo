@@ -185,7 +185,12 @@ struct Engine::Impl {
   bool have_st{false};
   Options opt;
   gufo::npu::runtime::NpuRuntime rt;
-  gufo::npu::runtime::Program p_conv, p_h, p_qkv, p_ffn;
+  gufo::npu::runtime::Program p_conv;
+  // WP10: every program binds its weights once (first-bind-sticky stack), so
+  // programs are per-layer and weights bind at creation; no rebind happens.
+  std::vector<gufo::npu::runtime::Program> pH, pQkv, pFfn, pH64, pQkv64, pGu64, pDn64;
+  std::vector<gufo::npu::runtime::WeightBuffer> m_ffn_dn;  // down proj packed for p_dn64
+  bool m64 = false;  // m64 prefill programs available and in use for n > 16
   std::vector<gufo::npu::runtime::WeightBuffer> m_out, m_qkv, m_ffn;
   std::vector<gufo::npu::runtime::ConvLayer> m_conv;
   std::vector<gufo::npu::runtime::AttnLayer> m_attn;
@@ -275,22 +280,49 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
 
     // Programs needed (driven by spec/constraints; LFM3 uses these 4)
     s.p_conv = s.rt.MakeProgram(2048, 2048, options.programs + "/insts_conv.txt", std::size_t{64} * gufo::npu::runtime::kStripBytes, error, 64);
-    s.p_h = s.rt.MakeProgram(2048, 2048, options.programs + "/insts_plain_2048x2048.txt", 0, error);
-    s.p_qkv = s.rt.MakeProgram(2048, 3072, options.programs + "/insts_plain_2048x3072.txt", 0, error);
-    s.p_ffn = s.rt.MakeProgram(2048, 2048, options.programs + "/insts_ffn.txt",
-                               std::size_t{136} * gufo::npu::runtime::kStripBytes, error);
+    // WP10 m64 prefill programs: rows batch 4x16 -> weight streams amortized 4x.
+    const auto have_m64 = [options](const char* f) {
+      std::ifstream t(options.programs + "/" + f);
+      return t.good();
+    };
+    // m64 prefill GEMMs are EXPERIMENTAL (WP10): the XRT/xdna stack in use does not
+    // guarantee that conv-history weight-page syncs are visible to the program's very
+    // next dispatch (~1-2 ms delayed, no API to wait for it; see AGENT-4-report.md),
+    // which the 64-row conv sub-step loop hits on nearly every document. Opt in with
+    // GUFO_M64=1 (2-2.5x prefill speed, ~0.02 NLL corruption risk).
+    s.m64 = std::getenv("GUFO_M64") != nullptr &&
+            have_m64("insts_plain_2048x2048_m64.txt") && have_m64("insts_plain_2048x3072_m64.txt") &&
+            have_m64("insts_ffngu64.txt") && have_m64("insts_plain_7680x2048_m64.txt");
 
     const auto t0 = Clock::now();
     const std::size_t L = c.layers.size();
     s.m_conv.resize(L); s.m_attn.resize(L); s.m_out.resize(L);
     s.programs_dir = options.programs;
     s.npu_attn = !std::getenv("GUFO_CPU_ATTN") && options.context >= 1; s.m_qkv.resize(L); s.m_ffn.resize(L);
+    s.m_ffn_dn.resize(L);
     s.gate_w.resize(L); s.k_cache.resize(L); s.v_cache.resize(L);
     s.capacity.assign(L, 0);
     std::vector<float> buf;
+    s.pH.resize(L);
+    s.pQkv.resize(L);
+    s.pFfn.resize(L);
+    if (s.m64) {
+      s.pH64.resize(L);
+      s.pQkv64.resize(L);
+      s.pGu64.resize(L);
+      s.pDn64.resize(L);
+    }
     for (std::size_t l = 0; l < L; ++l) {
       const auto& lw = s.w->layers[l];
       const std::string pre = "model.layers." + std::to_string(l) + ".";
+      s.pH[l] = s.rt.MakeProgram(2048, 2048, options.programs + "/insts_plain_2048x2048.txt", 0, error);
+      s.pQkv[l] = s.rt.MakeProgram(2048, 3072, options.programs + "/insts_plain_2048x3072.txt", 0, error);
+      s.pFfn[l] = s.rt.MakeProgram(2048, 2048, options.programs + "/insts_ffn.txt",
+                                   std::size_t{136} * gufo::npu::runtime::kStripBytes, error);
+      if (s.m64) {
+        s.pH64[l] = s.rt.MakeProgram(2048, 2048, options.programs + "/insts_plain_2048x2048_m64.txt", 0, error, 0, 4);
+        s.pQkv64[l] = s.rt.MakeProgram(2048, 3072, options.programs + "/insts_plain_2048x3072_m64.txt", 0, error, 0, 4);
+      }
       if (c.layers[l] == LayerType::kConvolution) {
         buf.resize(std::size_t{6144} * 2048);
         s.LoadRows(pre + "conv.in_proj.weight", lw.in_proj, buf.data(), 6144, 2048);
@@ -303,9 +335,9 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
         s.LoadRows(pre + "self_attn.q_proj.weight", lw.q, buf.data(), 2048, 2048);
         s.LoadRows(pre + "self_attn.k_proj.weight", lw.k, buf.data() + std::size_t{2048} * 2048, 512, 2048);
         s.LoadRows(pre + "self_attn.v_proj.weight", lw.v, buf.data() + std::size_t{2560} * 2048, 512, 2048);
-        s.m_qkv[l] = s.rt.PackWeight(buf.data(), 3072, 2048); s.rt.Attach(s.m_qkv[l], s.p_qkv);
+        s.m_qkv[l] = s.rt.PackWeight(buf.data(), 3072, 2048);;
         s.LoadRows(pre + "self_attn.o_proj.weight", lw.attn_out, buf.data(), 2048, 2048);
-        s.m_out[l] = s.rt.PackWeight(buf.data(), 2048, 2048); s.rt.Attach(s.m_out[l], s.p_h);
+        s.m_out[l] = s.rt.PackWeight(buf.data(), 2048, 2048);;
         s.gate_w[l].resize(std::size_t{s.heads} * s.H);
         for (std::uint32_t h = 0; h < s.heads; ++h)
           DecodeRow(lw.attn_gate, h, std::span<float>(s.gate_w[l].data() + std::size_t{h} * s.H, s.H));
@@ -342,9 +374,14 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
         buf.resize(std::size_t{2048} * 7680);
         s.LoadRows(pre + "feed_forward.w2.weight", lw.down, buf.data(), 2048, 7680);
         gufo::npu::runtime::PackMatInt5(buf.data(), 2048, 7680, m.host + gu_bytes);
+        if (s.m64) s.m_ffn_dn[l] = s.rt.PackWeight(buf.data(), 2048, 7680);
         m.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        if (s.m64) {
+          s.pGu64[l] = s.rt.MakeProgram(2048, 15360, options.programs + "/insts_ffngu64.txt", 0, error, 0, 4);
+          s.pDn64[l] = s.rt.MakeProgram(7680, 2048, options.programs + "/insts_plain_7680x2048_m64.txt", 0, error, 0, 4);
+        }
         s.m_ffn[l] = std::move(m);
-        s.rt.Attach(s.m_ffn[l], s.p_ffn);
+        (void)0;
       }
     }
     // WP4: pack tied embedding as int5 head for NPU argmax, if program exists.
@@ -373,7 +410,7 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
             }
           }
           s.m_argmax = s.rt.PackWeight(emb.data(), V, s.H);
-          s.rt.Attach(s.m_argmax, s.p_argmax);
+          ;
           s.npu_argmax = true;
           std::fprintf(stderr, "npu engine: packed int5 argmax head (%u x %u)\n", V, s.H);
         } catch (...) {
@@ -383,7 +420,8 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
     }
     std::fprintf(stderr, "npu engine: packed %zu layers in %.1f s (spec: %s)\n", L,
                  Ms(t0) / 1000.0, s.spec.name.c_str());
-    return std::unique_ptr<Engine>(new Engine(std::move(im)));
+    auto eng = std::unique_ptr<Engine>(new Engine(std::move(im)));
+    return eng;
   } catch (const std::exception& e) {
     if (error) *error = e.what();
     return nullptr;
@@ -403,7 +441,10 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
   Impl& s = *impl_;
   const auto& c = s.w->config;
   const std::uint32_t n = static_cast<std::uint32_t>(tokens.size());
-  if (n == 0 || n > kMaxRows || s.pos + n > s.opt.context) return false;
+  // m64 prefill (WP10): 17..64 rows run on the m64 programs; EncodeA zero-pads and
+  // DecodeC skips rows >= n, so n need not be a multiple of 16.
+  if (n == 0 || s.pos + n > s.opt.context) return false;
+  if (n > 64 || (n > 16 && !s.m64)) return false;
   const std::uint32_t H = s.H, I = s.I, hd = s.hd, heads = s.heads, kvh = s.kvh, kvd = s.kvd, qd = s.qd;
   std::vector<float> x(std::size_t{n} * H), z(x.size()), z2(x.size()), branch(x.size()),
       qkv(std::size_t{n} * 3072), attn(std::size_t{n} * qd);
@@ -415,11 +456,19 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     RmsNorm(x.data(), static_cast<const float*>(lw.norm.data), z.data(), n, H, c.eps);
     s.t_cpu += Ms(cpu0);
     if (c.layers[l] == LayerType::kConvolution) {
-      s.rt.ConvStep(s.m_conv[l], z.data(), n, branch.data(), &s.tim);
-      cpu0 = Clock::now();
+      // Conv/attention kernels stay m16 (row-batching needs no weight-stream win there):
+      // run them in 16-row sub-steps; only the GEMMs batch to m64.
+      for (std::uint32_t o = 0; o < n; o += 16) {
+        const std::uint32_t m = std::min(16u, n - o);
+        s.rt.ConvStep(s.m_conv[l], z.data() + std::size_t{o} * H, m, branch.data() + std::size_t{o} * H, &s.tim);
+        // m64 chunks: roll conv history after every sub-step so the next sub-step sees
+        // its left context; n <= 16 keeps the deferred Commit (speculative rollback).
+        if (n > 16) s.rt.ConvCommit(s.m_conv[l], m, /*settle=*/true);
+      }
+            cpu0 = Clock::now();
     } else {
-      s.rt.Gemm(s.p_qkv, s.m_qkv[l], z.data(), n, qkv.data(), &s.tim);
-      cpu0 = Clock::now();
+      s.rt.Gemm(s.m64 && n > 16 ? s.pQkv64[l] : s.pQkv[l], s.m_qkv[l], z.data(), n, qkv.data(), &s.tim);
+            cpu0 = Clock::now();
       const bool swa = c.layers[l] == LayerType::kSlidingAttention;
       const float theta = swa ? c.theta_swa : c.theta;
       const auto* fac = static_cast<const float*>(s.w->rope_freqs.data);
@@ -473,10 +522,15 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       }
       bool npu_done = false;
       if (s.m_attn[l].host) {
-        const std::uint32_t capl = s.capacity[l];
-        (void)capl;
-        s.rt.AttnAppend(s.m_attn[l], s.pos, n, k.data(), s.v_cache[l].data(), &s.tim);
-        npu_done = s.rt.AttnRun(s.m_attn[l], s.pos, n, q.data(), s.k_cache[l].data(), s.v_cache[l].data(), s.programs_dir, attn.data(), &s.tim);
+        // Attn kernel is m16: one append+run pass per 16-row block.
+        npu_done = true;
+        for (std::uint32_t o = 0; o < n; o += 16) {
+          const std::uint32_t m = std::min(16u, n - o);
+          s.rt.AttnAppend(s.m_attn[l], s.pos + o, m, k.data() + std::size_t{o} * kvd, s.v_cache[l].data(), &s.tim);
+          npu_done = s.rt.AttnRun(s.m_attn[l], s.pos + o, m, q.data() + std::size_t{o} * qd,
+                                  s.k_cache[l].data(), s.v_cache[l].data(), s.programs_dir,
+                                  attn.data() + std::size_t{o} * qd, &s.tim) && npu_done;
+        }
         if (npu_done) {
           for (std::uint32_t t = 0; t < n; ++t)
             for (std::uint32_t h = 0; h < heads; ++h) {
@@ -649,7 +703,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
         std::fprintf(stderr, "attn check layer %zu pos %u n %u: rel err %.4f\n", l, s.pos, n, std::sqrt(num / den));
       }
       s.t_cpu += Ms(cpu0);
-      s.rt.Gemm(s.p_h, s.m_out[l], attn.data(), n, branch.data(), &s.tim);
+      s.rt.Gemm(s.m64 && n > 16 ? s.pH64[l] : s.pH[l], s.m_out[l], attn.data(), n, branch.data(), &s.tim);
     }
     cpu0 = Clock::now();
     if (lw.post_norm.data) {
@@ -660,15 +714,18 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     }
     RmsNorm(x.data(), static_cast<const float*>(lw.ffn_norm.data), z.data(), n, H, c.eps);
     s.t_cpu += Ms(cpu0);
-    s.rt.Ffn(s.p_ffn, s.m_ffn[l], z.data(), n, branch.data(), &s.tim);
-    cpu0 = Clock::now();
+    if (s.m64 && n > 16)
+      s.rt.Ffn64(s.m_ffn[l], s.pGu64[l], s.m_ffn_dn[l], s.pDn64[l], z.data(), n, branch.data(), &s.tim);
+    else
+      s.rt.Ffn(s.pFfn[l], s.m_ffn[l], z.data(), n, branch.data(), &s.tim);
+            cpu0 = Clock::now();
     if (lw.post_ffn_norm.data) {
       RmsNorm(branch.data(), static_cast<const float*>(lw.post_ffn_norm.data), z2.data(), n, H, c.eps);
       for (std::size_t i = 0; i < x.size(); ++i) x[i] += z2[i];
     } else {
       for (std::size_t i = 0; i < x.size(); ++i) x[i] += branch[i];
     }
-  }
+      }
   if (hidden) {
     hidden->resize(std::size_t{n} * H);
     RmsNorm(x.data(), static_cast<const float*>(s.w->output_norm.data), hidden->data(), n, H, c.eps);
@@ -731,9 +788,9 @@ std::uint32_t Engine::Argmax(const float* hidden_row) {
 void Engine::ArgmaxRows(const float* hidden, std::uint32_t rows, std::uint32_t* out) {
   Impl& s = *impl_;
   if (s.npu_argmax) {
-    // Run in chunks of kMaxRows; each call does one NPU dispatch.
-    for (std::uint32_t off = 0; off < rows; off += kMaxRows) {
-      const std::uint32_t n = std::min(kMaxRows, rows - off);
+    // Run in chunks of 16 (argmax kernel is m16); each call does one NPU dispatch.
+    for (std::uint32_t off = 0; off < rows; off += 16) {
+      const std::uint32_t n = std::min(16u, rows - off);
       s.rt.Argmax(s.p_argmax, s.m_argmax, hidden + std::size_t{off} * s.H, n, out + off, &s.tim);
     }
     return;
