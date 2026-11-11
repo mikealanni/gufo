@@ -1,16 +1,25 @@
 #include "aie_kernel_utils.h"
 #include <aie_api/aie.hpp>
 
+// WP10: the AIE C runtime drags __cxa_finalize (atexit.o) + float32_lt (softfloat) into
+// every core's program memory via the exit path, which never runs on the NPU. Stub it.
+extern "C" void __cxa_finalize(void *) {}
+
 constexpr int kRows = 16;
 constexpr int kCols = 32;
 constexpr int kK = 64;
 
-// GEMM/conv scratch and attention state never live in the same dispatch: share one arena.
-alignas(128) uint8_t arena[6144];
-static bfloat16 *const c_stage = (bfloat16 *)(arena + 0);
-static bfp16ebs8 *const b_scratch = (bfp16ebs8 *)(arena + 1024);
+// One arena holds everything live in L1: gemm scratch (m64: c_stage 4 KB + b_scratch +
+// comb + bbuf = 9 KB from +8192) aliases the attention output accumulator (a_o), since
+// gemm and attention dispatches never overlap. attn keeps 0..8192 for its row state,
+// a_o lives at +8192..+40960, a_chunk at +40960.
+alignas(128) uint8_t arena[42496];
+static bfloat16 *const c_stage = (bfloat16 *)(arena + 5120);
+static bfp16ebs8 *const b_scratch = (bfp16ebs8 *)(arena + 9216);
+static int g_mrows = 1;  // A row-blocks per B tile (1 = decode, 4 = m64 prefill)
+static int g_m = 0;      // current row-block within the current B tile
 
-static inline aie::vector<bfloat16, 64> ExpandScales(const bfloat16 *p) {
+__attribute__((noinline)) static aie::vector<bfloat16, 64> ExpandScales(const bfloat16 *p) {
   aie::vector<bfloat16, 8> s = aie::load_v<8>(p);
   auto z1 = aie::interleave_zip(s, s, 1);
   aie::vector<bfloat16, 16> s16 = aie::concat(z1.first, z1.second);
@@ -38,17 +47,23 @@ __attribute__((noinline)) static void Unpack(const uint16_t *__restrict pw,
   }
 }
 
-static inline void MacTile(bfp16ebs8 *__restrict pA) {
-  bfloat16 *pC = c_stage;
+__attribute__((noinline)) static void MacTile(bfp16ebs8 *__restrict pA, bfloat16 *__restrict pC,
+                                             int first) {
   for (int sb = 0; sb < kCols / 16; sb++) {
     aie::block_vector_input_buffer_stream<bfp16ebs8, 64> pB_stream(b_scratch);
     pB_stream.seek(sb * (kK / 8) * 2);
     aie::block_vector_input_buffer_stream<bfp16ebs8, 64> pA_stream(pA);
     pA_stream.seek(0);
-    aie::accum<accfloat, 64> acc0(aie::load_v<64>(pC));
-    aie::accum<accfloat, 64> acc1(aie::load_v<64>(pC + 64));
-    aie::accum<accfloat, 64> acc2(aie::load_v<64>(pC + 128));
-    aie::accum<accfloat, 64> acc3(aie::load_v<64>(pC + 192));
+    aie::vector<bfloat16, 64> v0 = aie::load_v<64>(pC), v1 = aie::load_v<64>(pC + 64),
+                                      v2 = aie::load_v<64>(pC + 128), v3 = aie::load_v<64>(pC + 192);
+    if (first) {  // first k-tile: start the C accumulator at zero (no zero_kernel call)
+      const aie::vector<bfloat16, 64> z = aie::zeros<bfloat16, 64>();
+      v0 = z; v1 = z; v2 = z; v3 = z;
+    }
+    aie::accum<accfloat, 64> acc0(v0);
+    aie::accum<accfloat, 64> acc1(v1);
+    aie::accum<accfloat, 64> acc2(v2);
+    aie::accum<accfloat, 64> acc3(v3);
     for (int ks = 0; ks < kK / 8; ks++) {
       aie::block_vector<bfp16ebs8, 64> a0 = pA_stream.pop();
       aie::block_vector<bfp16ebs8, 64> b0 = pB_stream.pop();
@@ -73,10 +88,12 @@ __attribute__((noinline)) static void FlushSwiglu(bfp16ebs8 *__restrict pC_bfp16
   const aie::vector<bfloat16, 64> c_hi = aie::broadcast<bfloat16, 64>((bfloat16)-1.4453125f);
   const aie::vector<bfloat16, 64> c_lo = aie::broadcast<bfloat16, 64>((bfloat16)0.0026175f);
   const aie::vector<bfloat16, 64> one = aie::broadcast<bfloat16, 64>((bfloat16)1.0f);
-  for (int sb = 0; sb < 2; sb++)
-    for (int br = 0; br < 2; br++) {
-      aie::vector<bfloat16, 64> gb = aie::load_v<64>(c_stage + sb * 256 + (br * 2) * 64);
-      aie::vector<bfloat16, 64> ub = aie::load_v<64>(c_stage + sb * 256 + (br * 2 + 1) * 64);
+  for (int mb = 0; mb < g_mrows; mb++)
+    for (int sb = 0; sb < 2; sb++)
+      for (int br = 0; br < 2; br++) {
+        const bfloat16 *base = c_stage + mb * 512;
+        aie::vector<bfloat16, 64> gb = aie::load_v<64>(base + sb * 256 + (br * 2) * 64);
+        aie::vector<bfloat16, 64> ub = aie::load_v<64>(base + sb * 256 + (br * 2 + 1) * 64);
       aie::accum<accfloat, 64> ap = aie::mul(gb, c_hi);
       ap = aie::mac(ap, gb, c_lo);
       aie::vector<float, 64> arg = ap.template to_vector<float>();
@@ -93,7 +110,7 @@ __attribute__((noinline)) static void FlushSwiglu(bfp16ebs8 *__restrict pC_bfp16
 __attribute__((noinline)) static void FlushPlain(bfp16ebs8 *__restrict pC_bfp16) {
   aie::block_vector_output_buffer_stream<bfp16ebs8, 64> out(pC_bfp16);
   out.seek(0);
-  for (int i = 0; i < kRows * kCols / 64; i++) {
+  for (int i = 0; i < g_mrows * kRows * kCols / 64; i++) {
     aie::accum<accfloat, 64> a(aie::load_v<64>(c_stage + i * 64));
     out.push(a.template to_vector<bfp16ebs8>());
   }
@@ -101,9 +118,12 @@ __attribute__((noinline)) static void FlushPlain(bfp16ebs8 *__restrict pC_bfp16)
 
 // Per-strip argmax reduce: 16 rows x 32 cols -> (float max, uint32 col) per row.
 __attribute__((noinline)) static void FlushArgmax(uint8_t *__restrict pC) {
+  // WP10: compare IEEE-754 order-preserved uint keys, not floats: AIE has no scalar float
+  // compare and the softfloat helper costs 186 B of the 16 KB program memory.
   float bv[kRows];
   uint32_t bc[kRows];
-  for (int r = 0; r < kRows; ++r) { bv[r] = -3.4e38f; bc[r] = 0; }
+  uint32_t bk[kRows];
+  for (int r = 0; r < kRows; ++r) { bv[r] = -3.4e38f; bc[r] = 0; bk[r] = 0; }
   for (int sb = 0; sb < 2; ++sb) {
     for (int acc = 0; acc < 4; ++acc) {
       const int rowbase = (acc >= 2) ? 8 : 0;
@@ -113,8 +133,10 @@ __attribute__((noinline)) static void FlushArgmax(uint8_t *__restrict pC) {
         const int row = rowbase + rr;
         const bfloat16 *pr = p + rr * 8;
         for (int c = 0; c < 8; ++c) {
-          float v = (float)pr[c];
-          if (v > bv[row]) { bv[row] = v; bc[row] = colbase + (uint32_t)c; }
+          const float v = (float)pr[c];
+          const uint32_t fbits = (uint32_t)*(const uint16_t *)(pr + c) << 16;
+          const uint32_t key = fbits & 0x80000000u ? ~fbits : (fbits | 0x80000000u);
+          if (key > bk[row]) { bk[row] = key; bv[row] = v; bc[row] = colbase + (uint32_t)c; }
         }
       }
     }
@@ -127,8 +149,8 @@ __attribute__((noinline)) static void FlushArgmax(uint8_t *__restrict pC) {
 
 
 constexpr int kCombRows = 24;
-static bfloat16 *const comb = (bfloat16 *)(arena + 3456);
-static bfloat16 *const bbuf = (bfloat16 *)(arena + 4992);
+static bfloat16 *const comb = (bfloat16 *)(arena + 14848);
+static bfloat16 *const bbuf = (bfloat16 *)(arena + 16384);
 static int strip_ctr = 0;
 
 static inline aie::vector<bfloat16, 64> Rep8(const bfloat16 *p) {
@@ -201,13 +223,30 @@ void attn_out(uint8_t *pC, int32_t idx) { AttnOut(pC, idx); }
 static int kc_p1 = 0;
 static int kc_dn = 0;
 
+// Shared k-tile advance: unpack once per B tile, mac mrows A-blocks, advance the k counter.
+// Returns true when the C tile (all k-tiles) is complete.
+__attribute__((noinline)) static bool TileStep(bfp16ebs8 *__restrict pA, uint8_t *__restrict pBp,
+                                              int32_t kcnt, int *kc) {
+  if (g_m == 0) Unpack((const uint16_t *)pBp, (const bfloat16 *)(pBp + 1408));
+  MacTile(pA, c_stage + g_m * kRows * kCols, *kc == 0);
+  if (++g_m < g_mrows) return false;
+  g_m = 0;
+  if (*kc == kcnt - 1) {
+    *kc = 0;
+    return true;
+  }
+  *kc += 1;
+  return false;
+}
+
 void matmul_p1(bfp16ebs8 *__restrict pA, uint8_t *__restrict pBp,
-               uint8_t *__restrict pC, int32_t kcnt, int32_t mode) {
+               uint8_t *__restrict pC, int32_t kcnt, int32_t mode, int32_t mrows) {
   ::aie::set_rounding(::aie::rounding_mode::conv_even);
+  g_mrows = mrows;
   if (mode == 1) {
     if (kc_p1 < kcnt - 1) {
       Unpack((const uint16_t *)pBp, (const bfloat16 *)(pBp + 1408));
-      MacTile(pA);
+      MacTile(pA, c_stage, kc_p1 == 0);
       kc_p1 += 1;
       return;
     }
@@ -215,35 +254,18 @@ void matmul_p1(bfp16ebs8 *__restrict pA, uint8_t *__restrict pBp,
     FlushConv(pBp, pC);
     return;
   }
-  Unpack((const uint16_t *)pBp, (const bfloat16 *)(pBp + 1408));
-  MacTile(pA);
-  if (kc_p1 == kcnt - 1) {
-    kc_p1 = 0;
-    FlushSwiglu((bfp16ebs8 *)pC);
-  } else {
-    kc_p1 += 1;
-  }
+  if (TileStep(pA, pBp, kcnt, &kc_p1)) FlushSwiglu((bfp16ebs8 *)pC);
 }
 
 void matmul_dn(bfp16ebs8 *__restrict pA, uint8_t *__restrict pBp,
-               uint8_t *__restrict pC, int32_t kcnt, int32_t mode) {
+               uint8_t *__restrict pC, int32_t kcnt, int32_t mode, int32_t mrows) {
   ::aie::set_rounding(::aie::rounding_mode::conv_even);
-  Unpack((const uint16_t *)pBp, (const bfloat16 *)(pBp + 1408));
-  MacTile(pA);
-  if (kc_dn == kcnt - 1) {
-    kc_dn = 0;
-    if (mode == 2)
-      FlushArgmax(pC);
-    else
-      FlushPlain((bfp16ebs8 *)pC);
-  } else {
-    kc_dn += 1;
-  }
+  g_mrows = mrows;
+  if (!TileStep(pA, pBp, kcnt, &kc_dn)) return;
+  if (mode == 2)
+    FlushArgmax(pC);
+  else
+    FlushPlain((bfp16ebs8 *)pC);
 }
 
-void zero_kernel(uint8_t *__restrict cOut) {
-  const aie::vector<bfloat16, 64> zeros = aie::zeros<bfloat16, 64>();
-  for (int i = 0; i < kRows * kCols / 64; i++)
-    aie::store_v(c_stage + i * 64, zeros);
-}
-}
+}  // extern "C"

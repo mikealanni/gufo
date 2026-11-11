@@ -21,13 +21,14 @@ constexpr int kAttnRowBlocks = 8;   // 64 q rows = 8 blocks of 8
 constexpr int kAttnDimBlocks = 16;  // 128 dims
 
 alignas(128) bfp16ebs8 a_q[kAttnRowBlocks * 16 * 8];       // [rb][ks] blocks of 8 groups
-alignas(128) uint8_t a_chunk[4608];                          // K (256 groups) then V^T (256 groups)
-alignas(128) float a_o[kAttnRowBlocks * kAttnDimBlocks * 64];
+// a_chunk and a_o live in the shared arena (attn-only state; gemm dispatches alias a_o).
+uint8_t *const a_chunk = (uint8_t *)(arena + 37888);       // K (256 groups) then V^T (256 groups)
+float *const a_o = (float *)(arena + 5120);                // PV accumulator
 static float *const a_m = (float *)(arena + 0);       // 64 rows
 static int32_t *const a_hi = (int32_t *)(arena + 256);  // last token visible to the streamed (finalized-V) path
 static int32_t *const a_pp = (int32_t *)(arena + 512);  // row position (last token visible to the tail path)
 static int32_t *const a_lo = (int32_t *)(arena + 768);  // row window floor: first key valid for the row
-static float *const a_l = (float *)(arena + 4096);
+static float *const a_l = (float *)(arena + 1024);
 static int a_pos = 0, a_n = 0, a_feed = 0, a_chunk_idx = 0;
 static int a_qhi = 0, a_win = 0;      // ring: absolute chunk of newest tokens; sliding window size (0 = full ctx)
 static int a_tab[32];                 // ring: slot chunk -> qhi - absolute chunk (-1 = stale slot)

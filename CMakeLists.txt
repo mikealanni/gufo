@@ -283,6 +283,27 @@ if (GUFO_BUILD_NPU_ENGINE)
   target_compile_options(gufo-npu PRIVATE -O3 -march=native -ffast-math -fno-finite-math-only)
   target_link_libraries(gufo-npu PRIVATE gufo_lfm3 OpenMP::OpenMP_CXX
     ${GUFO_XRT_LIB_DIR}/libxrt_coreutil.so.2 ${GUFO_XRT_LIB_DIR}/libxrt_core.so.2)
+  add_executable(sbtest-gemm64
+    src/npu/runtime/runtime.cpp
+    tools/npu/decode_int5/sbtest_gemm64.cpp)
+  add_executable(sbtest-ffn64
+    src/npu/runtime/runtime.cpp
+    tools/npu/decode_int5/sbtest_ffn64.cpp)
+  add_executable(sbtest-ffn64b
+    src/npu/runtime/runtime.cpp
+    tools/npu/decode_int5/sbtest_ffn64b.cpp)
+  target_include_directories(sbtest-gemm64 PRIVATE ${PROJECT_SOURCE_DIR} ${GUFO_XRT_INCLUDE_DIR})
+  target_compile_options(sbtest-gemm64 PRIVATE -O3 -march=native -ffast-math -fno-finite-math-only)
+  target_link_libraries(sbtest-gemm64 PRIVATE OpenMP::OpenMP_CXX
+    ${GUFO_XRT_LIB_DIR}/libxrt_coreutil.so.2 ${GUFO_XRT_LIB_DIR}/libxrt_core.so.2)
+  target_include_directories(sbtest-ffn64 PRIVATE ${PROJECT_SOURCE_DIR} ${GUFO_XRT_INCLUDE_DIR})
+  target_include_directories(sbtest-ffn64b PRIVATE ${PROJECT_SOURCE_DIR} ${GUFO_XRT_INCLUDE_DIR})
+  target_compile_options(sbtest-ffn64 PRIVATE -O3 -march=native -ffast-math -fno-finite-math-only)
+  target_compile_options(sbtest-ffn64b PRIVATE -O3 -march=native -ffast-math -fno-finite-math-only)
+  target_link_libraries(sbtest-ffn64 PRIVATE OpenMP::OpenMP_CXX
+    ${GUFO_XRT_LIB_DIR}/libxrt_coreutil.so.2 ${GUFO_XRT_LIB_DIR}/libxrt_core.so.2)
+  target_link_libraries(sbtest-ffn64b PRIVATE OpenMP::OpenMP_CXX
+    ${GUFO_XRT_LIB_DIR}/libxrt_coreutil.so.2 ${GUFO_XRT_LIB_DIR}/libxrt_core.so.2)
 endif()
 
 add_executable(gufo

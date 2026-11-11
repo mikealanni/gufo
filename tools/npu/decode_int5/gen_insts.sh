@@ -13,8 +13,10 @@ trap 'rm -rf "$work"' EXIT
 
 gen_plain() {
   local K="$1" N="$2"
-  local out="${3:-insts_plain_${K}x${N}.txt}"
-  python3 "$dir/n32_core_placed.py" -m 16 -k 64 -n 128 -M 16 -K "$K" -N "$N" --mode plain --k2 "$K" --n2 "$N" >"$work/a.mlir"
+  local MR="${3:-1}"
+  local out
+  if [[ -n "${4:-}" ]]; then out="$4"; elif [[ "$MR" == 1 ]]; then out="insts_plain_${K}x${N}.txt"; else out="insts_plain_${K}x${N}_m64.txt"; fi
+  python3 "$dir/n32_core_placed.py" -m 16 -k 64 -n 128 -M 16 -K "$K" -N "$N" --mode plain --k2 "$K" --n2 "$N" --mrows "$MR" >"$work/a.mlir"
   aiecc --aietools="${AIETOOLS:?}" --alloc-scheme=basic-sequential --no-compile --no-link \
     --no-xchesscc --aie-generate-npu-insts --unified --dynamic-objFifos \
     --npu-insts-name="$work/i.txt" "$work/a.mlir" >/dev/null
@@ -23,9 +25,11 @@ gen_plain() {
 }
 
 gen_ffn() {
-  local K1="$1" N1="$2" K2="$3" N2="$4" out="${5:-insts_ffn.txt}"
+  local K1="$1" N1="$2" K2="$3" N2="$4" MR="${5:-1}"
+  local out
+  if [[ -n "${6:-}" ]]; then out="$6"; elif [[ "$MR" == 1 ]]; then out="insts_ffn.txt"; else out="insts_ffn_m64.txt"; fi
   python3 "$dir/n32_core_placed.py" -m 16 -k 64 -n 128 -M 16 -K "$K1" -N "$N1" --mode ffn \
-    --k1 "$K1" --n1 "$N1" --k2 "$K2" --n2 "$N2" >"$work/a.mlir"
+    --k1 "$K1" --n1 "$N1" --k2 "$K2" --n2 "$N2" --mrows "$MR" >"$work/a.mlir"
   aiecc --aietools="${AIETOOLS:?}" --alloc-scheme=basic-sequential --no-compile --no-link \
     --no-xchesscc --aie-generate-npu-insts --unified --dynamic-objFifos \
     --npu-insts-name="$work/i.txt" "$work/a.mlir" >/dev/null
@@ -55,7 +59,7 @@ gen_attn() {
 }
 
 gen_attn_all() {
-  for mc in 1 2 4 8 16 32 64 128 256 512; do gen_attn "$mc"; done
+  for mc in 1 2 3 4 8 16 32 64 128 256 512; do gen_attn "$mc"; done
 }
 
 gen_argmax() {
@@ -80,15 +84,15 @@ case "${1:-default}" in
     gen_conv "$2" "$3" "${4:-}"
     ;;
   plain)
-    gen_plain "$2" "$3" "${4:-}"
+    gen_plain "$2" "$3" "${4:-1}" "${5:-}"
     ;;
   ffn)
-    gen_ffn "$2" "$3" "$4" "$5" "${6:-}"
+    gen_ffn "$2" "$3" "$4" "$5" "${6:-1}" "${7:-}"
     ;;
   spec)
     # Minimal: emit LFM3 defaults; full spec-driven enumeration is in ModelSpec tooling.
     echo "spec-driven generation: using model spec program needs (LFM3 default set)"
-    gen_ffn 2048 15360 7680 2048 insts_ffn.txt
+    gen_ffn 2048 15360 7680 2048 1 insts_ffn.txt
     gen_conv 2048 6144
     gen_plain 2048 2048
     gen_plain 2048 3072
@@ -97,11 +101,16 @@ case "${1:-default}" in
     ;;
   default|*)
     # LFM3-1.7B (WP6): shapes explicit, no literals in generator.
-    gen_ffn 2048 15360 7680 2048 insts_ffn.txt
+    gen_ffn 2048 15360 7680 2048 1 insts_ffn.txt
     gen_conv 2048 6144
     gen_plain 2048 2048
     gen_plain 2048 3072
     gen_argmax 2048 128000
     gen_attn_all
+    # WP10 m64 prefill variants (ffn split: gu-only + plain down).
+    gen_ffn 2048 15360 0 0 4 insts_ffngu64.txt
+    gen_plain 7680 2048 4
+    gen_plain 2048 2048 4
+    gen_plain 2048 3072 4
     ;;
 esac
