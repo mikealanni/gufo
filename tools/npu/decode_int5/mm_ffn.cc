@@ -99,6 +99,32 @@ __attribute__((noinline)) static void FlushPlain(bfp16ebs8 *__restrict pC_bfp16)
   }
 }
 
+// Per-strip argmax reduce: 16 rows x 32 cols -> (float max, uint32 col) per row.
+__attribute__((noinline)) static void FlushArgmax(uint8_t *__restrict pC) {
+  float bv[kRows];
+  uint32_t bc[kRows];
+  for (int r = 0; r < kRows; ++r) { bv[r] = -3.4e38f; bc[r] = 0; }
+  for (int sb = 0; sb < 2; ++sb) {
+    for (int acc = 0; acc < 4; ++acc) {
+      const int rowbase = (acc >= 2) ? 8 : 0;
+      const uint32_t colbase = (uint32_t)(sb * 16 + (acc & 1) * 8);
+      const bfloat16 *p = c_stage + sb * 256 + acc * 64;
+      for (int rr = 0; rr < 8; ++rr) {
+        const int row = rowbase + rr;
+        const bfloat16 *pr = p + rr * 8;
+        for (int c = 0; c < 8; ++c) {
+          float v = (float)pr[c];
+          if (v > bv[row]) { bv[row] = v; bc[row] = colbase + (uint32_t)c; }
+        }
+      }
+    }
+  }
+  for (int r = 0; r < kRows; ++r) {
+    ((float *)pC)[r * 2] = bv[r];
+    ((uint32_t *)pC)[r * 2 + 1] = bc[r];
+  }
+}
+
 
 constexpr int kCombRows = 24;
 static bfloat16 *const comb = (bfloat16 *)(arena + 3456);
@@ -200,14 +226,16 @@ void matmul_p1(bfp16ebs8 *__restrict pA, uint8_t *__restrict pBp,
 }
 
 void matmul_dn(bfp16ebs8 *__restrict pA, uint8_t *__restrict pBp,
-               uint8_t *__restrict pC, int32_t kcnt) {
-  bfp16ebs8 *pC_bfp16 = (bfp16ebs8 *)pC;
+               uint8_t *__restrict pC, int32_t kcnt, int32_t mode) {
   ::aie::set_rounding(::aie::rounding_mode::conv_even);
   Unpack((const uint16_t *)pBp, (const bfloat16 *)(pBp + 1408));
   MacTile(pA);
   if (kc_dn == kcnt - 1) {
     kc_dn = 0;
-    FlushPlain(pC_bfp16);
+    if (mode == 2)
+      FlushArgmax(pC);
+    else
+      FlushPlain((bfp16ebs8 *)pC);
   } else {
     kc_dn += 1;
   }

@@ -58,7 +58,21 @@ gen_attn_all() {
   for mc in 1 2 4 8 16 32 64 128 256 512; do gen_attn "$mc"; done
 }
 
+gen_argmax() {
+  local K="$1"
+  local N="$2"
+  local out="${3:-insts_argmax_${K}x${N}.txt}"
+  python3 "$dir/n32_core_placed.py" -m 16 -k 64 -n 128 -M 16 -K "$K" -N "$K" --mode argmax \
+    --k2 "$K" --n2 "$N" >"$work/a.mlir"
+  aiecc --aietools="${AIETOOLS:?}" --alloc-scheme=basic-sequential --no-compile --no-link     --no-xchesscc --aie-generate-npu-insts --unified --dynamic-objFifos     --npu-insts-name="$work/i.txt" "$work/a.mlir" >/dev/null
+  mv "$work/i.txt" "$dir/runtime/$out"
+  echo "generated $out (argmax ${K}x${N})"
+}
+
 case "${1:-default}" in
+  argmax)
+    gen_argmax "$2" "$3" "${4:-}"
+    ;;
   attn)
     gen_attn "$2"
     ;;
@@ -78,6 +92,7 @@ case "${1:-default}" in
     gen_conv 2048 6144
     gen_plain 2048 2048
     gen_plain 2048 3072
+    gen_argmax 2048 128000
     gen_attn_all
     ;;
   default|*)
@@ -86,6 +101,7 @@ case "${1:-default}" in
     gen_conv 2048 6144
     gen_plain 2048 2048
     gen_plain 2048 3072
+    gen_argmax 2048 128000
     gen_attn_all
     ;;
 esac

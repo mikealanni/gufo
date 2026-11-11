@@ -70,7 +70,7 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None):
         )
         matmul_dn = external_func(
             "matmul_dn",
-            inputs=[A_ty, B_l1_ty, C_l1_ty, np.int32],
+            inputs=[A_ty, B_l1_ty, C_l1_ty, np.int32, np.int32],
             link_with=f"mm_{m}x{k}x{n}.o",
         )
 
@@ -174,7 +174,7 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None):
                             for _ in range_(k2):
                                 elem_b = B_l2l1[row][col].acquire(ObjectFifoPort.Consume, 1)
                                 elem_a = A_l2l1.acquire(ObjectFifoPort.Consume, 1)
-                                matmul_dn(elem_a, elem_b, elem_out, k2_i32)
+                                matmul_dn(elem_a, elem_b, elem_out, k2_i32, attn_on_i32)
                                 A_l2l1.release(ObjectFifoPort.Consume, 1)
                                 B_l2l1[row][col].release(ObjectFifoPort.Consume, 1)
                             C_l1l2[row][col].release(ObjectFifoPort.Produce, 1)
@@ -265,6 +265,10 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None):
             N2 = n2 if n2 is not None else 2048
             k1t = K1 // k
             KA, rtp_mode = K1, 0
+        elif mode == "argmax":
+            K1, K2, N1, N2 = k, (k2 if k2 is not None else K), 0, (n2 if n2 is not None else N)
+            k1t = 0
+            KA, rtp_mode = K2, 0
         else:
             K1, K2, N1, N2 = k, (k2 if k2 is not None else K), 0, (n2 if n2 is not None else N)
             k1t = 0
@@ -289,7 +293,7 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None):
                     npu_rtp_write(f"rtp_{row}_{col}", 2, K2 // k)
                     npu_rtp_write(f"rtp_{row}_{col}", 3, N2 // n // n_aie_cols)
                     npu_rtp_write(f"rtp_{row}_{col}", 4, rtp_mode)
-                    npu_rtp_write(f"rtp_{row}_{col}", 5, 0)
+                    npu_rtp_write(f"rtp_{row}_{col}", 5, 2 if mode == "argmax" else 0)
                     npu_rtp_write(f"rtp_{row}_{col}", 6, 0)
                     set_lock_value(rtp_locks[row][col], 1)
             A_tap = TensorAccessPattern((1, a_groups), 0, [1, 1, 1, a_groups], [0, 0, 0, 1])
