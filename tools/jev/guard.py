@@ -611,7 +611,27 @@ def biggest_foreign_rss(skip_pgid, skip_pids=()):
             continue
         if rss > best:
             best, best_pid = rss, int(entry)
-    return best_pid
+    page = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+    return best_pid, best * page / (1024 ** 3)
+
+
+def foreign_rss_over_gb(skip_pgid, skip_pids, limit_gb):
+    """Pid and RSS (GB) of a non-gufo process exceeding limit_gb, or (0, 0)."""
+    page = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) in skip_pids:
+            continue
+        try:
+            pid = int(entry)
+            if os.getpgid(pid) == skip_pgid:
+                continue
+            with open(f"/proc/{entry}/statm") as f:
+                rss_gb = int(f.read().split()[1]) * page / (1024 ** 3)
+        except (OSError, ValueError):
+            continue
+        if rss_gb > limit_gb:
+            return pid, rss_gb
+    return 0, 0.0
 
 
 class Judge:
@@ -902,22 +922,34 @@ class Guard:
 
     async def memory_watchdog(self):
         low = 0
+        rss_hits = 0
         while True:
             await asyncio.sleep(2)
             if self.state != "up":
                 low = 0
+                rss_hits = 0
                 continue
-            low = low + 1 if mem_available_gb() < self.a.reactive_gb else 0
+            avail = mem_available_gb()
+            low = low + 1 if avail < self.a.reactive_gb else 0
+            own = {os.getpid()}
+            if self.judge is not None and self.judge.proc is not None:
+                own.add(self.judge.proc.pid)
+            big_pid, big_rss = foreign_rss_over_gb(self.proc.pid if self.proc else -1, own, self.a.foreign_rss_gb)
+            rss_hits = rss_hits + 1 if big_pid else 0
+            reason = None
             if low >= 3:
+                if not big_pid:
+                    big_pid, big_rss = biggest_foreign_rss(self.proc.pid if self.proc else -1, own)
+                reason = f"memory pressure avail={avail:.1f}GB (<{self.a.reactive_gb}GB), top pid={big_pid} rss={big_rss:.1f}GB"
+            elif rss_hits >= 2:
+                reason = f"foreign process rss pressure pid={big_pid} rss={big_rss:.1f}GB (>{self.a.foreign_rss_gb}GB)"
+            if reason:
                 low = 0
-                own = {os.getpid()}
-                if self.judge is not None and self.judge.proc is not None:
-                    own.add(self.judge.proc.pid)
-                pid = biggest_foreign_rss(self.proc.pid if self.proc else -1, own)
-                await self.drain_for_watchdog(f"memory pressure, top process pid={pid}")
-                if await self.stop_gufo(f"memory pressure, top process pid={pid}"):
-                    self._attribute_catch(pid, f"memory watchdog pid={pid}")
-                    self.begin_watch(f"pid {pid}", lambda: [pid] if os.path.exists(f"/proc/{pid}") else [], True)
+                rss_hits = 0
+                await self.drain_for_watchdog(reason)
+                if await self.stop_gufo(reason):
+                    self._attribute_catch(big_pid, f"memory watchdog pid={big_pid}")
+                    self.begin_watch(f"pid {big_pid}", lambda pid=big_pid: [pid] if os.path.exists(f"/proc/{pid}") else [], True)
 
     def own_pids(self):
         own = {os.getpid()}
@@ -1219,7 +1251,10 @@ def main():
     p.add_argument("--npu-dir", default=f"{home}/gufo/tools/npu")
     p.add_argument("--judge-cutoff", type=float, default=0.85)
     p.add_argument("--free-target-gb", type=float, default=60)
-    p.add_argument("--reactive-gb", type=float, default=2.5)
+    p.add_argument("--reactive-gb", type=float, default=15.0,
+                   help="stop gufo when available memory stays below this for ~6s")
+    p.add_argument("--foreign-rss-gb", type=float, default=20.0,
+                   help="stop gufo when any non-gufo process RSS exceeds this")
     p.add_argument("--quiet", type=float, default=8)
     p.add_argument("--appear-grace", type=float, default=30)
     p.add_argument("--max-hold", type=float, default=7200)

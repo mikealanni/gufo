@@ -393,7 +393,9 @@ export default {
         });
       } catch (err) { noteError("http.request", err); }
     });
-    // /jev: native command, so the session id comes from opencode itself (documented execute({ sessionID })).
+    // /jev is a markdown command (~/.config/opencode/commands/jev.md -> ~/.gufo/jev-ctl.sh): opencode 2.2.6 has no
+    // working plugin output call. Set JEV_PLUGIN_COMMAND=1 to register the old native command instead.
+    if (process.env.JEV_PLUGIN_COMMAND === "1") {
     try {
       await ctx.command.transform((editor: any) => {
         editor.add({
@@ -409,6 +411,7 @@ export default {
       });
       try { await ctx.command.reload(); } catch (err) { noteError("command.reload", err); }
     } catch (err) { noteError("command.register", err); }
+    }
     await ctx.tool.hook("execute.before", async (e: any) => {
       const sid = String(e.sessionID ?? "");
       const call = String(e.id ?? e.callID ?? "");
