@@ -1,3 +1,8 @@
+// Standalone attention kernel harness (attn instruction streams).
+//   gufo-attn <xclbin> <insts_attn_MC.txt> <L> [n=16] [reps=10]
+// env: RING=1 [WIN=256] -> sliding-window ring cache (384 tokens, 24 chunks, needs insts_attn_3)
+//      MIXINSTS=<insts_plain> ITERS=<n> -> determinism: repeat attn, interleaved with a GEMM program
+//      QS=<float> -> q scale factor
 #include <immintrin.h>
 #include <xrt/xrt_bo.h>
 #include <xrt/xrt_device.h>
@@ -7,6 +12,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <random>
@@ -32,15 +38,6 @@ static void DecGroup(const uint8_t* p, float* v) {
   float mult = std::ldexp(1.0f, (int)p[0] - 127) / 64.0f;
   for (int i = 0; i < 8; ++i) v[i] = (float)(int8_t)p[1 + i] * mult;
 }
-static float bf16r(float f) {
-  uint32_t u;
-  std::memcpy(&u, &f, 4);
-  u += 0x7FFF + ((u >> 16) & 1);
-  u &= 0xFFFF0000u;
-  float r;
-  std::memcpy(&r, &u, 4);
-  return r;
-}
 
 int main(int argc, char** argv) {
   const char* xclbin = argv[1];
@@ -48,8 +45,14 @@ int main(int argc, char** argv) {
   const int L = atoi(argv[3]);      // total keys (pos + n)
   const int n = argc > 4 ? atoi(argv[4]) : 16;
   const int reps = argc > 5 ? atoi(argv[5]) : 10;
+  const int ring = getenv("RING") ? atoi(getenv("RING")) : 0;
+  const int win = getenv("WIN") ? atoi(getenv("WIN")) : 256;
+  const int RING_CHUNKS = 24;       // ring_tokens / 16, must match runtime (384/16)
   const int pos = L - n, HD = 128, KVH = 4, QH = 16;
-  const int qchunks = (L + 15) / 16, mchunks = (qchunks + 7) / 8;
+  int qchunks = (L + 15) / 16;
+  int ringtok = 0;
+  if (ring) { ringtok = RING_CHUNKS * 16; qchunks = RING_CHUNKS; }
+  const int mchunks = (qchunks + 7) / 8;
   std::mt19937 rng(5);
   std::normal_distribution<float> nd(0, 1);
   const float log2e = 1.4426950408889634f, sc = log2e / std::sqrt((float)HD);
@@ -59,7 +62,7 @@ int main(int argc, char** argv) {
   for (auto& x : V) x = nd(rng);
   // quantize + build device formats; keep decoded copies for the reference
   std::vector<float> Qd = Q, Kd = K, Vd = V;
-  std::vector<uint8_t> A((size_t)33 * 128 * 9, 0);
+  std::vector<uint8_t> A((size_t)69 * 128 * 9, 0);
   std::vector<uint8_t> Bbuf((size_t)8 * mchunks * 3 * 4 * 1536, 0);
   std::vector<float> Mrow((size_t)4 * 64, 0.f);
   for (int r = 0; r < KVH; ++r) {
@@ -80,9 +83,12 @@ int main(int argc, char** argv) {
       DecGroup(o, &Qd[((size_t)hq * 16 + t) * HD + ks * 8]);
     }
   }
-  for (int r = 0; r < KVH; ++r)
-    for (int q = 0; q < qchunks; ++q) {
-      int c = q % 8, m = q / 8;
+  // chunk cache: absolute chunks, or ring slots written by token (last writer wins)
+  for (int r = 0; r < KVH; ++r) {
+    const int nq = ring ? (int)((L + 15) / 16) : qchunks;   // ring: walk absolute, write slots
+    for (int q = 0; q < nq; ++q) {
+      if (!ring && q >= qchunks) continue;
+      const int sq = ring ? q % RING_CHUNKS : q;                    // slot chunk
       uint8_t chunk[4608] = {0};
       for (int kb = 0; kb < 2; ++kb) {
         for (int ks = 0; ks < 16; ++ks) for (int tt = 0; tt < 8; ++tt) {
@@ -101,10 +107,41 @@ int main(int argc, char** argv) {
         }
       }
       for (int j = 0; j < 3; ++j)
-        std::memcpy(&Bbuf[((((size_t)q) * 3 + j) * 4 + r) * 1536], chunk + j * 1536, 1536); (void)c; (void)m;
+        std::memcpy(&Bbuf[(((size_t)sq * 3 + j) * 4 + r) * 1536], chunk + j * 1536, 1536);
     }
-  int32_t hdr[2] = {pos, n};
-  std::memcpy(A.data(), hdr, 8);
+  }
+  {
+    // Tail: exact bf16 V (and K groups) for the 8-token blocks the rows live in.
+    const int total = L, t0 = pos & ~7;
+    for (int r = 0; r < KVH; ++r)
+      for (int tb = 0; tb < 3; ++tb) {
+        uint8_t* dst = &A[((size_t)(1 + 32 + (tb * 4 + r) * 3)) * 1152];
+        int tokbase = t0 + tb * 8;
+        if (tokbase >= total) continue;
+        for (int ks = 0; ks < 16; ++ks) for (int tt = 0; tt < 8; ++tt) {
+          if (tokbase + tt >= total) continue;
+          float v8[8]; for (int i = 0; i < 8; ++i) v8[i] = K[((size_t)r * L + tokbase + tt) * HD + ks * 8 + i];
+          EncGroup(v8, dst + (ks * 8 + tt) * 9);
+        }
+        uint16_t* vd = (uint16_t*)(dst + 1152);
+        for (int db = 0; db < 16; ++db) for (int tt = 0; tt < 8; ++tt) for (int d = 0; d < 8; ++d) {
+          if (tokbase + tt >= total) continue;
+          float v = V[((size_t)r * L + tokbase + tt) * HD + db * 8 + d];
+          uint32_t u; std::memcpy(&u, &v, 4); vd[(db * 8 + tt) * 8 + d] = (uint16_t)(u >> 16);
+        }
+      }
+  }
+  {
+    int32_t h[4] = {pos, n, (L - 1) / 16, ring ? win : 0};
+    std::memcpy(A.data(), h, 16);
+    if (ring) {
+      int32_t* tab = (int32_t*)(A.data() + 16);
+      for (int s = 0; s < 24; ++s) tab[s] = -1;
+      const int qhi = (L - 1) / 16;
+      const int lo0 = pos + 1 > win ? pos + 1 - win : 0;
+      for (int q = lo0 / 16; q <= qhi; ++q) tab[q % 24] = qhi - q;
+    }
+  }
   std::memcpy(A.data() + 128, Mrow.data(), Mrow.size() * 4);
   const size_t c_bytes = (size_t)8 * 34 * 4 * 1024;
   xrt::device dev(0u);
@@ -115,7 +152,7 @@ int main(int argc, char** argv) {
   std::ifstream f(insts, std::ios::binary | std::ios::ate);
   size_t isz = f.tellg(); f.seekg(0);
   std::vector<char> iw(isz); f.read(iw.data(), isz);
-  xrt::bo ib(dev, isz, XCL_BO_FLAGS_CACHEABLE, kern.group_id(1));
+  xrt::bo ib(dev, isz, XRT_BO_FLAGS_CACHEABLE, kern.group_id(1));
   std::memcpy(ib.map<void*>(), iw.data(), isz); ib.sync(XCL_BO_SYNC_BO_TO_DEVICE);
   xrt::bo ba(dev, A.size(), XRT_BO_FLAGS_HOST_ONLY, kern.group_id(3));
   xrt::bo bb(dev, Bbuf.size(), XRT_BO_FLAGS_HOST_ONLY, kern.group_id(3));
@@ -132,6 +169,34 @@ int main(int argc, char** argv) {
   }
   bc.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
   const uint8_t* C = bc.map<uint8_t*>();
+  {
+    std::vector<uint8_t> first(C, C + c_bytes);
+    const char* mix = getenv("MIXINSTS");
+    xrt::bo ib2, ba2, bb2, bc2;
+    size_t isz2 = 0;
+    if (mix) {
+      std::ifstream f2(mix, std::ios::binary | std::ios::ate);
+      isz2 = f2.tellg(); f2.seekg(0);
+      std::vector<char> iw2(isz2); f2.read(iw2.data(), isz2);
+      ib2 = xrt::bo(dev, isz2, XRT_BO_FLAGS_CACHEABLE, kern.group_id(1));
+      std::memcpy(ib2.map<void*>(), iw2.data(), isz2); ib2.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      ba2 = xrt::bo(dev, (size_t)16 * 2048 / 8 * 9, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(3));
+      bb2 = xrt::bo(dev, (size_t)16 * 32 * 4 * 1536, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(3));
+      bc2 = xrt::bo(dev, (size_t)16 * 4096, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(3));
+      std::memset(ba2.map<void*>(), 0, (size_t)16 * 2048 / 8 * 9); std::memset(bb2.map<void*>(), 0, (size_t)16 * 32 * 4 * 1536);
+      ba2.sync(XCL_BO_SYNC_BO_TO_DEVICE); bb2.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    }
+    int bad = 0;
+    const int iters = getenv("ITERS") ? atoi(getenv("ITERS")) : 3000;
+    for (int r = 0; r < iters; ++r) {
+      if (mix) { auto run2 = kern(3, ib2, (unsigned)(isz2 / 4), ba2, bb2, bc2); run2.wait(); }
+      auto run = kern(3, ib, (unsigned)(isz / 4), ba, bb, bc);
+      run.wait();
+      bc.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+      if (std::memcmp(first.data(), C, c_bytes) != 0) ++bad;
+    }
+    std::printf("determinism: %d of %d repeats differ\n", bad, iters);
+  }
   // merge
   std::vector<double> O((size_t)KVH * 64 * HD, 0.0), Ls((size_t)KVH * 64, 0.0);
   for (int c = 0; c < 8; ++c) for (int r = 0; r < KVH; ++r) {
@@ -153,17 +218,20 @@ int main(int argc, char** argv) {
     int hq = r * 4 + i / 16, t = i % 16;
     if (t >= n) continue;
     int lim = pos + t;
-    std::vector<double> s(lim + 1);
+    int first = (ring && lim + 1 > win) ? lim + 1 - win : 0;
+    int cnt = lim - first + 1;
+    std::vector<double> s(cnt);
     double mx = -1e30;
-    for (int tok = 0; tok <= lim; ++tok) { double d = 0; for (int x = 0; x < HD; ++x) d += (double)Qd[((size_t)hq * 16 + t) * HD + x] * Kd[((size_t)r * L + tok) * HD + x]; s[tok] = d; mx = std::max(mx, d); }
+    for (int tok = first; tok <= lim; ++tok) { double d = 0; for (int x = 0; x < HD; ++x) d += (double)Qd[((size_t)hq * 16 + t) * HD + x] * Kd[((size_t)r * L + tok) * HD + x]; s[tok - first] = d; mx = std::max(mx, d); }
     double sum = 0; for (auto& v : s) { v = std::exp2(v - mx); sum += v; }
     for (int x = 0; x < HD; ++x) {
-      double ref = 0; for (int tok = 0; tok <= lim; ++tok) ref += s[tok] * Vd[((size_t)r * L + tok) * HD + x];
+      double ref = 0; for (int tok = first; tok <= lim; ++tok) ref += s[tok - first] * Vd[((size_t)r * L + tok) * HD + x];
       ref /= sum;
       double got = Ls[(size_t)r * 64 + i] > 0 ? O[((size_t)r * 64 + i) * HD + x] / Ls[(size_t)r * 64 + i] : 0.0;
       num += (got - ref) * (got - ref); den += ref * ref; maxabs = std::max(maxabs, std::fabs(got - ref));
     }
   }
-  std::printf("attn L=%d n=%d: rel err %.5f max abs %.5f; best %.4f ms (kv %.1f MB)\n", L, n, std::sqrt(num / den), maxabs, best, 8.0 * mchunks * 3 * 6144 / 1e6);
+  std::printf("attn L=%d n=%d%s: rel err %.5f max abs %.5f; best %.4f ms (kv %.1f MB)\n", L, n,
+              ring ? " RING" : "", std::sqrt(num / den), maxabs, best, 8.0 * mchunks * 3 * 6144 / 1e6);
   return 0;
 }
