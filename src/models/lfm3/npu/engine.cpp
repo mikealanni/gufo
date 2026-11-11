@@ -188,6 +188,9 @@ struct Engine::Impl {
   gufo::npu::runtime::Program p_conv, p_h, p_qkv, p_ffn;
   std::vector<gufo::npu::runtime::WeightBuffer> m_out, m_qkv, m_ffn;
   std::vector<gufo::npu::runtime::ConvLayer> m_conv;
+  std::vector<gufo::npu::runtime::AttnLayer> m_attn;
+  bool npu_attn{false};
+  std::string programs_dir;
   gufo::npu::runtime::NpuRuntime::Timings tim;
   std::uint32_t H{}, I{}, heads{}, hd{}, kvh{}, qd{}, kvd{}, taps{}, window{};
   std::uint32_t pos{0};
@@ -232,6 +235,8 @@ Engine::~Engine() {
                  t.calls, t.enc, t.syncA + t.submit + t.wait + t.syncC, t.dec, impl_->t_cpu);
     std::fprintf(stderr, "  syncA %.1f ms, submit %.1f ms, wait %.1f ms, syncC %.1f ms\n",
                  t.syncA, t.submit, t.wait, t.syncC);
+    std::fprintf(stderr, "  attn calls %d: append %.1f ms, prep %.1f ms, wait %.1f ms, merge %.1f ms\n",
+                 t.attn_calls, t.attn_append, t.attn_prep, t.attn_wait, t.attn_merge);
   }
 }
 
@@ -273,7 +278,9 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
 
     const auto t0 = Clock::now();
     const std::size_t L = c.layers.size();
-    s.m_conv.resize(L); s.m_out.resize(L); s.m_qkv.resize(L); s.m_ffn.resize(L);
+    s.m_conv.resize(L); s.m_attn.resize(L); s.m_out.resize(L);
+    s.programs_dir = options.programs;
+    s.npu_attn = !std::getenv("GUFO_CPU_ATTN") && options.context >= 1; s.m_qkv.resize(L); s.m_ffn.resize(L);
     s.gate_w.resize(L); s.k_cache.resize(L); s.v_cache.resize(L);
     s.capacity.assign(L, 0);
     std::vector<float> buf;
@@ -301,6 +308,8 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
         s.capacity[l] = c.layers[l] == LayerType::kSlidingAttention
                             ? std::min(options.context, s.window + kRows)
                             : options.context;
+        if (s.npu_attn && c.layers[l] == LayerType::kFullAttention && s.kvh == 4 && s.hd == 128 && s.heads == 16)
+          s.m_attn[l] = s.rt.MakeAttnLayer(options.context);
         s.k_cache[l].assign(std::size_t{s.capacity[l]} * s.kvd, 0);
         s.v_cache[l].assign(std::size_t{s.capacity[l]} * s.kvd, 0);
       }
@@ -342,6 +351,7 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
 void Engine::Reset() {
   Impl& s = *impl_; s.pos = 0;
   for (auto& cl : s.m_conv) if (cl.hidden) s.rt.ConvReset(cl);
+  for (auto& al : s.m_attn) if (al.host) s.rt.AttnReset(al);
   for (auto& v : s.k_cache) std::fill(v.begin(), v.end(), std::uint16_t{0});
   for (auto& v : s.v_cache) std::fill(v.begin(), v.end(), std::uint16_t{0});
 }
@@ -419,6 +429,28 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
           s.v_cache[l][std::size_t{slot} * kvd + i] = Bf16Bits(v[std::size_t{t} * kvd + i]);
         }
       }
+      bool npu_done = false;
+      if (s.m_attn[l].host) {
+        const std::uint32_t capl = s.capacity[l];
+        (void)capl;
+        s.rt.AttnAppend(s.m_attn[l], s.pos, n, k.data(), s.v_cache[l].data(), &s.tim);
+        npu_done = s.rt.AttnRun(s.m_attn[l], s.pos, n, q.data(), s.k_cache[l].data(), s.v_cache[l].data(), s.programs_dir, attn.data(), &s.tim);
+        if (npu_done) {
+          for (std::uint32_t t = 0; t < n; ++t)
+            for (std::uint32_t h = 0; h < heads; ++h) {
+              const float g = 1.0f / (1.0f + std::exp(-gate[std::size_t(t) * heads + h]));
+              float* o = &attn[std::size_t(t) * qd + h * hd];
+              for (std::uint32_t d = 0; d < hd; ++d) o[d] *= g;
+            }
+        } else {
+          static bool warned = false;
+          if (!warned) { std::fprintf(stderr, "npu attention fallback (layer %zu)\n", l); warned = true; }
+        }
+      }
+      static const bool check = std::getenv("GUFO_ATTN_CHECK") != nullptr;
+      std::vector<float> attn_npu;
+      if (check && npu_done) { attn_npu = attn; npu_done = false; }
+      if (!npu_done) {
       const float inv_sqrt = 1.0f / std::sqrt(static_cast<float>(hd));
       const std::uint32_t cap = s.capacity[l];
       // WP0: bf16 KV + SIMD dot/accum, no per-(token,head) heap allocation.
@@ -568,6 +600,12 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
           for (std::uint32_t d = 0; d < hd; d += 16)
             _mm512_storeu_ps(o + d, _mm512_mul_ps(_mm512_loadu_ps(acco + d), gv));
         }
+      }
+      if (!attn_npu.empty()) {
+        double num = 0, den = 0;
+        for (std::size_t i = 0; i < std::size_t{n} * qd; ++i) { const double d = attn_npu[i] - attn[i]; num += d * d; den += double(attn[i]) * attn[i]; }
+        std::fprintf(stderr, "attn check layer %zu pos %u n %u: rel err %.4f\n", l, s.pos, n, std::sqrt(num / den));
+      }
       s.t_cpu += Ms(cpu0);
       s.rt.Gemm(s.p_h, s.m_out[l], attn.data(), n, branch.data(), &s.tim);
     }

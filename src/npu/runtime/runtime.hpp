@@ -105,6 +105,16 @@ struct ConvLayer {
   std::uint32_t last_n{0};
 };
 
+// Full-attention layer KV cache in the attention kernel layout, plus its
+// per-bucket runs. Layout: [chunk q = token/16][3][4 kv heads][1536 B].
+struct AttnLayer {
+  xrt::bo kv;
+  std::uint8_t* host{};
+  std::uint32_t capacity_chunks{};
+  std::vector<float> kmax2;  // running max |k|^2 per kv head
+  std::unordered_map<std::uint32_t, xrt::run> runs;
+};
+
 class NpuRuntime {
  public:
   NpuRuntime() = default;
@@ -133,6 +143,8 @@ class NpuRuntime {
   // Updates timing accumulators.
   struct Timings {
     double enc{0}, syncA{0}, submit{0}, wait{0}, syncC{0}, dec{0};
+    double attn_append{0}, attn_prep{0}, attn_wait{0}, attn_merge{0};
+    int attn_calls{0};
     int calls{0};
   };
   void Gemm(Program& p, WeightBuffer& wb, const float* x, std::uint32_t n,
@@ -152,12 +164,30 @@ class NpuRuntime {
   void ConvCommit(ConvLayer& cl, std::uint32_t k);
   void ConvReset(ConvLayer& cl);
 
+  // Attention on the NPU (4 kv heads x 4 q heads x 128 dims, up to 16 rows per pass).
+  AttnLayer MakeAttnLayer(std::uint32_t capacity_tokens);
+  void AttnReset(AttnLayer& al);
+  /// Append rows [pos, pos+n) of k/v (n x 512, after norm+rope) to the device
+  /// cache. `k_hist`/`v_hist` are the host bf16 caches ([slot][512], slot = token).
+  void AttnAppend(AttnLayer& al, std::uint32_t pos, std::uint32_t n, const float* k,
+                  const std::uint16_t* v_hist, Timings* tm = nullptr);
+  /// q: n x 2048 (16 heads x 128, after norm+rope). Writes normalized attention
+  /// output (n x 2048, before the output gate). Returns false if a row's softmax
+  /// mass is outside the safe range (caller falls back to the CPU path).
+  bool AttnRun(AttnLayer& al, std::uint32_t pos, std::uint32_t n, const float* q,
+               const std::uint16_t* k_hist, const std::uint16_t* v_hist,
+               const std::string& programs_dir, float* out, Timings* tm = nullptr);
+
 
  private:
   xrt::device dev_;
   xrt::hw_context ctx_;
   xrt::kernel kern_;
   bool ready_{false};
+  xrt::bo attn_a_, attn_c_;
+  std::uint8_t* attn_ah_{};
+  std::uint8_t* attn_ch_{};
+  std::unordered_map<std::uint32_t, std::pair<xrt::bo, std::size_t>> attn_insts_;
 };
 
 }  // namespace gufo::npu::runtime

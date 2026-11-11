@@ -9,10 +9,21 @@ constexpr int kAttnDimBlocks = 16;  // 128 dims
 alignas(128) bfp16ebs8 a_q[kAttnRowBlocks * 16 * 8];       // [rb][ks] blocks of 8 groups
 alignas(128) uint8_t a_chunk[4608];                          // K (256 groups) then V^T (256 groups)
 alignas(128) float a_o[kAttnRowBlocks * kAttnDimBlocks * 64];
-static float *const a_m = (float *)(arena + 0);
-static int32_t *const a_hi = (int32_t *)(arena + 2048);
+static float *const a_m = (float *)(arena + 0);       // 64 rows
+static int32_t *const a_hi = (int32_t *)(arena + 256);  // last token visible to the streamed (finalized-V) path
+static int32_t *const a_pp = (int32_t *)(arena + 512);  // row position (last token visible to the tail path)
 static float *const a_l = (float *)(arena + 4096);
 static int a_pos = 0, a_n = 0, a_feed = 0, a_chunk_idx = 0;
+
+template <typename T>
+static inline aie::vector<T, 64> RepEach8(const aie::vector<T, 8> &s) {
+  auto z1 = aie::interleave_zip(s, s, 1);
+  aie::vector<T, 16> s16 = aie::concat(z1.first, z1.second);
+  auto z2 = aie::interleave_zip(s16, s16, 1);
+  aie::vector<T, 32> s32 = aie::concat(z2.first, z2.second);
+  auto z3 = aie::interleave_zip(s32, s32, 1);
+  return aie::concat(z3.first, z3.second);
+}
 
 static inline aie::vector<int32, 64> LaneCol() {
   alignas(128) static const int32_t tbl[64] = {
@@ -36,21 +47,20 @@ static inline aie::vector<bfloat16, 64> Exp2Wide(const aie::vector<float, 64> &a
 
 // hdr: int32[0]=pos, [1]=n; float M rows for this kv head at byte offset 128 + row_id*256.
 __attribute__((noinline)) static void AttnBegin(const uint8_t *hdr, int row_id) {
+  // Rounding mode persists across dispatches: pin it so results never depend on the previous program.
+  ::aie::set_rounding(::aie::rounding_mode::conv_even);
   const int32_t *ih = (const int32_t *)hdr;
   a_pos = ih[0];
   a_n = ih[1];
   a_feed = 0;
   a_chunk_idx = 0;
   const float *mrow = (const float *)(hdr + 128 + row_id * 256);
-  for (int rb = 0; rb < kAttnRowBlocks; rb++)
-    for (int rib = 0; rib < 8; rib++) {
-      const int t = (rb & 1) * 8 + rib;
-      const int32_t hi = t < a_n ? a_pos + t : -1;
-      for (int c = 0; c < 8; c++) {
-        a_m[rb * 64 + rib * 8 + c] = mrow[rb * 8 + rib];
-        a_hi[rb * 64 + rib * 8 + c] = hi;
-      }
-    }
+  for (int i = 0; i < 64; i++) {
+    const int t = i & 15;
+    a_m[i] = mrow[i];
+    a_pp[i] = t < a_n ? a_pos + t : -1;
+    a_hi[i] = t < a_n ? ((a_pos + t) & ~7) - 1 : -1;
+  }
   const aie::vector<float, 64> z = aie::zeros<float, 64>();
   for (int i = 0; i < kAttnRowBlocks * kAttnDimBlocks; i++) aie::store_v(a_o + i * 64, z);
   for (int i = 0; i < kAttnRowBlocks; i++) aie::store_v(a_l + i * 64, z);
@@ -84,11 +94,11 @@ __attribute__((noinline)) static void AttnChunk(int tokbase) {
       s0 = mac_8x8_8x8T(a, b0, s0);
       s1 = mac_8x8_8x8T(a, b1, s1);
     }
-    const aie::vector<float, 64> mv = aie::load_v<64>(a_m + rb * 64);
+    const aie::vector<float, 64> mv = RepEach8<float>(aie::load_v<8>(a_m + rb * 8));
     aie::vector<bfloat16, 64> p0 = Exp2Wide(aie::sub(s0.template to_vector<float>(), mv));
     aie::vector<bfloat16, 64> p1 = Exp2Wide(aie::sub(s1.template to_vector<float>(), mv));
     const aie::vector<int32, 64> rel =
-        aie::sub(aie::load_v<64>(a_hi + rb * 64), aie::broadcast<int32, 64>(tokbase));
+        aie::sub(RepEach8<int32>(aie::load_v<8>(a_hi + rb * 8)), aie::broadcast<int32, 64>(tokbase));
     p0 = aie::select(zero, p0, aie::ge(rel, col));
     p1 = aie::select(zero, p1, aie::ge(rel, aie::add(col, aie::broadcast<int32, 64>(8))));
     aie::accum<accfloat, 64> la(aie::load_v<64>(a_l + rb * 64));
@@ -124,6 +134,58 @@ __attribute__((noinline)) static void AttnFeed(const uint8_t *pB, int col) {
   const int tokbase = (a_chunk_idx * 8 + col) * 16;
   a_chunk_idx++;
   if (tokbase <= a_pos + a_n - 1) AttnChunk(tokbase);
+}
+
+// Tail path: the 8-token blocks that contain the pass rows use exact bf16 V so a row's result never depends on
+// tokens appended after it. a_chunk holds [K block: 16 ks x 8 groups][V: 16 db x 8 tok x 8 dims bf16].
+__attribute__((noinline)) static void AttnTail(int tb) {
+  const int tokbase = (a_pos & ~7) + tb * 8;
+  if (tokbase > a_pos + a_n - 1) return;
+  const bfp16ebs8 *kt = (const bfp16ebs8 *)a_chunk;
+  const bfloat16 *vt = (const bfloat16 *)(a_chunk + 1152);
+  const aie::vector<int32, 64> col = LaneCol();
+  const aie::vector<bfloat16, 64> ones = aie::broadcast<bfloat16, 64>((bfloat16)1.0f);
+  const aie::vector<bfloat16, 64> zero = aie::zeros<bfloat16, 64>();
+  for (int rb = 0; rb < kAttnRowBlocks; rb++) {
+    aie::block_vector_input_buffer_stream<bfp16ebs8, 64> qs(a_q);
+    qs.seek(rb * 16);
+    aie::block_vector_input_buffer_stream<bfp16ebs8, 64> ks(kt);
+    ks.seek(0);
+    aie::accum<accfloat, 64> s = aie::zeros<accfloat, 64>();
+    for (int i = 0; i < 16; i++) {
+      aie::block_vector<bfp16ebs8, 64> a = qs.pop();
+      aie::block_vector<bfp16ebs8, 64> b = ks.pop();
+      s = mac_8x8_8x8T(a, b, s);
+    }
+    const aie::vector<float, 64> mv = RepEach8<float>(aie::load_v<8>(a_m + rb * 8));
+    aie::vector<bfloat16, 64> p = Exp2Wide(aie::sub(s.template to_vector<float>(), mv));
+    const aie::vector<int32, 64> rel_hi =
+        aie::sub(RepEach8<int32>(aie::load_v<8>(a_hi + rb * 8)), aie::broadcast<int32, 64>(tokbase));
+    const aie::vector<int32, 64> rel_pp =
+        aie::sub(RepEach8<int32>(aie::load_v<8>(a_pp + rb * 8)), aie::broadcast<int32, 64>(tokbase));
+    p = aie::select(zero, p, aie::lt(rel_hi, col));
+    p = aie::select(zero, p, aie::ge(rel_pp, col));
+    aie::accum<accfloat, 64> la(aie::load_v<64>(a_l + rb * 64));
+    la = aie::mac(la, p, ones);
+    aie::store_v(a_l + rb * 64, la.template to_vector<float>());
+    for (int db = 0; db < kAttnDimBlocks; db++) {
+      float *op = a_o + (rb * kAttnDimBlocks + db) * 64;
+      aie::mmul<8, 8, 8, bfloat16, bfloat16, accfloat> mm;
+      mm.mul(p, aie::load_v<64>(vt + db * 64));
+      aie::vector<float, 64> d = mm.template to_vector<float>();
+      aie::store_v(op, aie::add(aie::load_v<64>(op), d));
+    }
+  }
+}
+
+// A-stream element idx (0..35) of the tail: block tb = idx/12, kv head = (idx%12)/3, part = idx%3.
+// Only column 0 computes the tail (its partial is added to the merged result).
+__attribute__((noinline)) static void AttnTailFeed(const uint8_t *pA, int idx, int row_id, int col_id) {
+  const int tb = idx / 12, r = (idx % 12) / 3, e = idx % 3;
+  if (r != row_id || col_id != 0) return;
+  uint8_t *dst = a_chunk + e * 1152;
+  for (int i = 0; i < 1152; i += 64) aie::store_v(dst + i, aie::load_v<64>(pA + i));
+  if (e == 2) AttnTail(tb);
 }
 
 // Output element idx: 0..31 = a_o (32 KB), 32..33 = a_l (2 KB).

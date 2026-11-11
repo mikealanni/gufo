@@ -44,7 +44,24 @@ gen_conv() {
   echo "generated $out (conv ${H}: in_proj ${N1} -> out_proj ${H})"
 }
 
+gen_attn() {
+  local MC="$1"
+  python3 "$dir/n32_core_placed.py" -m 16 -k 64 -n 128 -M 16 -K 2048 -N 2048 --mode attn --k1 "$MC" >"$work/a.mlir"
+  aiecc --aietools="${AIETOOLS:?}" --alloc-scheme=basic-sequential --no-compile --no-link \
+    --no-xchesscc --aie-generate-npu-insts --unified --dynamic-objFifos \
+    --npu-insts-name="$work/i.txt" "$work/a.mlir" >/dev/null
+  mv "$work/i.txt" "$dir/runtime/insts_attn_${MC}.txt"
+  echo "generated insts_attn_${MC}.txt (${MC} chunks per column, $((MC * 128)) tokens)"
+}
+
+gen_attn_all() {
+  for mc in 1 2 4 8 16 32 64 128 256 512; do gen_attn "$mc"; done
+}
+
 case "${1:-default}" in
+  attn)
+    gen_attn "$2"
+    ;;
   conv)
     gen_conv "$2" "$3" "${4:-}"
     ;;
@@ -61,6 +78,7 @@ case "${1:-default}" in
     gen_conv 2048 6144
     gen_plain 2048 2048
     gen_plain 2048 3072
+    gen_attn_all
     ;;
   default|*)
     # LFM3-1.7B (WP6): shapes explicit, no literals in generator.
@@ -68,5 +86,6 @@ case "${1:-default}" in
     gen_conv 2048 6144
     gen_plain 2048 2048
     gen_plain 2048 3072
+    gen_attn_all
     ;;
 esac

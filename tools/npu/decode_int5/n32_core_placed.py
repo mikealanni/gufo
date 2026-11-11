@@ -76,6 +76,7 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None):
 
         attn_begin = external_func("attn_begin", inputs=[A_ty, np.int32], link_with=f"mm_{m}x{k}x{n}.o")
         attn_q = external_func("attn_q", inputs=[A_ty, np.int32, np.int32], link_with=f"mm_{m}x{k}x{n}.o")
+        attn_tail = external_func("attn_tail", inputs=[A_ty, np.int32, np.int32, np.int32], link_with=f"mm_{m}x{k}x{n}.o")
         attn_feed = external_func("attn_feed", inputs=[B_l1_ty, np.int32], link_with=f"mm_{m}x{k}x{n}.o")
         attn_out = external_func("attn_out", inputs=[C_l1_ty, np.int32], link_with=f"mm_{m}x{k}x{n}.o")
 
@@ -122,6 +123,7 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None):
 
         rtp_ty = np.ndarray[(8,), np.dtype[np.int32]]
         ATTN_Q_ELEMS = 32
+        ATTN_TAIL_ELEMS = 36
         ATTN_OUT_ELEMS = 34
         rtps = [[None] * n_aie_cols for _ in range(n_aie_rows)]
         rtp_locks = [[None] * n_aie_cols for _ in range(n_aie_rows)]
@@ -188,6 +190,10 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None):
                                 elem_a = A_l2l1.acquire(ObjectFifoPort.Consume, 1)
                                 attn_q(elem_a, arith.index_cast(T.i32(), qi), row_c)
                                 A_l2l1.release(ObjectFifoPort.Consume, 1)
+                            for ti in range_(ATTN_TAIL_ELEMS):
+                                elem_a = A_l2l1.acquire(ObjectFifoPort.Consume, 1)
+                                attn_tail(elem_a, arith.index_cast(T.i32(), ti), row_c, col_c)
+                                A_l2l1.release(ObjectFifoPort.Consume, 1)
                             for _ in range_(attn_feeds):
                                 elem_b = B_l2l1[row][col].acquire(ObjectFifoPort.Consume, 1)
                                 attn_feed(elem_b, col_c)
@@ -199,7 +205,7 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None):
 
         if mode == "attn":
             mchunks = k1 if k1 is not None else 4
-            a_groups = (1 + ATTN_Q_ELEMS) * 128
+            a_groups = (1 + ATTN_Q_ELEMS + ATTN_TAIL_ELEMS) * 128
             chunk_bytes = 3 * n_aie_rows * BQ
             b_total = n_aie_cols * mchunks * chunk_bytes
             c_per_col = ATTN_OUT_ELEMS * n_aie_rows * CB

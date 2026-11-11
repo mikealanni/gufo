@@ -168,6 +168,7 @@ __attribute__((noinline)) static void FlushConv(const uint8_t *__restrict ctl_b,
 extern "C" {
 void attn_begin(uint8_t *hdr, int32_t row_id) { AttnBegin(hdr, row_id); }
 void attn_q(uint8_t *pA, int32_t idx, int32_t row_id) { AttnQ(pA, idx, row_id); }
+void attn_tail(uint8_t *pA, int32_t idx, int32_t row_id, int32_t col_id) { AttnTailFeed(pA, idx, row_id, col_id); }
 void attn_feed(uint8_t *pB, int32_t col) { AttnFeed(pB, col); }
 void attn_out(uint8_t *pC, int32_t idx) { AttnOut(pC, idx); }
 

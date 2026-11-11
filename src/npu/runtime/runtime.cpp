@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <omp.h>
 #include <stdexcept>
 
 namespace gufo::npu::runtime {
@@ -249,6 +250,13 @@ void NpuRuntime::Ffn(Program& p, WeightBuffer& wb, const float* x,
 }
 
 namespace {
+// Partial BO syncs that start or end inside a page are not reliable: flush whole pages.
+void SyncToDevice(xrt::bo& bo, std::size_t offset, std::size_t size) {
+  constexpr std::size_t kPage = 4096;
+  const std::size_t lo = offset / kPage * kPage;
+  const std::size_t hi = std::min<std::size_t>(bo.size(), (offset + size + kPage - 1) / kPage * kPage);
+  bo.sync(XCL_BO_SYNC_BO_TO_DEVICE, hi - lo, lo);
+}
 constexpr std::uint32_t kConvHistOffset = 512;
 constexpr std::uint32_t kConvTapOffset = 64;
 constexpr std::uint32_t kConvMaxTaps = 7;
@@ -376,9 +384,258 @@ void NpuRuntime::ConvCommit(ConvLayer& cl, std::uint32_t k) {
         }
       }
     for (std::uint32_t col = 0; col < 8; ++col)
-      cl.w.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE, 4 * kQuarterBytes,
-                   (std::size_t{(g * 8 + col)} * (tk + 1) + tk) * 4 * kQuarterBytes);
+      SyncToDevice(cl.w.bo, (std::size_t{(g * 8 + col)} * (tk + 1) + tk) * 4 * kQuarterBytes,
+                   4 * kQuarterBytes);
   }
+}
+
+namespace {
+constexpr std::uint32_t kAttnHd = 128, kAttnKvh = 4, kAttnChunkBytes = 3 * 4 * kQuarterBytes;
+constexpr std::uint32_t kAttnQElems = 32, kAttnOutElems = 34, kAttnTailElems = 36;
+constexpr std::size_t kAttnAElems = 1 + kAttnQElems + kAttnTailElems;
+
+// Byte offset of piece `byte` (0..4607) of chunk q for kv head r inside the BO.
+inline std::size_t AttnOff(std::uint32_t q, std::uint32_t r, std::uint32_t byte) {
+  return std::size_t{q} * kAttnChunkBytes + std::size_t{byte / kQuarterBytes} * 4 * kQuarterBytes +
+         std::size_t{r} * kQuarterBytes + byte % kQuarterBytes;
+}
+inline void AttnLoadChunk(const std::uint8_t* base, std::uint32_t q, std::uint32_t r, std::uint8_t* chunk) {
+  for (std::uint32_t j = 0; j < 3; ++j)
+    std::memcpy(chunk + j * kQuarterBytes, base + AttnOff(q, r, j * kQuarterBytes), kQuarterBytes);
+}
+inline void AttnStoreChunk(std::uint8_t* base, std::uint32_t q, std::uint32_t r, const std::uint8_t* chunk) {
+  for (std::uint32_t j = 0; j < 3; ++j)
+    std::memcpy(base + AttnOff(q, r, j * kQuarterBytes), chunk + j * kQuarterBytes, kQuarterBytes);
+}
+}  // namespace
+
+AttnLayer NpuRuntime::MakeAttnLayer(std::uint32_t capacity_tokens) {
+  AttnLayer al;
+  std::uint32_t mc = 1;
+  const std::uint32_t qch = (capacity_tokens + 15) / 16;
+  while (mc * 8 < qch) mc *= 2;
+  al.capacity_chunks = mc * 8;
+  const std::size_t bytes = std::size_t{al.capacity_chunks} * kAttnChunkBytes;
+  al.kv = xrt::bo(dev_, bytes, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(3));
+  al.host = al.kv.map<std::uint8_t*>();
+  std::memset(al.host, 0, bytes);
+  al.kv.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  al.kmax2.assign(kAttnKvh, 0.f);
+  if (!attn_a_) {
+    attn_a_ = xrt::bo(dev_, kAttnAElems * 1152, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(3));
+    attn_c_ = xrt::bo(dev_, std::size_t{8} * kAttnOutElems * 4 * kRowBytes, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(3));
+    attn_ah_ = attn_a_.map<std::uint8_t*>();
+    attn_ch_ = attn_c_.map<std::uint8_t*>();
+    std::memset(attn_ah_, 0, kAttnAElems * 1152);
+  }
+  return al;
+}
+
+void NpuRuntime::AttnReset(AttnLayer& al) {
+  std::memset(al.host, 0, std::size_t{al.capacity_chunks} * kAttnChunkBytes);
+  al.kv.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  std::fill(al.kmax2.begin(), al.kmax2.end(), 0.f);
+}
+
+void NpuRuntime::AttnAppend(AttnLayer& al, std::uint32_t pos, std::uint32_t n, const float* k,
+                            const std::uint16_t* v_hist, Timings* tm) {
+  const auto t_start = Clock::now();
+  const std::uint32_t kvd = kAttnKvh * kAttnHd;
+  const std::uint32_t q0 = pos / 16, q1 = (pos + n - 1) / 16;
+  for (std::uint32_t r = 0; r < kAttnKvh; ++r) {
+    for (std::uint32_t t = 0; t < n; ++t) {
+      float s2 = 0;
+      for (std::uint32_t d = 0; d < kAttnHd; ++d) s2 += k[std::size_t{t} * kvd + r * kAttnHd + d] * k[std::size_t{t} * kvd + r * kAttnHd + d];
+      al.kmax2[r] = std::max(al.kmax2[r], s2);
+    }
+    for (std::uint32_t q = q0; q <= q1; ++q) {
+      alignas(64) std::uint8_t chunk[4608];
+      AttnLoadChunk(al.host, q, r, chunk);
+      for (std::uint32_t tt = 0; tt < 16; ++tt) {
+        const std::uint32_t tok = q * 16 + tt;
+        if (tok < pos || tok >= pos + n) continue;
+        const std::uint32_t kb = tt / 8, i8 = tt % 8;
+        for (std::uint32_t ks = 0; ks < 16; ++ks) {
+          float v8[8];
+          std::memcpy(v8, k + std::size_t{tok - pos} * kvd + r * kAttnHd + ks * 8, 32);
+          EncGroup(v8, chunk + (std::size_t{kb} * 16 + ks) * 8 * 9 + i8 * 9);
+        }
+      }
+      for (std::uint32_t kb = 0; kb < 2; ++kb) {
+        const std::uint32_t t0 = q * 16 + kb * 8;
+        if (t0 + 8 <= pos || t0 >= pos + n) continue;  // block untouched
+        for (std::uint32_t db = 0; db < 16; ++db)
+          for (std::uint32_t g = 0; g < 8; ++g) {
+            float v8[8];
+            for (std::uint32_t i8 = 0; i8 < 8; ++i8) {
+              const std::uint32_t tok = t0 + i8;
+              v8[i8] = tok < pos + n ? Bf16Float(v_hist[std::size_t{tok} * kvd + r * kAttnHd + db * 8 + g]) : 0.f;
+            }
+            EncGroup(v8, chunk + 2304 + ((std::size_t{kb} * 16 + db) * 8 + g) * 9);
+          }
+      }
+      AttnStoreChunk(al.host, q, r, chunk);
+    }
+  }
+  SyncToDevice(al.kv, std::size_t{q0} * kAttnChunkBytes, std::size_t{q1 - q0 + 1} * kAttnChunkBytes);
+  if (tm) tm->attn_append += Ms(t_start);
+}
+
+bool NpuRuntime::AttnRun(AttnLayer& al, std::uint32_t pos, std::uint32_t n, const float* q,
+                         const std::uint16_t* k_hist, const std::uint16_t* v_hist,
+                         const std::string& programs_dir, float* out, Timings* tm) {
+  auto t_start = Clock::now();
+  const std::uint32_t kvd = kAttnKvh * kAttnHd, qd = 16 * kAttnHd;
+  const float qscale = 1.4426950408889634f / std::sqrt(static_cast<float>(kAttnHd));
+  const std::uint32_t total = pos + n;
+  std::uint32_t mc = 1;
+  while (mc * 8 * 16 < total) mc *= 2;
+  if (mc * 8 > al.capacity_chunks) return false;
+  // header: pos, n, then M per (kv head, row)
+  auto* hdr = attn_ah_;
+  std::memset(hdr, 0, 1152);
+  const std::int32_t ih[2] = {static_cast<std::int32_t>(pos), static_cast<std::int32_t>(n)};
+  std::memcpy(hdr, ih, 8);
+  auto* mrow = reinterpret_cast<float*>(hdr + 128);
+#pragma omp parallel for schedule(static, 1)
+  for (std::int32_t rr = 0; rr < static_cast<std::int32_t>(kAttnKvh); ++rr) {
+    const std::uint32_t r = static_cast<std::uint32_t>(rr);
+    std::vector<float> qs(std::size_t{64} * kAttnHd);
+    const float kbound = std::sqrt(al.kmax2[r]);
+    // Q block for this kv head: rows i = hq*16 + t (hq = 0..3), zero for t >= n
+    std::fill(qs.begin(), qs.end(), 0.f);
+    for (std::uint32_t i = 0; i < 64; ++i) {
+      const std::uint32_t hq = i / 16, t = i % 16;
+      if (t >= n) continue;
+      const float* src = q + std::size_t{t} * qd + (r * 4 + hq) * kAttnHd;
+      for (std::uint32_t d = 0; d < kAttnHd; ++d) qs[std::size_t{i} * kAttnHd + d] = src[d] * qscale;
+    }
+    std::uint8_t* qb = attn_ah_ + std::size_t{1 + r * 8} * 1152;
+    for (std::uint32_t rb = 0; rb < 8; ++rb)
+      for (std::uint32_t ks = 0; ks < 16; ++ks)
+        for (std::uint32_t rib = 0; rib < 8; ++rib) {
+          const float* src = &qs[std::size_t{rb * 8 + rib} * kAttnHd + ks * 8];
+          EncGroup(src, qb + (std::size_t{rb * 16 + ks} * 8 + rib) * 9);
+        }
+    for (std::uint32_t i = 0; i < 64; ++i) {
+      const std::uint32_t hq = i / 16, t = i % 16;
+      float qn = 0;
+      for (std::uint32_t d = 0; d < kAttnHd; ++d) qn += qs[std::size_t{i} * kAttnHd + d] * qs[std::size_t{i} * kAttnHd + d];
+      const float bound = std::sqrt(qn) * kbound;
+      float m = -1e30f;
+      if (t < n) {
+        const std::uint32_t last = pos + t;  // keys 0..last valid for this row
+        const std::uint32_t lo = last >= 32 ? last - 31 : 0;
+        auto score = [&](std::uint32_t tok) {
+          float s = 0;
+          const std::uint16_t* kr = k_hist + std::size_t{tok} * kvd + r * kAttnHd;
+          for (std::uint32_t d = 0; d < kAttnHd; ++d) s += qs[std::size_t{i} * kAttnHd + d] * Bf16Float(kr[d]);
+          return s;
+        };
+        for (std::uint32_t tok = lo; tok <= last; ++tok) m = std::max(m, score(tok));
+        for (std::uint32_t tok = 0; tok < std::min(8u, lo); ++tok) m = std::max(m, score(tok));
+        m = std::min(std::max(m, bound - 100.f), bound);
+      } else {
+        m = 0.f;
+      }
+      mrow[r * 64 + i] = m;
+      (void)hq;
+    }
+  }
+  {
+    // Tail: exact bf16 V (and the cached K groups) for the 8-token blocks the rows live in.
+    const std::uint32_t t0 = pos & ~7u;
+    for (std::uint32_t r = 0; r < kAttnKvh; ++r) {
+      alignas(64) std::uint8_t chunk[4608];
+      for (std::uint32_t tb = 0; tb < 3; ++tb) {
+        std::uint8_t* dst = attn_ah_ + (std::size_t{1 + kAttnQElems} + (tb * 4 + r) * 3) * 1152;
+        std::memset(dst, 0, 3 * 1152);
+        const std::uint32_t tokbase = t0 + tb * 8;
+        if (tokbase >= total) continue;
+        AttnLoadChunk(al.host, tokbase / 16, r, chunk);
+        const std::uint32_t kb = (tokbase % 16) / 8;
+        for (std::uint32_t ks = 0; ks < 16; ++ks)
+          for (std::uint32_t tt = 0; tt < 8; ++tt)
+            if (tokbase + tt < total)
+              std::memcpy(dst + (ks * 8 + tt) * 9, chunk + (kb * 16 + ks) * 72 + tt * 9, 9);
+        auto* vd = reinterpret_cast<std::uint16_t*>(dst + 1152);
+        for (std::uint32_t db = 0; db < 16; ++db)
+          for (std::uint32_t tt = 0; tt < 8; ++tt)
+            if (tokbase + tt < total)
+              std::memcpy(vd + (db * 8 + tt) * 8,
+                          v_hist + std::size_t{tokbase + tt} * kvd + r * kAttnHd + db * 8, 16);
+      }
+    }
+  }
+  attn_a_.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  auto it = attn_insts_.find(mc);
+  if (it == attn_insts_.end()) {
+    const std::string path = programs_dir + "/insts_attn_" + std::to_string(mc) + ".txt";
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) return false;
+    const std::size_t sz = static_cast<std::size_t>(f.tellg());
+    f.seekg(0);
+    std::vector<char> buf(sz);
+    f.read(buf.data(), static_cast<std::streamsize>(sz));
+    xrt::bo bo(dev_, sz, XCL_BO_FLAGS_CACHEABLE, kern_.group_id(1));
+    std::memcpy(bo.map<void*>(), buf.data(), sz);
+    bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    it = attn_insts_.emplace(mc, std::make_pair(bo, sz / 4)).first;
+  }
+  auto rit = al.runs.find(mc);
+  if (rit == al.runs.end()) {
+    xrt::run run(kern_);
+    run.set_arg(0, 3u);
+    run.set_arg(1, it->second.first);
+    run.set_arg(2, static_cast<unsigned>(it->second.second));
+    run.set_arg(3, attn_a_);
+    run.set_arg(4, al.kv);
+    run.set_arg(5, attn_c_);
+    rit = al.runs.emplace(mc, std::move(run)).first;
+  }
+  if (tm) { tm->attn_prep += Ms(t_start); t_start = Clock::now(); }
+  rit->second.start();
+  for (;;) {
+    const auto st = rit->second.state();
+    if (st == ERT_CMD_STATE_COMPLETED) break;
+    if (st != ERT_CMD_STATE_NEW && st != ERT_CMD_STATE_QUEUED && st != ERT_CMD_STATE_RUNNING &&
+        st != ERT_CMD_STATE_SUBMITTED)
+      break;
+  }
+  rit->second.wait();
+  attn_c_.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+  if (tm) { tm->attn_wait += Ms(t_start); t_start = Clock::now(); }
+  // merge: partials of all columns share M, so they add
+  bool ok = true;
+  alignas(64) static thread_local std::vector<float> tot;
+  for (std::uint32_t r = 0; r < kAttnKvh; ++r) {
+    tot.assign(std::size_t{kAttnOutElems} * 256, 0.f);
+    for (std::uint32_t c = 0; c < 8; ++c)
+      for (std::uint32_t i = 0; i < kAttnOutElems; ++i) {
+        const auto* e = reinterpret_cast<const float*>(attn_ch_ + ((std::size_t{c} * kAttnOutElems + i) * 4 + r) * kRowBytes);
+        float* d = &tot[std::size_t{i} * 256];
+        for (int x = 0; x < 256; x += 16)
+          _mm512_storeu_ps(d + x, _mm512_add_ps(_mm512_loadu_ps(d + x), _mm512_loadu_ps(e + x)));
+      }
+    const float* o = tot.data();
+    const float* lt = tot.data() + std::size_t{32} * 256;
+    for (std::uint32_t i = 0; i < 64; ++i) {
+      const std::uint32_t hq = i / 16, t = i % 16;
+      if (t >= n) continue;
+      const std::uint32_t rb = i / 8, rib = i % 8;
+      float l = 0;
+      for (int cc = 0; cc < 8; ++cc) l += lt[rb * 64 + rib * 8 + cc];
+      if (!(l > 1e-30f) || !(l < 1e30f)) { ok = false; continue; }
+      const float inv = 1.0f / l;
+      for (std::uint32_t db = 0; db < 16; ++db)
+        for (int cc = 0; cc < 8; ++cc)
+          out[std::size_t{t} * qd + (r * 4 + hq) * kAttnHd + db * 8 + cc] =
+              o[(std::size_t{rb} * 16 + db) * 64 + rib * 8 + cc] * inv;
+    }
+  }
+  (void)kAttnQElems;
+  if (tm) { tm->attn_merge += Ms(t_start); ++tm->attn_calls; }
+  return ok;
 }
 
 }  // namespace gufo::npu::runtime
