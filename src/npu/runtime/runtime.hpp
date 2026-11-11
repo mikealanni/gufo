@@ -107,10 +107,15 @@ struct ConvLayer {
 
 // Full-attention layer KV cache in the attention kernel layout, plus its
 // per-bucket runs. Layout: [chunk q = token/16][3][4 kv heads][1536 B].
+// Sliding-window layers use a ring: token t lives at slot t % ring_tokens, the kernel
+// gets a slot->absolute map (tab) in the header and masks by absolute position.
 struct AttnLayer {
   xrt::bo kv;
   std::uint8_t* host{};
   std::uint32_t capacity_chunks{};
+  std::uint32_t ring_tokens{0};  // 0 = absolute (full-attention) layout
+  std::uint32_t window{0};       // sliding window size (0 = full context)
+  std::uint32_t hist_tokens{0};  // tokens held in v_hist/k_hist (cache bound for block writes)
   std::vector<float> kmax2;  // running max |k|^2 per kv head
   std::unordered_map<std::uint32_t, xrt::run> runs;
 };
@@ -165,7 +170,8 @@ class NpuRuntime {
   void ConvReset(ConvLayer& cl);
 
   // Attention on the NPU (4 kv heads x 4 q heads x 128 dims, up to 16 rows per pass).
-  AttnLayer MakeAttnLayer(std::uint32_t capacity_tokens);
+  AttnLayer MakeAttnLayer(std::uint32_t capacity_tokens, std::uint32_t ring_tokens = 0,
+                         std::uint32_t window = 0);
   void AttnReset(AttnLayer& al);
   /// Append rows [pos, pos+n) of k/v (n x 512, after norm+rope) to the device
   /// cache. `k_hist`/`v_hist` are the host bf16 caches ([slot][512], slot = token).

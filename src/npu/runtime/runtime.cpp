@@ -409,12 +409,20 @@ inline void AttnStoreChunk(std::uint8_t* base, std::uint32_t q, std::uint32_t r,
 }
 }  // namespace
 
-AttnLayer NpuRuntime::MakeAttnLayer(std::uint32_t capacity_tokens) {
+AttnLayer NpuRuntime::MakeAttnLayer(std::uint32_t capacity_tokens, std::uint32_t ring_tokens,
+                                    std::uint32_t window) {
   AttnLayer al;
+  al.ring_tokens = ring_tokens;
+  al.window = window;
+  al.hist_tokens = ring_tokens ? ring_tokens : capacity_tokens;
   std::uint32_t mc = 1;
-  const std::uint32_t qch = (capacity_tokens + 15) / 16;
-  while (mc * 8 < qch) mc *= 2;
-  al.capacity_chunks = mc * 8;
+  if (ring_tokens) {
+    al.capacity_chunks = ring_tokens / 16;  // ring: exactly ring_tokens/16 chunks (24 for 384)
+  } else {
+    const std::uint32_t qch = (capacity_tokens + 15) / 16;
+    while (mc * 8 < qch) mc *= 2;
+    al.capacity_chunks = mc * 8;
+  }
   const std::size_t bytes = std::size_t{al.capacity_chunks} * kAttnChunkBytes;
   al.kv = xrt::bo(dev_, bytes, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(3));
   al.host = al.kv.map<std::uint8_t*>();
@@ -441,19 +449,40 @@ void NpuRuntime::AttnAppend(AttnLayer& al, std::uint32_t pos, std::uint32_t n, c
                             const std::uint16_t* v_hist, Timings* tm) {
   const auto t_start = Clock::now();
   const std::uint32_t kvd = kAttnKvh * kAttnHd;
-  const std::uint32_t q0 = pos / 16, q1 = (pos + n - 1) / 16;
+  const std::uint32_t ring = al.ring_tokens;
+  // Chunk list to touch: absolute chunks for the full layout, ring slots otherwise.
+  std::uint32_t chunks[2], nch = 0;
+  if (ring) {
+    const std::uint32_t s0 = (pos % ring) / 16, s1 = ((pos + n - 1) % ring) / 16;
+    if (s0 == s1) { chunks[0] = s0; nch = 1; } else { chunks[0] = s0; chunks[1] = s1; nch = 2; }
+  } else {
+    chunks[0] = pos / 16;
+    nch = (pos + n - 1) / 16 - chunks[0] + 1;
+  }
+  // Token written at slot offset `tt` of chunk `q` by this pass, or kInvalid if that
+  // slot belongs to another pass (full layout: q*16+tt is always the absolute token).
+  const std::uint32_t kInvalid = 0xFFFFFFFFu;
+  auto tok_at = [&](std::uint32_t q, std::uint32_t tt) -> std::uint32_t {
+    if (!ring) {
+      const std::uint32_t tok = q * 16 + tt;
+      return (tok >= pos && tok < pos + n) ? tok : kInvalid;
+    }
+    const std::uint32_t d = (q * 16 + tt + ring - (pos % ring)) % ring;
+    return d < n ? pos + d : kInvalid;
+  };
   for (std::uint32_t r = 0; r < kAttnKvh; ++r) {
     for (std::uint32_t t = 0; t < n; ++t) {
       float s2 = 0;
       for (std::uint32_t d = 0; d < kAttnHd; ++d) s2 += k[std::size_t{t} * kvd + r * kAttnHd + d] * k[std::size_t{t} * kvd + r * kAttnHd + d];
       al.kmax2[r] = std::max(al.kmax2[r], s2);
     }
-    for (std::uint32_t q = q0; q <= q1; ++q) {
+    for (std::uint32_t ci = 0; ci < nch; ++ci) {
+      const std::uint32_t q = chunks[ci];
       alignas(64) std::uint8_t chunk[4608];
       AttnLoadChunk(al.host, q, r, chunk);
       for (std::uint32_t tt = 0; tt < 16; ++tt) {
-        const std::uint32_t tok = q * 16 + tt;
-        if (tok < pos || tok >= pos + n) continue;
+        const std::uint32_t tok = tok_at(q, tt);
+        if (tok == kInvalid) continue;  // slot not written by this pass
         const std::uint32_t kb = tt / 8, i8 = tt % 8;
         for (std::uint32_t ks = 0; ks < 16; ++ks) {
           float v8[8];
@@ -462,22 +491,33 @@ void NpuRuntime::AttnAppend(AttnLayer& al, std::uint32_t pos, std::uint32_t n, c
         }
       }
       for (std::uint32_t kb = 0; kb < 2; ++kb) {
+        // V groups are stored finalized, so a touched block is rewritten whole from
+        // v_hist: it mirrors current cache contents in slot order (live values for
+        // slots this pass does not write, zeros past total). Never clobber a live
+        // neighbour of a partial block; never read past the cache.
         const std::uint32_t t0 = q * 16 + kb * 8;
-        if (t0 + 8 <= pos || t0 >= pos + n) continue;  // block untouched
+        const std::uint32_t cap_tok = ring ? ring : al.hist_tokens;
+        if (t0 >= cap_tok) continue;      // slots do not exist
+        if (!ring && t0 + 8 <= pos) continue;  // fully-finished block (original skip)
         for (std::uint32_t db = 0; db < 16; ++db)
           for (std::uint32_t g = 0; g < 8; ++g) {
             float v8[8];
             for (std::uint32_t i8 = 0; i8 < 8; ++i8) {
-              const std::uint32_t tok = t0 + i8;
-              v8[i8] = tok < pos + n ? Bf16Float(v_hist[std::size_t{tok} * kvd + r * kAttnHd + db * 8 + g]) : 0.f;
+              const std::uint32_t slot = t0 + i8;  // ring: slot == absolute mod ring
+              v8[i8] = slot < cap_tok ? Bf16Float(v_hist[std::size_t{slot} * kvd + r * kAttnHd + db * 8 + g])
+                                      : 0.f;
             }
             EncGroup(v8, chunk + 2304 + ((std::size_t{kb} * 16 + db) * 8 + g) * 9);
           }
       }
       AttnStoreChunk(al.host, q, r, chunk);
+      if (ring) SyncToDevice(al.kv, std::size_t{q} * kAttnChunkBytes, kAttnChunkBytes);
     }
   }
-  SyncToDevice(al.kv, std::size_t{q0} * kAttnChunkBytes, std::size_t{q1 - q0 + 1} * kAttnChunkBytes);
+  if (!ring) {
+    const std::uint32_t q0 = pos / 16, q1 = (pos + n - 1) / 16;
+    SyncToDevice(al.kv, std::size_t{q0} * kAttnChunkBytes, std::size_t{q1 - q0 + 1} * kAttnChunkBytes);
+  }
   if (tm) tm->attn_append += Ms(t_start);
 }
 
@@ -488,14 +528,31 @@ bool NpuRuntime::AttnRun(AttnLayer& al, std::uint32_t pos, std::uint32_t n, cons
   const std::uint32_t kvd = kAttnKvh * kAttnHd, qd = 16 * kAttnHd;
   const float qscale = 1.4426950408889634f / std::sqrt(static_cast<float>(kAttnHd));
   const std::uint32_t total = pos + n;
+  const std::uint32_t ring = al.ring_tokens;
   std::uint32_t mc = 1;
-  while (mc * 8 * 16 < total) mc *= 2;
+  if (ring) {
+    mc = al.capacity_chunks / 8;  // ring: fixed program (24 chunks = 3 per column)
+  } else {
+    while (mc * 8 * 16 < total) mc *= 2;
+  }
   if (mc * 8 > al.capacity_chunks) return false;
-  // header: pos, n, then M per (kv head, row)
+  // header: pos, n, qhi, win, tab[24], then M per (kv head, row)
   auto* hdr = attn_ah_;
   std::memset(hdr, 0, 1152);
-  const std::int32_t ih[2] = {static_cast<std::int32_t>(pos), static_cast<std::int32_t>(n)};
-  std::memcpy(hdr, ih, 8);
+  std::int32_t ih[4] = {static_cast<std::int32_t>(pos), static_cast<std::int32_t>(n),
+                       static_cast<std::int32_t>((total - 1) / 16),
+                       static_cast<std::int32_t>(al.window)};
+  std::memcpy(hdr, ih, 16);
+  if (ring) {
+    // tab[slot] = qhi - absolute chunk (latest occupant), -1 if that chunk is not needed
+    std::int32_t* tab = reinterpret_cast<std::int32_t*>(hdr + 16);
+    const std::int32_t qhi = ih[2];
+    for (std::int32_t s = 0; s < 24; ++s) tab[s] = -1;
+    const std::uint32_t lo0 = pos + 1 > al.window ? pos + 1 - al.window : 0;
+    for (std::uint32_t q = lo0 / 16; q <= static_cast<std::uint32_t>(qhi); ++q)
+      tab[q % 24] = qhi - static_cast<std::int32_t>(q);
+  }
+  auto hist_slot = [&](std::uint32_t tok) { return ring ? tok % ring : tok; };
   auto* mrow = reinterpret_cast<float*>(hdr + 128);
 #pragma omp parallel for schedule(static, 1)
   for (std::int32_t rr = 0; rr < static_cast<std::int32_t>(kAttnKvh); ++rr) {
@@ -528,12 +585,13 @@ bool NpuRuntime::AttnRun(AttnLayer& al, std::uint32_t pos, std::uint32_t n, cons
         const std::uint32_t lo = last >= 32 ? last - 31 : 0;
         auto score = [&](std::uint32_t tok) {
           float s = 0;
-          const std::uint16_t* kr = k_hist + std::size_t{tok} * kvd + r * kAttnHd;
+          const std::uint16_t* kr = k_hist + std::size_t{hist_slot(tok)} * kvd + r * kAttnHd;
           for (std::uint32_t d = 0; d < kAttnHd; ++d) s += qs[std::size_t{i} * kAttnHd + d] * Bf16Float(kr[d]);
           return s;
         };
         for (std::uint32_t tok = lo; tok <= last; ++tok) m = std::max(m, score(tok));
-        for (std::uint32_t tok = 0; tok < std::min(8u, lo); ++tok) m = std::max(m, score(tok));
+        // extra early-token probing only applies to the absolute (full) cache
+        for (std::uint32_t tok = 0; !ring && tok < std::min(8u, lo); ++tok) m = std::max(m, score(tok));
         m = std::min(std::max(m, bound - 100.f), bound);
       } else {
         m = 0.f;
@@ -552,7 +610,7 @@ bool NpuRuntime::AttnRun(AttnLayer& al, std::uint32_t pos, std::uint32_t n, cons
         std::memset(dst, 0, 3 * 1152);
         const std::uint32_t tokbase = t0 + tb * 8;
         if (tokbase >= total) continue;
-        AttnLoadChunk(al.host, tokbase / 16, r, chunk);
+        AttnLoadChunk(al.host, hist_slot(tokbase) / 16, r, chunk);
         const std::uint32_t kb = (tokbase % 16) / 8;
         for (std::uint32_t ks = 0; ks < 16; ++ks)
           for (std::uint32_t tt = 0; tt < 8; ++tt)
@@ -563,7 +621,7 @@ bool NpuRuntime::AttnRun(AttnLayer& al, std::uint32_t pos, std::uint32_t n, cons
           for (std::uint32_t tt = 0; tt < 8; ++tt)
             if (tokbase + tt < total)
               std::memcpy(vd + (db * 8 + tt) * 8,
-                          v_hist + std::size_t{tokbase + tt} * kvd + r * kAttnHd + db * 8, 16);
+                          v_hist + std::size_t{hist_slot(tokbase + tt)} * kvd + r * kAttnHd + db * 8, 16);
       }
     }
   }
