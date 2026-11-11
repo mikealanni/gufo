@@ -401,9 +401,33 @@ export default {
           description: "jev control: pause|resume [all] | autoeffort on|off [level] | feature <name> on|off | status",
           execute: async (j: any) => {
             const sid = String(j.sessionID ?? "");
-            const out = await control(LOG_DIR, sid, String(j.prompt?.text ?? ""));
+            const out = await control(LOG_DIR, sid, String(j.prompt?.text ?? j.text ?? j.args ?? ""));
             trace("command.jev", { sid, out });
-            try { await ctx.session.synthetic({ sessionID: sid, text: out, resume: false }); } catch (err) { noteError("command.synthetic", err); }
+            // opencode 2.2.6: session.synthetic may not exist; try fallbacks so /jev status prints output.
+            let shown = false;
+            try {
+              if (ctx.session?.synthetic) {
+                await ctx.session.synthetic({ sessionID: sid, text: out, resume: false });
+                shown = true;
+              }
+            } catch (err) { noteError("command.synthetic", err); }
+            if (!shown) {
+              try {
+                if (ctx.session?.prompt) {
+                  await ctx.session.prompt({ sessionID: sid, text: out });
+                  shown = true;
+                }
+              } catch (err) { noteError("command.prompt", err); }
+            }
+            if (!shown) {
+              try {
+                if (ctx.client?.session?.prompt) {
+                  await ctx.client.session.prompt({ path: { id: sid }, body: { parts: [{ type: "text", text: out }] } });
+                  shown = true;
+                }
+              } catch (err) { noteError("command.client", err); }
+            }
+            return out;
           },
         });
       });
