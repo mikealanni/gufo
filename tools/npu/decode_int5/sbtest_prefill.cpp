@@ -222,6 +222,12 @@ int main(int argc, char** argv) {
       wwg.run.start();
       wwg.run.wait();
       pg.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+      {
+        const std::size_t nb2 = std::size_t{M} * 2 * na / 8 * 9;
+        std::size_t nd = 0;
+        for (std::size_t i = 0; i < nb2; ++i) nd += (pg.ch[i] != pa.ch[i]);
+        std::printf("plain-gu C vs swi-act wire BYTES DIFF: %zu of %zu\n", nd, nb2);
+      }
       std::printf("plain gu C raw hex (first 72 B):");
       for (int i = 0; i < 72; ++i) std::printf(" %02x", pg.ch[i]);
       std::printf("\n");
@@ -452,6 +458,244 @@ int main(int argc, char** argv) {
             (r & 7);
         std::memcpy(awire.data() + ablk * 9, src, 9);
       }
+    if (swimode == 10) {  // cfg31: PLAIN gu pair -> on-core swiglu reshape -> dn
+      std::snprintf(pth, sizeof pth, "%s/insts_atb_%ux2048x8192.txt", dir.c_str(), M);
+      Program qa = rt.MakeProgram(HID, 2 * na, pth, std::size_t{M} * 2 * na / 8 * 9, &err, 0,
+                                  mrows, 3, 5);
+      std::snprintf(pth, sizeof pth, "%s/insts_atb_%ux2048x7168.txt", dir.c_str(), M);
+      Program qb = rt.MakeProgram(HID, 2 * nb, pth, std::size_t{M} * 2 * nb / 8 * 9, &err, 0,
+                                  mrows, 3, 5);
+      rt.EncodeAAtb(xs.data(), M, HID, qa);
+      std::memcpy(qb.ah, qa.ah, std::size_t{M} * HID / 8 * 9);
+      WeightBuffer wqa = rt.PackWeightAtb(wsa.data(), 2 * na, HID, 4);
+      WeightBuffer wqb = rt.PackWeightAtb(wsb.data(), 2 * nb, HID, 4);
+      const auto t_g0 = Clock::now();
+      dispatch(rt, qa, wqa);
+      dispatch(rt, qb, wqb);
+      const double gu_ms = ms(t_g0, Clock::now());
+      if (std::getenv("GUFO_PMAP")) {  // where do gate/up live on the plain wire?
+        const std::size_t nq = std::size_t{M} * 2 * na / 8 * 9;
+        std::vector<float> zq = gufo::npu::atb::bfp16ebs8ToFloat(
+            int(nq), static_cast<std::uint8_t*>(qa.ch), 0);
+        long good[2][2] = {{0}};
+        long tot = 0;
+        for (std::uint32_t r = 0; r < M; r += 4)
+          for (std::uint32_t c = 0; c < na; c += 8) {
+            const std::size_t p = hw(act_block(r, c, 8));
+            for (int d = 0; d < 2; ++d) {  // candidate: gate at slot half d
+              const std::size_t b0 = p - 8 + d * 8;
+              const float v = zq[b0 * 8 + (c & 7)];
+              const double g = gact[std::size_t{r} * INT + c];
+              good[d][0] += std::fabs(v - g) <= 0.12 * std::fabs(g) + 2e-2;
+              const float w = zq[(b0 + 8) * 8 + (c & 7)];
+              const double u = uact[std::size_t{r} * INT + c];
+              good[d][1] += std::fabs(w - u) <= 0.12 * std::fabs(u) + 2e-2;
+            }
+            ++tot;
+          }
+        std::printf("plain wire match (of %ld): gate@half0 %ld up@half1 %ld | gate@half1 %ld up@half0 %ld\n",
+                    tot, good[0][0], good[0][1], good[1][0], good[1][1]);
+        return 0;
+      }
+      NpuRuntime rt6;
+      if (!rt6.Init(dir + "/final_swresh_k2048.xclbin", &err)) {
+        std::fprintf(stderr, "init swresh: %s\n", err.c_str());
+        return 1;
+      }
+      std::snprintf(pth, sizeof pth, "%s/insts_swresh_%ux7680x2048.txt", dir.c_str(), M);
+      Program prg = rt6.MakeProgram(INT, HID, pth, std::size_t{M} * INT / 8 * 9, &err, 0,
+                                    mrows, 3, 5);
+      prg.a = qa.c;
+      WeightBuffer fake;
+      fake.bo = qb.c;
+      fake.bytes = std::size_t{M} * 2 * nb / 8 * 9;
+      WeightBuffer& wr = rt6.WeightSlot(fake, prg);
+      if (std::getenv("SWI31_TAG")) {  // permutation x-ray: tag each wire block
+        const std::size_t nqb = std::size_t{M} * 2 * na / 8;  // gate wire blocks
+        auto* qb8 = static_cast<std::uint8_t*>(qa.ch);
+        for (std::size_t b = 0; b < nqb; ++b) {  // tag: 0xA9 | (block idx+1) 24 bit
+          const std::uint32_t tv = static_cast<std::uint32_t>(b + 1);
+          qb8[b * 9 + 0] = 0xA9;
+          qb8[b * 9 + 1] = tv & 0xff;
+          qb8[b * 9 + 2] = (tv >> 8) & 0xff;
+          qb8[b * 9 + 3] = (tv >> 16) & 0xff;
+          for (int i = 4; i < 9; ++i) qb8[b * 9 + i] = 0x11 * (i + b);
+        }
+        qa.c.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        wr.run.start();
+        wr.run.wait();
+        prg.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        const auto* o8 = static_cast<const std::uint8_t*>(prg.c.map());
+        const std::size_t nob = std::size_t{M} * INT / 8;  // out blocks
+        long ok = 0;
+        for (std::size_t b = 0; b < nob; ++b) ok += (o8[b * 9] == 0xA9);
+        std::printf("TAG: out blocks with wire tag: %ld/%zu\n", ok, nob);
+        {  // full-kernel triage: zeros vs garbage in first blocks
+          long z = 0;
+          for (std::size_t b = 0; b < nob; ++b) {
+            bool allz = true;
+            for (int i = 0; i < 9; ++i) allz &= (o8[b * 9 + i] == 0);
+            z += allz;
+          }
+          std::printf("TAG: zero blocks: %ld/%zu; b0 bytes:", z, nob);
+          for (int i = 0; i < 18; ++i) std::printf(" %02x", o8[i]);
+          std::printf(" | b16:");
+          for (int i = 0; i < 9; ++i) std::printf(" %02x", o8[16 * 9 + i]);
+          std::printf("\n");
+        }
+        std::printf("outblk->src(wire blk):");  // full map of first tile(s)
+        for (std::size_t b = 0; b < 32; ++b) {
+          const std::uint32_t tv =
+              o8[b * 9 + 1] | (o8[b * 9 + 2] << 8) | (o8[b * 9 + 3] << 16);
+          const std::uint32_t src = tv ? tv - 1 : 0xFFFFFFFFu;
+          std::printf(" b%zu<-%x", b, src);
+        }
+        std::printf("\n");
+        // expected for RAW passthrough: out blk 8n+e? vec push => blocks 8n..8n+7
+        // all from slot(n) half 0: s(n) = ((rg>>2)<<6)|((rg&3)<<4)|((kq)<<1)|p
+        std::printf("expected: b8n..8n+7 <- slot n (gate half), n=(rg*8+kq)*2+p\n");
+        for (int rg = 0; rg < 2; ++rg)
+          for (int kq = 0; kq < 8; ++kq)
+            for (int p = 0; p < 2; ++p) {
+              const int n = (rg * 8 + kq) * 2 + p;
+              const int sl = (rg >> 2 << 6) | (rg & 3) << 4 | (kq << 1) | p;
+              std::printf(" n%d->s%d", n, sl);
+            }
+        std::printf("\n");
+        return 0;
+      }
+      wr.run.start();
+      wr.run.wait();
+      if (std::getenv("SWI31_PRE")) {  // poison output: 0xAB = "never written"
+        auto *m8 = static_cast<std::uint8_t *>(prg.c.map());
+        const std::size_t ob = std::size_t{M} * INT / 8 * 9;
+        memset(m8, 0xAB, ob);
+        prg.c.sync(XCL_BO_SYNC_BO_TO_DEVICE, ob, 0);
+      }
+      const auto t_r0 = Clock::now();
+      wr.run.start();
+      wr.run.wait();
+      const double resh_ms = ms(t_r0, Clock::now());
+      prg.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+      // act check in dn-A order vs torch act
+      std::vector<float> zo = gufo::npu::atb::bfp16ebs8ToFloat(
+          int(std::size_t{M} * INT / 8 * 9), static_cast<std::uint8_t*>(prg.c.map()), 0);
+      double an = 0, ad = 0;
+      const bool rawref = std::getenv("SWI31_RAW") != nullptr;
+      for (std::uint32_t r = 0; r < M; ++r)
+        for (std::uint32_t c = 0; c < INT; c += 8) {
+          const std::size_t ablk =
+              (std::size_t(r >> 7) * (INT / 64) + (c >> 6)) * 1024 +
+              (std::size_t(((r & 127) >> 4) * 8 + ((c & 63) >> 3)) * 2 +
+               ((r & 127) >> 3 & 1)) *
+                      8 +
+              (r & 7);
+          for (std::uint32_t e = 0; e < 8; ++e) {
+            const double v = zo[ablk * 8 + e];
+            const double w =
+                rawref ? gact[std::size_t{r} * INT + c + e]
+                       : (std::getenv("SWI31_RAW3")
+                              ? double(gact[std::size_t{r} * INT + c + e]) *
+                                    double(uact[std::size_t{r} * INT + c + e])
+                              : act[std::size_t{r} * INT + c + e]);
+            an += (v - w) * (v - w);
+            ad += w * w;
+          }
+        }
+      std::printf("verify act(swresh)    relL2 %.4f  (plain gu pair %.2f ms, swresh %.2f ms)\n",
+                  std::sqrt(an / ad), gu_ms, resh_ms);
+      if (std::getenv("SWI31_ZMAP")) {  // which dn tiles came back all-zero?
+        std::vector<int> zt;
+        std::size_t zab = 0;  // tiles still 0xAB = never written by measured run
+        for (std::size_t t = 0; t < std::size_t{M} * INT / 8 / 1024; ++t) {
+          bool z = true, p = true;
+          const auto *p8 = static_cast<const std::uint8_t*>(prg.c.map()) + t * 1024 * 9;
+          for (std::size_t i = 0; i < 1024 * 9; ++i) {
+            z &= (p8[i] == 0);
+            p &= (p8[i] == 0xAB);
+          }
+          if (z) zt.push_back(int(t));
+          zab += p;
+        }
+        std::printf("unwritten(0xAB) tiles: %zu\n", zab);
+        std::printf("zero tiles: %zu of %zu:", zt.size(), std::size_t{M} * INT / 8 / 1024);
+        int prev = -2, from = -1;
+        for (int v : zt) {
+          if (v != prev + 1) {
+            if (from >= 0) std::printf(" %d..%d", from, prev);
+            from = v;
+          }
+          prev = v;
+        }
+        if (from >= 0) std::printf(" %d..%d", from, prev);
+        std::printf("\n");
+        return 0;
+      }
+      if (std::getenv("SWI31_WHERE")) {  // exact RAW copy check: o[n] == wire[slot(n)]
+        std::vector<float> zq = gufo::npu::atb::bfp16ebs8ToFloat(
+            int(std::size_t{M} * 2 * na / 8 * 9), static_cast<std::uint8_t*>(qa.ch), 0);
+        long exact = 0, tot = 0;
+        std::printf("mismatch(n,slot):");
+        for (std::uint32_t r = 0; r < 128; ++r)
+          for (std::uint32_t c8 = 0; c8 < 8; ++c8) {
+            const std::size_t ablk =
+                (std::size_t(r >> 7) * (INT / 64) + 0) * 1024 +
+                (std::size_t(((r & 127) >> 4) * 8 + c8) * 2 + ((r & 127) >> 3 & 1)) * 8 +
+                (r & 7);
+            const std::size_t gbase = hw(act_block(r, c8 * 8, 8)) - 8;  // gate block
+            const bool ok =
+                std::fabs(zo[ablk * 8 + 3] - zq[gbase * 8 + 3]) <=
+                    0.15f * std::fabs(zq[gbase * 8 + 3]) + 2e-2f &&
+                std::fabs(zo[ablk * 8 + 5] - zq[gbase * 8 + 5]) <=
+                    0.15f * std::fabs(zq[gbase * 8 + 5]) + 2e-2f;
+            ++tot;
+            if (ok)
+              ++exact;
+            else if (tot < 40) {
+              long mb = 9999;
+              const float ref3 = zo[ablk * 8 + 3], ref5 = zo[ablk * 8 + 5];
+              for (std::size_t b = 0; b < 8192; ++b)
+                if (std::fabs(zq[b * 8 + 3] - ref3) < 0.13f * (std::fabs(ref3) + 2e-2f) &&
+                    std::fabs(zq[b * 8 + 5] - ref5) < 0.13f * (std::fabs(ref5) + 2e-2f)) {
+                  mb = long(b);
+                  break;
+                }
+              std::printf(" (%u,%u:e%+ld,g%+ld)", r, c8,
+                          std::int64_t(ablk) - std::int64_t(gbase),
+                          std::int64_t(ablk) - mb);
+            }
+          }
+        std::printf("\nRAW copy exact: %ld/%ld\n", exact, tot);
+        return 0;
+      }
+      std::snprintf(pth, sizeof pth, "%s/insts_atb_%ux7680x2048.txt", dir.c_str(), M);
+      Program pdn2 =
+          rt2.MakeProgram(INT, HID, pth, std::size_t{M} * HID / 8 * 9, &err, 0, mrows, 3, 5);
+      rt2.RebindA(pdn2, prg.c);
+      WeightBuffer& wd2 = rt2.WeightSlot(wd, pdn2);
+      wd2.run.start();
+      wd2.run.wait();
+      const auto t_t0 = Clock::now();
+      wd2.run.start();
+      wd2.run.wait();
+      const double dn2_ms = ms(t_t0, Clock::now());
+      pdn2.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+      std::vector<float> y(std::size_t{M} * HID);
+      rt2.DecodeCAtb(y.data(), M, HID, pdn2);
+      std::vector<float> yref(std::size_t{M} * HID);
+      RefMatmulXWT(act.data(), Wd.data(), yref.data(), M, HID, INT);
+      double tn = 0, td = 0;
+      for (std::size_t e = 0; e < y.size(); ++e) {
+        const double d = double(y[e]) - double(yref[e]);
+        tn += d * d;
+        td += double(yref[e]) * double(yref[e]);
+      }
+      std::printf("verify dn(swresh-A)   relL2 %.4f  %s   (%.2f ms, zero host encode)\n",
+                  std::sqrt(tn / td), tn / td < 0.08 * 0.08 ? "PASS" : "FAIL", dn2_ms);
+      std::printf("CHAIN TOTAL: %.2f ms (gu %.2f + swresh %.2f + dn %.2f)\n",
+                  gu_ms + resh_ms + dn2_ms, gu_ms, resh_ms, dn2_ms);
+      return 0;
+    }
     if (swimode == 8) {  // cfg30: on-device reshape pass -> dn; zero host encode.
       NpuRuntime rt5;
       if (!rt5.Init(dir + "/final_swiresh_k2048.xclbin", &err)) {
