@@ -1,12 +1,11 @@
-# JEV as an opencode plugin: port plan (Phase 0 = log only)
+# JEV as an opencode plugin: design history
 
-Status: plan, written 2026-11-08. Nothing here is built yet. Phase 0 is the only
-phase to build now; later phases are outlined so the design does not paint
-itself into a corner.
-
-Audience: the local LLM (gufo, through opencode) that will build Phase 0, and the
-human who reviews it. Read the whole file first. Follow "Rules" and "Do not"
-literally.
+> **Status: shipped and in use.** This file is the original port plan
+> (2026-11-08, Phase 0 = log only). The plugin has since gone past Phase 0: it
+> stops and restarts gufo around heavy commands, controls reasoning effort,
+> runs goals and finish checks, and provides `/jev`. The "log only" and "Rules"
+> sections below describe Phase 0 only and no longer apply. For current
+> behaviour and usage read [JEV.md](JEV.md).
 
 ## Why
 
