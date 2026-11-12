@@ -308,6 +308,13 @@ head, so use `--speculative dflash2` there (auto costs 5% to 15% against it).
 Every option is described in [docs/NPU.md](docs/NPU.md). Without
 `GUFO_NPU_DIR` the build runs GPU-only.
 
+## jev
+
+`tools/jev/` holds a guard proxy and an opencode plugin that keep a local gufo
+server usable next to heavy work: it stops gufo before heavy commands, restarts
+the same model afterwards, switches models with `/jev switch`, and controls
+reasoning effort. See [docs/JEV.md](docs/JEV.md).
+
 ## Build from source
 
 ```sh
