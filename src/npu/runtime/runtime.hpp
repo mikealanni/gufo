@@ -88,6 +88,8 @@ struct Program {
   std::uint32_t K{}, N{};
   std::uint32_t mrows{1};  // A row-blocks per B tile (1 = 16 rows decode, 4 = m64 prefill)
   xrt::bo insts, a, c;
+  xrt::bo a2;   // AGENT-8 cfg29: second A stream (device act-wire tap programs)
+  bool four_a{false};  // program args are (A1, A2, B, C)
   std::size_t words{};
   std::uint8_t* ah{};
   std::uint8_t* ch{};
@@ -184,6 +186,22 @@ class NpuRuntime {
     WeightBuffer& w = WeightSlot(wb, p);
     w.run.start();
     w.run.wait();
+  }
+
+  /// AGENT-8 cfg29: re-point a program's A staging buffer at an external BO
+  /// (the gu programs' C output) for the device-resident act-wire tap.
+  void RebindA(Program& p, xrt::bo bo, xrt::bo bo2 = xrt::bo()) {
+    p.a = bo;
+    p.ah = static_cast<std::uint8_t*>(p.a.map<void*>());
+    if (bo2) {
+      p.a2 = bo2;
+      p.four_a = true;
+    }
+  }
+
+  /// AGENT-8: raw device buffer from this runtime's heap (tap-chain bring-up).
+  xrt::bo MakeBo(std::size_t bytes, int group = 3) {
+    return xrt::bo(dev_, bytes, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(group));
   }
  private:
   // Staging for the ATB A/C streams: the xrt BO mapping is write-combined, so

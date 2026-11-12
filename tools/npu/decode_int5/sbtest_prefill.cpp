@@ -91,11 +91,11 @@ int main(int argc, char** argv) {
     const int swimode = std::atoi(std::getenv("GUFO_PREFILL_SWI"));
     // mode 6 = FULLC xclbin (kernel emits act twice into a FULL-width C wire):
     // first half of the C buffer is the clean halved act stream.
-    const std::size_t cfmul = swimode == 6 ? 2 : 1;
+    const std::size_t cfmul = swimode >= 6 ? 2 : 1;
     // mode 6 artifacts are per-N (full-width C does not fit a 15360 design),
     // so the 7168 program runs on a second runtime instance.
     std::unique_ptr<NpuRuntime> rt3b;
-    if (swimode == 6) {
+    if (swimode >= 6 || swimode == 1) {  // per-N swi xclbins (stage 8192 / 7168)
       rt3b = std::make_unique<NpuRuntime>();
       if (!rt3b->Init(dir + "/final_atb_swi_b_k2048.xclbin", &err)) {
         std::fprintf(stderr, "init swi_b: %s\n", err.c_str());
@@ -249,7 +249,7 @@ int main(int argc, char** argv) {
     // mode 6 (SWI_DUP full-C): per full tile of 2048 wire blocks (= 128 act
     // vecs), act vec q occupies wire blocks 16q+8..16q+15.
     const auto hw = [&](std::size_t h) {
-      return swimode == 6
+      return swimode >= 6
                  ? (h >> 10) * 2048 + 16 * ((h >> 3) & 127) + 8 + (h & 7)
                  : h;
     };
@@ -452,6 +452,105 @@ int main(int argc, char** argv) {
             (r & 7);
         std::memcpy(awire.data() + ablk * 9, src, 9);
       }
+    if (swimode == 8) {  // cfg30: on-device reshape pass -> dn; zero host encode.
+      NpuRuntime rt5;
+      if (!rt5.Init(dir + "/final_swiresh_k2048.xclbin", &err)) {
+        std::fprintf(stderr, "init swiresh: %s\n", err.c_str());
+        return 1;
+      }
+      std::snprintf(pth, sizeof pth, "%s/insts_swiresh_%ux7680x2048.txt", dir.c_str(), M);
+      Program prg = rt5.MakeProgram(INT, HID, pth, std::size_t{M} * INT / 8 * 9, &err, 0,
+                                    mrows, 3, 5);
+      // Bind A := pa.C wire, B := pb.C wire (via the weight-slot arg), C := out.
+      prg.a = pa.c;
+      WeightBuffer fake;
+      fake.bo = pb.c;
+      fake.bytes = std::size_t{M} * nb / 8 * 9 * 2;
+      WeightBuffer& wr = rt5.WeightSlot(fake, prg);
+      wr.run.start();
+      wr.run.wait();  // warm: first C write is lost on this stack
+      const auto t_r0 = Clock::now();
+      wr.run.start();
+      wr.run.wait();
+      const double resh_ms = ms(t_r0, Clock::now());
+      prg.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+      std::size_t nbad = 0;
+      {
+        const std::uint8_t* g = static_cast<const std::uint8_t*>(prg.c.map());
+        for (std::size_t b = 0; b < awire.size(); ++b) nbad += (g[b] != awire[b]);
+      }
+      std::printf("verify reshape BYTES vs host shuffle: %s (%zu bad of %zu, %.2f ms)\n",
+                  nbad ? "FAIL" : "PASS", nbad, awire.size(), resh_ms);
+      // dn GEMM reading the DEVICE-PRODUCED A wire (no encode, no A sync).
+      std::snprintf(pth, sizeof pth, "%s/insts_atb_%ux7680x2048.txt", dir.c_str(), M);
+      Program pdn2 =
+          rt2.MakeProgram(INT, HID, pth, std::size_t{M} * HID / 8 * 9, &err, 0, mrows, 3, 5);
+      rt2.RebindA(pdn2, prg.c);
+      WeightBuffer& wd2 = rt2.WeightSlot(wd, pdn2);
+      wd2.run.start();
+      wd2.run.wait();  // warm
+      const auto t_t0 = Clock::now();
+      wd2.run.start();
+      wd2.run.wait();
+      const double dn2_ms = ms(t_t0, Clock::now());
+      pdn2.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+      std::vector<float> y(std::size_t{M} * HID);
+      rt2.DecodeCAtb(y.data(), M, HID, pdn2);
+      std::vector<float> yref(std::size_t{M} * HID);
+      RefMatmulXWT(act.data(), Wd.data(), yref.data(), M, HID, INT);
+      double tn = 0, td = 0;
+      for (std::size_t e = 0; e < y.size(); ++e) {
+        const double d = double(y[e]) - double(yref[e]);
+        tn += d * d;
+        td += double(yref[e]) * double(yref[e]);
+      }
+      std::printf("verify dn(dev-A)      relL2 %.4f  %s   (%.2f ms, zero host encode)\n",
+                  std::sqrt(tn / td), tn / td < 0.08 * 0.08 ? "PASS" : "FAIL", dn2_ms);
+      return 0;
+    }
+    if (swimode == 7) {  // cfg29: dn runs DIRECTLY from the gu programs' C wires
+      // via the DMA tap program — no host encode, no A sync, activations never
+      // leave device memory.
+      NpuRuntime rt4;
+      if (!rt4.Init(dir + "/final_dn_tap_k2048.xclbin", &err)) {
+        std::fprintf(stderr, "init dn_tap: %s\n", err.c_str());
+        return 1;
+      }
+      std::snprintf(pth, sizeof pth, "%s/insts_dntap_%ux7680x2048.txt", dir.c_str(), M);
+      // 4-arg program: (A1=3, A2=4, B=5, C=6); 3-arg ladder variant: (A=3, B=4, C=5)
+      const bool t3 = std::getenv("GUFO_TAP3") != nullptr;
+      Program pdn2 = rt4.MakeProgram(INT, HID, pth, std::size_t{M} * HID / 8 * 9, &err, 0,
+                                    mrows, 3, t3 ? 5 : 6);
+      WeightBuffer wd4 = rt4.PackWeightAtb(Wd.data(), HID, INT, t3 ? 4 : 5);
+      if (std::getenv("GUFO_TAP_SCRATCH")) {  // bring-up: in-xclbin BOs, tap only
+        xrt::bo a1 = rt4.MakeBo(18 << 20, 3);
+        rt4.RebindA(pdn2, a1,
+                    t3 ? xrt::bo()
+                       : (std::getenv("GUFO_TAP_SAMEBO") ? a1 : rt4.MakeBo(5 << 20, 4)));
+      } else if (!t3)
+        rt4.RebindA(pdn2, pa.c, pb.c);  // A streams = gu C output BOs
+      WeightBuffer& w2 = rt4.WeightSlot(wd4, pdn2);
+      w2.run.start();
+      w2.run.wait();  // warm: first C write is lost
+      const auto t_t0 = Clock::now();
+      w2.run.start();
+      w2.run.wait();
+      const double tap_ms = ms(t_t0, Clock::now());
+      pdn2.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+      std::vector<float> y(std::size_t{M} * HID);
+      rt4.DecodeCAtb(y.data(), M, HID, pdn2);
+      std::vector<float> yref(std::size_t{M} * HID);
+      RefMatmulXWT(act.data(), Wd.data(), yref.data(), M, HID, INT);
+      double tn = 0, td = 0;
+      for (std::size_t e = 0; e < y.size(); ++e) {
+        const double d = double(y[e]) - double(yref[e]);
+        tn += d * d;
+        td += double(yref[e]) * double(yref[e]);
+      }
+      std::printf("verify dn(A-tap NPU)  relL2 %.4f  %s   (%.2f ms, zero host encode)\n",
+                  std::sqrt(tn / td), tn / td < 0.08 * 0.08 ? "PASS" : "FAIL", tap_ms);
+      return 0;
+    }
     std::memcpy(pdn.ah, awire.data(), awire.size());
     const auto t_dn0 = Clock::now();
     dispatch(rt2, pdn, wd);

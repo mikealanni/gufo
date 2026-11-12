@@ -139,6 +139,13 @@ void NpuRuntime::AttachTo(xrt::run& run, WeightBuffer& wb, Program& prog) {
   run.set_arg(0, 3u);
   run.set_arg(1, prog.insts);
   run.set_arg(2, static_cast<unsigned>(prog.words));
+  if (prog.four_a) {  // cfg29 tap program: (A1, A2, B, C)
+    run.set_arg(3, prog.a);
+    run.set_arg(4, prog.a2);
+    run.set_arg(5, wb.bo);
+    run.set_arg(6, prog.c);
+    return;
+  }
   run.set_arg(3, prog.a);
   run.set_arg(4, wb.bo);
   run.set_arg(5, prog.c);
