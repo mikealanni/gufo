@@ -528,6 +528,21 @@ def conflicts(res, command, avail_gb, reactive_gb):
     return False
 
 
+def rewrite_model(body, model_id):
+    """Point a JSON request at the model gufo currently serves. Returns (body, old_name or None)."""
+    if not model_id or not body:
+        return body, None
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return body, None
+    if not isinstance(data, dict) or not isinstance(data.get("model"), str) or data["model"] == model_id:
+        return body, None
+    old = data["model"]
+    data["model"] = model_id
+    return json.dumps(data).encode(), old
+
+
 def tool_commands(calls):
     out = []
     for call in calls.values():
@@ -786,6 +801,7 @@ class Guard:
             except (OSError, ValueError):
                 pass
         self.switching = False
+        self.rewritten = set()
         self.model_id = None  # id reported by gufo's /v1/models after the last successful start
         self.expected_model = None  # first model id seen; a restart must report the same id
         load_learned()
@@ -1231,6 +1247,14 @@ class Guard:
                 await resp.prepare(request)
             await self.wait_ready(resp)
         headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP}
+        if request.method == "POST":
+            # Clients (opencode) keep asking for the model they were configured with after a switch.
+            body, old_model = rewrite_model(body, self.model_id)
+            if old_model:
+                if old_model not in self.rewritten:
+                    self.rewritten.add(old_model)
+                    log(f"requests for model {old_model!r} are served by the loaded model {self.model_id!r}")
+                headers = {k: v for k, v in headers.items() if k.lower() != "content-length"}
         try:
             async with self.session.request(request.method, self.a.upstream + request.path_qs,
                                             data=body, headers=headers) as up:
