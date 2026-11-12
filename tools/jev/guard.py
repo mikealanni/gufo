@@ -63,10 +63,10 @@ HEAVY_RES = [
     {"npu"},                # npu-lock.sh
 ]
 assert len(HEAVY_RES) == len(HEAVY), "HEAVY and HEAVY_RES must stay parallel"
-# Model kinds ~/run-gufo.sh can start (GUFO_KIND).
+# Models ~/run-gufo.sh can start (GUFO_MODEL).
 MODEL_KINDS = ("flash-next", "27b", "35b", "glm", "flint", "laguna")
 # Launch variables that belong to one model; they must not leak into another model when switching.
-MODEL_SPECIFIC_ENV = ("GUFO_MODEL", "GUFO_DFLASH", "GUFO_MTP", "GUFO_DIR", "GUFO_BIN", "CTX")
+MODEL_SPECIFIC_ENV = ("GUFO_MODEL_PATH", "GUFO_DFLASH", "GUFO_MTP", "GUFO_DIR", "GUFO_BIN", "CTX")
 MODEL_EXT = (".gguf", ".safetensors", ".bin")
 GPU_CONTENT = re.compile(r"import\s+torch|from\s+torch|\bhipMalloc|\bhipLaunch|libamdhip|\bcuda\b|rocm|/dev/kfd|\.cuda\(", re.I)
 RAM_CONTENT = re.compile(r"llama[._-]?cpp|\bvllm\b|safetensors|from_pretrained|\bgguf\b", re.I)
@@ -792,14 +792,20 @@ class Guard:
         # environment, so a gufo the guard stopped always comes back as the same model.
         self.launch_env = {k: v for k, v in os.environ.items()
                            if k.startswith("GUFO_") or k in ("CTX", "JOBS", "KIND")}
-        # The model last loaded survives a guard restart: unless GUFO_KIND is set explicitly, boot loads it again.
+        # GUFO_MODEL names the model. Older launches used GUFO_KIND for the name and GUFO_MODEL for the weights path.
+        legacy_path = self.launch_env.get("GUFO_MODEL")
+        if legacy_path and legacy_path not in MODEL_KINDS:
+            self.launch_env["GUFO_MODEL_PATH"] = self.launch_env.pop("GUFO_MODEL")
+        if "GUFO_KIND" in self.launch_env:
+            self.launch_env.setdefault("GUFO_MODEL", self.launch_env.pop("GUFO_KIND"))
+        # The model last loaded survives a guard restart: unless GUFO_MODEL is set explicitly, boot loads it again.
         self.model_file = os.path.join(os.path.expanduser("~"), ".gufo", "jev-log", "guard-model.json")
-        if "GUFO_KIND" not in self.launch_env and not any(k in self.launch_env for k in MODEL_SPECIFIC_ENV):
+        if "GUFO_MODEL" not in self.launch_env and not any(k in self.launch_env for k in MODEL_SPECIFIC_ENV):
             try:
                 with open(self.model_file) as f:
                     saved = json.load(f).get("kind")
                 if isinstance(saved, str) and saved in MODEL_KINDS:
-                    self.launch_env["GUFO_KIND"] = saved
+                    self.launch_env["GUFO_MODEL"] = saved
             except (OSError, ValueError):
                 pass
         self.switching = False
@@ -857,16 +863,20 @@ class Guard:
                 return
         log(f"jev-log: watchdog catch ({note}) not attributable to any recent light decision")
 
+    def model_name(self):
+        return self.launch_env.get("GUFO_MODEL", "flash-next")
+
     async def start_gufo(self):
         async with self.lock:
             if self.state == "up":
                 return
             self.state = "starting"
-            env = dict(os.environ, **self.launch_env, PORT=str(self.a.upstream_port), HOST="127.0.0.1", GUFO_GUARD="0")
+            base_env = {k: v for k, v in os.environ.items() if k not in ("GUFO_KIND", "GUFO_MODEL")}
+            env = dict(base_env, **self.launch_env, PORT=str(self.a.upstream_port), HOST="127.0.0.1", GUFO_GUARD="0")
             self.proc = await asyncio.create_subprocess_exec(
                 "bash", self.a.run_script, env=env, start_new_session=True,
                 stdin=asyncio.subprocess.DEVNULL)
-            log(f"starting gufo pid={self.proc.pid} on :{self.a.upstream_port} kind={self.launch_env.get('GUFO_KIND', 'flash-next')} expected_model={self.expected_model!r}")
+            log(f"starting gufo pid={self.proc.pid} on :{self.a.upstream_port} kind={self.model_name()} expected_model={self.expected_model!r}")
             deadline = time.time() + self.a.start_timeout
             while time.time() < deadline:
                 if self.proc.returncode is not None:
@@ -889,7 +899,7 @@ class Guard:
                             try:
                                 os.makedirs(os.path.dirname(self.model_file), exist_ok=True)
                                 with open(self.model_file, "w") as f:
-                                    json.dump({"kind": self.launch_env.get("GUFO_KIND", "flash-next"),
+                                    json.dump({"kind": self.model_name(),
                                                "model": self.model_id, "time": time.time()}, f)
                             except OSError:
                                 pass
@@ -918,7 +928,7 @@ class Guard:
             self.ready.clear()
             self.stops += 1
             t_stop = time.time()
-            log(f"stopping gufo model={self.model_id!r} kind={self.launch_env.get('GUFO_KIND', 'flash-next')} ({reason})")
+            log(f"stopping gufo model={self.model_id!r} kind={self.model_name()} ({reason})")
             os.killpg(self.proc.pid, signal.SIGTERM)
             try:
                 await asyncio.wait_for(self.proc.wait(), self.a.stop_timeout)
@@ -1368,7 +1378,7 @@ class Guard:
             return web.json_response({"error": f"unknown model {kind!r}", "models": list(MODEL_KINDS)}, status=400)
         if self.switching or self.state in ("starting", "stopping"):
             return web.json_response({"error": "busy", "state": self.state}, status=409)
-        if kind == self.launch_env.get("GUFO_KIND", "flash-next") and self.state == "up":
+        if kind == self.model_name() and self.state == "up":
             return web.json_response({"state": self.state, "kind": kind, "note": "already loaded"})
         self.switching = True
         try:
@@ -1377,7 +1387,7 @@ class Guard:
                 return web.json_response({"error": "gufo did not stop"}, status=500)
             for key in MODEL_SPECIFIC_ENV:
                 self.launch_env.pop(key, None)  # set for the previous model; run-gufo.sh has defaults per kind
-            self.launch_env["GUFO_KIND"] = kind
+            self.launch_env["GUFO_MODEL"] = kind
             self.expected_model = None  # the new model defines what restarts must reload
             self.model_id = None
             self.want_up = True
@@ -1393,7 +1403,7 @@ class Guard:
             "opencode_active": self.opencode_active(), "prepare_api": 1, "default_effort": os.environ.get("GUFO_EFFORT", "low"), "pinned_effort": self.pinned_effort(),
             "idle_s": round(time.time() - self.last_activity) if self.last_activity else None,
             "mem_available_gb": round(mem_available_gb(), 1),
-            "model": self.model_id, "kind": self.launch_env.get("GUFO_KIND", "flash-next"), "models": list(MODEL_KINDS),
+            "model": self.model_id, "kind": self.model_name(), "models": list(MODEL_KINDS),
             "judge": self.judge is not None and self.judge.proc is not None
             and self.judge.proc.returncode is None})
 
