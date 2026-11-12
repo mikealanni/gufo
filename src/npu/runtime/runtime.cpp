@@ -119,6 +119,8 @@ Program NpuRuntime::MakeProgram(std::uint32_t K, std::uint32_t N,
   p.ch = p.c.map<std::uint8_t*>();
   std::memset(p.ah, 0, ab);
   std::memset(p.ch, 0, cb);
+  p.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);  // flush dirty zero lines: evicted later they overwrite device writes
+  p.c.sync(XCL_BO_SYNC_BO_TO_DEVICE);
   (void)error;
   return p;
 }
@@ -665,6 +667,7 @@ ConvLayer NpuRuntime::PackConv(const float* w_in, const float* conv_w,
   cl.prog.c = xrt::bo(dev_, cb, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(3));
   cl.prog.ch = cl.prog.c.map<std::uint8_t*>();
   std::memset(cl.prog.ch, 0, cb);
+  cl.prog.c.sync(XCL_BO_SYNC_BO_TO_DEVICE);
   const std::uint32_t K = hidden, tk = K / kTileK;
   const std::size_t in_bytes = std::size_t{3 * hidden / kStrip} * (tk + 1) * 4 * kQuarterBytes;
   const std::size_t out_bytes = std::size_t{hidden / kStrip} * tk * 4 * kQuarterBytes;
@@ -890,6 +893,8 @@ AttnLayer NpuRuntime::MakeAttnLayer(std::uint32_t capacity_tokens, std::uint32_t
     attn_ah_ = attn_a_.map<std::uint8_t*>();
     attn_ch_ = attn_c_.map<std::uint8_t*>();
     std::memset(attn_ah_, 0, kAttnAElems * 1152);
+    attn_a_.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    attn_c_.sync(XCL_BO_SYNC_BO_TO_DEVICE);
   }
   return al;
 }

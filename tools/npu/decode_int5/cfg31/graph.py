@@ -37,6 +37,11 @@ def main():
         print(ctx.module)
 
 
+import os
+BATCH = int(os.environ.get("SWI31_BATCH", "4"))
+AWAIT_IN = os.environ.get("SWI31_AWAIT_IN", "0") == "1"
+
+
 def lin(full, offset, nblk):
     return TensorAccessPattern((1, full), offset, [1, 1, 1, nblk], [0, 0, 0, 1])
 
@@ -117,7 +122,7 @@ def my_design(M, K, N, m, k, n):
                         T = ((mt >> 2) * 8 + (kt >> 3)) * 32 + (kt & 7) * 4 + (mt & 3)
                         it = shim_dma_single_bd_task(
                             A_fifos[g], A, tap=lin(M * 1024, T * 2048, 2048),
-                            issue_token=False,
+                            issue_token=AWAIT_IN,
                         )
                         ct = shim_dma_single_bd_task(
                             Cs_fifos[g], C,
@@ -128,9 +133,10 @@ def my_design(M, K, N, m, k, n):
                         dma_start_task(ct)
                         ins.append(it)
                         outs.append(ct)
-                        if len(outs) == 4:
-                            for i in range(4):
+                        if len(outs) == BATCH:
+                            for i in range(len(outs)):
                                 dma_await_task(outs[i])
+                                (dma_await_task(ins[i]) if AWAIT_IN else None)
                                 dma_free_task(ins[i])
                             outs, ins = [], []
                 for mt2 in range(2):  # B: mt0, mt1: kt' 0..55
@@ -139,7 +145,7 @@ def my_design(M, K, N, m, k, n):
                         T = ((mt >> 2) * 7 + (k2 >> 3)) * 32 + (k2 & 7) * 4 + (mt & 3)
                         it = shim_dma_single_bd_task(
                             B_fifos[g], B, tap=lin(M * 896, T * 2048, 2048),
-                            issue_token=False,
+                            issue_token=AWAIT_IN,
                         )
                         ct = shim_dma_single_bd_task(
                             Cs_fifos[g], C,
@@ -150,13 +156,15 @@ def my_design(M, K, N, m, k, n):
                         dma_start_task(ct)
                         ins.append(it)
                         outs.append(ct)
-                        if len(outs) == 4:
-                            for i in range(4):
+                        if len(outs) == BATCH:
+                            for i in range(len(outs)):
                                 dma_await_task(outs[i])
+                                (dma_await_task(ins[i]) if AWAIT_IN else None)
                                 dma_free_task(ins[i])
                             outs, ins = [], []
                 for i in range(len(outs)):
                     dma_await_task(outs[i])
+                    (dma_await_task(ins[i]) if AWAIT_IN else None)
                     dma_free_task(ins[i])
 
 

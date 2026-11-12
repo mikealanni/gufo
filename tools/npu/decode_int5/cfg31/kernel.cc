@@ -11,6 +11,9 @@
 // per iteration so the dependency chains dual-issue (NOLIB bisect: SFU cost
 // was +9.3 ms on 4 cores, raw walk+push floor 3.26 ms).
 #include "aie_kernel_utils.h"
+#if !defined(SWI31_NR) && !defined(SWI31_INV) && !defined(SWI31_TANH)
+#define SWI31_TANH  // SWI31_DEFAULT_TANH: native tanh sigmoid, no reciprocal
+#endif
 #include <aie_api/aie.hpp>
 #include <cstdint>
 
@@ -36,7 +39,15 @@ __attribute__((always_inline)) static inline aie::accum<accfloat, 64> silu_mul(
   const aie::vector<bfloat16, 64> ub = au.template to_vector<bfloat16>();
   aie::accum<accfloat, 64> ap = aie::mul(gb, c_hi);
   ap = aie::mac(ap, gb, c_lo);
-#ifdef SWI31_NR   // vector NR reciprocal: aie::inv(bf16) compiles to 64 SCALAR
+#ifdef SWI31_TANH  // sigmoid(g) = 0.5 + 0.5*tanh(g/2): one native SFU op, no reciprocal
+  const aie::vector<bfloat16, 64> half = aie::broadcast<bfloat16, 64>((bfloat16)0.5f);
+  const aie::accum<accfloat, 64> ah = aie::mul(gb, half);
+  const aie::vector<bfloat16, 64> th = aie::tanh<bfloat16>(ah.template to_vector<float>());
+  aie::accum<accfloat, 64> as = aie::accum<accfloat, 64>(half);
+  as = aie::mac(as, th, half);
+  const aie::vector<bfloat16, 64> sig = as.template to_vector<bfloat16>();
+  (void)c_hi; (void)c_lo; (void)one;
+#elif defined(SWI31_NR)   // vector NR reciprocal: aie::inv(bf16) compiles to 64 SCALAR
   // divides per vec (IR-proven: scalar get_real/upd loop, no recip insn;
   // cost +9.3 ms). Trick: s = 2^-|arg| in (0,1], so d = 1+s in (1,2] where
   // y0=1/sqrt(2) has NR error e0=0.414 -> 3 steps -> 8.5e-4 (< bf16 quantum).

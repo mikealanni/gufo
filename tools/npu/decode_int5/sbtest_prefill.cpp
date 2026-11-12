@@ -11,6 +11,7 @@
 //   final_atb_k2048.xclbin, final_atb_k7680.xclbin (core ELFs, one per K class)
 //   insts_atb_1024x<K>x<N>.txt
 #include <cstdio>
+#include <thread>
 #include <immintrin.h>
 #include <omp.h>
 #include <cmath>
@@ -571,6 +572,51 @@ int main(int argc, char** argv) {
         const std::size_t ob = std::size_t{M} * INT / 8 * 9;
         memset(m8, 0xAB, ob);
         prg.c.sync(XCL_BO_SYNC_BO_TO_DEVICE, ob, 0);
+      }
+      if (const char* bu = std::getenv("SWI31_BURST")) {  // K dispatches with no host work between
+        const int nb = std::atoi(bu);
+        if (const char* ps = std::getenv("SWI31_PRESYNC")) {  // td | fd | both
+          const std::string m = ps;
+          if (m == "td" || m == "both") prg.c.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+          if (m == "fd" || m == "both") prg.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        }
+        const char* gu = std::getenv("SWI31_GAPUS");
+        const int gapUs = gu ? std::atoi(gu) : 0;
+        for (int r = 0; r < nb; ++r) {
+          if (gapUs && r) std::this_thread::sleep_for(std::chrono::microseconds(gapUs));
+          wr.run.start();
+          wr.run.wait();
+        }
+        prg.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        const auto* q = static_cast<const std::uint8_t*>(prg.c.map());
+        int zt = 0;
+        for (std::size_t t = 0; t < 960; ++t) {
+          bool allz = true;
+          for (std::size_t i = 0; i < 1024 * 9 && allz; ++i) allz = q[t * 1024 * 9 + i] == 0;
+          zt += allz;
+        }
+        std::printf("BURST %d: zero tiles %d\n", nb, zt);
+        return 0;
+      }
+      if (const char* rep = std::getenv("SWI31_REP")) {  // same inputs, N dispatches: per-run zero tiles
+        const int nrep = std::atoi(rep);
+        const std::size_t tb = 1024 * 9;
+        const char* gapEnv = std::getenv("SWI31_GAP");
+        const int gapMs = gapEnv ? std::atoi(gapEnv) : 0;
+        for (int r = 0; r < nrep; ++r) {
+          if (gapMs) std::this_thread::sleep_for(std::chrono::milliseconds(gapMs));
+          wr.run.start();
+          wr.run.wait();
+          prg.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+          const auto* q = static_cast<const std::uint8_t*>(prg.c.map());
+          int zt = 0;
+          for (std::size_t t = 0; t < 960; ++t) {
+            bool allz = true;
+            for (std::size_t i = 0; i < tb && allz; ++i) allz = q[t * tb + i] == 0;
+            zt += allz;
+          }
+          std::printf("REP %d: zero tiles %d\n", r, zt);
+        }
       }
       const auto t_r0 = Clock::now();
       wr.run.start();
