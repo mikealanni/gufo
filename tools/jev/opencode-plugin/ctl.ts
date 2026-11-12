@@ -10,13 +10,23 @@ const exists = (p: string): boolean => { try { readFileSync(p); return true; } c
 const rm = (p: string): void => { try { unlinkSync(p); } catch { /* absent */ } };
 
 export const HELP = [
-  "jev control (type /jev <option>)",
-  "  status                      plugin state, pause, features, autoeffort, guard (model, memory)",
-  "  pause [all]                 pause jev (in the TUI this pauses all sessions)",
-  "  resume [all]                resume jev",
-  "  autoeffort on|off [level]   let jev pick reasoning effort, or pin it (minimal|low|medium|high|xhigh|max)",
-  "  feature <name> on|off       switch one feature: command, effort, goal, finish, pre",
-  "  help                        this list",
+  "jev options",
+  "",
+  "/jev status",
+  "   plugin and guard state",
+  "/jev pause [all]",
+  "   pause jev",
+  "/jev resume [all]",
+  "   resume jev",
+  "/jev autoeffort on",
+  "   jev picks the reasoning effort",
+  "/jev autoeffort off [level]",
+  "   pin the effort (default low)",
+  "   levels: minimal low medium high xhigh max",
+  "/jev feature <name> on|off",
+  "   names: command effort goal finish pre",
+  "/jev help",
+  "   this list",
 ].join("\n");
 
 export async function control(logDir: string, sid: string, argText: string): Promise<string> {
@@ -56,14 +66,16 @@ export async function control(logDir: string, sid: string, argText: string): Pro
 }
 
 async function status(logDir: string, sid: string): Promise<string> {
-  const lines: string[] = [];
-  lines.push(`session ${sid || "(unknown)"}: ${exists(join(logDir, `plugin-pause.${safe(sid)}`)) ? "PAUSED" : "active"}` + (exists(join(logDir, "plugin-pause")) ? " (global pause on)" : ""));
-  lines.push("features: " + FEATURES.map((f) => `${f}=${exists(join(logDir, `feature-off.${f}`)) || process.env[`JEV_${f.toUpperCase()}`] === "off" ? "off" : "on"}`).join(" "));
-  lines.push(exists(join(logDir, "autoeffort-off")) ? `autoeffort: OFF, pinned to ${String(readFileSync(join(logDir, "autoeffort-off"), "utf8")).trim()}` : "autoeffort: ON");
+  const paused = exists(join(logDir, `plugin-pause.${safe(sid)}`)) || exists(join(logDir, "plugin-pause"));
+  const feats = FEATURES.map((f) => `${f} ${exists(join(logDir, `feature-off.${f}`)) || process.env[`JEV_${f.toUpperCase()}`] === "off" ? "off" : "on"}`).join(", ");
+  const lines: string[] = ["jev status", "", `plugin: ${paused ? "PAUSED" : "active"}`, `features: ${feats}`];
+  lines.push(exists(join(logDir, "autoeffort-off")) ? `autoeffort: off, pinned to ${String(readFileSync(join(logDir, "autoeffort-off"), "utf8")).trim()}` : "autoeffort: on");
   try {
     const r = await fetch(`${GUARD_URL}/jev-guard/status`, { signal: AbortSignal.timeout(2000) });
     const g = (await r.json()) as Record<string, unknown>;
-    lines.push(`guard: state=${g.state} stops=${g.stops} default_effort=${g.default_effort} mem_available_gb=${g.mem_available_gb} judge=${g.judge}`);
+    if (g.state === undefined) { lines.push("guard: not running (port 8900 is served without it)"); return lines.join("\n"); }
+    lines.push(`guard: ${g.state}`, `model: ${g.model ?? "-"} (${g.kind ?? "-"})`, `free memory: ${g.mem_available_gb} GB`,
+      `judge: ${g.judge ? "on" : "off"}`, `stops: ${g.stops}`);
   } catch { lines.push("guard: unreachable"); }
   return lines.join("\n");
 }

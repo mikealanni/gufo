@@ -27,8 +27,8 @@ export default Plugin.define({
           if (text === "pause" || text === "resume") text += " all";
           let out: string;
           try {
-            // A bare /jev lists the options (and the current status) so nobody has to remember them.
-            out = text ? await control(LOG_DIR, "tui", text) : `${HELP}\n\n${await control(LOG_DIR, "tui", "status")}`;
+            // A bare /jev lists the options so nobody has to remember them.
+            out = text ? await control(LOG_DIR, "tui", text) : HELP;
           } catch (err) { out = `jev error: ${String(err)}`; }
           try { await context.ui.dialog.alert({ title: "jev", message: out }); }
           catch { context.ui.toast.show({ title: "jev", message: out, variant: "info", duration: 15000 }); }
