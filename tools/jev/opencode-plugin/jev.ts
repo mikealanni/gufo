@@ -161,7 +161,8 @@ function flagOn(path: string, key: string): boolean {
   pauseChecked.set(key, { at: now, on });
   return on;
 }
-const FEATURES = ["command", "effort", "goal", "finish", "pre"] as const;
+const GUARD_URL = process.env.JEV_GUARD_URL ?? "http://127.0.0.1:8900";
+const FEATURES = ["command", "effort", "goal", "finish", "pre", "recover"] as const;
 function featureOn(name: (typeof FEATURES)[number]): boolean {
   return process.env[`JEV_${name.toUpperCase()}`] !== "off" && !flagOn(join(LOG_DIR, `feature-off.${name}`), `f:${name}`);
 }
@@ -505,6 +506,37 @@ export default {
       subagent.set(sid, child);
       return child;
     }
+    // A turn that failed (gufo restarted, connection lost): once the guard reports gufo up, continue it.
+    const execStart = new Map<string, number>();
+    const recoverTries = new Map<string, { n: number; since: number }>();
+    const RECOVER_MAX = 3, RECOVER_WINDOW_MS = 1_800_000, RECOVER_WAIT_MS = 300_000, RECOVER_POLL_MS = 3000;
+    async function recover(sid: string): Promise<void> {
+      const failedAt = Date.now();
+      const r = recoverTries.get(sid);
+      const rec = r && failedAt - r.since < RECOVER_WINDOW_MS ? r : { n: 0, since: failedAt };
+      if (rec.n >= RECOVER_MAX) return;
+      recoverTries.set(sid, rec);
+      let up = false;
+      while (Date.now() - failedAt < RECOVER_WAIT_MS) {
+        try {
+          const st = await fetch(`${GUARD_URL}/jev-guard/status`, { signal: AbortSignal.timeout(3000) });
+          const info = st.ok ? await st.json() as { state?: string } : {};
+          if (info.state === "up") { up = true; break; }
+        } catch { /* guard or gufo not reachable yet */ }
+        await new Promise((res) => setTimeout(res, RECOVER_POLL_MS));
+      }
+      if (!up || disabled(sid) || (execStart.get(sid) ?? 0) > failedAt) return;
+      await new Promise((res) => setTimeout(res, 2000));
+      if ((execStart.get(sid) ?? 0) > failedAt) return;
+      rec.n++;
+      const entry = seen.get(sid);
+      enqueue({
+        ts: Date.now() / 1000, plugin_version: PLUGIN_VERSION, feature: "recover",
+        session: sid, call: "", provider: entry?.provider ?? "", model: entry?.model ?? "",
+        decision: { action: "continue", try: rec.n, waited_ms: Date.now() - failedAt }, segment: "", cmd: "", dur_ms: null, note: "",
+      });
+      await injectPrompt(sid, "Continue where you left off; the previous request was interrupted.");
+    }
     // Turn end: finish detector and goal tracker.
     const lastTurnEnd = new Map<string, number>();
     const ctrl = new AbortController();
@@ -516,6 +548,12 @@ export default {
             injected("event");
             trace("event", ev);
             const t = (ev as any)?.type as string;
+            if (t === "session.execution.started" || t === "session.execution.failed" || t === "session.error") {
+              const rsid = (ev as any)?.data?.sessionID as string | undefined;
+              if (rsid && t === "session.execution.started") execStart.set(rsid, Date.now());
+              else if (rsid && featureOn("recover") && isGufo(rsid) && !disabled(rsid) && !(await isSubagent(rsid))) void recover(rsid).catch((err) => noteError("recover", err));
+              continue;
+            }
             if (t !== "session.idle" && t !== "session.execution.succeeded" && t !== "session.step.ended") continue;
             const sid = (ev as any)?.data?.sessionID as string | undefined;
             if (sid && t !== "session.step.ended") releaseSessionLocks(LOG_DIR, sid);

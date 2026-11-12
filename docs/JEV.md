@@ -23,6 +23,9 @@ machine. It has two parts.
   clients keep their connection and are pointed at the new model.
 - **Effort control.** The plugin picks the reasoning effort per request, or
   pins it.
+- **Recover.** When a turn fails because gufo restarted or the connection dropped,
+  the plugin waits for the guard to report gufo up and sends "Continue" (at most
+  3 times per 30 minutes per session).
 - **Goal, finish, pre.** Keep the agent working until a task is done, detect
   early finishes, and screen requests before the model sees them.
 
@@ -64,7 +67,7 @@ Restart opencode after changing either file.
 | `/jev autoeffort off [level]` | pin the effort (default `low`); levels `none minimal low medium high xhigh max`, `none` disables thinking |
 | `/jev switch <model>` | reload gufo as another model |
 | `/jev goal [text]`, `/jev goal off` | keep working until done (max 3 pushes), or cancel |
-| `/jev feature <name> on\|off` | `command effort goal finish pre` |
+| `/jev feature <name> on\|off` | `command effort goal finish pre recover` |
 | `/jev help` | list the options |
 
 The same controls work from a terminal with `jev-ctl.sh`.

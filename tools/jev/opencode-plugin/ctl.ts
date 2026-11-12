@@ -3,7 +3,7 @@ import { mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 
 import { join } from "node:path";
 
 const LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
-const FEATURES = ["command", "effort", "goal", "finish", "pre"];
+const FEATURES = ["command", "effort", "goal", "finish", "pre", "recover"];
 const GUARD_URL = process.env.JEV_GUARD_URL ?? "http://127.0.0.1:8900";
 const safe = (s: string): string => s.replace(/[^\w.-]/g, "_");
 const exists = (p: string): boolean => { try { readFileSync(p); return true; } catch { return false; } };
@@ -32,7 +32,7 @@ export const HELP = [
   "/jev goal off",
   "   cancel the goal",
   "/jev feature <name> on|off",
-  "   names: command effort goal finish pre",
+  "   names: command effort goal finish pre recover",
   "/jev help",
   "   this list",
 ].join("\n");
