@@ -690,7 +690,8 @@ class Guard:
         self.gen_inflight = 0
         self.heavy_waiting = 0
         self.idle_noted = False
-        self.want_up = True
+        self.want_up = True  # the operator started the guard, which starts gufo once at boot
+        self.guard_stopped = False  # True only while gufo is down because THIS guard stopped it
         load_learned()
         if LEARNED:
             log(f"learned heavy keys: {len(LEARNED)}")
@@ -763,6 +764,8 @@ class Guard:
                     async with self.session.get(self.a.upstream + "/v1/models") as r:
                         if r.status == 200:
                             self.state = "up"
+                            self.guard_stopped = False
+                            self.want_up = True
                             self.ready.set()
                             log(f"gufo is up, start_took={time.time() - deadline + self.a.start_timeout:.1f}s")
                             return
@@ -777,6 +780,9 @@ class Guard:
             if self.proc is None or self.proc.returncode is not None:
                 self.state = "down"
                 self.ready.clear()
+                if not self.guard_stopped:
+                    # gufo was not running and we did not stop it: never bring it back on our own.
+                    self.want_up = False
                 return True
             self.state = "stopping"
             self.ready.clear()
@@ -795,6 +801,8 @@ class Guard:
             while mem_available_gb() < self.a.free_target_gb and time.time() < deadline:
                 await asyncio.sleep(1)
             self.state = "down"
+            self.guard_stopped = True
+            self.want_up = True
             log(f"gufo stopped, {mem_available_gb():.0f} GB available, stop_took={time.time() - t_stop:.1f}s")
             return True
 
@@ -1026,8 +1034,11 @@ class Guard:
     async def wait_ready(self, resp):
         t_wait = time.time()
         while not self.ready.is_set():
+            if not self.want_up and self.state == "down":
+                log("gufo is not running and the guard did not stop it; not starting it for a request")
+                return
             idle = self.starter is None or self.starter.done()
-            if (self.state == "down" and idle and time.time() - self.last_fail > 15
+            if (self.want_up and self.state == "down" and idle and time.time() - self.last_fail > 15
                     and (self.watch_task is None or self.watch_task.done())):
                 self.starter = asyncio.create_task(self.start_gufo())
             try:
