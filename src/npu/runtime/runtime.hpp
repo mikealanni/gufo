@@ -198,6 +198,9 @@ class NpuRuntime {
   /// (needed when one is issued immediately, i.e. inside an m64 step).
   void ConvCommit(ConvLayer& cl, std::uint32_t k, bool settle = false);
   void ConvReset(ConvLayer& cl);
+  void ConvRefresh(ConvLayer& cl);
+  /// Copy the conv history of `src` (e.g. the 64-row program) into `dst` (the 16-row program).
+  void ConvCopyHistory(ConvLayer& dst, const ConvLayer& src);
 
   // Attention on the NPU (4 kv heads x 4 q heads x 128 dims, up to 16 rows per pass).
   AttnLayer MakeAttnLayer(std::uint32_t capacity_tokens, std::uint32_t ring_tokens = 0,

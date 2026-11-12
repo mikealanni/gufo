@@ -19,6 +19,13 @@ double Ms(Clock::time_point a) {
 }
 }  // namespace
 
+// BO syncs on this stack are not fenced: invalidate our cached copy of device-written data explicitly.
+static void FlushCache(const void* p, std::size_t bytes) {
+  const char* a = static_cast<const char*>(p);
+  for (std::size_t o = 0; o < bytes; o += 64) _mm_clflushopt(const_cast<char*>(a + o));
+  _mm_mfence();
+}
+
 void PackMatInt5(const float* W, std::uint32_t N, std::uint32_t K,
                  std::uint8_t* dst, std::uint32_t extra_tiles) {
   const std::uint32_t strips = N / kStrip, tk = K / kTileK;
@@ -199,6 +206,8 @@ void NpuRuntime::Ffn64(WeightBuffer& wb_gu, Program& p_gu,
     }
   }
   if (t) t->wait += Ms(t0);
+  p_gu.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+  FlushCache(p_gu.ch, p_gu.c.size());
   // gu C wire per (tap s, aie-row r) element: 4 swiglu row-blocks of 288 B at mb*288
   // (matches the fused m16 down-A DMA pattern [1,ktile,mrows,rows,288] x [0,SB,288,CB,1]).
   const std::uint8_t* cgu = p_gu.ch;
@@ -233,6 +242,7 @@ void NpuRuntime::Ffn64(WeightBuffer& wb_gu, Program& p_gu,
   if (t) t->wait += Ms(t0);
   t0 = Clock::now();
   p_dn.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+  FlushCache(p_dn.ch, p_dn.c.size());
   if (t) t->syncC += Ms(t0);
   t0 = Clock::now();
   DecodeC(y, n, p_dn);
@@ -260,6 +270,15 @@ void NpuRuntime::EncodeA(const float* x, std::uint32_t n, std::uint32_t K,
                                 _mm256_loadu_ps(src), _MM_FROUND_TO_NEAREST_INT)));
         EncGroup(v, o);
       }
+  // Make the freshly written activations visible to the device: the A buffer is reused by every layer
+  // and BO sync alone is not fenced on this stack.
+  {
+    const char* a0 = reinterpret_cast<const char*>(p.ah);
+    const std::size_t abytes = std::size_t{tk} * mr * 1152;
+#pragma omp parallel for
+    for (std::int64_t o = 0; o < static_cast<std::int64_t>(abytes); o += 64) _mm_clflushopt(const_cast<char*>(a0 + o));
+    _mm_mfence();
+  }
 }
 
 void NpuRuntime::DecodeC(float* y, std::uint32_t n, Program& p,
@@ -319,6 +338,7 @@ void NpuRuntime::Gemm(Program& p, WeightBuffer& wb, const float* x,
   if (t) t->wait += Ms(t0);
   t0 = Clock::now();
   p.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+  FlushCache(p.ch, p.c.size());
   if (t) t->syncC += Ms(t0);
   t0 = Clock::now();
   DecodeC(y, n, p);
@@ -356,6 +376,7 @@ void NpuRuntime::Ffn(Program& p, WeightBuffer& wb, const float* x,
   if (t) t->wait += Ms(t0);
   t0 = Clock::now();
   p.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+  FlushCache(p.ch, p.c.size());
   if (t) t->syncC += Ms(t0);
   t0 = Clock::now();
   DecodeC(y, n, p, p.ch + std::size_t{120} * kStripBytes, 2048);
@@ -393,6 +414,7 @@ void NpuRuntime::Argmax(Program& p, WeightBuffer& wb, const float* x,
   if (t) t->wait += Ms(t0);
   t0 = Clock::now();
   p.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+  FlushCache(p.ch, p.c.size());
   if (t) t->syncC += Ms(t0);
   t0 = Clock::now();
   const std::uint32_t strips = p.N / kStrip;
@@ -527,6 +549,7 @@ void NpuRuntime::ConvStep(ConvLayer& cl, const float* z, std::uint32_t n, float*
   if (t) t->wait += Ms(t0);
   t0 = Clock::now();
   cl.prog.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+  FlushCache(cl.prog.ch, cl.prog.c.size());
   if (t) t->syncC += Ms(t0);
   t0 = Clock::now();
   DecodeC(y, n, cl.prog, cl.prog.ch + std::size_t{3 * cl.hidden / kStrip} * kStripBytes, cl.hidden);
@@ -536,7 +559,7 @@ void NpuRuntime::ConvStep(ConvLayer& cl, const float* z, std::uint32_t n, float*
 }
 
 void NpuRuntime::ConvCommit(ConvLayer& cl, std::uint32_t k, bool settle) {
-  k = std::min(k, cl.last_n);  // m64 Step runs conv in 16-row sub-steps; C holds only the last
+  k = std::min(k, cl.last_n);
   const std::uint32_t tk = cl.hidden / kTileK, groups = 3 * cl.hidden / kStrip / 8;
   const std::uint32_t hist = cl.taps - 1;
   for (std::uint32_t g = 1; g < groups; g += 3) {
@@ -546,22 +569,39 @@ void NpuRuntime::ConvCommit(ConvLayer& cl, std::uint32_t k, bool settle) {
         const std::uint32_t s2 = g * 8 + col;
         auto* dst = reinterpret_cast<std::uint16_t*>(
             cl.w.host + ((std::size_t{s2} * (tk + 1) + tk) * 4 + r) * kQuarterBytes + kConvHistOffset);
-        const auto* src = reinterpret_cast<const std::uint16_t*>(
-            cl.prog.ch + std::size_t{16 + j * 8 + col} * kStripBytes + std::size_t{r} * kRowBytes);
+        // role-1 bx output: per mb a 1024B region, per cbk 256B, per rh(8 rows) 128B, per row 16B.
+        const std::uint8_t* sbase =
+            cl.prog.ch + std::size_t{16 + j * 8 + col} * kStripBytes + std::size_t{r} * kRowBytes;
         for (std::uint32_t cbk = 0; cbk < 4; ++cbk) {
           std::uint16_t nh[6][8];
           for (std::uint32_t i = 0; i < hist; ++i) {
             const std::uint32_t idx = k + i;
-            const std::uint16_t* row = idx < hist ? dst + (cbk * hist + idx) * 8
-                                                  : src + cbk * 128 + (idx - hist) * 8;
+            const std::uint16_t* row;
+            if (idx < hist) {
+              row = dst + (cbk * hist + idx) * 8;
+            } else {
+              const std::uint32_t ri = idx - hist;  // row index in this chunk's output
+              const std::uint32_t mb = ri / 16;
+              const std::uint32_t lr = ri % 16;
+              row = reinterpret_cast<const std::uint16_t*>(
+                  sbase + std::size_t{mb} * 1024 + std::size_t{cbk} * 256 +
+                  std::size_t{lr / 8} * 128 + std::size_t{lr % 8} * 16);
+            }
             std::memcpy(nh[i], row, 16);
           }
           std::memcpy(dst + cbk * hist * 8, nh, hist * 16);
         }
+        // Push the new history out of the CPU caches ourselves: BO sync is not ordered with a fence
+        // on this stack, and the device reads host memory directly.
+        for (const char* q = reinterpret_cast<const char*>(dst); q < reinterpret_cast<const char*>(dst) + 4 * hist * 16 + 64; q += 64)
+          _mm_clflushopt(const_cast<char*>(q));
+        _mm_mfence();
       }
-    for (std::uint32_t col = 0; col < 8; ++col)
-      SyncToDevice(cl.w.bo, (std::size_t{(g * 8 + col)} * (tk + 1) + tk) * 4 * kQuarterBytes,
-                   4 * kQuarterBytes);
+    static const int nsync = std::getenv("GUFO_SYNC_N") ? std::atoi(std::getenv("GUFO_SYNC_N")) : 1;
+    for (int it = 0; it < nsync; ++it)
+      for (std::uint32_t col = 0; col < 8; ++col)
+        SyncToDevice(cl.w.bo, (std::size_t{(g * 8 + col)} * (tk + 1) + tk) * 4 * kQuarterBytes,
+                     4 * kQuarterBytes);
   }
       // WP10: weight-page TO_DEVICE syncs on this XRT/xdna stack become visible to
   // the program's next dispatch only ~1 ms later, and no BO operation waits for
@@ -576,6 +616,33 @@ void NpuRuntime::ConvCommit(ConvLayer& cl, std::uint32_t k, bool settle) {
     if (kSettleUs > 0) usleep(static_cast<useconds_t>(kSettleUs));
   }
   cl.last_n = 0;  // C rows now reflected in history; a repeat commit is a no-op.
+}
+
+void NpuRuntime::ConvCopyHistory(ConvLayer& dst, const ConvLayer& src) {
+  const std::uint32_t tk = dst.hidden / kTileK, groups = 3 * dst.hidden / kStrip / 8;
+  for (std::uint32_t g = 1; g < groups; g += 3)
+    for (std::uint32_t col = 0; col < 8; ++col) {
+      for (std::uint32_t r = 0; r < 4; ++r) {
+        const std::size_t off = ((std::size_t{g * 8 + col} * (tk + 1) + tk) * 4 + r) * kQuarterBytes + kConvHistOffset;
+        std::memcpy(dst.w.host + off, src.w.host + off, 4 * 6 * 16);
+        for (std::size_t q = 0; q < 4 * 6 * 16 + 64; q += 64) _mm_clflushopt(dst.w.host + off + q);
+      }
+      SyncToDevice(dst.w.bo, (std::size_t{(g * 8 + col)} * (tk + 1) + tk) * 4 * kQuarterBytes, 4 * kQuarterBytes);
+    }
+  _mm_mfence();
+}
+
+void NpuRuntime::ConvRefresh(ConvLayer& cl) {
+  const std::uint32_t tk = cl.hidden / kTileK, groups = 3 * cl.hidden / kStrip / 8;
+  for (std::uint32_t g = 1; g < groups; g += 3)
+    for (std::uint32_t col = 0; col < 8; ++col) {
+      for (std::uint32_t r = 0; r < 4; ++r) {
+        auto* dst = reinterpret_cast<volatile std::uint8_t*>(
+            cl.w.host + ((std::size_t{g * 8 + col} * (tk + 1) + tk) * 4 + r) * kQuarterBytes + kConvHistOffset);
+        for (std::uint32_t i = 0; i < 4 * 6 * 16; ++i) dst[i] = dst[i];
+      }
+      SyncToDevice(cl.w.bo, (std::size_t{(g * 8 + col)} * (tk + 1) + tk) * 4 * kQuarterBytes, 4 * kQuarterBytes);
+    }
 }
 
 namespace {

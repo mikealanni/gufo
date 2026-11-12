@@ -354,7 +354,14 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None, 
                     lambda s: s * k1t * n_aie_rows * BQ_, k1t * n_aie_rows * BQ_,
                     lambda s: ({2: 0, 1: 16, 0: 32}[(s // 8) % 3] + (s // 8 // 3) * 8 + s % 8) * SB,
                 )
-                a2 = (C, TensorAccessPattern((1, c_total), 0, [K2 // k // 2, 2, 2, 576], [SB, 2 * CB, CB, 1]))
+                if mrows > 1:
+                    # m64 conv: role 2 wrote mrows 576-byte bfp16 pieces (mb-major) per core row of each
+                    # role-2 strip slot. k-tile kt = 2*slot + pair uses core rows (2*pair, 2*pair+1) of
+                    # slot; slot and pair merge into one stride (2*CB). A order: kt, mb, row-in-pair.
+                    a2 = (C, TensorAccessPattern((1, c_total), 0,
+                              [K2 // k, mrows, 2, 576], [2 * CB, 576, CB, 1]))
+                else:
+                    a2 = (C, TensorAccessPattern((1, c_total), 0, [K2 // k // 2, 2, 2, 576], [SB, 2 * CB, CB, 1]))
             elif mode == "ffn":
                 phase(
                     N1 // n // n_aie_cols, (A, A_tap),

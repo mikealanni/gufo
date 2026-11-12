@@ -27,6 +27,8 @@ class Engine {
                                         std::string* error);
   void Reset();
   std::uint32_t Position() const;
+  /// Rows per prefill pass: 64 with the m64 programs, else 16.
+  std::uint32_t PrefillRows() const;
   /// Runs up to kMaxRows tokens from the current position. `hidden` (optional)
   /// receives the final-norm rows, tokens.size() x hidden floats.
   bool Step(std::span<const std::uint32_t> tokens, std::vector<float>* hidden);

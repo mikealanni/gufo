@@ -186,6 +186,7 @@ struct Engine::Impl {
   Options opt;
   gufo::npu::runtime::NpuRuntime rt;
   gufo::npu::runtime::Program p_conv;
+  gufo::npu::runtime::Program p_conv64;
   // WP10: every program binds its weights once (first-bind-sticky stack), so
   // programs are per-layer and weights bind at creation; no rebind happens.
   std::vector<gufo::npu::runtime::Program> pH, pQkv, pFfn, pH64, pQkv64, pGu64, pDn64;
@@ -193,6 +194,7 @@ struct Engine::Impl {
   bool m64 = false;  // m64 prefill programs available and in use for n > 16
   std::vector<gufo::npu::runtime::WeightBuffer> m_out, m_qkv, m_ffn;
   std::vector<gufo::npu::runtime::ConvLayer> m_conv;
+  std::vector<gufo::npu::runtime::ConvLayer> m_conv64;
   std::vector<gufo::npu::runtime::AttnLayer> m_attn;
   bool npu_attn{false};
   std::string programs_dir;
@@ -285,18 +287,17 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
       std::ifstream t(options.programs + "/" + f);
       return t.good();
     };
-    // m64 prefill GEMMs are EXPERIMENTAL (WP10): the XRT/xdna stack in use does not
-    // guarantee that conv-history weight-page syncs are visible to the program's very
-    // next dispatch (~1-2 ms delayed, no API to wait for it; see AGENT-4-report.md),
-    // which the 64-row conv sub-step loop hits on nearly every document. Opt in with
-    // GUFO_M64=1 (2-2.5x prefill speed, ~0.02 NLL corruption risk).
-    s.m64 = std::getenv("GUFO_M64") != nullptr &&
+    const bool have_conv64 = have_m64("insts_conv_m64.txt");
+    if (have_conv64)
+      s.p_conv64 = s.rt.MakeProgram(2048, 2048, options.programs + "/insts_conv_m64.txt", std::size_t{64} * gufo::npu::runtime::kStripBytes, error, 64, 4);
+    // 64-row prefill programs (WP10). GUFO_NO_M64=1 falls back to 16-row passes.
+    s.m64 = std::getenv("GUFO_NO_M64") == nullptr &&
             have_m64("insts_plain_2048x2048_m64.txt") && have_m64("insts_plain_2048x3072_m64.txt") &&
             have_m64("insts_ffngu64.txt") && have_m64("insts_plain_7680x2048_m64.txt");
 
     const auto t0 = Clock::now();
     const std::size_t L = c.layers.size();
-    s.m_conv.resize(L); s.m_attn.resize(L); s.m_out.resize(L);
+    s.m_conv.resize(L); s.m_conv64.resize(L); s.m_attn.resize(L); s.m_out.resize(L);
     s.programs_dir = options.programs;
     s.npu_attn = !std::getenv("GUFO_CPU_ATTN") && options.context >= 1; s.m_qkv.resize(L); s.m_ffn.resize(L);
     s.m_ffn_dn.resize(L);
@@ -330,6 +331,9 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
         s.LoadRows(pre + "conv.out_proj.weight", lw.out_proj, wout.data(), 2048, 2048);
         s.m_conv[l] = s.rt.PackConv(buf.data(), static_cast<const float*>(lw.conv.data), s.taps,
                                     wout.data(), 2048, s.p_conv);
+        if (have_conv64)
+          s.m_conv64[l] = s.rt.PackConv(buf.data(), static_cast<const float*>(lw.conv.data), s.taps,
+                                        wout.data(), 2048, s.p_conv64);
       } else {
         buf.resize(std::size_t{3072} * 2048);
         s.LoadRows(pre + "self_attn.q_proj.weight", lw.q, buf.data(), 2048, 2048);
@@ -431,11 +435,13 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
 void Engine::Reset() {
   Impl& s = *impl_; s.pos = 0;
   for (auto& cl : s.m_conv) if (cl.hidden) s.rt.ConvReset(cl);
+  for (auto& cl : s.m_conv64) if (cl.hidden) s.rt.ConvReset(cl);
   for (auto& al : s.m_attn) if (al.host) s.rt.AttnReset(al);
   for (auto& v : s.k_cache) std::fill(v.begin(), v.end(), std::uint16_t{0});
   for (auto& v : s.v_cache) std::fill(v.begin(), v.end(), std::uint16_t{0});
 }
 std::uint32_t Engine::Position() const { return impl_->pos; }
+std::uint32_t Engine::PrefillRows() const { return impl_->m64 ? kMaxRows : 16; }
 
 bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hidden) {
   Impl& s = *impl_;
@@ -456,14 +462,40 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     RmsNorm(x.data(), static_cast<const float*>(lw.norm.data), z.data(), n, H, c.eps);
     s.t_cpu += Ms(cpu0);
     if (c.layers[l] == LayerType::kConvolution) {
-      // Conv/attention kernels stay m16 (row-batching needs no weight-stream win there):
-      // run them in 16-row sub-steps; only the GEMMs batch to m64.
-      for (std::uint32_t o = 0; o < n; o += 16) {
-        const std::uint32_t m = std::min(16u, n - o);
-        s.rt.ConvStep(s.m_conv[l], z.data() + std::size_t{o} * H, m, branch.data() + std::size_t{o} * H, &s.tim);
-        // m64 chunks: roll conv history after every sub-step so the next sub-step sees
-        // its left context; n <= 16 keeps the deferred Commit (speculative rollback).
-        if (n > 16) s.rt.ConvCommit(s.m_conv[l], m, /*settle=*/true);
+      if (s.m64 && n > 16 && !s.m_conv64.empty() && s.m_conv64[l].hidden) {
+        if (std::getenv("GUFO_REFRESH")) s.rt.ConvRefresh(s.m_conv64[l]);
+        s.rt.ConvStep(s.m_conv64[l], z.data(), n, branch.data(), &s.tim);
+        if (const char* dd = std::getenv("GUFO_DUMP_DIR")) {
+          if (s.pos < 192 && l < 4) {
+            char fn[512]; std::snprintf(fn, sizeof fn, "%s/p%u_C%zu.f32", dd, s.pos, l);
+            if (FILE* f = std::fopen(fn, "wb")) { std::fwrite(branch.data(), 4, branch.size(), f); std::fclose(f); }
+          }
+        }
+        if (std::getenv("GUFO_CONV_REPEAT") && l < 6) {
+          std::vector<float> b2(branch.size());
+          s.rt.ConvStep(s.m_conv64[l], z.data(), n, b2.data(), nullptr);
+          int bad = 0; std::string rows;
+          for (std::uint32_t r = 0; r < n; ++r) {
+            bool d = false;
+            for (std::uint32_t cc = 0; cc < H; ++cc) if (b2[std::size_t{r} * H + cc] != branch[std::size_t{r} * H + cc]) { d = true; break; }
+            if (d) { ++bad; rows += std::to_string(r) + ","; }
+          }
+          if (bad) std::fprintf(stderr, "[repeat] L%zu pos %u: %d rows differ: %s\n", l, s.pos, bad, rows.c_str());
+        }
+        if (std::getenv("GUFO_NANCHK")) {
+          int nn=0,ninf=0; float mx=0; int badrows=0;
+          std::string badlist;
+          for(uint32_t r=0;r<n;++r){ bool br=false; for(uint32_t c=0;c<H;++c){ float v=branch[size_t(r)*H+c]; if(v!=v){nn++;br=true;} else if(v>1e30||v<-1e30){ninf++;br=true;} if(v==v && std::abs(v)>std::abs(mx)) mx=v; } if(br){badrows++; if(badlist.size()<120) badlist += std::to_string(r)+",";} }
+          std::fprintf(stderr,"[conv64] L%zu nnan=%d ninf=%d badrows=%d/%u mx=%.4g bad=[%s]\n", l,nn,ninf,badrows,n,mx,badlist.c_str());
+        }
+        s.rt.ConvCommit(s.m_conv64[l], n, /*settle=*/false);
+        if (s.m_conv[l].hidden) s.rt.ConvCopyHistory(s.m_conv[l], s.m_conv64[l]);
+      } else {
+        for (std::uint32_t o = 0; o < n; o += 16) {
+          const std::uint32_t m = std::min(16u, n - o);
+          s.rt.ConvStep(s.m_conv[l], z.data() + std::size_t{o} * H, m, branch.data() + std::size_t{o} * H, &s.tim);
+          if (n > 16) s.rt.ConvCommit(s.m_conv[l], m, /*settle=*/true);
+        }
       }
             cpu0 = Clock::now();
     } else {
@@ -725,6 +757,16 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     } else {
       for (std::size_t i = 0; i < x.size(); ++i) x[i] += branch[i];
     }
+    if (std::getenv("GUFO_NANCHK")) {
+      bool bad=false; for(size_t i=0;i<x.size()&&!bad;++i) if(!(x[i]==x[i])) bad=true;
+      if(bad) { std::fprintf(stderr,"[nan] after layer %zu pos=%u\n", l, s.pos); }
+    }
+    if (const char* dd = std::getenv("GUFO_DUMP_DIR")) {
+      if (s.pos < 192) {
+        char fn[512]; std::snprintf(fn, sizeof fn, "%s/p%u_L%zu.f32", dd, s.pos, l);
+        if (FILE* f = std::fopen(fn, "wb")) { std::fwrite(x.data(), 4, x.size(), f); std::fclose(f); }
+      }
+    }
       }
   if (hidden) {
     hidden->resize(std::size_t{n} * H);
@@ -739,9 +781,16 @@ void Engine::Commit(std::uint32_t k) {
   Impl& s = *impl_;
   const auto& c = s.w->config;
   k = std::min(k, s.pending);
+  const bool use64conv = s.m64 && k > 16 && !s.m_conv64.empty();
   for (std::size_t l = 0; l < c.layers.size(); ++l)
-    if (c.layers[l] == LayerType::kConvolution)
-      s.rt.ConvCommit(s.m_conv[l], k);
+    if (c.layers[l] == LayerType::kConvolution) {
+      if (use64conv && s.m_conv64[l].hidden) {
+        // already committed right after its dispatch in Step (a late rewrite right before the next
+        // chunk's first dispatch is exactly what races with the device)
+        if (std::getenv("GUFO_RECOMMIT")) s.rt.ConvCommit(s.m_conv64[l], k);
+      } else
+        s.rt.ConvCommit(s.m_conv[l], k);
+    }
   s.pos += k; s.pending = 0;
 }
 
