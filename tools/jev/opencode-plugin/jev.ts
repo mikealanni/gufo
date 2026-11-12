@@ -1,7 +1,7 @@
 // Phase 0 command gate (docs/JEV-OPENCODE-PLUGIN.md Section 1, log-only).
 // No GPU/NPU, no judge, no mutation: hook bodies only classify + enqueue.
 // Entry point symlinked to ~/.config/opencode/plugins/jev.ts.
-import { appendFileSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -566,6 +566,18 @@ export default {
             const verdict = judgeFinish(task, response, hadTool, "stop");
             let acted = "";
             if (t !== "session.step.ended" && !hadTool && !(await isSubagent(sid))) {
+              // /jev goal [text] and /jev goal off leave marker files; the next turn end of any gufo session takes them.
+              const takeMarker = (name: string): string | null => {
+                try { const p = join(LOG_DIR, name); const t = readFileSync(p, "utf8"); unlinkSync(p); return t; } catch { return null; }
+              };
+              const armed_text = takeMarker("goal-pending");
+              if (armed_text !== null) {
+                const hist0 = toGoalMessages(lastMsgs.get(sid) ?? []);
+                const lastUser0 = [...hist0].reverse().find((m) => m.role === "user");
+                const text0 = armed_text.trim() || lastUser0?.text || "";
+                if (text0) goals.set(sid, { text: text0, continues: 0 });
+              }
+              if (takeMarker("goal-off") !== null) goals.delete(sid);
               const g = goals.get(sid);
               if (g && featureOn("goal")) {
                 const hist = toGoalMessages(lastMsgs.get(sid) ?? []);

@@ -41,6 +41,11 @@ case "$ARG" in
   status)
     [ -n "$SID" ] && { [ -e "$ONE" ] && echo "this session ($SID): PAUSED" || echo "this session ($SID): active"; }
     python3 "$HERE/status.py" 2>&1 | head -14 ;;
+  goal)
+    shift
+    mkdir -p "$DIR"
+    if [ "${1:-}" = "off" ]; then : > "$DIR/goal-off"; echo "goal cancelled for the next agent turn."
+    else printf '%s' "$*" > "$DIR/goal-pending"; echo "goal armed${*:+: $*}"; echo "it takes effect when the agent next stops."; fi ;;
   ""|help)
     cat <<'HELP'
 jev control (type jev <option>)
@@ -48,6 +53,8 @@ jev control (type jev <option>)
   pause [all]                 pause jev for this session, or all sessions
   resume [all]                resume jev
   autoeffort on|off [level]   let jev pick reasoning effort, or pin it (none = no thinking|minimal|low|medium|high|xhigh|max)
+  goal [text]                 keep the agent working until the task is done (no text = current task)
+  goal off                    cancel the goal
   feature <name> on|off       switch one feature: command, effort, goal, finish, pre
   help                        this list
 HELP

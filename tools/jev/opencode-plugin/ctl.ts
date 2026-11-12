@@ -23,6 +23,11 @@ export const HELP = [
   "/jev autoeffort off [level]",
   "   pin the effort (default low)",
   "   levels: none (no thinking) minimal low medium high xhigh max",
+  "/jev goal [text]",
+  "   keep the agent working until the task is done",
+  "   (no text = the current task; max 3 pushes)",
+  "/jev goal off",
+  "   cancel the goal",
   "/jev feature <name> on|off",
   "   names: command effort goal finish pre",
   "/jev help",
@@ -58,6 +63,12 @@ export async function control(logDir: string, sid: string, argText: string): Pro
       if (!FEATURES.includes(a) || (b !== "on" && b !== "off")) return `usage: /jev feature ${FEATURES.join("|")} on|off`;
       if (b === "off") writeFileSync(join(logDir, `feature-off.${a}`), ""); else rm(join(logDir, `feature-off.${a}`));
       return `feature '${a}' ${b.toUpperCase()}.`;
+    }
+    case "goal": {
+      const rest = argText.trim().slice(cmd.length).trim();
+      if (rest.toLowerCase() === "off") { writeFileSync(join(logDir, "goal-off"), ""); return "goal cancelled for the next agent turn."; }
+      writeFileSync(join(logDir, "goal-pending"), rest);
+      return rest ? `goal armed: ${rest.slice(0, 80)}\nit takes effect when the agent next stops.` : "goal armed for the current task\nit takes effect when the agent next stops.";
     }
     case "help": return HELP;
     case "status": case "": return await status(logDir, sid);
