@@ -311,6 +311,11 @@ if (GUFO_BUILD_NPU_ENGINE)
     ${GUFO_XRT_LIB_DIR}/libxrt_coreutil.so.2 ${GUFO_XRT_LIB_DIR}/libxrt_core.so.2)
   target_link_libraries(sbtest-ffn64b PRIVATE OpenMP::OpenMP_CXX
     ${GUFO_XRT_LIB_DIR}/libxrt_coreutil.so.2 ${GUFO_XRT_LIB_DIR}/libxrt_core.so.2)
+  add_executable(rmsnorm-ref-test
+    tools/npu/decode_int5/rmsnorm_ref_test.cpp)
+  target_include_directories(rmsnorm-ref-test PRIVATE ${PROJECT_SOURCE_DIR})
+  target_compile_options(rmsnorm-ref-test PRIVATE -O3 -march=native -ffast-math -fno-finite-math-only)
+  target_link_libraries(rmsnorm-ref-test PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
 add_executable(gufo
