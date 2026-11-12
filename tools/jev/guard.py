@@ -65,6 +65,8 @@ HEAVY_RES = [
 assert len(HEAVY_RES) == len(HEAVY), "HEAVY and HEAVY_RES must stay parallel"
 # Model kinds ~/run-gufo.sh can start (GUFO_KIND).
 MODEL_KINDS = ("flash-next", "27b", "35b", "glm", "flint", "laguna")
+# Launch variables that belong to one model; they must not leak into another model when switching.
+MODEL_SPECIFIC_ENV = ("GUFO_MODEL", "GUFO_DFLASH", "GUFO_MTP", "GUFO_DIR", "GUFO_BIN", "CTX")
 MODEL_EXT = (".gguf", ".safetensors", ".bin")
 GPU_CONTENT = re.compile(r"import\s+torch|from\s+torch|\bhipMalloc|\bhipLaunch|libamdhip|\bcuda\b|rocm|/dev/kfd|\.cuda\(", re.I)
 RAM_CONTENT = re.compile(r"llama[._-]?cpp|\bvllm\b|safetensors|from_pretrained|\bgguf\b", re.I)
@@ -792,7 +794,7 @@ class Guard:
                            if k.startswith("GUFO_") or k in ("CTX", "JOBS", "KIND")}
         # The model last loaded survives a guard restart: unless GUFO_KIND is set explicitly, boot loads it again.
         self.model_file = os.path.join(os.path.expanduser("~"), ".gufo", "jev-log", "guard-model.json")
-        if "GUFO_KIND" not in self.launch_env:
+        if "GUFO_KIND" not in self.launch_env and not any(k in self.launch_env for k in MODEL_SPECIFIC_ENV):
             try:
                 with open(self.model_file) as f:
                     saved = json.load(f).get("kind")
@@ -1373,6 +1375,8 @@ class Guard:
             await self.drain_for_watchdog(f"switching model to {kind}")
             if not await self.stop_gufo(f"switching model to {kind}"):
                 return web.json_response({"error": "gufo did not stop"}, status=500)
+            for key in MODEL_SPECIFIC_ENV:
+                self.launch_env.pop(key, None)  # set for the previous model; run-gufo.sh has defaults per kind
             self.launch_env["GUFO_KIND"] = kind
             self.expected_model = None  # the new model defines what restarts must reload
             self.model_id = None
