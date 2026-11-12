@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 export interface Plan { effort?: string; thinking?: boolean; budget?: number; reason: string }
 
-const LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"];
+const LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 const DEFAULT_PINNED = "low";
 const GUARD_URL = process.env.JEV_GUARD_URL ?? "http://127.0.0.1:8900";
 const BASELINE_TTL_MS = 30_000;

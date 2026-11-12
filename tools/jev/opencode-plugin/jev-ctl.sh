@@ -36,7 +36,7 @@ case "$ARG" in
         echo "autoeffort OFF: every gufo request without its own effort is pinned to '$LEVEL' (all sessions)." ;;
       on) rm -f "$EF"; echo "autoeffort ON: jev picks the reasoning effort per request." ;;
       *) [ -e "$EF" ] && echo "autoeffort: OFF, pinned to $(cat "$EF")" || echo "autoeffort: ON (default)"
-         echo "usage: /jev autoeffort on | off [minimal|low|medium|high|xhigh|max]" ;;
+         echo "usage: /jev autoeffort on | off [none|minimal|low|medium|high|xhigh|max]" ;;
     esac ;;
   status)
     [ -n "$SID" ] && { [ -e "$ONE" ] && echo "this session ($SID): PAUSED" || echo "this session ($SID): active"; }
@@ -47,7 +47,7 @@ jev control (type jev <option>)
   status                      plugin state, pause, features, autoeffort, guard (model, memory)
   pause [all]                 pause jev for this session, or all sessions
   resume [all]                resume jev
-  autoeffort on|off [level]   let jev pick reasoning effort, or pin it (minimal|low|medium|high|xhigh|max)
+  autoeffort on|off [level]   let jev pick reasoning effort, or pin it (none = no thinking|minimal|low|medium|high|xhigh|max)
   feature <name> on|off       switch one feature: command, effort, goal, finish, pre
   help                        this list
 HELP

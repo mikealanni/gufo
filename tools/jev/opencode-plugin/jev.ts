@@ -327,7 +327,7 @@ export default {
           // Effort plan: written into the request body by the http.request hook.
           let plan: Plan | null = null;
           const pinned = pinnedEffort(LOG_DIR);
-          if (pinned) plan = { effort: pinned, reason: "autoeffort-off" };
+          if (pinned) plan = pinned === "none" ? { thinking: false, reason: "autoeffort-off" } : { effort: pinned, reason: "autoeffort-off" };
           else if (featureOn("effort")) {
             if (lastRole === "tool") {
               const base = await baselineEffort();

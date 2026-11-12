@@ -2,7 +2,7 @@
 import { mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-const LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"];
+const LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 const FEATURES = ["command", "effort", "goal", "finish", "pre"];
 const GUARD_URL = process.env.JEV_GUARD_URL ?? "http://127.0.0.1:8900";
 const safe = (s: string): string => s.replace(/[^\w.-]/g, "_");
@@ -22,7 +22,7 @@ export const HELP = [
   "   jev picks the reasoning effort",
   "/jev autoeffort off [level]",
   "   pin the effort (default low)",
-  "   levels: minimal low medium high xhigh max",
+  "   levels: none (no thinking) minimal low medium high xhigh max",
   "/jev feature <name> on|off",
   "   names: command effort goal finish pre",
   "/jev help",
