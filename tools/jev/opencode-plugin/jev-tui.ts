@@ -1,11 +1,12 @@
 // TUI-side /jev: runs the control logic locally and shows the result in a dialog, so no model turn is started.
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { Plugin } from "@opencode/plugin/tui";
 import { control } from "./ctl.ts";
 
 const LOG_DIR = process.env.JEV_LOG_DIR ?? join(homedir(), ".gufo", "jev-log");
 
-export default {
+export default Plugin.define({
   id: "jev.tui",
   async setup(context: any) {
     context.keymap.layer(() => ({
@@ -31,4 +32,4 @@ export default {
       bindings: ["jev.control"],
     }));
   },
-};
+});
