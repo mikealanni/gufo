@@ -1,9 +1,11 @@
 #include "src/npu/runtime/runtime.hpp"
+#include "src/npu/runtime/atb_layout.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <omp.h>
@@ -19,15 +21,8 @@ double Ms(Clock::time_point a) {
 }
 }  // namespace
 
-// BO syncs on this stack are not fenced: invalidate our cached copy of device-written data explicitly.
-static void FlushCache(const void* p, std::size_t bytes) {
-  const char* a = static_cast<const char*>(p);
-  for (std::size_t o = 0; o < bytes; o += 64) _mm_clflushopt(const_cast<char*>(a + o));
-  _mm_mfence();
-}
-
 void PackMatInt5(const float* W, std::uint32_t N, std::uint32_t K,
-                 std::uint8_t* dst, std::uint32_t extra_tiles) {
+                 std::uint8_t* dst, std::uint32_t extra_tiles, const std::uint32_t* tile_perm) {
   const std::uint32_t strips = N / kStrip, tk = K / kTileK;
   std::vector<std::int8_t> q(std::size_t{N} * K);
   std::vector<std::uint16_t> sc(std::size_t{N} * (K / 32));
@@ -63,7 +58,7 @@ void PackMatInt5(const float* W, std::uint32_t N, std::uint32_t K,
             const int cib = lane >> 3, kk = lane & 7;
             const std::size_t nidx = std::size_t(s2) * 128 + r * 32 + sb * 16 +
                                      blk * 8 + cib;
-            const int x = q[nidx * K + t * 64 + sr * 8 + kk] + 16;
+            const int x = q[nidx * K + (tile_perm ? tile_perm[t] : std::uint32_t(t)) * 64 + sr * 8 + kk] + 16;
             words[(p / 3) * 64 + lane] |=
                 static_cast<std::uint16_t>(x << (5 * (p % 3)));
           }
@@ -75,7 +70,7 @@ void PackMatInt5(const float* W, std::uint32_t N, std::uint32_t K,
                 const std::size_t nidx = std::size_t(s2) * 128 + r * 32 +
                                          sb * 16 + blk * 8 + cib;
                 scl[((sb * 2 + blk) * 2 + qq) * 8 + cib] =
-                    sc[nidx * (K / 32) + t * 2 + qq];
+                    sc[nidx * (K / 32) + (tile_perm ? tile_perm[t] : std::uint32_t(t)) * 2 + qq];
               }
       }
 }
@@ -99,7 +94,8 @@ bool NpuRuntime::Init(const std::string& xclbin_path, std::string* error) {
 Program NpuRuntime::MakeProgram(std::uint32_t K, std::uint32_t N,
                                 const std::string& insts_path,
                                 std::size_t c_override, std::string* error,
-                                std::uint32_t a_extra_k, std::uint32_t mrows) {
+                                std::uint32_t a_extra_k, std::uint32_t mrows,
+                                int a_group, int c_group) {
   Program p;
   p.K = K;
   p.N = N;
@@ -116,9 +112,9 @@ Program NpuRuntime::MakeProgram(std::uint32_t K, std::uint32_t N,
   std::memcpy(p.insts.map<void*>(), buf.data(), sz);
   p.insts.sync(XCL_BO_SYNC_BO_TO_DEVICE);
   const std::size_t ab = std::size_t{16 * mrows} * (K + a_extra_k) / 8 * 9;
-  const std::size_t cb = c_override ? c_override : std::size_t{N / kStrip} * kStripBytes;
-  p.a = xrt::bo(dev_, ab, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(3));
-  p.c = xrt::bo(dev_, cb, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(3));
+  const std::size_t cb = c_override ? c_override : std::size_t{N / kStrip} * mrows * kStripBytes;
+  p.a = xrt::bo(dev_, ab, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(a_group));
+  p.c = xrt::bo(dev_, cb, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(c_group));
   p.ah = p.a.map<std::uint8_t*>();
   p.ch = p.c.map<std::uint8_t*>();
   std::memset(p.ah, 0, ab);
@@ -207,7 +203,6 @@ void NpuRuntime::Ffn64(WeightBuffer& wb_gu, Program& p_gu,
   }
   if (t) t->wait += Ms(t0);
   p_gu.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-  FlushCache(p_gu.ch, p_gu.c.size());
   // gu C wire per (tap s, aie-row r) element: 4 swiglu row-blocks of 288 B at mb*288
   // (matches the fused m16 down-A DMA pattern [1,ktile,mrows,rows,288] x [0,SB,288,CB,1]).
   const std::uint8_t* cgu = p_gu.ch;
@@ -215,8 +210,8 @@ void NpuRuntime::Ffn64(WeightBuffer& wb_gu, Program& p_gu,
     for (int r = 0; r < 4; ++r)
       for (std::uint32_t mb = 0; mb < p_dn.mrows; ++mb)
         std::memcpy(p_dn.ah + (std::size_t(s) * 4 + mb) * 1152 + std::size_t(r) * 288,
-                    cgu + std::size_t(s) * kStripBytes + std::size_t(r) * kRowBytes +
-                        std::size_t(mb) * 288,
+                    cgu + std::size_t(s) * p_gu.mrows * kStripBytes + std::size_t(mb) * 4 * kRowBytes +
+                        std::size_t(r) * kRowBytes,
                     288);
   (void)tk;
   t0 = Clock::now();
@@ -242,7 +237,6 @@ void NpuRuntime::Ffn64(WeightBuffer& wb_gu, Program& p_gu,
   if (t) t->wait += Ms(t0);
   t0 = Clock::now();
   p_dn.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-  FlushCache(p_dn.ch, p_dn.c.size());
   if (t) t->syncC += Ms(t0);
   t0 = Clock::now();
   DecodeC(y, n, p_dn);
@@ -270,15 +264,6 @@ void NpuRuntime::EncodeA(const float* x, std::uint32_t n, std::uint32_t K,
                                 _mm256_loadu_ps(src), _MM_FROUND_TO_NEAREST_INT)));
         EncGroup(v, o);
       }
-  // Make the freshly written activations visible to the device: the A buffer is reused by every layer
-  // and BO sync alone is not fenced on this stack.
-  {
-    const char* a0 = reinterpret_cast<const char*>(p.ah);
-    const std::size_t abytes = std::size_t{tk} * mr * 1152;
-#pragma omp parallel for
-    for (std::int64_t o = 0; o < static_cast<std::int64_t>(abytes); o += 64) _mm_clflushopt(const_cast<char*>(a0 + o));
-    _mm_mfence();
-  }
 }
 
 void NpuRuntime::DecodeC(float* y, std::uint32_t n, Program& p,
@@ -299,8 +284,8 @@ void NpuRuntime::DecodeC(float* y, std::uint32_t n, Program& p,
           continue;
         const std::size_t col = std::size_t(s) * 128 + r * 32 + sb * 16 +
                                 (acc & 1) * 8;
-        DecGroup(base + std::size_t(s) * kStripBytes + std::size_t(r) * kRowBytes +
-                     std::size_t(mb) * 576 + std::size_t(G) * 9,
+        DecGroup(base + std::size_t(s) * p.mrows * kStripBytes + std::size_t(mb) * 4 * kRowBytes +
+                     std::size_t(r) * kRowBytes + std::size_t(G) * 9,
                  y + std::size_t(row) * N + col);
       }
 }
@@ -338,10 +323,197 @@ void NpuRuntime::Gemm(Program& p, WeightBuffer& wb, const float* x,
   if (t) t->wait += Ms(t0);
   t0 = Clock::now();
   p.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-  FlushCache(p.ch, p.c.size());
   if (t) t->syncC += Ms(t0);
   t0 = Clock::now();
   DecodeC(y, n, p);
+  if (t) t->dec += Ms(t0);
+  if (t) ++t->calls;
+}
+
+// --- AGENT-7 big-M prefill (ATB) path -----------------------------------
+// The reference ATB helpers build a shuffled float copy, then encode it, then
+// decode C back through another float copy. That costs ~1.5 s per 1024-token
+// chunk on the host. These paths write/read the tile stream in place, fused
+// with the bfp16 codec, so the host side is a pass over the data.
+namespace {
+constexpr std::uint32_t kAtbTileM = 128;  // L1 tile m
+constexpr std::uint32_t kAtbTileN = 128;  // L1 tile n
+constexpr std::uint32_t kAtbTileK = 64;   // L1 tile k
+constexpr std::uint32_t kAtbTileBytes = kAtbTileM * kAtbTileK / 8 * 9;  // 9216
+// One 8x8 sub-block: 8 bfp16ebs8 vectors of 9 bytes (one per row/column).
+constexpr std::uint32_t kAtbBlkBytes = 8 * 9;  // 72
+
+// v8bfp16ebs8 encoder for one 8-value block (AIE2p truncation semantics).
+inline void EncodeBlock8(const float* x, std::uint8_t* out) {
+  std::uint32_t u[8];
+  std::uint32_t max_exp = 0;
+  for (int i = 0; i < 8; ++i) {
+    std::memcpy(&u[i], x + i, 4);
+    const std::uint32_t e = (u[i] >> 23) & 0xFFu;
+    max_exp = e > max_exp ? e : max_exp;
+  }
+  out[0] = static_cast<std::uint8_t>(max_exp);
+  for (int i = 0; i < 8; ++i) {
+    const std::uint32_t sign = u[i] & 0x80000000u;
+    const std::uint32_t exp = (u[i] >> 23) & 0xFFu;
+    std::uint32_t mant = u[i] & 0x007FFFFFu;
+    if (exp) mant |= 0x00800000u;
+    if (exp >= 255) {
+      out[1 + i] = 0;
+      continue;
+    }
+    mant = sign ? (~mant + 1u) : mant;
+    std::uint8_t v = static_cast<std::uint8_t>(mant >> 17);
+    std::int8_t sv = static_cast<std::int8_t>(v);
+    if (max_exp - exp >= 32)
+      out[1 + i] = sign ? 0xFF : 0x00;
+    else
+      out[1 + i] = static_cast<std::uint8_t>(sv >> (max_exp - exp));
+  }
+}
+
+// Decode one 8-value block into dst[0..7].
+inline float BlockScale(std::uint8_t e) {
+  const float m = e >= 127 ? static_cast<float>(1u << (e - 127))
+                           : 1.0f / static_cast<float>(1u << (127 - e));
+  return m / 64.0f;
+}
+inline void DecodeBlock8(const std::uint8_t* in, float* dst) {
+  const float mult = BlockScale(in[0]);
+  for (int i = 0; i < 8; ++i)
+    dst[i] = static_cast<float>(static_cast<std::int8_t>(in[1 + i])) * mult;
+}
+}  // namespace
+
+// K x N row-major float weights -> ATB B stream (transposed 1x2 8x8 tiles).
+WeightBuffer NpuRuntime::PackWeightAtb(const float* W, std::uint32_t K,
+                                       std::uint32_t N, int b_group) {
+  WeightBuffer wb;
+  wb.bytes = std::size_t{K} * N / 8 * 9;
+  wb.bo = xrt::bo(dev_, wb.bytes, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(b_group));
+  wb.host = wb.bo.map<std::uint8_t*>();
+  const std::uint32_t l1_rows = K / kAtbTileK;
+  const std::uint32_t l1_cols = N / kAtbTileN;
+#pragma omp parallel for collapse(2)
+  for (std::uint32_t l1_col = 0; l1_col < l1_cols; ++l1_col) {
+    for (std::uint32_t l1_row = 0; l1_row < l1_rows; ++l1_row) {
+      std::uint8_t* tile =
+          wb.host + (std::size_t{l1_col} * l1_rows + l1_row) * kAtbTileBytes;
+      for (std::uint32_t sbc_i = 0; sbc_i < 8; ++sbc_i) {
+        for (std::uint32_t sbr = 0; sbr < 8; ++sbr) {
+          for (std::uint32_t bis = 0; bis < 2; ++bis) {
+            std::uint8_t* blk =
+                tile + ((sbc_i * 8 + sbr) * 2 + bis) * kAtbBlkBytes;
+            const std::uint32_t cbc = sbc_i * 2 + bis;
+            const std::uint32_t row0 = (l1_row * kAtbTileK) + sbr * 8;
+            const std::uint32_t col0 = (l1_col * kAtbTileN) + cbc * 8;
+            for (std::uint32_t col_in = 0; col_in < 8; ++col_in) {
+              float v[8];
+              for (std::uint32_t row_in = 0; row_in < 8; ++row_in)
+                v[row_in] = W[std::size_t(row0 + row_in) * N + col0 + col_in];
+              EncodeBlock8(v, blk + col_in * 9);
+            }
+          }
+        }
+      }
+    }
+  }
+  wb.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  return wb;
+}
+
+// M x K row-major activations -> ATB A stream (row-major 2x1 8x8 tiles).
+void NpuRuntime::EncodeAAtb(const float* x, std::uint32_t M, std::uint32_t K,
+                            Program& p) {
+  const std::uint32_t l1_rows = M / kAtbTileM;
+  const std::uint32_t l1_cols = K / kAtbTileK;
+  atb_a_scratch_.resize(std::size_t{M} * K / 8 * 9);
+  std::uint8_t* const dst = atb_a_scratch_.data();
+#pragma omp parallel for collapse(2)
+  for (std::uint32_t l1_row = 0; l1_row < l1_rows; ++l1_row) {
+    for (std::uint32_t l1_col = 0; l1_col < l1_cols; ++l1_col) {
+      std::uint8_t* tile =
+          dst + (std::size_t{l1_row} * l1_cols + l1_col) * kAtbTileBytes;
+      for (std::uint32_t sbr = 0; sbr < 8; ++sbr) {
+        for (std::uint32_t sbc = 0; sbc < 8; ++sbc) {
+          for (std::uint32_t bis = 0; bis < 2; ++bis) {
+            std::uint8_t* blk =
+                tile + ((sbr * 8 + sbc) * 2 + bis) * kAtbBlkBytes;
+            const std::uint32_t row0 = l1_row * kAtbTileM + sbr * 16 + bis * 8;
+            const std::uint32_t col0 = l1_col * kAtbTileK + sbc * 8;
+            for (std::uint32_t rib = 0; rib < 8; ++rib)
+              EncodeBlock8(x + std::size_t(row0 + rib) * K + col0,
+                           blk + rib * 9);
+          }
+        }
+      }
+    }
+  }
+  std::memcpy(p.ah, dst, atb_a_scratch_.size());
+}
+
+// ATB C stream -> M x N row-major floats.
+void NpuRuntime::DecodeCAtb(float* y, std::uint32_t M, std::uint32_t N,
+                            Program& p) {
+  const std::uint32_t l1_rows = M / kAtbTileM;
+  const std::uint32_t l1_cols = N / kAtbTileN;
+  atb_c_scratch_.resize(std::size_t{M} * N / 8 * 9);
+  std::memcpy(atb_c_scratch_.data(), p.ch, atb_c_scratch_.size());
+  const std::uint8_t* const src = atb_c_scratch_.data();
+#pragma omp parallel for collapse(2)
+  for (std::uint32_t l1_row = 0; l1_row < l1_rows; ++l1_row) {
+    for (std::uint32_t l1_col = 0; l1_col < l1_cols; ++l1_col) {
+      const std::uint8_t* tile =
+          src + (std::size_t{l1_row} * l1_cols + l1_col) * kAtbTileBytes;
+      for (std::uint32_t sbr = 0; sbr < 8; ++sbr) {
+        for (std::uint32_t sbc = 0; sbc < 8; ++sbc) {
+          for (std::uint32_t br = 0; br < 2; ++br) {
+            for (std::uint32_t bc = 0; bc < 2; ++bc) {
+              const std::uint8_t* blk =
+                  tile + (((sbr * 8 + sbc) * 4) + br * 2 + bc) * kAtbBlkBytes;
+              const std::uint32_t row0 = l1_row * kAtbTileM + sbr * 16 + br * 8;
+              const std::uint32_t col0 = l1_col * kAtbTileN + sbc * 16 + bc * 8;
+              for (std::uint32_t rib = 0; rib < 8; ++rib) {
+                float v[8];
+                DecodeBlock8(blk + rib * 9, v);
+                std::memcpy(y + std::size_t(row0 + rib) * N + col0, v,
+                            sizeof(v));
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+void NpuRuntime::GemmAtb(Program& p, WeightBuffer& wb, const float* x,
+                         std::uint32_t M, float* y, Timings* t) {
+  WeightBuffer& w = WeightSlot(wb, p);
+  auto t0 = Clock::now();
+  EncodeAAtb(x, M, p.K, p);
+  if (t) t->enc += Ms(t0);
+  t0 = Clock::now();
+  p.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  if (t) t->syncA += Ms(t0);
+  t0 = Clock::now();
+  w.run.start();
+  if (t) t->submit += Ms(t0);
+  t0 = Clock::now();
+  // Plain driver wait: the decode path's state() spin costs ~3 ms per
+  // dispatch here (each poll is a driver round-trip), which swamped the GEMM.
+  w.run.wait();
+  if (!p.warmed) {  // WP10: a program's first C write is lost on this stack.
+    p.warmed = true;
+    w.run.start();
+    w.run.wait();
+  }
+  if (t) t->wait += Ms(t0);
+  t0 = Clock::now();
+  p.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+  if (t) t->syncC += Ms(t0);
+  t0 = Clock::now();
+  DecodeCAtb(y, M, p.N, p);
   if (t) t->dec += Ms(t0);
   if (t) ++t->calls;
 }
@@ -376,7 +548,6 @@ void NpuRuntime::Ffn(Program& p, WeightBuffer& wb, const float* x,
   if (t) t->wait += Ms(t0);
   t0 = Clock::now();
   p.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-  FlushCache(p.ch, p.c.size());
   if (t) t->syncC += Ms(t0);
   t0 = Clock::now();
   DecodeC(y, n, p, p.ch + std::size_t{120} * kStripBytes, 2048);
@@ -414,7 +585,6 @@ void NpuRuntime::Argmax(Program& p, WeightBuffer& wb, const float* x,
   if (t) t->wait += Ms(t0);
   t0 = Clock::now();
   p.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-  FlushCache(p.ch, p.c.size());
   if (t) t->syncC += Ms(t0);
   t0 = Clock::now();
   const std::uint32_t strips = p.N / kStrip;
@@ -470,7 +640,7 @@ ConvLayer NpuRuntime::PackConv(const float* w_in, const float* conv_w,
   cl.hidden = hidden;
   cl.taps = taps;
   cl.prog = tmpl;
-  const std::size_t cb = std::size_t{(3 * hidden + hidden) / kStrip} * kStripBytes;
+  const std::size_t cb = std::size_t{(3 * hidden + hidden) / kStrip} * tmpl.mrows * kStripBytes;
   cl.prog.c = xrt::bo(dev_, cb, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(3));
   cl.prog.ch = cl.prog.c.map<std::uint8_t*>();
   std::memset(cl.prog.ch, 0, cb);
@@ -491,7 +661,16 @@ ConvLayer NpuRuntime::PackConv(const float* w_in, const float* conv_w,
                     w_in + (std::size_t{src_base[role]} + ch) * K, K * 4);
     PackMatInt5(perm.data(), 3 * hidden, K, cl.w.host, 1);
   }
-  PackMatInt5(w_out, hidden, K, cl.w.host + in_bytes, 0);
+  if (tmpl.mrows > 1) {
+    // m64 conv: phase-2 A arrives pair-major (see the generator), so out_proj k-tiles are packed in the
+    // order kt' = pair * slots + slot, which holds original tile 2 * slot + pair.
+    const std::uint32_t slots = tk / 2;
+    std::vector<std::uint32_t> perm(tk);
+    for (std::uint32_t tp = 0; tp < tk; ++tp) perm[tp] = 2 * (tp % slots) + tp / slots;
+    PackMatInt5(w_out, hidden, K, cl.w.host + in_bytes, 0, perm.data());
+  } else {
+    PackMatInt5(w_out, hidden, K, cl.w.host + in_bytes, 0);
+  }
   const std::uint32_t groups = 3 * hidden / kStrip / 8;
   for (std::uint32_t g = 0; g < groups; ++g)
     for (std::uint32_t col = 0; col < 8; ++col)
@@ -549,10 +728,9 @@ void NpuRuntime::ConvStep(ConvLayer& cl, const float* z, std::uint32_t n, float*
   if (t) t->wait += Ms(t0);
   t0 = Clock::now();
   cl.prog.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-  FlushCache(cl.prog.ch, cl.prog.c.size());
   if (t) t->syncC += Ms(t0);
   t0 = Clock::now();
-  DecodeC(y, n, cl.prog, cl.prog.ch + std::size_t{3 * cl.hidden / kStrip} * kStripBytes, cl.hidden);
+  DecodeC(y, n, cl.prog, cl.prog.ch + std::size_t{3 * cl.hidden / kStrip} * cl.prog.mrows * kStripBytes, cl.hidden);
   if (t) t->dec += Ms(t0);
   if (t) ++t->calls;
   cl.last_n = n;
@@ -571,7 +749,7 @@ void NpuRuntime::ConvCommit(ConvLayer& cl, std::uint32_t k, bool settle) {
             cl.w.host + ((std::size_t{s2} * (tk + 1) + tk) * 4 + r) * kQuarterBytes + kConvHistOffset);
         // role-1 bx output: per mb a 1024B region, per cbk 256B, per rh(8 rows) 128B, per row 16B.
         const std::uint8_t* sbase =
-            cl.prog.ch + std::size_t{16 + j * 8 + col} * kStripBytes + std::size_t{r} * kRowBytes;
+            cl.prog.ch + std::size_t{16 + j * 8 + col} * cl.prog.mrows * kStripBytes + std::size_t{r} * kRowBytes;
         for (std::uint32_t cbk = 0; cbk < 4; ++cbk) {
           std::uint16_t nh[6][8];
           for (std::uint32_t i = 0; i < hist; ++i) {
@@ -584,7 +762,7 @@ void NpuRuntime::ConvCommit(ConvLayer& cl, std::uint32_t k, bool settle) {
               const std::uint32_t mb = ri / 16;
               const std::uint32_t lr = ri % 16;
               row = reinterpret_cast<const std::uint16_t*>(
-                  sbase + std::size_t{mb} * 1024 + std::size_t{cbk} * 256 +
+                  sbase + std::size_t{mb} * 4 * kRowBytes + std::size_t{cbk} * 256 +
                   std::size_t{lr / 8} * 128 + std::size_t{lr % 8} * 16);
             }
             std::memcpy(nh[i], row, 16);

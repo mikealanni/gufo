@@ -22,7 +22,9 @@ constexpr std::uint32_t kStrip = 128;
 constexpr std::uint32_t kQuarterBytes = 1536;
 constexpr std::uint32_t kWordBytes = 1408;
 // C staging: one 1024 B slot per core row and strip (576 B used by bfp16 tiles).
-constexpr std::uint32_t kRowBytes = 4096;  // C tap: 4 m64 row-block pieces (m16 uses its head)
+// C staging: one 1 KB element per core row and row-block. A strip of an m-row-block program is
+// [row-block][core row][kRowBytes], i.e. mrows * kStripBytes bytes.
+constexpr std::uint32_t kRowBytes = 1024;
 constexpr std::uint32_t kStripBytes = 4 * kRowBytes;
 
 inline float RoundHalf(float v) {
@@ -77,7 +79,8 @@ inline float Bf16Float(std::uint16_t b) {
 // Packer: int5 (3 values per 16-bit word, 11 words + 128B bf16 scales = 1536B
 // per core per k-tile of 64), laid out for the split-B 16-row decode GEMM.
 void PackMatInt5(const float* W, std::uint32_t N, std::uint32_t K,
-                 std::uint8_t* dst, std::uint32_t extra_tiles = 0);
+                 std::uint8_t* dst, std::uint32_t extra_tiles = 0,
+                 const std::uint32_t* tile_perm = nullptr);
 
 // Instruction-stream program (one runtime sequence) with its A/C staging BOs.
 struct WeightBuffer;  // fwd: Program pins one via wpin (see NpuRuntime::WeightSlot)
@@ -141,7 +144,8 @@ class NpuRuntime {
   Program MakeProgram(std::uint32_t K, std::uint32_t N,
                       const std::string& insts_path, std::size_t c_override,
                       std::string* error, std::uint32_t a_extra_k = 0,
-                      std::uint32_t mrows = 1);
+                      std::uint32_t mrows = 1, int a_group = 3,
+                      int c_group = 3);
 
   /// Allocate and pack a weight matrix (N rows x K cols, row-major float).
   WeightBuffer PackWeight(const float* W, std::uint32_t N, std::uint32_t K);
@@ -162,6 +166,25 @@ class NpuRuntime {
   void EncodeA(const float* x, std::uint32_t n, std::uint32_t K, Program& p);
   void DecodeC(float* y, std::uint32_t n, Program& p,
                const std::uint8_t* base = nullptr, std::uint32_t N = 0);
+
+  struct Timings;  // defined below
+  // --- AGENT-7 big-M prefill (ATB) path ---------------------------------
+  // Weights/outputs use the asymmetric-tile-buffering layout (see atb_layout.hpp):
+  // B = K x N row-major float -> ATB bfp16 tile stream; A = M x K row-major;
+  // C comes back as ATB bfp16 and is decoded to M x N row-major float.
+  WeightBuffer PackWeightAtb(const float* W, std::uint32_t K, std::uint32_t N,
+                             int b_group = 3);
+ private:
+  // Staging for the ATB A/C streams: the xrt BO mapping is write-combined, so
+  // 9-byte block stores to it run at ~1 GB/s. Encode/decode in cached memory and
+  // move the stream with one linear copy.
+  std::vector<std::uint8_t> atb_a_scratch_, atb_c_scratch_;
+ public:
+  void EncodeAAtb(const float* x, std::uint32_t M, std::uint32_t K, Program& p);
+  void DecodeCAtb(float* y, std::uint32_t M, std::uint32_t N, Program& p);
+  /// Synchronous prefill GEMM: x (M x K) -> y (M x N), M = 16 * p.mrows.
+  void GemmAtb(Program& p, WeightBuffer& wb, const float* x, std::uint32_t M,
+               float* y, Timings* t = nullptr);
 
   // Synchronous GEMM: encode x (n x K), run, decode to y (n x N).
   // Updates timing accumulators.

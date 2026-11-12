@@ -60,21 +60,22 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None, 
         BQ = 1536
         B_l2_ty = np.ndarray[(n_aie_rows * BQ,), np.dtype[np.uint8]]
         B_l1_ty = np.ndarray[(BQ,), np.dtype[np.uint8]]
-        # C taps are 4 KB: m64 prefill (WP10) flushes 4 row-blocks into one tap; m16 uses its head.
-        CB = 4096
+        # One 1 KB C element per core row and row-block: a 64-row program emits mrows elements per strip.
+        CB = 1024
         C_l1_ty = np.ndarray[(CB,), np.dtype[np.uint8]]
         C_l2_ty = np.ndarray[(n_aie_rows * CB,), np.dtype[np.uint8]]
 
         matmul_gu = external_func(
             "matmul_p1",
-            inputs=[A_ty, B_l1_ty, C_l1_ty, np.int32, np.int32, np.int32],
+            inputs=[A_ty, B_l1_ty, np.int32, np.int32, np.int32],
             link_with=f"mm_{m}x{k}x{n}.o",
         )
         matmul_dn = external_func(
             "matmul_dn",
-            inputs=[A_ty, B_l1_ty, C_l1_ty, np.int32, np.int32, np.int32],
+            inputs=[A_ty, B_l1_ty, np.int32, np.int32, np.int32],
             link_with=f"mm_{m}x{k}x{n}.o",
         )
+        c_emit = external_func("c_emit", inputs=[C_l1_ty, np.int32], link_with=f"mm_{m}x{k}x{n}.o")
 
         attn_begin = external_func("attn_begin", inputs=[A_ty, np.int32], link_with=f"mm_{m}x{k}x{n}.o")
         attn_q = external_func("attn_q", inputs=[A_ty, np.int32, np.int32], link_with=f"mm_{m}x{k}x{n}.o")
@@ -166,25 +167,29 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None, 
                         t2 = arith.index_cast(T.index(), t2_i32)
                         mrows_i = arith.index_cast(T.index(), mrows_i32)
                         for _ in range_(t1):
-                            elem_out = C_l1l2[row][col].acquire(ObjectFifoPort.Produce, 1)
                             for _ in range_(k1):
                                 elem_b = B_l2l1[row][col].acquire(ObjectFifoPort.Consume, 1)
                                 for _ in range_(mrows_i):
                                     elem_a = A_l2l1.acquire(ObjectFifoPort.Consume, 1)
-                                    matmul_gu(elem_a, elem_b, elem_out, k1_i32, mode_i32, mrows_i32)
+                                    matmul_gu(elem_a, elem_b, k1_i32, mode_i32, mrows_i32)
                                     A_l2l1.release(ObjectFifoPort.Consume, 1)
                                 B_l2l1[row][col].release(ObjectFifoPort.Consume, 1)
-                            C_l1l2[row][col].release(ObjectFifoPort.Produce, 1)
+                            for mb in range_(mrows_i):
+                                elem_out = C_l1l2[row][col].acquire(ObjectFifoPort.Produce, 1)
+                                c_emit(elem_out, arith.index_cast(T.i32(), mb))
+                                C_l1l2[row][col].release(ObjectFifoPort.Produce, 1)
                         for _ in range_(t2):
-                            elem_out = C_l1l2[row][col].acquire(ObjectFifoPort.Produce, 1)
                             for _ in range_(k2):
                                 elem_b = B_l2l1[row][col].acquire(ObjectFifoPort.Consume, 1)
                                 for _ in range_(mrows_i):
                                     elem_a = A_l2l1.acquire(ObjectFifoPort.Consume, 1)
-                                    matmul_dn(elem_a, elem_b, elem_out, k2_i32, dn_mode_i32, mrows_i32)
+                                    matmul_dn(elem_a, elem_b, k2_i32, dn_mode_i32, mrows_i32)
                                     A_l2l1.release(ObjectFifoPort.Consume, 1)
                                 B_l2l1[row][col].release(ObjectFifoPort.Consume, 1)
-                            C_l1l2[row][col].release(ObjectFifoPort.Produce, 1)
+                            for mb in range_(mrows_i):
+                                elem_out = C_l1l2[row][col].acquire(ObjectFifoPort.Produce, 1)
+                                c_emit(elem_out, arith.index_cast(T.i32(), mb))
+                                C_l1l2[row][col].release(ObjectFifoPort.Produce, 1)
                         attn_on = arith.index_cast(T.index(), attn_on_i32)
                         attn_feeds = arith.index_cast(T.index(), attn_feeds_i32)
                         row_c = arith.constant(T.i32(), row)
@@ -282,7 +287,7 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None, 
             KA, rtp_mode = K2, 0
         BQ_ = BQ
 
-        SB = n_aie_rows * CB
+        SB = mrows * n_aie_rows * CB  # C bytes per strip: mrows rounds of [row][CB]
         gu_bytes = k1t * (N1 // n) * n_aie_rows * BQ_ if N1 else 0
         dn_bytes = (K2 // k) * (N2 // n) * n_aie_rows * BQ_
         c_total = (N1 // n + N2 // n) * SB
@@ -313,9 +318,11 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None, 
                 in_groups = [[] for _ in range(tb_max)]
                 out_groups = [[] for _ in range(tb_max)]
                 for g in range(num_groups):
-                    a_task = shim_dma_single_bd_task(A_l3l2, a_tap_fn[0], tap=a_tap_fn[1], issue_token=False)
-                    dma_start_task(a_task)
-                    in_groups[g % tb_max].append(a_task)
+                    a_taps = a_tap_fn[1] if isinstance(a_tap_fn[1], (list, tuple)) else [a_tap_fn[1]]
+                    for a_tap_i in a_taps:
+                        a_task = shim_dma_single_bd_task(A_l3l2, a_tap_fn[0], tap=a_tap_i, issue_token=False)
+                        dma_start_task(a_task)
+                        in_groups[g % tb_max].append(a_task)
                     for col in range(n_aie_cols):
                         b_tap = TensorAccessPattern(
                             (1, gu_bytes + dn_bytes), b_off_fn(g * n_aie_cols + col), [1, 1, 1, b_len], [0, 0, 0, 1]
@@ -355,11 +362,11 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None, 
                     lambda s: ({2: 0, 1: 16, 0: 32}[(s // 8) % 3] + (s // 8 // 3) * 8 + s % 8) * SB,
                 )
                 if mrows > 1:
-                    # m64 conv: role 2 wrote mrows 576-byte bfp16 pieces (mb-major) per core row of each
-                    # role-2 strip slot. k-tile kt = 2*slot + pair uses core rows (2*pair, 2*pair+1) of
-                    # slot; slot and pair merge into one stride (2*CB). A order: kt, mb, row-in-pair.
-                    a2 = (C, TensorAccessPattern((1, c_total), 0,
-                              [K2 // k, mrows, 2, 576], [2 * CB, 576, CB, 1]))
+                    # m64 conv: role 2 emits one 576 B element per row-block; strip layout [mb][core row][CB].
+                    # k-tile kt' = pair*16 + slot (out_proj weights are packed in that order, see PackConv):
+                    # one BD per pair, order (slot, mb, row-in-pair).
+                    a2 = (C, [TensorAccessPattern((1, c_total), p * 2 * CB,
+                                  [K2 // k // 2, mrows, 2, 576], [SB, n_aie_rows * CB, CB, 1]) for p in range(2)])
                 else:
                     a2 = (C, TensorAccessPattern((1, c_total), 0, [K2 // k // 2, 2, 2, 576], [SB, 2 * CB, CB, 1]))
             elif mode == "ffn":
@@ -373,7 +380,7 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None, 
                 if mrows > 1:
                     # m64: per (k-tile, row-block) A tap = 4 r pieces of 288 B, m stride 288.
                     a2 = (C, TensorAccessPattern((1, c_total), 0,
-                              [1, K2 // k, mrows, n_aie_rows, 288], [0, SB, 288, CB, 1]))
+                              [1, K2 // k, mrows, n_aie_rows, 288], [0, SB, n_aie_rows * CB, CB, 1]))
                 else:
                     a2 = (C, TensorAccessPattern((1, c_total), 0, [1, K2 // k, n_aie_rows, 288], [0, SB, CB, 1]))
             else:

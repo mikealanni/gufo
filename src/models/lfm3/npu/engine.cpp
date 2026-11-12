@@ -289,7 +289,7 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
     };
     const bool have_conv64 = have_m64("insts_conv_m64.txt");
     if (have_conv64)
-      s.p_conv64 = s.rt.MakeProgram(2048, 2048, options.programs + "/insts_conv_m64.txt", std::size_t{64} * gufo::npu::runtime::kStripBytes, error, 64, 4);
+      s.p_conv64 = s.rt.MakeProgram(2048, 2048, options.programs + "/insts_conv_m64.txt", std::size_t{64} * 4 * gufo::npu::runtime::kStripBytes, error, 64, 4);
     // 64-row prefill programs (WP10). GUFO_NO_M64=1 falls back to 16-row passes.
     s.m64 = std::getenv("GUFO_NO_M64") == nullptr &&
             have_m64("insts_plain_2048x2048_m64.txt") && have_m64("insts_plain_2048x3072_m64.txt") &&
@@ -495,6 +495,12 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
           const std::uint32_t m = std::min(16u, n - o);
           s.rt.ConvStep(s.m_conv[l], z.data() + std::size_t{o} * H, m, branch.data() + std::size_t{o} * H, &s.tim);
           if (n > 16) s.rt.ConvCommit(s.m_conv[l], m, /*settle=*/true);
+        }
+      }
+      if (const char* dd = std::getenv("GUFO_DUMP_DIR")) {
+        if (s.pos < 192 && l < 4) {
+          char fn[512]; std::snprintf(fn, sizeof fn, "%s/p%u_B%zu.f32", dd, s.pos, l);
+          if (FILE* f = std::fopen(fn, "wb")) { std::fwrite(branch.data(), 4, branch.size(), f); std::fclose(f); }
         }
       }
             cpu0 = Clock::now();

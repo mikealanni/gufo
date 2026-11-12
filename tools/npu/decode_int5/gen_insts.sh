@@ -115,5 +115,6 @@ case "${1:-default}" in
     gen_plain 7680 2048 4
     gen_plain 2048 2048 4
     gen_plain 2048 3072 4
+    gen_conv 2048 6144 4
     ;;
 esac

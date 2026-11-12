@@ -14,12 +14,18 @@ constexpr int kK = 64;
 // gemm and attention dispatches never overlap. attn keeps 0..8192 for its row state,
 // a_o lives at +8192..+40960, a_chunk at +40960.
 alignas(128) uint8_t arena[42496];
-static bfloat16 *const c_stage = (bfloat16 *)(arena + 5120);
-static bfp16ebs8 *const b_scratch = (bfp16ebs8 *)(arena + 9216);
+// GEMM scratch sits at the very start of L1 data (same banks as the original 6 KB layout); it overlays the
+// attention row state, which is re-initialised by every attention dispatch.
+static bfloat16 *const c_stage = (bfloat16 *)(arena + 0);
+static bfp16ebs8 *const b_scratch = (bfp16ebs8 *)(arena + 4096);
 static int g_mrows = 1;  // A row-blocks per B tile (1 = decode, 4 = m64 prefill)
 static int g_m = 0;      // current row-block within the current B tile
+// Flushes write their result for all row-blocks into outbuf ([mb][out_unit bytes]); c_emit then hands
+// one 1 KB C element per row-block to the C fifo (keeps the C stream at the decode size).
+static uint8_t *const outbuf = arena + 27904;
+static int out_unit = 64;
 
-__attribute__((noinline)) static aie::vector<bfloat16, 64> ExpandScales(const bfloat16 *p) {
+static inline aie::vector<bfloat16, 64> ExpandScales(const bfloat16 *p) {
   aie::vector<bfloat16, 8> s = aie::load_v<8>(p);
   auto z1 = aie::interleave_zip(s, s, 1);
   aie::vector<bfloat16, 16> s16 = aie::concat(z1.first, z1.second);
@@ -47,8 +53,8 @@ __attribute__((noinline)) static void Unpack(const uint16_t *__restrict pw,
   }
 }
 
-__attribute__((noinline)) static void MacTile(bfp16ebs8 *__restrict pA, bfloat16 *__restrict pC,
-                                             int first) {
+static inline __attribute__((always_inline)) void MacTile(bfp16ebs8 *__restrict pA, bfloat16 *__restrict pC,
+                                                                  int first) {
   for (int sb = 0; sb < kCols / 16; sb++) {
     aie::block_vector_input_buffer_stream<bfp16ebs8, 64> pB_stream(b_scratch);
     pB_stream.seek(sb * (kK / 8) * 2);
@@ -168,6 +174,7 @@ __attribute__((noinline)) static void FlushConv(const uint8_t *__restrict ctl_b,
   strip_ctr = (s == 5) ? 0 : s + 1;
   const int role = s % 3;
   const int mr = g_mrows;
+  out_unit = role == 1 ? 1024 : (role == 2 ? 576 : 64);
   const int comb_rows = 8 + 16 * mr;  // 8 (hist slot) + 16 rows per row-block
   if (role == 0) {
     for (int mb = 0; mb < mr; mb++)
@@ -246,32 +253,39 @@ __attribute__((noinline)) static bool TileStep(bfp16ebs8 *__restrict pA, uint8_t
   return false;
 }
 
-void matmul_p1(bfp16ebs8 *__restrict pA, uint8_t *__restrict pBp,
-               uint8_t *__restrict pC, int32_t kcnt, int32_t mode, int32_t mrows) {
+void matmul_p1(bfp16ebs8 *__restrict pA, uint8_t *__restrict pBp, int32_t kcnt, int32_t mode,
+               int32_t mrows) {
   ::aie::set_rounding(::aie::rounding_mode::conv_even);
   g_mrows = mrows;
   if (mode == 1) {
-    if (g_m == 0) Unpack((const uint16_t *)pBp, (const bfloat16 *)(pBp + 1408));
-    MacTile(pA, c_stage + g_m * kRows * kCols, kc_p1 == 0);
-    if (++g_m < g_mrows) return;
-    g_m = 0;
-    if (kc_p1 < kcnt - 1) { kc_p1 += 1; return; }
-    kc_p1 = 0;
-    FlushConv(pBp, pC);
+    if (TileStep(pA, pBp, kcnt, &kc_p1)) FlushConv(pBp, outbuf);
     return;
   }
-  if (TileStep(pA, pBp, kcnt, &kc_p1)) FlushSwiglu((bfp16ebs8 *)pC);
+  if (TileStep(pA, pBp, kcnt, &kc_p1)) {
+    out_unit = 288;
+    FlushSwiglu((bfp16ebs8 *)outbuf);
+  }
 }
 
-void matmul_dn(bfp16ebs8 *__restrict pA, uint8_t *__restrict pBp,
-               uint8_t *__restrict pC, int32_t kcnt, int32_t mode, int32_t mrows) {
+void matmul_dn(bfp16ebs8 *__restrict pA, uint8_t *__restrict pBp, int32_t kcnt, int32_t mode,
+               int32_t mrows) {
   ::aie::set_rounding(::aie::rounding_mode::conv_even);
   g_mrows = mrows;
   if (!TileStep(pA, pBp, kcnt, &kc_dn)) return;
-  if (mode == 2)
-    FlushArgmax(pC);
-  else
-    FlushPlain((bfp16ebs8 *)pC);
+  if (mode == 2) {
+    out_unit = 128;
+    FlushArgmax(outbuf);
+  } else {
+    out_unit = 576;
+    FlushPlain((bfp16ebs8 *)outbuf);
+  }
+}
+
+// Hand row-block mb of the last flush to the C fifo element (1 KB).
+// outbuf + mb * out_unit is only 32 B aligned for some units (288 B swiglu pieces): use unaligned loads.
+void c_emit(uint8_t *__restrict pC, int32_t mb) {
+  const uint8_t *src = outbuf + mb * out_unit;
+  for (int i = 0; i < out_unit; i += 64) aie::store_v(pC + i, aie::load_unaligned_v<64>(src + i));
 }
 
 }  // extern "C"
