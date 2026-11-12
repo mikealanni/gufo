@@ -84,8 +84,10 @@ LIGHT_WORDS = {
     "tee", "xxd", "sha256sum", "md5sum", "sha1sum", "strings", "nm", "objdump", "readelf", "ldd", "nl", "cut", "basename", "dirname", "readlink", "realpath", "du",
     "df", "ps", "pgrep", "sleep", "wait", "kill", "tar", "unzip", "gh", "jj",
     "env", "printenv", "id", "whoami", "hostname", "uname", "nproc", "free", "uptime", "lsof", "ss",
-    "read", "export", "test", "[", "[[", "local", "return", "exit", "break", "continue",
+    "journalctl", "dmesg", "source", ".", "read", "export", "test", "[", "[[", "local", "return", "exit", "break", "continue",
 }
+PY_EDIT = re.compile(r"^python3?\s+-\s*<<")
+PY_RUNS = re.compile(r"subprocess|os\.system|Popen|torch|pyxrt|ctypes")
 SHELL_KEYWORDS = ("do", "then", "else", "elif", "if", "while", "until", "!", "{", "(")
 END_WORDS = {"done", "fi", "esac", "}", ")"}
 LOOP_HEADER = re.compile(r"^(?:for\s+\w+\s+in\b|for\s+\(\()")
@@ -178,6 +180,7 @@ DEFAULT_PINNED_EFFORT = "low"
 DRAIN_MAX = 1800
 MIN_NEEDLE_CHARS = 5
 WATCHDOG_DRAIN_MAX = 300
+NPU_IDLE_S = 20
 MEM_HARD_FLOOR_GB = 1.5
 
 
@@ -462,6 +465,8 @@ def classify(command):
             continue
         if first_word(seg) in LIGHT_WORDS:
             continue
+        if PY_EDIT.match(seg) and not PY_RUNS.search(seg):
+            continue
         if any(os.path.basename(x) in LIGHT_SCRIPTS for x in executed_scripts(seg)):
             continue
         if BUILD_ONLY.match(seg):
@@ -518,10 +523,13 @@ def estimate_model_gb(command):
     return total / 1e9
 
 
-def conflicts(res, command, avail_gb, reactive_gb):
-    """True when the command needs something gufo holds. Pure-ram commands must also not fit."""
-    if res & {"gpu", "npu"}:
+def conflicts(res, command, avail_gb, reactive_gb, busy=True):
+    """True when the command needs something gufo holds. Pure-ram commands must also not fit.
+    NPU-only commands share the NPU with an idle gufo as long as memory fits."""
+    if "gpu" in res or ("npu" in res and busy):
         return True
+    if "npu" in res:
+        res = res | {"ram"}
     if "ram" in res:
         need = estimate_model_gb(command)
         if need:
@@ -1008,7 +1016,7 @@ class Guard:
             heavy = verdict == "heavy" or by_judge
             if verdict == "heavy" and not by_judge:
                 res = resources_of(seg) | script_resources(cmd)
-                if not conflicts(res, cmd, mem_available_gb(), self.a.reactive_gb):
+                if not conflicts(res, cmd, mem_available_gb(), self.a.reactive_gb, self.gufo_busy()):
                     log(f"resource check: needs {sorted(res) or 'none'}, nothing gufo holds is contended; leaving gufo running")
                     heavy = False
                     verdict = "light"
@@ -1140,6 +1148,10 @@ class Guard:
                 if await self.stop_gufo(f"foreign GPU process pid={found[0]}"):
                     self._attribute_catch(found[0], f"kfd watchdog pid={found[0]}")
                     self.begin_watch(f"kfd {found[0]}", self.foreign_kfd, quiet=KFD_QUIET)
+
+    def gufo_busy(self):
+        """True while gufo is generating or did so within the last NPU_IDLE_S seconds."""
+        return self.gen_inflight > 0 or time.time() - self.last_activity < NPU_IDLE_S
 
     def opencode_active(self):
         """True while a generation request is in flight or one finished recently."""
@@ -1360,7 +1372,7 @@ class Guard:
             return web.json_response({"state": self.state, "skipped": "generic", "mem_available_gb": round(mem_available_gb(), 1)})
         log(f"plugin asks to prepare for: {segment[:80]} (session {str(data.get('session', ''))[:24]})")
         res = resources_of(segment) | script_resources(segment)
-        if res and not conflicts(res, segment, mem_available_gb(), self.a.reactive_gb):
+        if res and not conflicts(res, segment, mem_available_gb(), self.a.reactive_gb, self.gufo_busy()):
             log(f"resource check: needs {sorted(res)}, nothing gufo holds is contended; leaving gufo running")
             return web.json_response({"state": self.state, "skipped": "no-conflict", "resources": sorted(res),
                                       "mem_available_gb": round(mem_available_gb(), 1)})
