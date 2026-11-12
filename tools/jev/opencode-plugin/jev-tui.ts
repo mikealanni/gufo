@@ -9,6 +9,8 @@ const LOG_DIR = process.env.JEV_LOG_DIR ?? join(homedir(), ".gufo", "jev-log");
 export default Plugin.define({
   id: "jev.tui",
   async setup(context: any) {
+    // The server process loads every file in plugins/ too; only the TUI context has a keymap.
+    if (!context?.keymap?.layer) return;
     context.keymap.layer(() => ({
       mode: "global",
       priority: 10,
