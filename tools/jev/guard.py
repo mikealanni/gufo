@@ -41,7 +41,32 @@ HEAVY = [re.compile(p) for p in (
     r"^(?:\S*/)?python3?\s+(?!-c\b)\S+.*\b(torch|hip|rocm)\b",
     r"run-gufo\.sh",
     r"(?:^|\s)(?:\./)?build/[\w.-]+/(?:\S*/)?tests/\S*(?:_test|_tests|_bench|_probe)\b",
+    r"\bgufo-(?:npu|sbtest[\w-]*)\b",
+    r"npu-lock\.sh",
 )]
+# Which shared resources a heavy pattern needs (gufo itself holds gpu, npu and a lot of ram).
+# A heavy command only stops gufo when it needs something gufo holds; pure-ram commands also
+# have to be too big for the free memory (see conflicts()).
+HEAVY_RES = [
+    {"gpu", "npu", "ram"},  # gufo bench/serve/judge/...
+    {"gpu", "npu"},         # build/*/gufo
+    {"gpu"},                # ctest
+    {"gpu"},                # rocprof
+    {"gpu", "ram"},         # model-bench.py
+    {"gpu"}, {"gpu"},       # tools/prof/prof.py run
+    {"gpu"}, {"gpu"},       # tools/bench/
+    {"gpu", "ram"},         # pytest
+    {"gpu"},                # python torch/hip/rocm
+    {"gpu", "npu", "ram"},  # run-gufo.sh
+    {"gpu"},                # built test binaries
+    {"npu"},                # gufo-npu / gufo-sbtest*
+    {"npu"},                # npu-lock.sh
+]
+assert len(HEAVY_RES) == len(HEAVY), "HEAVY and HEAVY_RES must stay parallel"
+MODEL_EXT = (".gguf", ".safetensors", ".bin")
+GPU_CONTENT = re.compile(r"import\s+torch|from\s+torch|\bhipMalloc|\bhipLaunch|libamdhip|\bcuda\b|rocm|/dev/kfd|\.cuda\(", re.I)
+RAM_CONTENT = re.compile(r"llama[._-]?cpp|\bvllm\b|safetensors|from_pretrained|\bgguf\b", re.I)
+NPU_CONTENT = re.compile(r"\bxrt\b|xclbin|npu-lock|gufo-npu", re.I)
 LIGHT_SCRIPTS = {"chroma-helper.py"}
 # Compiling uses CPU and RAM only, and swap covers the memory, so a build never
 # stops gufo. Running the built tests still does (ctest and the test binaries).
@@ -447,6 +472,58 @@ def classify(command):
         if not unknown:
             unknown = seg
     return ("unknown", unknown) if unknown else ("light", "")
+
+
+def resources_of(segment):
+    """Union of the shared resources the heavy patterns matching this segment need."""
+    seg = QUOTED.sub('""', segment)
+    res = set()
+    for pat, r in zip(HEAVY, HEAVY_RES):
+        if pat.search(segment) or pat.search(seg):
+            res |= r
+    if re.search(r"\bctest\b.*--preset\s+(?:cpu-test|pr)\b", segment):
+        res = (res - {"gpu"}) | {"ram"}  # CPU-only test presets do not touch the GPU
+    return res
+
+
+def script_resources(command):
+    """Resources named inside the scripts a command runs (empty when only builds are in there)."""
+    res = set()
+    for path in executed_scripts(command):
+        try:
+            with open(os.path.expanduser(path), errors="ignore") as f:
+                text = f.read(SCRIPT_BYTES)
+        except OSError:
+            continue
+        if GPU_CONTENT.search(text):
+            res.add("gpu")
+        if NPU_CONTENT.search(text):
+            res.add("npu")
+        if RAM_CONTENT.search(text):
+            res.add("ram")
+    return res
+
+
+def estimate_model_gb(command):
+    """Size in GB of the model files named in the command (0 when none can be found)."""
+    total = 0
+    for tok in re.findall(r"[^\s'\"=]+", command):
+        path = os.path.expanduser(tok)
+        if path.endswith(MODEL_EXT) and os.path.isfile(path):
+            total += os.path.getsize(path)
+    return total / 1e9
+
+
+def conflicts(res, command, avail_gb, reactive_gb):
+    """True when the command needs something gufo holds. Pure-ram commands must also not fit."""
+    if res & {"gpu", "npu"}:
+        return True
+    if "ram" in res:
+        need = estimate_model_gb(command)
+        if need:
+            return avail_gb - 1.3 * need < reactive_gb
+        return avail_gb < 40  # model size unknown: only stop when memory is already tight
+    return False
 
 
 def tool_commands(calls):
@@ -881,6 +958,12 @@ class Guard:
                     p = None
             by_judge = verdict == "unknown" and p is not None and p >= self.a.judge_cutoff
             heavy = verdict == "heavy" or by_judge
+            if verdict == "heavy" and not by_judge:
+                res = resources_of(seg) | script_resources(cmd)
+                if not conflicts(res, cmd, mem_available_gb(), self.a.reactive_gb):
+                    log(f"resource check: needs {sorted(res) or 'none'}, nothing gufo holds is contended; leaving gufo running")
+                    heavy = False
+                    verdict = "light"
             log(f"decision pattern={verdict} judge_p_yes={p if p is None else round(p, 3)} "
                 f"judge_would_stop={p is not None and p >= self.a.judge_cutoff} "
                 f"acts={'stop' if heavy else 'none'} cmd={cmd[:100]!r}")
@@ -1220,6 +1303,11 @@ class Guard:
             log(f"plugin asks to prepare for {segment[:60]!r}, but nothing specific can be watched; leaving gufo running")
             return web.json_response({"state": self.state, "skipped": "generic", "mem_available_gb": round(mem_available_gb(), 1)})
         log(f"plugin asks to prepare for: {segment[:80]} (session {str(data.get('session', ''))[:24]})")
+        res = resources_of(segment) | script_resources(segment)
+        if res and not conflicts(res, segment, mem_available_gb(), self.a.reactive_gb):
+            log(f"resource check: needs {sorted(res)}, nothing gufo holds is contended; leaving gufo running")
+            return web.json_response({"state": self.state, "skipped": "no-conflict", "resources": sorted(res),
+                                      "mem_available_gb": round(mem_available_gb(), 1)})
         await self.prepare_for_test(segment, own=False)
         return web.json_response({"state": self.state, "mem_available_gb": round(mem_available_gb(), 1)})
 
