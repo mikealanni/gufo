@@ -638,6 +638,51 @@ int main(int argc, char** argv) {
 
   std::vector<double> acc(ops.size(), 0.0);
 
+  // Device-pipeline experiment: queue op i+1 (encode+start) while op i is still
+  // running on the device, deferred wait. No C sync/decode: measures the
+  // ceiling of host/device overlap for the scaffold chain.
+  if (std::getenv("GUFO_PREFILL_PIPE")) {
+    const bool is_conv[24] = {true, true, false, true, false, true, false, true,
+                             false, true, false, true, false, true, false, true,
+                             false, true, false, true, false, true, false, true};
+    const auto idx = [&](const char* nm) {
+      for (std::size_t i = 0; i < ops.size(); ++i)
+        if (!std::strcmp(ops[i].name, nm)) return i;
+      return std::size_t{0};
+    };
+    std::vector<std::size_t> seq;
+    for (int l = 0; l < 24; ++l) {
+      seq.push_back(is_conv[l] ? idx("conv_in") : idx("qkv"));
+      seq.push_back(is_conv[l] ? idx("conv_out") : idx("o"));
+      seq.push_back(idx("gu_a"));
+      seq.push_back(idx("gu_b"));
+      if (!skip_dn) seq.push_back(idx("dn"));
+    }
+    for (std::size_t i : seq)  // ensure pinned+warm (first C write lost)
+      rtp(i).GemmAtb(progs[i], wbs[i], x.data(), M, y.data(), nullptr);
+    for (int it = 0; it < iters; ++it) {
+      const auto t0 = Clock::now();
+      WeightBuffer* pend = nullptr;
+      for (std::size_t i : seq) {
+        WeightBuffer& w = rtp(i).WeightSlot(wbs[i], progs[i]);
+        rtp(i).EncodeAAtb(x.data(), M, ops[i].K, progs[i]);
+        progs[i].a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        rtp(i).SlotRun(w);
+        rtp(i).AttachTo(w.run, w, progs[i]);
+        w.run.start();
+        if (pend) {
+          pend->run.wait();
+          pend = nullptr;
+        }
+        pend = &w;
+      }
+      if (pend) pend->run.wait();
+      const double d = ms(t0, Clock::now());
+      std::printf("pipe iter %d: %.2f ms = %.0f tok/s\n", it, d, 1000.0 * M / d);
+    }
+    return 0;
+  }
+
   std::vector<gufo::npu::runtime::NpuRuntime::Timings> tm(ops.size());
   // Real LFM3-1.7B layout: 24 layers, 13 conv (0,1,3,5,...,23) + 11 attention.
   const int layers = 24;
