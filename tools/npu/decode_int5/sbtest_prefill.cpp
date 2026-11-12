@@ -468,12 +468,25 @@ int main(int argc, char** argv) {
                                   mrows, 3, 5);
       rt.EncodeAAtb(xs.data(), M, HID, qa);
       std::memcpy(qb.ah, qa.ah, std::size_t{M} * HID / 8 * 9);
-      WeightBuffer wqa = rt.PackWeightAtb(wsa.data(), 2 * na, HID, 4);
-      WeightBuffer wqb = rt.PackWeightAtb(wsb.data(), 2 * nb, HID, 4);
+      WeightBuffer wqa = rt.PackFfnGuAtb(G.data(), U.data(), na, HID, 4);
+      WeightBuffer wqb = rt.PackFfnGuAtb(G.data() + std::size_t{na} * HID, U.data() + std::size_t{na} * HID, nb, HID, 4);
       const auto t_g0 = Clock::now();
       dispatch(rt, qa, wqa);
       dispatch(rt, qb, wqb);
       const double gu_ms = ms(t_g0, Clock::now());
+      // Device-only gu timing: second dispatch, start+wait only (no syncs).
+      {
+        const auto t_d0 = Clock::now();
+        qa.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        wqa.run.start();
+        wqa.run.wait();
+        qb.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        wqb.run.start();
+        wqb.run.wait();
+        const double gu_dev_ms = ms(t_d0, Clock::now());
+        std::printf("verify act(swresh)    relL2 %.4f  (plain gu pair %.2f ms, gu device-only %.2f ms, swresh %.2f ms)\n",
+                    std::sqrt(an / ad), gu_ms, gu_dev_ms, resh_ms);
+      }
       if (std::getenv("GUFO_PMAP")) {  // where do gate/up live on the plain wire?
         const std::size_t nq = std::size_t{M} * 2 * na / 8 * 9;
         std::vector<float> zq = gufo::npu::atb::bfp16ebs8ToFloat(

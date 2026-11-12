@@ -19,6 +19,7 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/models/lfm3/weights.hpp"
 #include "src/npu/model_spec.hpp"
+#include "src/npu/runtime/ffn_atb.hpp"
 #include "src/npu/runtime/runtime.hpp"
 
 namespace gufo::models::lfm3::npu {
@@ -192,6 +193,7 @@ struct Engine::Impl {
   std::vector<gufo::npu::runtime::Program> pH, pQkv, pFfn, pH64, pQkv64, pGu64, pDn64;
   std::vector<gufo::npu::runtime::WeightBuffer> m_ffn_dn;  // down proj packed for p_dn64
   bool m64 = false;  // m64 prefill programs available and in use for n > 16
+  std::unique_ptr<gufo::npu::runtime::FfnAtbChain> atb;  // GUFO_ATB=1: 1024-row device-resident FFN
   std::vector<gufo::npu::runtime::WeightBuffer> m_out, m_qkv, m_ffn;
   std::vector<gufo::npu::runtime::ConvLayer> m_conv;
   std::vector<gufo::npu::runtime::ConvLayer> m_conv64;
@@ -295,6 +297,14 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
             have_m64("insts_plain_2048x2048_m64.txt") && have_m64("insts_plain_2048x3072_m64.txt") &&
             have_m64("insts_ffngu64.txt") && have_m64("insts_plain_7680x2048_m64.txt");
 
+    if (std::getenv("GUFO_ATB") != nullptr && s.m64) {
+      s.atb = std::make_unique<gufo::npu::runtime::FfnAtbChain>();
+      std::string aerr;
+      if (!s.atb->Init(options.programs, &aerr)) {
+        std::fprintf(stderr, "GUFO_ATB init failed: %s\n", aerr.c_str());
+        s.atb.reset();
+      }
+    }
     const auto t0 = Clock::now();
     const std::size_t L = c.layers.size();
     s.m_conv.resize(L); s.m_conv64.resize(L); s.m_attn.resize(L); s.m_out.resize(L);
@@ -379,6 +389,13 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
         s.LoadRows(pre + "feed_forward.w2.weight", lw.down, buf.data(), 2048, 7680);
         gufo::npu::runtime::PackMatInt5(buf.data(), 2048, 7680, m.host + gu_bytes);
         if (s.m64) s.m_ffn_dn[l] = s.rt.PackWeight(buf.data(), 2048, 7680);
+        if (s.atb) {
+          std::string aerr;
+          if (!s.atb->AddLayer(gate.data(), up.data(), buf.data(), &aerr)) {
+            std::fprintf(stderr, "GUFO_ATB layer %zu: %s\n", l, aerr.c_str());
+            s.atb.reset();
+          }
+        }
         m.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
         if (s.m64) {
           s.pGu64[l] = s.rt.MakeProgram(2048, 15360, options.programs + "/insts_ffngu64.txt", 0, error, 0, 4);
@@ -441,28 +458,36 @@ void Engine::Reset() {
   for (auto& v : s.v_cache) std::fill(v.begin(), v.end(), std::uint16_t{0});
 }
 std::uint32_t Engine::Position() const { return impl_->pos; }
-std::uint32_t Engine::PrefillRows() const { return impl_->m64 ? kMaxRows : 16; }
+std::uint32_t Engine::PrefillRows() const { return impl_->atb ? gufo::npu::runtime::FfnAtbChain::kM : (impl_->m64 ? kMaxRows : 16); }
 
 bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hidden) {
   Impl& s = *impl_;
   const auto& c = s.w->config;
-  const std::uint32_t n = static_cast<std::uint32_t>(tokens.size());
+  const std::uint32_t nTot = static_cast<std::uint32_t>(tokens.size());
   // m64 prefill (WP10): 17..64 rows run on the m64 programs; EncodeA zero-pads and
   // DecodeC skips rows >= n, so n need not be a multiple of 16.
-  if (n == 0 || s.pos + n > s.opt.context) return false;
-  if (n > 64 || (n > 16 && !s.m64)) return false;
+  if (nTot == 0 || s.pos + nTot > s.opt.context) return false;
+  const std::uint32_t max_rows = s.atb ? gufo::npu::runtime::FfnAtbChain::kM : 64;
+  if (nTot > max_rows || (nTot > 16 && !s.m64)) return false;
+  const std::uint32_t pos0 = s.pos;
   const std::uint32_t H = s.H, I = s.I, hd = s.hd, heads = s.heads, kvh = s.kvh, kvd = s.kvd, qd = s.qd;
-  std::vector<float> x(std::size_t{n} * H), z(x.size()), z2(x.size()), branch(x.size()),
-      qkv(std::size_t{n} * 3072), attn(std::size_t{n} * qd);
-  for (std::uint32_t i = 0; i < n; ++i)
-    DecodeRow(s.w->embedding, tokens[i], std::span<float>(&x[std::size_t{i} * H], H));
+  std::vector<float> X(std::size_t{nTot} * H), Z(X.size()), Z2(X.size()), Br(X.size());
+  for (std::uint32_t i = 0; i < nTot; ++i)
+    DecodeRow(s.w->embedding, tokens[i], std::span<float>(&X[std::size_t{i} * H], H));
   auto cpu0 = Clock::now();
   for (std::size_t l = 0; l < c.layers.size(); ++l) {
     const auto& lw = s.w->layers[l];
+    for (std::uint32_t o = 0; o < nTot; o += 64) {
+    const std::uint32_t n = std::min<std::uint32_t>(64, nTot - o);
+    const bool use64 = s.m64 && (n > 16 || nTot > 64);
+    s.pos = pos0 + o;
+    std::vector<float> x(X.begin() + std::size_t{o} * H, X.begin() + std::size_t{o + n} * H),
+        z(x.size()), z2(x.size()), branch(x.size()), qkv(std::size_t{n} * 3072),
+        attn(std::size_t{n} * qd);
     RmsNorm(x.data(), static_cast<const float*>(lw.norm.data), z.data(), n, H, c.eps);
     s.t_cpu += Ms(cpu0);
     if (c.layers[l] == LayerType::kConvolution) {
-      if (s.m64 && n > 16 && !s.m_conv64.empty() && s.m_conv64[l].hidden) {
+      if (use64 && !s.m_conv64.empty() && s.m_conv64[l].hidden) {
         if (std::getenv("GUFO_REFRESH")) s.rt.ConvRefresh(s.m_conv64[l]);
         s.rt.ConvStep(s.m_conv64[l], z.data(), n, branch.data(), &s.tim);
         if (const char* dd = std::getenv("GUFO_DUMP_DIR")) {
@@ -494,7 +519,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
         for (std::uint32_t o = 0; o < n; o += 16) {
           const std::uint32_t m = std::min(16u, n - o);
           s.rt.ConvStep(s.m_conv[l], z.data() + std::size_t{o} * H, m, branch.data() + std::size_t{o} * H, &s.tim);
-          if (n > 16) s.rt.ConvCommit(s.m_conv[l], m, /*settle=*/true);
+          if (n > 16 || nTot > 64) s.rt.ConvCommit(s.m_conv[l], m, /*settle=*/true);
         }
       }
       if (const char* dd = std::getenv("GUFO_DUMP_DIR")) {
@@ -505,7 +530,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       }
             cpu0 = Clock::now();
     } else {
-      s.rt.Gemm(s.m64 && n > 16 ? s.pQkv64[l] : s.pQkv[l], s.m_qkv[l], z.data(), n, qkv.data(), &s.tim);
+      s.rt.Gemm(use64 ? s.pQkv64[l] : s.pQkv[l], s.m_qkv[l], z.data(), n, qkv.data(), &s.tim);
             cpu0 = Clock::now();
       const bool swa = c.layers[l] == LayerType::kSlidingAttention;
       const float theta = swa ? c.theta_swa : c.theta;
@@ -741,7 +766,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
         std::fprintf(stderr, "attn check layer %zu pos %u n %u: rel err %.4f\n", l, s.pos, n, std::sqrt(num / den));
       }
       s.t_cpu += Ms(cpu0);
-      s.rt.Gemm(s.m64 && n > 16 ? s.pH64[l] : s.pH[l], s.m_out[l], attn.data(), n, branch.data(), &s.tim);
+      s.rt.Gemm(use64 ? s.pH64[l] : s.pH[l], s.m_out[l], attn.data(), n, branch.data(), &s.tim);
     }
     cpu0 = Clock::now();
     if (lw.post_norm.data) {
@@ -752,34 +777,46 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     }
     RmsNorm(x.data(), static_cast<const float*>(lw.ffn_norm.data), z.data(), n, H, c.eps);
     s.t_cpu += Ms(cpu0);
-    if (s.m64 && n > 16)
-      s.rt.Ffn64(s.m_ffn[l], s.pGu64[l], s.m_ffn_dn[l], s.pDn64[l], z.data(), n, branch.data(), &s.tim);
+    std::copy(x.begin(), x.end(), X.begin() + std::size_t{o} * H);
+    std::copy(z.begin(), z.end(), Z.begin() + std::size_t{o} * H);
+    }
+    s.pos = pos0;
+    if (s.atb && nTot > 64)
+      s.atb->Run(l, Z.data(), nTot, Br.data());
+    else if (s.m64 && nTot > 16)
+      s.rt.Ffn64(s.m_ffn[l], s.pGu64[l], s.m_ffn_dn[l], s.pDn64[l], Z.data(), nTot, Br.data(), &s.tim);
     else
-      s.rt.Ffn(s.pFfn[l], s.m_ffn[l], z.data(), n, branch.data(), &s.tim);
-            cpu0 = Clock::now();
+      s.rt.Ffn(s.pFfn[l], s.m_ffn[l], Z.data(), nTot, Br.data(), &s.tim);
+    cpu0 = Clock::now();
     if (lw.post_ffn_norm.data) {
-      RmsNorm(branch.data(), static_cast<const float*>(lw.post_ffn_norm.data), z2.data(), n, H, c.eps);
-      for (std::size_t i = 0; i < x.size(); ++i) x[i] += z2[i];
+      RmsNorm(Br.data(), static_cast<const float*>(lw.post_ffn_norm.data), Z2.data(), nTot, H, c.eps);
+      for (std::size_t i = 0; i < X.size(); ++i) X[i] += Z2[i];
     } else {
-      for (std::size_t i = 0; i < x.size(); ++i) x[i] += branch[i];
+      for (std::size_t i = 0; i < X.size(); ++i) X[i] += Br[i];
     }
     if (std::getenv("GUFO_NANCHK")) {
-      bool bad=false; for(size_t i=0;i<x.size()&&!bad;++i) if(!(x[i]==x[i])) bad=true;
+      bool bad=false; for(size_t i=0;i<X.size()&&!bad;++i) if(!(X[i]==X[i])) bad=true;
       if(bad) { std::fprintf(stderr,"[nan] after layer %zu pos=%u\n", l, s.pos); }
     }
     if (const char* dd = std::getenv("GUFO_DUMP_DIR")) {
       if (s.pos < 192) {
         char fn[512]; std::snprintf(fn, sizeof fn, "%s/p%u_L%zu.f32", dd, s.pos, l);
-        if (FILE* f = std::fopen(fn, "wb")) { std::fwrite(x.data(), 4, x.size(), f); std::fclose(f); }
+        if (FILE* f = std::fopen(fn, "wb")) { std::fwrite(X.data(), 4, X.size(), f); std::fclose(f); }
       }
     }
       }
   if (hidden) {
-    hidden->resize(std::size_t{n} * H);
-    RmsNorm(x.data(), static_cast<const float*>(s.w->output_norm.data), hidden->data(), n, H, c.eps);
+    hidden->resize(std::size_t{nTot} * H);
+    RmsNorm(X.data(), static_cast<const float*>(s.w->output_norm.data), hidden->data(), nTot, H, c.eps);
   }
-  s.pending = n;
+  s.pending = nTot;
   s.t_cpu += Ms(cpu0);
+  if (std::getenv("GUFO_ATB_STATS"))
+    std::fprintf(stderr, "[step] n %u cpu %.1f ms  npu enc %.1f wait %.1f dec %.1f (cumulative)\n", nTot, s.t_cpu,
+                 s.tim.enc, s.tim.wait, s.tim.dec);
+  if (s.atb && std::getenv("GUFO_ATB_STATS") && s.atb->calls)
+    std::fprintf(stderr, "[atb] calls %zu enc %.1f dev %.1f dec %.1f ms (cumulative)\n", s.atb->calls,
+                 s.atb->enc_ms, s.atb->dev_ms, s.atb->dec_ms);
   return true;
 }
 
