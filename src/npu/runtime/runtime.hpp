@@ -203,6 +203,10 @@ class NpuRuntime {
   xrt::bo MakeBo(std::size_t bytes, int group = 3) {
     return xrt::bo(dev_, bytes, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(group));
   }
+  /// Pack FFN gate+up interleaved weights (N = 2*na) for the ATB path.
+  WeightBuffer PackFfnGuAtb(const float* gate, const float* up, std::uint32_t na, std::uint32_t hidden, int b_group = 3);
+  /// Pack FFN down weights for the ATB path.
+  WeightBuffer PackFfnDnAtb(const float* Wd, std::uint32_t hidden, std::uint32_t INT, int b_group = 3);
  private:
   // Staging for the ATB A/C streams: the xrt BO mapping is write-combined, so
   // 9-byte block stores to it run at ~1 GB/s. Encode/decode in cached memory and
