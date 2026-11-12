@@ -47,8 +47,8 @@ ModelSpec ModelSpec::Lfm3_1_7B() {
   s.name = "LFM3-1.7B";
   s.hidden = 2048;
   s.vocab = 0;  // from GGUF
-  s.layers = 16;
-  s.context = 8192;
+  s.layers = 24;
+  s.context = 262144;
   s.norm_eps = 1e-5f;
   s.output_norm = "output_norm.weight";
   s.embedding.tensor = "token_embd.weight";
