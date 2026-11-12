@@ -9,7 +9,7 @@ SAFE="$(printf '%s' "$SID" | tr -c 'A-Za-z0-9._-' '_')"
 ALL="$DIR/plugin-pause"
 ONE="$DIR/plugin-pause.$SAFE"
 ARG="${1:-}"; SCOPE="${2:-}"
-[ "$ARG" = "pause" ] || [ "$ARG" = "resume" ] || [ "$ARG" = "status" ] || [ "$ARG" = "autoeffort" ] || [ "$ARG" = "feature" ] || { set -- $ARG; ARG="${1:-}"; SCOPE="${2:-}"; }
+[ "$ARG" = "pause" ] || [ "$ARG" = "resume" ] || [ "$ARG" = "status" ] || [ "$ARG" = "autoeffort" ] || [ "$ARG" = "feature" ] || [ "$ARG" = "goal" ] || { set -- $ARG; ARG="${1:-}"; SCOPE="${2:-}"; }
 case "$ARG" in
   pause)
     mkdir -p "$DIR"
