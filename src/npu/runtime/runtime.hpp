@@ -176,6 +176,15 @@ class NpuRuntime {
   // ATB bfp16 and is decoded to M x N row-major float.
   WeightBuffer PackWeightAtb(const float* W, std::uint32_t N, std::uint32_t K,
                              int b_group = 3);
+
+  /// AGENT-8: dispatch-only floor measurement: submit the program's run and
+  /// wait for completion. Assumes A/B are already device-resident. Yields
+  /// (dispatch + device compute) per call, excluding encode/sync/decode.
+  void DispatchAtb(Program& p, WeightBuffer& wb) {
+    WeightBuffer& w = WeightSlot(wb, p);
+    w.run.start();
+    w.run.wait();
+  }
  private:
   // Staging for the ATB A/C streams: the xrt BO mapping is write-combined, so
   // 9-byte block stores to it run at ~1 GB/s. Encode/decode in cached memory and

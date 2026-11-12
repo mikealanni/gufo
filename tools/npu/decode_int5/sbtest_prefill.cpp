@@ -17,6 +17,7 @@
 #include <cstring>
 #include <chrono>
 #include <random>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -71,6 +72,404 @@ int main(int argc, char** argv) {
   if (!rt2.Init(dir + "/final_atb_k7680.xclbin", &err)) {
     std::fprintf(stderr, "init k7680: %s\n", err.c_str());
     return 1;
+  }
+
+  // ----- AGENT-8: swiglu-in-gu-flush (cfg28) chained probe -----------------
+  // gu programs (stage N=8192/7168 -> act N=4096/3584, C half-width on device)
+  // -> byte-shuffle act wire into dn A -> plain dn GEMM. Verifies act against
+  // CPU silu(X.G^T)*(X.U^T) and dn(act) against act.Wd^T. Scaffold shuffle is
+  // host-side; it proves the wire formats chain so the copy can move to the
+  // device (or be elided by tap permutation) later.
+  if (std::getenv("GUFO_PREFILL_SWI")) {
+    NpuRuntime rt3;  // swiglu-flush program (N=8192 design; mode 6 also has _b)
+    if (!rt3.Init(dir + "/final_atb_swi_k2048.xclbin", &err)) {
+      std::fprintf(stderr, "init swi: %s\n", err.c_str());
+      return 1;
+    }
+    const std::uint32_t HID = 2048, INT = 7680;
+    const std::uint32_t na = 4096, nb = 3584;  // act halves (stage 8192 / 7168)
+    const int swimode = std::atoi(std::getenv("GUFO_PREFILL_SWI"));
+    // mode 6 = FULLC xclbin (kernel emits act twice into a FULL-width C wire):
+    // first half of the C buffer is the clean halved act stream.
+    const std::size_t cfmul = swimode == 6 ? 2 : 1;
+    // mode 6 artifacts are per-N (full-width C does not fit a 15360 design),
+    // so the 7168 program runs on a second runtime instance.
+    std::unique_ptr<NpuRuntime> rt3b;
+    if (swimode == 6) {
+      rt3b = std::make_unique<NpuRuntime>();
+      if (!rt3b->Init(dir + "/final_atb_swi_b_k2048.xclbin", &err)) {
+        std::fprintf(stderr, "init swi_b: %s\n", err.c_str());
+        return 1;
+      }
+    }
+    NpuRuntime& rpb = rt3b ? *rt3b : rt3;
+    char pth[512];
+    std::snprintf(pth, sizeof pth, "%s/insts_atb_swi_%ux2048x8192.txt", dir.c_str(), M);
+    Program pa =
+        rt3.MakeProgram(HID, 2 * na, pth, cfmul * std::size_t{M} * na / 8 * 9, &err, 0, mrows, 3,
+                        5);
+    std::snprintf(pth, sizeof pth, "%s/insts_atb_swi_%ux2048x7168.txt", dir.c_str(), M);
+    Program pb =
+        rpb.MakeProgram(HID, 2 * nb, pth, cfmul * std::size_t{M} * nb / 8 * 9, &err, 0, mrows, 3,
+                        5);
+    std::snprintf(pth, sizeof pth, "%s/insts_atb_%ux7680x2048.txt", dir.c_str(), M);
+    Program pdn = rt2.MakeProgram(INT, HID, pth, std::size_t{M} * HID / 8 * 9, &err, 0, mrows, 3, 5);
+    if (!err.empty()) {
+      std::fprintf(stderr, "swi programs: %s\n", err.c_str());
+      return 1;
+    }
+
+    std::mt19937 rng(99);
+    std::uniform_real_distribution<float> uni(-1.f, 1.f);
+    std::vector<float> xs(std::size_t{M} * HID), G(std::size_t{INT} * HID),
+        U(std::size_t{INT} * HID), Wd(std::size_t{HID} * INT);
+    for (auto& v : xs) v = uni(rng);
+    for (auto& v : G) v = uni(rng);
+    for (auto& v : U) v = uni(rng);
+    for (auto& v : Wd) v = uni(rng);
+    if (swimode == 2) {  // act == 0 expected: G = U = 0
+      std::fill(G.begin(), G.end(), 0.f);
+      std::fill(U.begin(), U.end(), 0.f);
+    }
+
+    // cfg28 stage pairing: C-stream units are 8x8 blocks ordered
+    // (sbr,sbc,br,bc); consecutive vecs (bc0,bc1) cover stage cols
+    // 16*sbc+0..7 and 8..15 -> gate/up must interleave at 8-col granularity:
+    // stage row s = 16q+r: r<8 gate row of model col c0+8q+r, r>=8 up row.
+    auto pack_swi = [&](std::uint32_t c0, std::uint32_t n) {
+      std::vector<float> ws(std::size_t{2} * n * HID);
+      for (std::uint32_t s = 0; s < 2 * n; ++s) {
+        const std::uint32_t q = s >> 4, r = s & 15;
+        const float* src =
+            (r < 8 ? G.data() : U.data()) + std::size_t{c0 + q * 8 + (r & 7)} * HID;
+        std::memcpy(ws.data() + std::size_t{s} * HID, src, std::size_t{HID} * 4);
+      }
+      return ws;
+    };
+    const std::vector<float> wsa = pack_swi(0, na), wsb = pack_swi(na, nb);
+    WeightBuffer wa = rt3.PackWeightAtb(wsa.data(), 2 * na, HID, 4);
+    WeightBuffer wwb = rpb.PackWeightAtb(wsb.data(), 2 * nb, HID, 4);
+    WeightBuffer wd = rt2.PackWeightAtb(Wd.data(), HID, INT, 4);
+
+    // A is identical for both swi programs: encode once, mirror the stream.
+    rt3.EncodeAAtb(xs.data(), M, HID, pa);
+    std::memcpy(pb.ah, pa.ah, std::size_t{M} * HID / 8 * 9);
+
+    auto dispatch = [&](NpuRuntime& r, Program& p, WeightBuffer& w) {
+      WeightBuffer& ww = r.WeightSlot(w, p);
+      p.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      ww.run.start();
+      ww.run.wait();
+      if (!p.warmed) {  // first C write is lost on this stack
+        p.warmed = true;
+        ww.run.start();
+        ww.run.wait();
+      }
+      p.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    };
+    const auto t_swi0 = Clock::now();
+    dispatch(rt3, pa, wa);
+    dispatch(rpb, pb, wwb);
+    const double swi_ms = ms(t_swi0, Clock::now());
+
+    // Diagnostic: scale-byte histogram of act streams + reference hexdump of a
+    // VERIFIED plain C stream (plain gu_a on rt) for byte-pattern comparison.
+    if (true) {
+      int hist[256] = {0};
+      const std::size_t ba = std::size_t{M} * na / 8 * 9, bb = std::size_t{M} * nb / 8 * 9;
+      for (std::size_t b = 0; b < ba / 9; ++b) hist[pa.ch[b * 9]]++;
+      for (std::size_t b = 0; b < bb / 9; ++b) hist[pb.ch[b * 9]]++;
+      std::printf("act scale-byte hist (top):");
+      for (int pass = 0; pass < 4; ++pass) {
+        int best = -1;
+        for (int e = 0; e < 256; ++e)
+          if (hist[e] > 0 && (best < 0 || hist[e] > hist[best])) best = e;
+        if (best < 0) break;
+        std::printf(" e%d:%d", best, hist[best]);
+        hist[best] = 0;
+      }
+      std::printf("\n");
+    }
+
+    // Diagnostic: is the act wire non-zero at all, and where?
+    {
+      auto scan = [](const std::uint8_t* p, std::size_t n) {
+        std::size_t nz = 0;
+        for (std::size_t i = 0; i < n; ++i) nz += p[i] != 0;
+        return nz;
+      };
+      const std::size_t ba = std::size_t{M} * na / 8 * 9, bb = std::size_t{M} * nb / 8 * 9;
+      std::printf("act wire: A %zu/%zu nonzero bytes  B %zu/%zu\n", scan(pa.ch, ba), ba,
+                  scan(pb.ch, bb), bb);
+      std::printf("act A raw hex (first 72 B):");
+      for (int i = 0; i < 72; ++i) std::printf(" %02x", pa.ch[i]);
+      std::printf("\nact B raw hex (first 72 B):");
+      for (int i = 0; i < 72; ++i) std::printf(" %02x", pb.ch[i]);
+      std::printf("\n");
+    }
+    // Plain (verified) gu_a C for byte-pattern reference.
+    if (true) {
+      char ip[512];
+      std::snprintf(ip, sizeof ip, "%s/insts_atb_%ux2048x8192.txt", dir.c_str(), M);
+      Program pg =
+          rt.MakeProgram(HID, 2 * na, ip, std::size_t{M} * 2 * na / 8 * 9, &err, 0, mrows, 3, 5);
+      rt.EncodeAAtb(xs.data(), M, HID, pg);
+      WeightBuffer wg = rt.PackWeightAtb(wsa.data(), 2 * na, HID, 4);
+      WeightBuffer& wwg = rt.WeightSlot(wg, pg);
+      pg.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      wwg.run.start();
+      wwg.run.wait();
+      wwg.run.start();
+      wwg.run.wait();
+      pg.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+      std::printf("plain gu C raw hex (first 72 B):");
+      for (int i = 0; i < 72; ++i) std::printf(" %02x", pg.ch[i]);
+      std::printf("\n");
+      if (swimode == 2) return 0;
+    }
+    if (swimode == 2) return 0;
+
+    // act wire -> logical act[M][INT] (cfg28 stage-pairing tile map):
+    // program P, act col jp, row r -> v8 block
+    //   o64=jp&63, bcb=o64>>3, mp=r>>9, rcore=(r>>7)&3, r_in=r&127,
+    //   s=64*((r_in>>6)&1)+16*((r_in>>4)&3)+2*bcb+((r_in>>3)&1),
+    //   v8=((mp*np+(jp>>9))*8+((jp>>6)&7))*4096 + rcore*1024 + s*8 + (r_in&7)
+    auto act_block = [](std::uint32_t r, std::uint32_t jp, std::uint32_t np) {
+      const std::uint32_t o64 = jp & 63, bcb = o64 >> 3;
+      const std::uint32_t mp = r >> 9, rcore = (r >> 7) & 3, r_in = r & 127;
+      const std::uint32_t s =
+          64 * ((r_in >> 6) & 1) + 16 * ((r_in >> 4) & 3) + 2 * bcb + ((r_in >> 3) & 1);
+      return (std::size_t(mp * np + (jp >> 9)) * 8 + ((jp >> 6) & 7)) * 4096 +
+             std::size_t(rcore) * 1024 + s * 8 + (r_in & 7);
+    };
+    std::vector<float> za = gufo::npu::atb::bfp16ebs8ToFloat(
+        int(cfmul * std::size_t{M} * na / 8 * 9), static_cast<std::uint8_t*>(pa.ch), 0);
+    std::vector<float> zb = gufo::npu::atb::bfp16ebs8ToFloat(
+        int(cfmul * std::size_t{M} * nb / 8 * 9), static_cast<std::uint8_t*>(pb.ch), 0);
+    // mode 6 (SWI_DUP full-C): per full tile of 2048 wire blocks (= 128 act
+    // vecs), act vec q occupies wire blocks 16q+8..16q+15.
+    const auto hw = [&](std::size_t h) {
+      return swimode == 6
+                 ? (h >> 10) * 2048 + 16 * ((h >> 3) & 127) + 8 + (h & 7)
+                 : h;
+    };
+    std::vector<float> act(std::size_t{M} * INT), gact(std::size_t{M} * INT),
+        uact(std::size_t{M} * INT);
+    RefMatmulXWT(xs.data(), G.data(), gact.data(), M, INT, HID);
+    RefMatmulXWT(xs.data(), U.data(), uact.data(), M, INT, HID);
+    if (swimode == 4) {  // passthrough: recover true layout by matching blocks
+      RefMatmulXWT(xs.data(), G.data(), gact.data(), M, INT, HID);
+      
+      
+      
+      const std::size_t nba = std::size_t{M} * na / 8 * 9, nbb = std::size_t{M} * nb / 8 * 9;
+      std::FILE* f = std::fopen("/tmp/opencode/swi_match.txt", "w");
+      std::printf("matching sample blocks (kind r c0 -> err)...\n");
+      for (int t = 0; t < 120; ++t) {
+        const bool prog = t >= 60;
+        const auto& z = prog ? zb : za;
+        const std::uint32_t cbase = prog ? na : 0;
+        const std::size_t nblk = (prog ? nbb : nba) / 9;
+        const std::size_t blk = nblk / 600 * t + 3;
+        if (blk * 8 + 8 > z.size()) continue;
+        const float* v = z.data() + blk * 8;
+        if (!(std::fabs(v[0]) > 1.f)) continue;  // skip zero blocks
+        // candidate kinds: 0 = row-major (r fixed, c..c+7), 1 = col (c fixed, r..r+7)
+        float best[2] = {1e30f, 1e30f};
+        std::uint32_t bc[2] = {0xFFFFFFFFu, 0xFFFFFFFFu};
+        for (std::uint32_t r = 0; r < M; ++r) {
+          const float* g = gact.data() + std::size_t{r} * INT + cbase;
+          for (std::uint32_t c = 0; c + 8 <= (prog ? nb : na); c += 1) {
+            float e = 0, m0 = std::fabs(v[0]) + 1;
+            for (int i = 0; i < 8; ++i) {
+              const float d = std::fabs(v[i] - g[c + i]);
+              e = std::max(e, d / m0);
+            }
+            if (e < best[0]) { best[0] = e; bc[0] = r * 16384 + c; }
+          }
+        }
+        for (std::uint32_t c = 0; c + 8 <= (prog ? nb : na); ++c) {
+          for (std::uint32_t r = 0; r + 8 < M; r += 4) {
+            float e = 0, m0 = std::fabs(v[0]) + 1;
+            for (int i = 0; i < 8; ++i) {
+              const float d = std::fabs(v[i] - gact[std::size_t{r + i} * INT + cbase + c]);
+              e = std::max(e, d / m0);
+            }
+            if (e < best[1]) { best[1] = e; bc[1] = r * 16384 + c; }
+          }
+        }
+        std::printf("blk %6zu p%d: rowkind err %.3f @(r%u,c%u)   colkind err %.3f @(r%u,c%u)\n",
+                    blk, int(prog), best[0], bc[0] >> 14, bc[0] & 16383, best[1], bc[1] >> 14,
+                    bc[1] & 16383);
+        std::fprintf(f, "%zu %d %.4f %u %.4f %u\n", blk, int(prog), best[0], bc[0], best[1],
+                     bc[1]);
+      }
+      std::fclose(f);
+      return 0;
+    }
+    if (swimode == 6) {  // where is data in the full C buffers?
+      auto qcount = [](const std::uint8_t* p, std::size_t q) {
+        std::size_t nz = 0;
+        for (std::size_t i = 0; i < q; ++i) nz += p[i] != 0;
+        return nz;
+      };
+      const std::size_t qa = cfmul * std::size_t{M} * na / 8 * 9 / 4,
+                      qb = cfmul * std::size_t{M} * nb / 8 * 9 / 4;
+      std::printf("pa.ch nz per quarter:");
+      for (int i = 0; i < 4; ++i) std::printf(" %zu", qcount(static_cast<std::uint8_t*>(pa.ch) + i * qa, qa));
+      std::printf("\npb.ch nz per quarter:");
+      for (int i = 0; i < 4; ++i) std::printf(" %zu", qcount(static_cast<std::uint8_t*>(pb.ch) + i * qb, qb));
+      std::printf("\n");
+    }
+    double num = 0, den = 0;
+    double tn[8][8] = {{0}}, td[8][8] = {{0}};
+    for (std::uint32_t r = 0; r < M; ++r)
+      for (std::uint32_t c = 0; c < INT; ++c) {
+        const std::uint32_t np = (c < na ? na : nb) / 512;
+        const float v = c < na ? za[hw(act_block(r, c, np)) * 8 + (c & 7)]
+                              : zb[hw(act_block(r, c - na, np)) * 8 + (c & 7)];
+        act[std::size_t{r} * INT + c] = v;
+        const float g = gact[std::size_t{r} * INT + c];
+        const float ref = g / (1.f + std::exp(-g)) * uact[std::size_t{r} * INT + c];
+        const double d = v - ref;
+        num += d * d;
+        den += double(ref) * ref;
+        if (c < na && (c & 15) == 0) {
+          const double dd = v - double(ref);
+          tn[r >> 7][(c >> 9) & 7] += dd * dd;
+          td[r >> 7][(c >> 9) & 7] += double(ref) * double(ref);
+        }
+      }
+    {
+      std::printf("per-tile relL2 (rows mp0-7, cols c/512 0-7):\n");
+      for (int rr = 0; rr < 8; ++rr) {
+        std::printf("mp%d", rr);
+        for (int cc = 0; cc < 8; ++cc)
+          std::printf(" %6.3f", td[rr][cc] ? std::sqrt(tn[rr][cc] / td[rr][cc]) : -1.0);
+        std::printf("\n");
+      }
+    }
+    {
+      const double rel = std::sqrt(num / den);
+      std::printf("verify act(swiglu NPU) relL2 %.4f  %s\n", rel,                  rel < 0.08 ? "PASS" : "FAIL");
+      if (swimode == 5) {  // passthrough kernel: compare against GATE only
+        num = den = 0;
+        long ngood = 0, nbad = 0, ninf = 0;
+        for (std::uint32_t r = 0; r < M; ++r)
+          for (std::uint32_t c = 0; c < INT; ++c) {
+            const std::uint32_t np = (c < na ? na : nb) / 512;
+            const float v = c < na
+                                ? za[act_block(r, c, np) * 8 + (c & 7)]
+                                : zb[act_block(r, c - na, np) * 8 + (c & 7)];
+            const double g = double(gact[std::size_t{r} * INT + c]);
+            if (!(std::fabs(v) < 1e9)) { ++ninf; ++nbad; continue; }
+            if (std::fabs(v - g) <= 0.12 * std::fabs(g) + 2e-2)
+              ++ngood;
+            else
+              ++nbad;
+          }
+        std::printf("passthrough cells: good %ld bad %ld (huge %ld) of %d\n", ngood, nbad,
+                    ninf, int(M) * INT);
+        {  // positional structure of good cells
+          long tot[4][8] = {{0}}, good[4][8] = {{0}};
+          for (std::uint32_t r = 0; r < M; r += 2)
+            for (std::uint32_t c = 0; c < na; c += 9) {
+              const std::size_t blk = act_block(r, c, 8);
+              const float v = za[blk * 8 + (c & 7)];
+              const double g = gact[std::size_t{r} * INT + c];
+              const std::uint32_t isg = std::fabs(v) < 1e9 &&
+                                        std::fabs(v - g) <= 0.12 * std::fabs(g) + 2e-2;
+              const std::uint32_t r_in = r & 127;
+              ++tot[0][blk & 7];
+              good[0][blk & 7] += isg;
+              ++tot[1][(((r_in >> 6) & 1) << 1) | ((r_in >> 3) & 1)];
+              good[1][(((r_in >> 6) & 1) << 1) | ((r_in >> 3) & 1)] += isg;
+              ++tot[2][(c >> 6) & 7];
+              good[2][(c >> 6) & 7] += isg;
+              ++tot[3][(r >> 7) & 3];
+              good[3][(r >> 7) & 3] += isg;
+            }
+          const char* nm[4] = {"blk&7", "half,row8", "corecol", "rcore"};
+          for (int h = 0; h < 4; ++h) {
+            std::printf("good%% by %s:", nm[h]);
+            for (int i = 0; i < 8; ++i)
+              if (tot[h][i]) std::printf(" %d:%d", i, (int)(good[h][i] * 100 / tot[h][i]));
+            std::printf("\n");
+          }
+        }
+        {  // multiset fingerprint: is the wire carrying gate values AT ALL?
+          std::vector<float> a(za), b(zb), g = gact;
+          a.insert(a.end(), b.begin(), b.end());
+          std::sort(a.begin(), a.end());
+          std::sort(g.begin(), g.end());
+          double n2 = 0, d2 = 0;
+          for (std::size_t i = 0; i < g.size(); ++i) {
+            const double d = double(a[i]) - double(g[i]);
+            n2 += d * d;
+            d2 += double(g[i]) * double(g[i]);
+          }
+          std::printf("multiset(sorted) rel-diff %.4f  act[min %.1f max %.1f] gate[min %.1f max %.1f]\n",
+                      std::sqrt(n2 / d2), a.front(), a.back(), g.front(), g.back());
+        }
+        std::printf("good-density map (row=64 tok, col=64 ch; digit=good %%):\n");
+        for (std::uint32_t r = 0; r < M; r += 64) {
+          std::printf("r%4u", r);
+          for (std::uint32_t c = 0; c < INT; c += 64) {
+            int good = 0, tot = 0;
+            for (std::uint32_t i = 0; i < 64; i += 3)
+              for (std::uint32_t j = 0; j < 64; j += 7) {
+                const std::uint32_t cc = c + j;
+                const std::uint32_t np = (cc < na ? na : nb) / 512;
+                const float v = cc < na ? za[act_block(r + i, cc, np) * 8 + (cc & 7)]
+                                         : zb[act_block(r + i, cc - na, np) * 8 + (cc & 7)];
+                ++tot;
+                if (std::fabs(v) < 1e9 &&
+                    std::fabs(v - gact[std::size_t{r + i} * INT + cc]) <=
+                        0.12f * std::fabs(gact[std::size_t{r + i} * INT + cc]) + 2e-2f)
+                  ++good;
+              }
+            std::printf("%d", good * 10 / tot);
+          }
+          std::printf("\n");
+        }
+        return 0;
+      }
+    }
+
+    // Byte-shuffle the act wire (pa || pb blocks) into dn's A stream blocks.
+    std::vector<std::uint8_t> awire(std::size_t{M} * INT / 8 * 9);
+    for (std::uint32_t r = 0; r < M; ++r)
+      for (std::uint32_t c = 0; c < INT; c += 8) {
+        const std::uint32_t np = (c < na ? na : nb) / 512;
+        const std::uint8_t* src =
+            (c < na ? pa.ch : pb.ch) + hw(act_block(r, c < na ? c : c - na, np)) * 9;
+        // dn A block: tile (r>>7, c>>6) of [M/128 x 120] 8x8 2x1 layout.
+        const std::size_t ablk =
+            (std::size_t(r >> 7) * (INT / 64) + (c >> 6)) * 1024 +
+            (std::size_t(((r & 127) >> 4) * 8 + ((c & 63) >> 3)) * 2 +
+             ((r & 127) >> 3 & 1)) *
+                    8 +
+            (r & 7);
+        std::memcpy(awire.data() + ablk * 9, src, 9);
+      }
+    std::memcpy(pdn.ah, awire.data(), awire.size());
+    const auto t_dn0 = Clock::now();
+    dispatch(rt2, pdn, wd);
+    const double dn_ms = ms(t_dn0, Clock::now());
+    std::vector<float> y(std::size_t{M} * HID);
+    rt2.DecodeCAtb(y.data(), M, HID, pdn);
+    std::vector<float> yref(std::size_t{M} * HID);
+    RefMatmulXWT(act.data(), Wd.data(), yref.data(), M, HID, INT);
+    num = den = 0;
+    for (std::size_t e = 0; e < y.size(); ++e) {
+      const double d = double(y[e]) - double(yref[e]);
+      num += d * d;
+      den += double(yref[e]) * double(yref[e]);
+    }
+    std::printf("verify dn(act_npu)   relL2 %.4f  %s\n", std::sqrt(num / den),
+                num / den < 0.08 * 0.08 ? "PASS" : "FAIL");
+    std::printf("timings: gu pair (2 dispatches) %.2f ms   dn %.2f ms\n", swi_ms, dn_ms);
+    return 0;
   }
 
   // Real shapes (N multiple of 128 per dispatch; gu = 15360 is split in two).
@@ -208,6 +607,33 @@ int main(int argc, char** argv) {
       return 0;
     }
     return 0;
+  }
+
+  // Device floor: with A already resident (verify ran each op), measure pure
+  // submit+wait per shape. Chunk floor = sum over the layer mix.
+  if (std::atoi(std::getenv("GUFO_PREFILL_DEBUG") ? std::getenv("GUFO_PREFILL_DEBUG")
+                                                  : "0") < 2) {
+    std::printf("device floor (submit+wait, A resident):\n");
+    double total_floor = 0;
+    for (std::size_t i = 0; i < ops.size(); ++i) {
+      if (skip_dn && ops[i].second) continue;
+      rtp(i).GemmAtb(progs[i], wbs[i], x.data(), M, y.data(), nullptr);  // warm
+      const auto f0 = Clock::now();
+      constexpr int kRep = 10;
+      for (int k = 0; k < kRep; ++k) rtp(i).DispatchAtb(progs[i], wbs[i]);
+      const double dms = ms(f0, Clock::now()) / kRep;
+      const int per_chunk = std::strcmp(ops[i].name, "conv_in") == 0 ||
+                                    std::strcmp(ops[i].name, "conv_out") == 0
+                                ? 13
+                                : std::strcmp(ops[i].name, "qkv") == 0 ||
+                                          std::strcmp(ops[i].name, "o") == 0
+                                      ? 11
+                                      : 24;
+      total_floor += dms * per_chunk;
+      std::printf("  %-9s %7.2f ms x%2d\n", ops[i].name, dms, per_chunk);
+    }
+    std::printf("  chunk floor %.1f ms = %.0f tok/s GEMM-only\n", total_floor,
+                1024000.0 / total_floor);
   }
 
   std::vector<double> acc(ops.size(), 0.0);
