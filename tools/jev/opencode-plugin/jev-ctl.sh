@@ -48,7 +48,7 @@ case "$ARG" in
 try:
     g=json.load(sys.stdin); print("loaded: %s (%s)\nmodels: %s\nuse: jev switch <model>" % (g["kind"], g.get("model") or "starting", " ".join(g["models"])))
 except Exception:
-    print("guard is not running; start it first")'
+    print("the guard is not running: gufo runs without it.\nrestart it behind the guard: ~/jev-stop.sh, then ~/run-gufo.sh")'
     else
       curl -s -m130 -X POST "$GUARD/jev-guard/switch" -H 'content-type: application/json' -d "{\"kind\":\"$SCOPE\"}" | python3 -c 'import sys,json
 try:
@@ -56,7 +56,7 @@ try:
     if isinstance(g.get("error"), dict): raise ValueError
     print(("switch failed: %s" % g["error"]) if "error" in g else ("switching to %s; gufo restarts now" % g["kind"]))
 except Exception:
-    print("guard is not running; start it first")'
+    print("the guard is not running: gufo runs without it.\nrestart it behind the guard: ~/jev-stop.sh, then ~/run-gufo.sh")'
     fi ;;
   goal)
     shift

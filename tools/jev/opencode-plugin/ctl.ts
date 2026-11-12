@@ -71,19 +71,19 @@ export async function control(logDir: string, sid: string, argText: string): Pro
       if (!a) {
         try {
           const g = (await (await fetch(`${GUARD_URL}/jev-guard/status`, { signal: AbortSignal.timeout(2000) })).json()) as Record<string, unknown>;
-          if (g.state === undefined) return "guard is not running; start it first";
+          if (g.state === undefined) return "the guard is not running: gufo runs without it.\nrestart it behind the guard: ~/jev-stop.sh, then ~/run-gufo.sh";
           return `loaded: ${g.kind} (${g.model ?? "starting"})\nmodels: ${(g.models as string[]).join(" ")}\nuse /jev switch <model>`;
-        } catch { return "guard is not running; start it first"; }
+        } catch { return "the guard is not running: gufo runs without it.\nrestart it behind the guard: ~/jev-stop.sh, then ~/run-gufo.sh"; }
       }
       try {
         const r = await fetch(`${GUARD_URL}/jev-guard/switch`, {
           method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ kind: a }), signal: AbortSignal.timeout(130000),
         });
         const g = (await r.json()) as Record<string, unknown>;
-        if (typeof g.error === "object") return "guard is not running; start it first";
+        if (typeof g.error === "object") return "the guard is not running: gufo runs without it.\nrestart it behind the guard: ~/jev-stop.sh, then ~/run-gufo.sh";
         if (!r.ok) return `switch failed: ${g.error ?? r.status}${g.models ? `\nmodels: ${(g.models as string[]).join(" ")}` : ""}`;
         return g.note ? `${a}: ${g.note}` : `switching to ${a}\ngufo restarts now; /jev switch shows when it is loaded`;
-      } catch { return "guard is not running; start it first"; }
+      } catch { return "the guard is not running: gufo runs without it.\nrestart it behind the guard: ~/jev-stop.sh, then ~/run-gufo.sh"; }
     }
     case "goal": {
       const rest = argText.trim().slice(cmd.length).trim();
