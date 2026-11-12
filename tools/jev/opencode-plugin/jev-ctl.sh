@@ -41,6 +41,17 @@ case "$ARG" in
   status)
     [ -n "$SID" ] && { [ -e "$ONE" ] && echo "this session ($SID): PAUSED" || echo "this session ($SID): active"; }
     python3 "$HERE/status.py" 2>&1 | head -14 ;;
+  ""|help)
+    cat <<'HELP'
+jev control (type jev <option>)
+  status                      plugin state, pause, features, autoeffort, guard (model, memory)
+  pause [all]                 pause jev for this session, or all sessions
+  resume [all]                resume jev
+  autoeffort on|off [level]   let jev pick reasoning effort, or pin it (minimal|low|medium|high|xhigh|max)
+  feature <name> on|off       switch one feature: command, effort, goal, finish, pre
+  help                        this list
+HELP
+    ;;
   *)
-    echo "usage: /jev pause|resume|status [all] | autoeffort on|off [level]" ;;
+    echo "unknown option: $ARG (run: jev help)" ;;
 esac

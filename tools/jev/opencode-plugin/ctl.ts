@@ -9,6 +9,16 @@ const safe = (s: string): string => s.replace(/[^\w.-]/g, "_");
 const exists = (p: string): boolean => { try { readFileSync(p); return true; } catch { return false; } };
 const rm = (p: string): void => { try { unlinkSync(p); } catch { /* absent */ } };
 
+export const HELP = [
+  "jev control (type /jev <option>)",
+  "  status                      plugin state, pause, features, autoeffort, guard (model, memory)",
+  "  pause [all]                 pause jev (in the TUI this pauses all sessions)",
+  "  resume [all]                resume jev",
+  "  autoeffort on|off [level]   let jev pick reasoning effort, or pin it (minimal|low|medium|high|xhigh|max)",
+  "  feature <name> on|off       switch one feature: command, effort, goal, finish, pre",
+  "  help                        this list",
+].join("\n");
+
 export async function control(logDir: string, sid: string, argText: string): Promise<string> {
   mkdirSync(logDir, { recursive: true });
   const [cmd = "", a = "", b = ""] = argText.trim().split(/\s+/);
@@ -39,8 +49,9 @@ export async function control(logDir: string, sid: string, argText: string): Pro
       if (b === "off") writeFileSync(join(logDir, `feature-off.${a}`), ""); else rm(join(logDir, `feature-off.${a}`));
       return `feature '${a}' ${b.toUpperCase()}.`;
     }
+    case "help": return HELP;
     case "status": case "": return await status(logDir, sid);
-    default: return "usage: /jev pause|resume [all] | autoeffort on|off [level] | feature <name> on|off | status";
+    default: return `unknown option "${cmd}"\n\n${HELP}`;
   }
 }
 

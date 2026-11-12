@@ -2,7 +2,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Plugin } from "@opencode/plugin/tui";
-import { control } from "./ctl.ts";
+import { HELP, control } from "./ctl.ts";
 
 const LOG_DIR = process.env.JEV_LOG_DIR ?? join(homedir(), ".gufo", "jev-log");
 
@@ -16,17 +16,20 @@ export default Plugin.define({
       priority: 10,
       commands: [{
         id: "jev.control",
-        title: "jev control",
+        title: "jev: status | pause | resume | autoeffort | feature | help",
         group: "jev",
         palette: true,
         slash: { name: "jev", arguments: true },
         enabled: () => true,
         run: async (input?: string) => {
-          let text = String(input ?? "").trim() || "status";
+          let text = String(input ?? "").trim();
           // Per-session pause needs a session id the TUI plugin does not have: act on all sessions.
           if (text === "pause" || text === "resume") text += " all";
           let out: string;
-          try { out = await control(LOG_DIR, "tui", text); } catch (err) { out = `jev error: ${String(err)}`; }
+          try {
+            // A bare /jev lists the options (and the current status) so nobody has to remember them.
+            out = text ? await control(LOG_DIR, "tui", text) : `${HELP}\n\n${await control(LOG_DIR, "tui", "status")}`;
+          } catch (err) { out = `jev error: ${String(err)}`; }
           try { await context.ui.dialog.alert({ title: "jev", message: out }); }
           catch { context.ui.toast.show({ title: "jev", message: out, variant: "info", duration: 15000 }); }
         },
