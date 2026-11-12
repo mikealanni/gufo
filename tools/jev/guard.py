@@ -1465,7 +1465,7 @@ def main():
     p.add_argument("--npu-dir", default=f"{home}/gufo/tools/npu")
     p.add_argument("--judge-cutoff", type=float, default=0.85)
     p.add_argument("--free-target-gb", type=float, default=60)
-    p.add_argument("--reactive-gb", type=float, default=28.0,
+    p.add_argument("--reactive-gb", type=float, default=15.0,
                    help="stop gufo when available memory stays below this for ~6s")
     p.add_argument("--foreign-rss-gb", type=float, default=20.0,
                    help="stop gufo when any non-gufo process RSS exceeds this")
