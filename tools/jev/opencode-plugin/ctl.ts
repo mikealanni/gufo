@@ -23,6 +23,9 @@ export const HELP = [
   "/jev autoeffort off [level]",
   "   pin the effort (default low)",
   "   levels: none (no thinking) minimal low medium high xhigh max",
+  "/jev switch <model>",
+  "   reload gufo as another model",
+  "   models: flash-next 27b 35b glm flint laguna",
   "/jev goal [text]",
   "   keep the agent working until the task is done",
   "   (no text = the current task; max 3 pushes)",
@@ -63,6 +66,24 @@ export async function control(logDir: string, sid: string, argText: string): Pro
       if (!FEATURES.includes(a) || (b !== "on" && b !== "off")) return `usage: /jev feature ${FEATURES.join("|")} on|off`;
       if (b === "off") writeFileSync(join(logDir, `feature-off.${a}`), ""); else rm(join(logDir, `feature-off.${a}`));
       return `feature '${a}' ${b.toUpperCase()}.`;
+    }
+    case "switch": {
+      if (!a) {
+        try {
+          const g = (await (await fetch(`${GUARD_URL}/jev-guard/status`, { signal: AbortSignal.timeout(2000) })).json()) as Record<string, unknown>;
+          if (g.state === undefined) return "guard is not running; start it first";
+          return `loaded: ${g.kind} (${g.model ?? "starting"})\nmodels: ${(g.models as string[]).join(" ")}\nuse /jev switch <model>`;
+        } catch { return "guard is not running; start it first"; }
+      }
+      try {
+        const r = await fetch(`${GUARD_URL}/jev-guard/switch`, {
+          method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ kind: a }), signal: AbortSignal.timeout(130000),
+        });
+        const g = (await r.json()) as Record<string, unknown>;
+        if (typeof g.error === "object") return "guard is not running; start it first";
+        if (!r.ok) return `switch failed: ${g.error ?? r.status}${g.models ? `\nmodels: ${(g.models as string[]).join(" ")}` : ""}`;
+        return g.note ? `${a}: ${g.note}` : `switching to ${a}\ngufo restarts now; /jev switch shows when it is loaded`;
+      } catch { return "guard is not running; start it first"; }
     }
     case "goal": {
       const rest = argText.trim().slice(cmd.length).trim();

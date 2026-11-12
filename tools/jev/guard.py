@@ -63,6 +63,8 @@ HEAVY_RES = [
     {"npu"},                # npu-lock.sh
 ]
 assert len(HEAVY_RES) == len(HEAVY), "HEAVY and HEAVY_RES must stay parallel"
+# Model kinds ~/run-gufo.sh can start (GUFO_KIND).
+MODEL_KINDS = ("flash-next", "27b", "35b", "glm", "flint", "laguna")
 MODEL_EXT = (".gguf", ".safetensors", ".bin")
 GPU_CONTENT = re.compile(r"import\s+torch|from\s+torch|\bhipMalloc|\bhipLaunch|libamdhip|\bcuda\b|rocm|/dev/kfd|\.cuda\(", re.I)
 RAM_CONTENT = re.compile(r"llama[._-]?cpp|\bvllm\b|safetensors|from_pretrained|\bgguf\b", re.I)
@@ -773,6 +775,17 @@ class Guard:
         # environment, so a gufo the guard stopped always comes back as the same model.
         self.launch_env = {k: v for k, v in os.environ.items()
                            if k.startswith("GUFO_") or k in ("CTX", "JOBS", "KIND")}
+        # The model last loaded survives a guard restart: unless GUFO_KIND is set explicitly, boot loads it again.
+        self.model_file = os.path.join(os.path.expanduser("~"), ".gufo", "jev-log", "guard-model.json")
+        if "GUFO_KIND" not in self.launch_env:
+            try:
+                with open(self.model_file) as f:
+                    saved = json.load(f).get("kind")
+                if isinstance(saved, str) and saved in MODEL_KINDS:
+                    self.launch_env["GUFO_KIND"] = saved
+            except (OSError, ValueError):
+                pass
+        self.switching = False
         self.model_id = None  # id reported by gufo's /v1/models after the last successful start
         self.expected_model = None  # first model id seen; a restart must report the same id
         load_learned()
@@ -855,6 +868,13 @@ class Guard:
                                 self.expected_model = self.model_id
                             elif self.model_id != self.expected_model:
                                 log(f"WARNING: gufo restarted as model {self.model_id!r}, expected {self.expected_model!r}")
+                            try:
+                                os.makedirs(os.path.dirname(self.model_file), exist_ok=True)
+                                with open(self.model_file, "w") as f:
+                                    json.dump({"kind": self.launch_env.get("GUFO_KIND", "flash-next"),
+                                               "model": self.model_id, "time": time.time()}, f)
+                            except OSError:
+                                pass
                             self.state = "up"
                             self.guard_stopped = False
                             self.want_up = True
@@ -1311,13 +1331,41 @@ class Guard:
         await self.prepare_for_test(segment, own=False)
         return web.json_response({"state": self.state, "mem_available_gb": round(mem_available_gb(), 1)})
 
+    async def switch(self, request):
+        """Stop gufo and start it again as another model; later restarts keep the new model."""
+        try:
+            data = await request.json()
+        except ValueError:
+            return web.json_response({"error": "bad json"}, status=400)
+        kind = str(data.get("kind", "")).strip().lower()
+        if kind not in MODEL_KINDS:
+            return web.json_response({"error": f"unknown model {kind!r}", "models": list(MODEL_KINDS)}, status=400)
+        if self.switching or self.state in ("starting", "stopping"):
+            return web.json_response({"error": "busy", "state": self.state}, status=409)
+        if kind == self.launch_env.get("GUFO_KIND", "flash-next") and self.state == "up":
+            return web.json_response({"state": self.state, "kind": kind, "note": "already loaded"})
+        self.switching = True
+        try:
+            await self.drain_for_watchdog(f"switching model to {kind}")
+            if not await self.stop_gufo(f"switching model to {kind}"):
+                return web.json_response({"error": "gufo did not stop"}, status=500)
+            self.launch_env["GUFO_KIND"] = kind
+            self.expected_model = None  # the new model defines what restarts must reload
+            self.model_id = None
+            self.want_up = True
+            self.guard_stopped = True
+            self.starter = asyncio.create_task(self.start_gufo())
+        finally:
+            self.switching = False
+        return web.json_response({"state": "starting", "kind": kind})
+
     async def status(self, request):
         return web.json_response({
             "state": self.state, "stops": self.stops, "inflight": self.inflight,
             "opencode_active": self.opencode_active(), "prepare_api": 1, "default_effort": os.environ.get("GUFO_EFFORT", "low"), "pinned_effort": self.pinned_effort(),
             "idle_s": round(time.time() - self.last_activity) if self.last_activity else None,
             "mem_available_gb": round(mem_available_gb(), 1),
-            "model": self.model_id, "kind": self.launch_env.get("GUFO_KIND", "flash-next"),
+            "model": self.model_id, "kind": self.launch_env.get("GUFO_KIND", "flash-next"), "models": list(MODEL_KINDS),
             "judge": self.judge is not None and self.judge.proc is not None
             and self.judge.proc.returncode is None})
 
@@ -1338,6 +1386,7 @@ class Guard:
         app = web.Application(client_max_size=1 << 30)
         app.router.add_get("/jev-guard/status", self.status)
         app.router.add_post("/jev-guard/prepare", self.prepare)
+        app.router.add_post("/jev-guard/switch", self.switch)
         app.router.add_post("/jev-guard/classify", self.classify_command)
         app.router.add_route("*", "/{tail:.*}", self.proxy)
         runner = web.AppRunner(app)

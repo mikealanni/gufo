@@ -9,7 +9,7 @@ SAFE="$(printf '%s' "$SID" | tr -c 'A-Za-z0-9._-' '_')"
 ALL="$DIR/plugin-pause"
 ONE="$DIR/plugin-pause.$SAFE"
 ARG="${1:-}"; SCOPE="${2:-}"
-[ "$ARG" = "pause" ] || [ "$ARG" = "resume" ] || [ "$ARG" = "status" ] || [ "$ARG" = "autoeffort" ] || [ "$ARG" = "feature" ] || [ "$ARG" = "goal" ] || { set -- $ARG; ARG="${1:-}"; SCOPE="${2:-}"; }
+[ "$ARG" = "pause" ] || [ "$ARG" = "resume" ] || [ "$ARG" = "status" ] || [ "$ARG" = "autoeffort" ] || [ "$ARG" = "feature" ] || [ "$ARG" = "goal" ] || [ "$ARG" = "switch" ] || { set -- $ARG; ARG="${1:-}"; SCOPE="${2:-}"; }
 case "$ARG" in
   pause)
     mkdir -p "$DIR"
@@ -41,6 +41,23 @@ case "$ARG" in
   status)
     [ -n "$SID" ] && { [ -e "$ONE" ] && echo "this session ($SID): PAUSED" || echo "this session ($SID): active"; }
     python3 "$HERE/status.py" 2>&1 | head -14 ;;
+  switch)
+    GUARD="${JEV_GUARD_URL:-http://127.0.0.1:8900}"
+    if [ -z "$SCOPE" ]; then
+      curl -s -m3 "$GUARD/jev-guard/status" | python3 -c 'import sys,json
+try:
+    g=json.load(sys.stdin); print("loaded: %s (%s)\nmodels: %s\nuse: jev switch <model>" % (g["kind"], g.get("model") or "starting", " ".join(g["models"])))
+except Exception:
+    print("guard is not running; start it first")'
+    else
+      curl -s -m130 -X POST "$GUARD/jev-guard/switch" -H 'content-type: application/json' -d "{\"kind\":\"$SCOPE\"}" | python3 -c 'import sys,json
+try:
+    g=json.load(sys.stdin)
+    if isinstance(g.get("error"), dict): raise ValueError
+    print(("switch failed: %s" % g["error"]) if "error" in g else ("switching to %s; gufo restarts now" % g["kind"]))
+except Exception:
+    print("guard is not running; start it first")'
+    fi ;;
   goal)
     shift
     mkdir -p "$DIR"
@@ -53,6 +70,7 @@ jev control (type jev <option>)
   pause [all]                 pause jev for this session, or all sessions
   resume [all]                resume jev
   autoeffort on|off [level]   let jev pick reasoning effort, or pin it (none = no thinking|minimal|low|medium|high|xhigh|max)
+  switch <model>              reload gufo as another model (flash-next 27b 35b glm flint laguna)
   goal [text]                 keep the agent working until the task is done (no text = current task)
   goal off                    cancel the goal
   feature <name> on|off       switch one feature: command, effort, goal, finish, pre
