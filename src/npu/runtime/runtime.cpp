@@ -433,6 +433,23 @@ WeightBuffer NpuRuntime::PackWeightAtb(const float* W, std::uint32_t N,
   return wb;
 }
 
+WeightBuffer NpuRuntime::PackFfnGuAtb(const float* gate, const float* up,
+                                      std::uint32_t na, std::uint32_t hidden,
+                                      int b_group) {
+  std::vector<float> buf(std::size_t{2} * na * hidden);
+  for (std::uint32_t s = 0; s < 2 * na; ++s) {
+    const std::uint32_t q = s >> 4, r = s & 15;
+    const float* src = (r < 8 ? gate : up) + std::size_t{q * 8 + (r & 7)} * hidden;
+    std::memcpy(buf.data() + std::size_t{s} * hidden, src, std::size_t{hidden} * 4);
+  }
+  return PackWeightAtb(buf.data(), 2 * na, hidden, b_group);
+}
+
+WeightBuffer NpuRuntime::PackFfnDnAtb(const float* Wd, std::uint32_t hidden,
+                                      std::uint32_t INT, int b_group) {
+  return PackWeightAtb(Wd, hidden, INT, b_group);
+}
+
 // M x K row-major activations -> ATB A stream (row-major 2x1 8x8 tiles).
 void NpuRuntime::EncodeAAtb(const float* x, std::uint32_t M, std::uint32_t K,
                             Program& p) {
@@ -721,6 +738,10 @@ void NpuRuntime::ConvReset(ConvLayer& cl) {
       for (std::uint32_t r = 0; r < 4; ++r)
         std::memset(cl.w.host + ((std::size_t{g * 8 + col} * (tk + 1) + tk) * 4 + r) * kQuarterBytes +
                         kConvHistOffset, 0, 4 * 6 * 16);
+  for (std::uint32_t g = 1; g < groups; g += 3)
+    for (std::uint32_t col = 0; col < 8; ++col)
+      SyncToDevice(cl.w.bo, (std::size_t{(g * 8 + col)} * (tk + 1) + tk) * 4 * kQuarterBytes,
+                   4 * kQuarterBytes);
 }
 
 void NpuRuntime::ConvStep(ConvLayer& cl, const float* z, std::uint32_t n, float* y,
