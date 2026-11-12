@@ -11,18 +11,45 @@
 //   final_atb_k2048.xclbin, final_atb_k7680.xclbin (core ELFs, one per K class)
 //   insts_atb_1024x<K>x<N>.txt
 #include <cstdio>
+#include <immintrin.h>
 #include <omp.h>
 #include <cmath>
 #include <cstring>
 #include <chrono>
+#include <random>
 #include <string>
 #include <vector>
 
 #include "src/npu/runtime/runtime.hpp"
+#include "src/npu/runtime/atb_layout.hpp"
 
 using gufo::npu::runtime::NpuRuntime;
 using gufo::npu::runtime::Program;
 using gufo::npu::runtime::WeightBuffer;
+
+// CPU reference for the ATB GEMM: Y = X @ W^T, X is M x K, W is the model layout
+// N x K. So Y[m][n] = sum_k X[m][k] * W[n][k]. AVX2 dot product, parallel over m.
+static void RefMatmulXWT(const float* X, const float* W, float* Y,
+                         std::uint32_t M, std::uint32_t N, std::uint32_t K) {
+#pragma omp parallel for schedule(static)
+  for (std::uint32_t m = 0; m < M; ++m) {
+    const float* xr = X + std::size_t{m} * K;
+    for (std::uint32_t n = 0; n < N; ++n) {
+      const float* wn = W + std::size_t{n} * K;
+      __m256 acc = _mm256_setzero_ps();
+      std::uint32_t k = 0;
+      for (; k + 8 <= K; k += 8)
+        acc = _mm256_fmadd_ps(_mm256_loadu_ps(xr + k), _mm256_loadu_ps(wn + k), acc);
+      alignas(32) float t[8];
+      _mm256_store_ps(t, acc);
+      float s = t[0] + t[1] + t[2] + t[3] + t[4] + t[5] + t[6] + t[7];
+      for (; k < K; ++k) s += xr[k] * wn[k];
+      Y[std::size_t{m} * N + n] = s;
+    }
+  }
+}
+
+
 
 int main(int argc, char** argv) {
   const std::string dir = argc > 1 ? argv[1] : "tools/npu/decode_int5/runtime";
@@ -63,12 +90,15 @@ int main(int argc, char** argv) {
   const bool skip_dn = std::getenv("GUFO_PREFILL_SKIP_DN") != nullptr;
   std::vector<Program> progs(ops.size());
   std::vector<WeightBuffer> wbs(ops.size());
+  std::vector<std::vector<float>> wmat(ops.size());  // model-layout [N][K]
   auto rtp = [&](std::size_t i) -> NpuRuntime& { return ops[i].second ? rt2 : rt; };
 
+  std::mt19937 rng(1234);
+  std::uniform_real_distribution<float> uni(-1.f, 1.f);
   for (std::size_t i = 0; i < ops.size(); ++i) {
     const auto& o = ops[i];
     if (skip_dn && o.second) continue;
-    char insts[256], xcl[256];
+    char insts[256];
     std::snprintf(insts, sizeof(insts), "%s/insts_atb_%ux%ux%u.txt", dir.c_str(), M, o.K, o.N);
     NpuRuntime& r = rtp(i);
     progs[i] = r.MakeProgram(o.K, o.N, insts, std::size_t{M} * o.N / 8 * 9, &err, 0,
@@ -77,13 +107,16 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "%s: %s\n", o.name, err.c_str());
       return 1;
     }
-    // Synthetic weights (timing only).
-    std::vector<float> w(std::size_t{o.K} * o.N, 0.0625f);
-    wbs[i] = r.PackWeightAtb(w.data(), o.K, o.N, /*b_group=*/4);
+    // Random weights in model layout [N rows][K cols].
+    wmat[i].resize(std::size_t{o.N} * o.K);
+    for (auto& v : wmat[i]) v = uni(rng);
+    wbs[i] = r.PackWeightAtb(wmat[i].data(), o.N, o.K, /*b_group=*/4);
   }
+
   std::printf("prefill probe: chunk M=%u, %zu GEMM shapes, %d iters, %d omp threads\n", M,
               ops.size(), iters, omp_get_max_threads());
-  std::vector<float> x(std::size_t{M} * 7680, 1.0f), y(std::size_t{M} * 15360, 0.0f);
+  std::vector<float> x(std::size_t{M} * 7680), y(std::size_t{M} * 15360, 0.0f);
+  for (auto& v : x) v = uni(rng);
   // Isolate the host halves.
   {
     const std::size_t ia = 4;  // gu_a: K=2048 N=8192
@@ -104,24 +137,86 @@ int main(int argc, char** argv) {
   }
 
 
-  // Numerics sanity: with W = 0.0625 (exact in bfp16) and x = 1, every output is
-  // K * 0.0625. Any layout/indexing bug shows up as a stray value here.
-  for (std::size_t i = 0; i < ops.size(); ++i) {
-    if (skip_dn && ops[i].second) continue;
-    const double want = ops[i].K * 0.0625;
-    rtp(i).GemmAtb(progs[i], wbs[i], x.data(), M, y.data(), nullptr);
-    std::size_t bad = 0;
-    for (std::uint32_t r = 0; r < M; ++r)
-      for (std::uint32_t c = 0; c < ops[i].N; ++c)
-        if (std::fabs(y[std::size_t(r) * ops[i].N + c] - want) > 1e-3 * want) ++bad;
-    std::printf("verify %-9s want %8.2f bad %zu/%u\n", ops[i].name, want, bad,
-                M * ops[i].N);
+  // Numerics: compare the NPU output against the CPU reference Y = X @ W^T
+  // with random X and W. bfp16 should give a few percent relative L2 error;
+  // a wrong B-orientation would give ~sqrt(2) (uncorrelated sums).
+  {
+    std::vector<float> ref(std::size_t{M} * 15360);
+    for (std::size_t i = 0; i < ops.size(); ++i) {
+      if (skip_dn && ops[i].second) continue;
+      const std::uint32_t K = ops[i].K, N = ops[i].N;
+      RefMatmulXWT(x.data(), wmat[i].data(), ref.data(), M, N, K);
+      rtp(i).GemmAtb(progs[i], wbs[i], x.data(), M, y.data(), nullptr);
+      double num = 0, den = 0, mx = 0;
+      for (std::size_t e = 0; e < std::size_t{M} * N; ++e) {
+        const double d = y[e] - ref[e];
+        num += d * d;
+        den += double(ref[e]) * ref[e];
+        mx = std::fabs(d) > mx ? std::fabs(d) : mx;
+      }
+      const double rel = den > 0 ? std::sqrt(num / den) : 1.0;
+      std::printf("verify %-9s K=%-5u N=%-6u relL2 %.4f  maxabs %.3f  %s\n", ops[i].name,
+                  K, N, rel, mx, rel < 0.08 ? "PASS" : "FAIL");
+    }
   }
+
+  // Debug: identity composition. X[m][k] = (m==k), W model-layout identity
+  // W[n][k] = (n==k). Then Y[m][n] = sum_k X[m][k] W[n][k] = (m==n).
+  // Where the 1s land reveals any A/B/C block-mapping permutation.
+  if (std::getenv("GUFO_PREFILL_DEBUG")) {
+    const std::size_t i = 3;  // "o": K=N=2048
+    const std::uint32_t K = ops[i].K, N = ops[i].N;
+    std::fill(x.begin(), x.end(), 0.f);
+    for (std::uint32_t m = 0; m < M; ++m) x[std::size_t{m} * K + m] = 1.f;
+    std::fill(wmat[i].begin(), wmat[i].end(), 0.f);
+    for (std::uint32_t n = 0; n < N; ++n) wmat[i][std::size_t{n} * K + n] = 1.f;
+    wbs[i] = rtp(i).PackWeightAtb(wmat[i].data(), N, K, 4);
+    rtp(i).GemmAtb(progs[i], wbs[i], x.data(), M, y.data(), nullptr);
+    std::printf("identity map (row -> cols with y==1):\n");
+    for (std::uint32_t m = 0; m < 12; ++m) {
+      std::printf("  m=%u:", m);
+      for (std::uint32_t n = 0; n < N; ++n)
+        if (std::fabs(y[std::size_t{m} * N + n]) > 0.5f) std::printf(" %u", n);
+      std::printf("\n");
+    }
+    // Debug2: invert the raw stream with the harness reference functions at
+    // several L1_block_m hypotheses to find the true C dispatch mapping.
+    if (std::atoi(std::getenv("GUFO_PREFILL_DEBUG")) >= 2) {
+      // Tagged identity: C[m][m] = m+1 (exact in bfp16ebs8 for m < 128*8).
+      std::fill(wmat[i].begin(), wmat[i].end(), 0.f);
+      for (std::uint32_t n = 0; n < N; ++n) wmat[i][std::size_t{n} * K + n] = float(n + 1);
+      wbs[i] = rtp(i).PackWeightAtb(wmat[i].data(), N, K, 4);
+      rtp(i).GemmAtb(progs[i], wbs[i], x.data(), M, y.data(), nullptr);
+      const std::size_t nbytes = std::size_t{M} * N / 8 * 9;
+      std::vector<std::uint8_t> raw(nbytes);
+      std::memcpy(raw.data(), progs[i].ch, nbytes);
+      // Decode with the harness reference codec (index i: group = i/8, col-in = i%8).
+      auto z = gufo::npu::atb::bfp16ebs8ToFloat(int(nbytes), raw.data(), 0);
+      std::printf("raw C stream scan (m -> stream loc):\n");
+      std::size_t shown = 0, tot = 0;
+      std::FILE* mapf = std::fopen("/tmp/opencode/c_map.txt", "w");
+      for (std::size_t i = 0; i < z.size(); ++i) {
+        if (std::fabs(z[i]) < 0.5f) continue;
+        const std::size_t g = i / 8, cib = i % 8;
+        const std::size_t b = g / 8, rib = g % 8;
+        const std::size_t m = std::size_t(z[i]) - 1;
+        std::fprintf(mapf, "%zu %zu %zu %zu %zu\n", m, b, b / (N / 8), b % (N / 8), rib * 8 + cib);
+        ++tot;
+      }
+      std::fclose(mapf);
+      std::printf("  wrote %zu entries to /tmp/opencode/c_map.txt\n", tot);
+      return 0;
+    }
+    return 0;
+  }
+
   std::vector<double> acc(ops.size(), 0.0);
+
   std::vector<gufo::npu::runtime::NpuRuntime::Timings> tm(ops.size());
-  const int layers = 16;
-  // LFM3: conv at layer 1,2 then alternating conv/attn; 9 conv + 7 attn.
-  const bool is_conv[16] = {true, true, false, true, false, true, false, true,
+  // Real LFM3-1.7B layout: 24 layers, 13 conv (0,1,3,5,...,23) + 11 attention.
+  const int layers = 24;
+  const bool is_conv[24] = {true, true, false, true, false, true, false, true,
+                            false, true, false, true, false, true, false, true,
                             false, true, false, true, false, true, false, true};
 
 

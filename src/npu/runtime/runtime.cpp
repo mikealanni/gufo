@@ -385,9 +385,11 @@ inline void DecodeBlock8(const std::uint8_t* in, float* dst) {
 }
 }  // namespace
 
-// K x N row-major float weights -> ATB B stream (transposed 1x2 8x8 tiles).
-WeightBuffer NpuRuntime::PackWeightAtb(const float* W, std::uint32_t K,
-                                       std::uint32_t N, int b_group) {
+// Model-layout weights ([N rows][K cols], like PackWeight) -> ATB B stream.
+// The kernel computes C = A @ B with B[k][n], so the stream is built as
+// B[k][n] = W[n][k]. Tiles are the transposed 1x2 8x8 pattern over K x N.
+WeightBuffer NpuRuntime::PackWeightAtb(const float* W, std::uint32_t N,
+                                       std::uint32_t K, int b_group) {
   WeightBuffer wb;
   wb.bytes = std::size_t{K} * N / 8 * 9;
   wb.bo = xrt::bo(dev_, wb.bytes, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(b_group));
@@ -405,12 +407,12 @@ WeightBuffer NpuRuntime::PackWeightAtb(const float* W, std::uint32_t K,
             std::uint8_t* blk =
                 tile + ((sbc_i * 8 + sbr) * 2 + bis) * kAtbBlkBytes;
             const std::uint32_t cbc = sbc_i * 2 + bis;
-            const std::uint32_t row0 = (l1_row * kAtbTileK) + sbr * 8;
-            const std::uint32_t col0 = (l1_col * kAtbTileN) + cbc * 8;
+            const std::uint32_t row0 = (l1_row * kAtbTileK) + sbr * 8;  // k base
+            const std::uint32_t col0 = (l1_col * kAtbTileN) + cbc * 8;  // n base
             for (std::uint32_t col_in = 0; col_in < 8; ++col_in) {
               float v[8];
               for (std::uint32_t row_in = 0; row_in < 8; ++row_in)
-                v[row_in] = W[std::size_t(row0 + row_in) * N + col0 + col_in];
+                v[row_in] = W[std::size_t(col0 + col_in) * K + (row0 + row_in)];
               EncodeBlock8(v, blk + col_in * 9);
             }
           }
@@ -453,26 +455,38 @@ void NpuRuntime::EncodeAAtb(const float* x, std::uint32_t M, std::uint32_t K,
 }
 
 // ATB C stream -> M x N row-major floats.
+// The kernel emits one 128x128 tile per AIE core. The 4x8 core array walks
+// (m,n) tile passes of 4 m-tiles x 8 n-tiles, and the C outputs concatenate
+// core-column-major within each pass (measured against a tagged-identity GEMM:
+// tile (mt,nt) lands at stream slot
+//   ((mt/4)*npass + nt/8)*32 + (nt%8)*4 + (mt%4),  npass = N/1024).
+// Inside each tile the 8x8 blocks are 2x2-super-block ordered (row-pair
+// outer, 8 super-columns), i.e. layout_inverse_C_2x2_8x8block with a
+// 128x128 L1 block.
 void NpuRuntime::DecodeCAtb(float* y, std::uint32_t M, std::uint32_t N,
                             Program& p) {
-  const std::uint32_t l1_rows = M / kAtbTileM;
-  const std::uint32_t l1_cols = N / kAtbTileN;
+  constexpr std::uint32_t kAtbTileC = kAtbTileM * kAtbTileN / 8 * 9;  // 18432
+  const std::uint32_t mtiles = M / kAtbTileM;
+  const std::uint32_t ntiles = N / kAtbTileN;
+  const std::uint32_t npass = ntiles / 8;  // N / 1024
   atb_c_scratch_.resize(std::size_t{M} * N / 8 * 9);
   std::memcpy(atb_c_scratch_.data(), p.ch, atb_c_scratch_.size());
   const std::uint8_t* const src = atb_c_scratch_.data();
 #pragma omp parallel for collapse(2)
-  for (std::uint32_t l1_row = 0; l1_row < l1_rows; ++l1_row) {
-    for (std::uint32_t l1_col = 0; l1_col < l1_cols; ++l1_col) {
-      const std::uint8_t* tile =
-          src + (std::size_t{l1_row} * l1_cols + l1_col) * kAtbTileBytes;
+  for (std::uint32_t mt = 0; mt < mtiles; ++mt) {
+    for (std::uint32_t nt = 0; nt < ntiles; ++nt) {
+      const std::size_t tile =
+          (std::size_t{(mt / 4) * npass + nt / 8} * 32 + (nt % 8) * 4 +
+           (mt % 4));
+      const std::uint8_t* t = src + tile * kAtbTileC;
       for (std::uint32_t sbr = 0; sbr < 8; ++sbr) {
         for (std::uint32_t sbc = 0; sbc < 8; ++sbc) {
           for (std::uint32_t br = 0; br < 2; ++br) {
             for (std::uint32_t bc = 0; bc < 2; ++bc) {
               const std::uint8_t* blk =
-                  tile + (((sbr * 8 + sbc) * 4) + br * 2 + bc) * kAtbBlkBytes;
-              const std::uint32_t row0 = l1_row * kAtbTileM + sbr * 16 + br * 8;
-              const std::uint32_t col0 = l1_col * kAtbTileN + sbc * 16 + bc * 8;
+                  t + (((sbr * 8 + sbc) * 4) + br * 2 + bc) * kAtbBlkBytes;
+              const std::uint32_t row0 = mt * kAtbTileM + sbr * 16 + br * 8;
+              const std::uint32_t col0 = nt * kAtbTileN + sbc * 16 + bc * 8;
               for (std::uint32_t rib = 0; rib < 8; ++rib) {
                 float v[8];
                 DecodeBlock8(blk + rib * 9, v);

@@ -168,11 +168,13 @@ class NpuRuntime {
                const std::uint8_t* base = nullptr, std::uint32_t N = 0);
 
   struct Timings;  // defined below
-  // --- AGENT-7 big-M prefill (ATB) path ---------------------------------
-  // Weights/outputs use the asymmetric-tile-buffering layout (see atb_layout.hpp):
-  // B = K x N row-major float -> ATB bfp16 tile stream; A = M x K row-major;
-  // C comes back as ATB bfp16 and is decoded to M x N row-major float.
-  WeightBuffer PackWeightAtb(const float* W, std::uint32_t K, std::uint32_t N,
+  // --- AGENT-7/8 big-M prefill (ATB) path --------------------------------
+  // Weights/outputs use the asymmetric-tile-buffering layout (see
+  // atb_layout.hpp). The kernel computes C = A @ B with A = M x K and B = K x N.
+  // Model weight tensors are [N rows][K cols] (same as PackWeight), so W is the
+  // model layout and the B stream is built as B[k][n] = W[n][k]. C comes back as
+  // ATB bfp16 and is decoded to M x N row-major float.
+  WeightBuffer PackWeightAtb(const float* W, std::uint32_t N, std::uint32_t K,
                              int b_group = 3);
  private:
   // Staging for the ATB A/C streams: the xrt BO mapping is write-combined, so
