@@ -692,6 +692,12 @@ class Guard:
         self.idle_noted = False
         self.want_up = True  # the operator started the guard, which starts gufo once at boot
         self.guard_stopped = False  # True only while gufo is down because THIS guard stopped it
+        # The model identity is fixed when the guard boots: every (re)start uses exactly this launch
+        # environment, so a gufo the guard stopped always comes back as the same model.
+        self.launch_env = {k: v for k, v in os.environ.items()
+                           if k.startswith("GUFO_") or k in ("CTX", "JOBS", "KIND")}
+        self.model_id = None  # id reported by gufo's /v1/models after the last successful start
+        self.expected_model = None  # first model id seen; a restart must report the same id
         load_learned()
         if LEARNED:
             log(f"learned heavy keys: {len(LEARNED)}")
@@ -748,11 +754,11 @@ class Guard:
             if self.state == "up":
                 return
             self.state = "starting"
-            env = dict(os.environ, PORT=str(self.a.upstream_port), HOST="127.0.0.1", GUFO_GUARD="0")
+            env = dict(os.environ, **self.launch_env, PORT=str(self.a.upstream_port), HOST="127.0.0.1", GUFO_GUARD="0")
             self.proc = await asyncio.create_subprocess_exec(
                 "bash", self.a.run_script, env=env, start_new_session=True,
                 stdin=asyncio.subprocess.DEVNULL)
-            log(f"starting gufo pid={self.proc.pid} on :{self.a.upstream_port}")
+            log(f"starting gufo pid={self.proc.pid} on :{self.a.upstream_port} kind={self.launch_env.get('GUFO_KIND', 'flash-next')} expected_model={self.expected_model!r}")
             deadline = time.time() + self.a.start_timeout
             while time.time() < deadline:
                 if self.proc.returncode is not None:
@@ -763,6 +769,15 @@ class Guard:
                 try:
                     async with self.session.get(self.a.upstream + "/v1/models") as r:
                         if r.status == 200:
+                            try:
+                                data = await r.json()
+                                self.model_id = (data.get("data") or [{}])[0].get("id")
+                            except Exception:
+                                self.model_id = None
+                            if self.expected_model is None:
+                                self.expected_model = self.model_id
+                            elif self.model_id != self.expected_model:
+                                log(f"WARNING: gufo restarted as model {self.model_id!r}, expected {self.expected_model!r}")
                             self.state = "up"
                             self.guard_stopped = False
                             self.want_up = True
@@ -788,7 +803,7 @@ class Guard:
             self.ready.clear()
             self.stops += 1
             t_stop = time.time()
-            log(f"stopping gufo ({reason})")
+            log(f"stopping gufo model={self.model_id!r} kind={self.launch_env.get('GUFO_KIND', 'flash-next')} ({reason})")
             os.killpg(self.proc.pid, signal.SIGTERM)
             try:
                 await asyncio.wait_for(self.proc.wait(), self.a.stop_timeout)
@@ -1214,6 +1229,7 @@ class Guard:
             "opencode_active": self.opencode_active(), "prepare_api": 1, "default_effort": os.environ.get("GUFO_EFFORT", "low"), "pinned_effort": self.pinned_effort(),
             "idle_s": round(time.time() - self.last_activity) if self.last_activity else None,
             "mem_available_gb": round(mem_available_gb(), 1),
+            "model": self.model_id, "kind": self.launch_env.get("GUFO_KIND", "flash-next"),
             "judge": self.judge is not None and self.judge.proc is not None
             and self.judge.proc.returncode is None})
 
