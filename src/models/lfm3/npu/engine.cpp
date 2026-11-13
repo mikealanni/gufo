@@ -479,7 +479,7 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
 }
 
 static std::uint32_t SuperChunks() {
-  static const std::uint32_t v = std::getenv("GUFO_SUPER") ? static_cast<std::uint32_t>(std::atoi(std::getenv("GUFO_SUPER"))) : 8;
+  static const std::uint32_t v = std::getenv("GUFO_SUPER") ? static_cast<std::uint32_t>(std::atoi(std::getenv("GUFO_SUPER"))) : 16;
   return v < 1 ? 1 : v;
 }
 
@@ -1158,7 +1158,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       return;
     }
     const int saved_threads = omp_get_max_threads();
-    static const int nw = std::getenv("GUFO_PAR_WORKERS") ? std::max(2, std::atoi(std::getenv("GUFO_PAR_WORKERS"))) : 3;
+    static const int nw = std::getenv("GUFO_PAR_WORKERS") ? std::max(2, std::atoi(std::getenv("GUFO_PAR_WORKERS"))) : 4;
     std::atomic<std::uint32_t> next{0};
     const auto worker = [&] {
       omp_set_num_threads(saved_threads / nw > 0 ? saved_threads / nw : 1);
