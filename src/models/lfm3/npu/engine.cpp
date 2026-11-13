@@ -8,6 +8,10 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -475,7 +479,7 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
 }
 
 static std::uint32_t SuperChunks() {
-  static const std::uint32_t v = std::getenv("GUFO_SUPER") ? static_cast<std::uint32_t>(std::atoi(std::getenv("GUFO_SUPER"))) : 4;
+  static const std::uint32_t v = std::getenv("GUFO_SUPER") ? static_cast<std::uint32_t>(std::atoi(std::getenv("GUFO_SUPER"))) : 8;
   return v < 1 ? 1 : v;
 }
 
@@ -509,6 +513,9 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     std::uint32_t n{0}, pos0{0}, row0{0};
   };
   std::vector<ChunkState> css(nChunks);
+  std::mutex npu_mu, tick_mu;
+  std::condition_variable tick_cv;
+  std::uint32_t conv_turn = 0, app_turn = 0;
   for (std::uint32_t ci = 0; ci < nChunks; ++ci) {
     ChunkState& cs = css[ci];
     cs.row0 = ci * kChunk;
@@ -524,6 +531,8 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
   const auto layer_run = [&](ChunkState& cs, int seg) {
     const std::uint32_t nTot = cs.n;
     const std::uint32_t pos0 = cs.pos0;
+    std::uint32_t lpos = pos0;
+    const std::uint32_t ci_ = cs.row0 / kChunk;
     auto& X = cs.X; auto& Z = cs.Z; auto& Z2 = cs.Z2; auto& Br = cs.Br;
     auto& QKV = cs.QKV; auto& ATT = cs.ATT; auto& QALL = cs.QALL; auto& GATE = cs.GATE;
     auto& KALL = cs.KALL; auto& VALL = cs.VALL; auto& CIN = cs.CIN; auto& CY = cs.CY; auto& BXB = cs.BXB;
@@ -545,7 +554,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       QKV.resize(std::size_t{nTot} * 3072);
       ATT.resize(std::size_t{nTot} * qd);
       const auto tq0 = Clock::now();
-      s.atb->RunQkv(l, Z.data(), nTot, QKV.data());
+      { std::lock_guard<std::mutex> g_(npu_mu); s.atb->RunQkv(l, Z.data(), nTot, QKV.data()); }
       g_t_qkv += Ms(tq0);
     }
     }
@@ -582,6 +591,17 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       RmsNorm(X.data(), static_cast<const float*>(lw.norm.data), Z.data(), nTot, H, c.eps);
       CIN.resize(std::size_t{nTot} * 6144);
       CY.resize(std::size_t{nTot} * H);
+      std::unique_lock<std::mutex> cvlk;
+      {
+        std::unique_lock<std::mutex> tl(tick_mu);
+        tick_cv.wait(tl, [&] { return conv_turn == ci_; });
+      }
+      cvlk = std::unique_lock<std::mutex>(npu_mu);
+      const auto conv_done = [&] {
+        cvlk.unlock();
+        { std::lock_guard<std::mutex> tl(tick_mu); ++conv_turn; }
+        tick_cv.notify_all();
+      };
       const auto tcA = Clock::now();
       static const int conv_dev = std::getenv("GUFO_CONV_DEV") ? std::atoi(std::getenv("GUFO_CONV_DEV")) : 1;
       const bool dev_conv = conv_dev && s.atb->HasConvDev(l) && s.taps == 7;
@@ -609,6 +629,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
         s.atb->RunConvOutRaw(l, nTot, Br.data());
         g_t_cout += Ms(tcC1);
         g_t_conv += Ms(tcv0);
+        conv_done();
         finish_all(Br.data());
       } else {
       s.atb->RunConvIn(l, Z.data(), nTot, CIN.data());
@@ -665,13 +686,19 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       s.atb->RunConvOut(l, CY.data(), nTot, Br.data());
       g_t_cout += Ms(tcC);
       g_t_conv += Ms(tcv0);
+      conv_done();
       finish_all(Br.data());
       }
+    }
+    const bool ordered_append = (seg == 0 || seg == 1) && defer && !big_conv;
+    if (ordered_append) {
+      std::unique_lock<std::mutex> tl(tick_mu);
+      tick_cv.wait(tl, [&] { return app_turn == ci_; });
     }
     for (std::uint32_t o = 0; !big_conv && o < nTot; o += 64) {
     const std::uint32_t n = std::min<std::uint32_t>(64, nTot - o);
     const bool use64 = s.m64 && (n > 16 || nTot > 64);
-    s.pos = pos0 + o;
+    lpos = pos0 + o;
     std::vector<float> x(X.begin() + std::size_t{o} * H, X.begin() + std::size_t{o + n} * H),
         z(x.size()), z2(x.size()), branch(x.size()), qkv(std::size_t{n} * 3072),
         attn(std::size_t{n} * qd);
@@ -687,8 +714,8 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
         s.rt.ConvStep(s.m_conv64[l], z.data(), n, branch.data(), &s.tim);
         g_t_conv += Ms(tcv0);
         if (const char* dd = std::getenv("GUFO_DUMP_DIR")) {
-          if (s.pos < 192 && l < 4) {
-            char fn[512]; std::snprintf(fn, sizeof fn, "%s/p%u_C%zu.f32", dd, s.pos, l);
+          if (lpos < 192 && l < 4) {
+            char fn[512]; std::snprintf(fn, sizeof fn, "%s/p%u_C%zu.f32", dd, lpos, l);
             if (FILE* f = std::fopen(fn, "wb")) { std::fwrite(branch.data(), 4, branch.size(), f); std::fclose(f); }
           }
         }
@@ -701,7 +728,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
             for (std::uint32_t cc = 0; cc < H; ++cc) if (b2[std::size_t{r} * H + cc] != branch[std::size_t{r} * H + cc]) { d = true; break; }
             if (d) { ++bad; rows += std::to_string(r) + ","; }
           }
-          if (bad) std::fprintf(stderr, "[repeat] L%zu pos %u: %d rows differ: %s\n", l, s.pos, bad, rows.c_str());
+          if (bad) std::fprintf(stderr, "[repeat] L%zu pos %u: %d rows differ: %s\n", l, lpos, bad, rows.c_str());
         }
         if (std::getenv("GUFO_NANCHK")) {
           int nn=0,ninf=0; float mx=0; int badrows=0;
@@ -719,8 +746,8 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
         }
       }
       if (const char* dd = std::getenv("GUFO_DUMP_DIR")) {
-        if (s.pos < 192 && l < 4) {
-          char fn[512]; std::snprintf(fn, sizeof fn, "%s/p%u_B%zu.f32", dd, s.pos, l);
+        if (lpos < 192 && l < 4) {
+          char fn[512]; std::snprintf(fn, sizeof fn, "%s/p%u_B%zu.f32", dd, lpos, l);
           if (FILE* f = std::fopen(fn, "wb")) { std::fwrite(branch.data(), 4, branch.size(), f); std::fclose(f); }
         }
       }
@@ -756,7 +783,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       for (std::int64_t t = 0; t < n; ++t) {
         float cs[64], sn[64];
         {
-          const float position = static_cast<float>(s.pos + t);
+          const float position = static_cast<float>(lpos + t);
           for (std::uint32_t i = 0; i < hd / 2; ++i) {
             float angle = position * std::pow(theta, -2.0f * static_cast<float>(i) / hd);
             if (!swa) angle /= fac[i];
@@ -776,7 +803,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
             base[i + hd / 2] = b * cs[i] + a * sn[i];
           }
         }
-        const std::uint32_t P = s.pos + t;
+        const std::uint32_t P = lpos + t;
         const std::uint32_t slot = P % s.capacity[l];
         if (defer_sw) continue;
         // WP0: store KV as bf16 (halves memory traffic).
@@ -795,7 +822,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
           std::copy(v.begin(), v.end(), VALL.begin() + std::size_t{o} * kvd);
         }
         for (std::uint32_t o2 = 0; !defer_sw && o2 < n; o2 += 16)
-          s.rt.AttnAppend(s.m_attn[l], s.pos + o2, std::min(16u, n - o2), k.data() + std::size_t{o2} * kvd,
+          s.rt.AttnAppend(s.m_attn[l], lpos + o2, std::min(16u, n - o2), k.data() + std::size_t{o2} * kvd,
                           s.v_cache[l].data(), &s.tim);
         std::copy(q.begin(), q.end(), QALL.begin() + std::size_t{o} * qd);
         std::copy(gate.begin(), gate.end(), GATE.begin() + std::size_t{o} * heads);
@@ -804,8 +831,8 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
         npu_done = true;
         for (std::uint32_t o = 0; o < n; o += 16) {
           const std::uint32_t m = std::min(16u, n - o);
-          s.rt.AttnAppend(s.m_attn[l], s.pos + o, m, k.data() + std::size_t{o} * kvd, s.v_cache[l].data(), &s.tim);
-          npu_done = s.rt.AttnRun(s.m_attn[l], s.pos + o, m, q.data() + std::size_t{o} * qd,
+          s.rt.AttnAppend(s.m_attn[l], lpos + o, m, k.data() + std::size_t{o} * kvd, s.v_cache[l].data(), &s.tim);
+          npu_done = s.rt.AttnRun(s.m_attn[l], lpos + o, m, q.data() + std::size_t{o} * qd,
                                   s.k_cache[l].data(), s.v_cache[l].data(), s.programs_dir,
                                   attn.data() + std::size_t{o} * qd, &s.tim) && npu_done;
         }
@@ -839,7 +866,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       std::vector<std::uint32_t> firsts(pairs), lens(pairs), chunk_counts(pairs), chunk_off(pairs);
       std::uint32_t total_chunks = 0;
       for (std::uint32_t t = 0; t < n; ++t) {
-        const std::uint32_t P = s.pos + t;
+        const std::uint32_t P = lpos + t;
         const std::uint32_t first = swa && P + 1 > s.window ? P + 1 - s.window : 0;
         const std::uint32_t len = P + 1 - first;
         for (std::uint32_t h = 0; h < heads; ++h) {
@@ -981,7 +1008,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       if (!attn_npu.empty()) {
         double num = 0, den = 0;
         for (std::size_t i = 0; i < std::size_t{n} * qd; ++i) { const double d = attn_npu[i] - attn[i]; num += d * d; den += double(attn[i]) * attn[i]; }
-        std::fprintf(stderr, "attn check layer %zu pos %u n %u: rel err %.4f\n", l, s.pos, n, std::sqrt(num / den));
+        std::fprintf(stderr, "attn check layer %zu pos %u n %u: rel err %.4f\n", l, lpos, n, std::sqrt(num / den));
       }
       s.t_cpu += Ms(cpu0);
       { const auto to0 = Clock::now();
@@ -994,7 +1021,11 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     finish(o, n, x, z, z2, branch.data());
     s.t_cpu += Ms(cpu0);
     }
-    s.pos = pos0;
+    lpos = pos0;
+    if (ordered_append) {
+      { std::lock_guard<std::mutex> tl(tick_mu); ++app_turn; }
+      tick_cv.notify_all();
+    }
     }
     if (seg == 0 || seg == 2) {
     if (defer_any) {
@@ -1034,16 +1065,19 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     if (seg == 0 || seg == 3) {
     if (big_attn) {
       const auto to0 = Clock::now();
-      s.atb->RunO(l, ATT.data(), nTot, Br.data());
+      { std::lock_guard<std::mutex> g_(npu_mu); s.atb->RunO(l, ATT.data(), nTot, Br.data()); }
       g_t_oproj += Ms(to0);
       finish_all(Br.data());
     }
+    {
+    std::lock_guard<std::mutex> g_(npu_mu);
     if (s.atb && nTot > 64)
       s.atb->Run(l, Z.data(), nTot, Br.data());
     else if (s.m64 && nTot > 16)
       s.rt.Ffn64(s.m_ffn[l], s.pGu64[l], s.m_ffn_dn[l], s.pDn64[l], Z.data(), nTot, Br.data(), &s.tim);
     else
       s.rt.Ffn(s.pFfn[l], s.m_ffn[l], Z.data(), nTot, Br.data(), &s.tim);
+    }
     cpu0 = Clock::now();
     const auto tpost0 = Clock::now();
     if (lw.post_ffn_norm.data) {
@@ -1057,23 +1091,50 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     g_t_post += Ms(tpost0);
     if (std::getenv("GUFO_NANCHK")) {
       bool bad=false; for(size_t i=0;i<X.size()&&!bad;++i) if(!(X[i]==X[i])) bad=true;
-      if(bad) { std::fprintf(stderr,"[nan] after layer %zu pos=%u\n", l, s.pos); }
+      if(bad) { std::fprintf(stderr,"[nan] after layer %zu pos=%u\n", l, lpos); }
     }
     if (const char* dd = std::getenv("GUFO_DUMP_DIR")) {
-      if (s.pos < 192) {
-        char fn[512]; std::snprintf(fn, sizeof fn, "%s/p%u_L%zu.f32", dd, s.pos, l);
+      if (lpos < 192) {
+        char fn[512]; std::snprintf(fn, sizeof fn, "%s/p%u_L%zu.f32", dd, lpos, l);
         if (FILE* f = std::fopen(fn, "wb")) { std::fwrite(X.data(), 4, X.size(), f); std::fclose(f); }
       }
     }
     }
   };
   const bool attn_layer = c.layers[l] != LayerType::kConvolution;
+  conv_turn = 0;
+  app_turn = 0;
+  static const bool par_env = !(std::getenv("GUFO_PAR") && std::atoi(std::getenv("GUFO_PAR")) == 0);
+  bool par_ok = par_env && nChunks > 1 && s.atb;
+  for (auto& cs : css) par_ok = par_ok && cs.n > 64;
+  const auto run_par = [&](int seg) {
+    if (!par_ok) {
+      for (auto& cs : css) layer_run(cs, seg);
+      return;
+    }
+    const int saved_threads = omp_get_max_threads();
+    static const int nw = std::getenv("GUFO_PAR_WORKERS") ? std::max(2, std::atoi(std::getenv("GUFO_PAR_WORKERS"))) : 2;
+    std::atomic<std::uint32_t> next{0};
+    const auto worker = [&] {
+      omp_set_num_threads(saved_threads / nw > 0 ? saved_threads / nw : 1);
+      for (;;) {
+        const std::uint32_t i = next.fetch_add(1);
+        if (i >= nChunks) break;
+        layer_run(css[i], seg);
+      }
+    };
+    std::vector<std::thread> ts;
+    for (int w = 1; w < nw; ++w) ts.emplace_back(worker);
+    worker();
+    for (auto& t : ts) t.join();
+    omp_set_num_threads(saved_threads);
+  };
   if (!attn_layer || nChunks == 1) {
-    for (auto& cs : css) layer_run(cs, 0);
+    run_par(0);
   } else {
-    for (auto& cs : css) layer_run(cs, 1);
+    run_par(1);
     for (auto& cs : css) layer_run(cs, 2);
-    for (auto& cs : css) layer_run(cs, 3);
+    run_par(3);
   }
   }
   s.pos = pos0;
