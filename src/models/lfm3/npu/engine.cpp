@@ -485,7 +485,7 @@ void Engine::Reset() {
 std::uint32_t Engine::Position() const { return impl_->pos; }
 std::uint32_t Engine::PrefillRows() const { return impl_->atb ? gufo::npu::runtime::FfnAtbChain::kM : (impl_->m64 ? kMaxRows : 16); }
 
-static double g_t_norm, g_t_prep, g_t_attn_npu, g_t_attn_cpu, g_t_resid, g_t_conv, g_t_qkv, g_t_oproj;
+static double g_t_cin, g_t_cmid, g_t_cout, g_t_norm, g_t_prep, g_t_attn_npu, g_t_attn_cpu, g_t_resid, g_t_conv, g_t_qkv, g_t_oproj;
 bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hidden) {
   Impl& s = *impl_;
   const auto& c = s.w->config;
@@ -501,17 +501,16 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
   for (std::uint32_t i = 0; i < nTot; ++i)
     DecodeRow(s.w->embedding, tokens[i], std::span<float>(&X[std::size_t{i} * H], H));
   auto cpu0 = Clock::now();
+  std::vector<float> QKV, ATT, QALL, GATE, KALL, VALL, CIN, CY, BXB;
   for (std::size_t l = 0; l < c.layers.size(); ++l) {
     const auto& lw = s.w->layers[l];
     const bool big_attn = s.atb && nTot > 64 && c.layers[l] != LayerType::kConvolution && s.atb->HasAttn(l);
-    std::vector<float> QKV, ATT, QALL, GATE;
     static const bool no_bigconv = std::getenv("GUFO_NO_BIGCONV") != nullptr;
     const bool big_conv = s.atb && !no_bigconv && nTot > 64 && c.layers[l] == LayerType::kConvolution &&
                           s.atb->HasConv(l) && s.m_conv64[l].hidden;
     const bool defer_any = big_attn && s.apre && s.m_attn[l].host;
     const bool defer_sw = defer_any && s.m_attn[l].ring_tokens;
     const bool defer = defer_any && !defer_sw;
-    std::vector<float> KALL, VALL;
     if (defer_any) { QALL.resize(std::size_t{nTot} * qd); GATE.resize(std::size_t{nTot} * heads); }
     if (defer_sw) { KALL.resize(std::size_t{nTot} * kvd); VALL.resize(std::size_t{nTot} * kvd); }
     if (big_attn) {
@@ -537,15 +536,20 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     if (big_conv) {
       const auto tcv0 = Clock::now();
       RmsNorm(X.data(), static_cast<const float*>(lw.norm.data), Z.data(), nTot, H, c.eps);
-      std::vector<float> CIN(std::size_t{nTot} * 6144), CY(std::size_t{nTot} * H);
+      CIN.resize(std::size_t{nTot} * 6144);
+      CY.resize(std::size_t{nTot} * H);
+      const auto tcA = Clock::now();
       s.atb->RunConvIn(l, Z.data(), nTot, CIN.data());
+      g_t_cin += Ms(tcA);
+      const auto tcB = Clock::now();
       // Temporary host middle: Bx = bf16(B*x), 7-tap causal conv over [history | Bx], y = C * conv.
       constexpr std::uint32_t kHist = 6;
       std::vector<std::uint16_t> hist(std::size_t{kHist} * H);
       s.rt.ConvGetHistory(s.m_conv64[l], hist.data());
       const auto* taps = static_cast<const float*>(lw.conv.data);
       const std::uint32_t nt = s.taps;
-      std::vector<float> bx(std::size_t{nTot + kHist} * H);
+      BXB.resize(std::size_t{nTot + kHist} * H);
+      auto& bx = BXB;
       for (std::uint32_t r = 0; r < kHist; ++r)
         for (std::uint32_t ch = 0; ch < H; ++ch) bx[std::size_t{r} * H + ch] = Bf16Float(hist[std::size_t{r} * H + ch]);
 #pragma omp parallel for
@@ -568,7 +572,10 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
         for (std::uint32_t ch = 0; ch < H; ++ch) nh[std::size_t{r} * H + ch] = Bf16Bits(bx[std::size_t{nTot + r} * H + ch]);
       s.rt.ConvSetHistory(s.m_conv64[l], nh.data());
       if (s.m_conv[l].hidden) s.rt.ConvCopyHistory(s.m_conv[l], s.m_conv64[l]);
+      g_t_cmid += Ms(tcB);
+      const auto tcC = Clock::now();
       s.atb->RunConvOut(l, CY.data(), nTot, Br.data());
+      g_t_cout += Ms(tcC);
       g_t_conv += Ms(tcv0);
       for (std::uint32_t o = 0; o < nTot; o += 64) {
         const std::uint32_t n = std::min<std::uint32_t>(64, nTot - o);
@@ -974,8 +981,10 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
   }
   s.pending = nTot;
   s.t_cpu += Ms(cpu0);
-  if (std::getenv("GUFO_ATB_STATS"))
+  if (std::getenv("GUFO_ATB_STATS")) {
+    std::fprintf(stderr, "[conv] in %.0f mid %.0f out %.0f ms\n", g_t_cin, g_t_cmid, g_t_cout);
     std::fprintf(stderr, "[cpu] norm %.0f prep %.0f attn_npu %.0f attn_cpu %.0f conv %.0f qkv %.0f oproj %.0f ms\n", g_t_norm, g_t_prep, g_t_attn_npu, g_t_attn_cpu, g_t_conv, g_t_qkv, g_t_oproj);
+  }
   if (std::getenv("GUFO_ATB_STATS"))
     std::fprintf(stderr, "[step] n %u cpu %.1f ms  npu enc %.1f wait %.1f dec %.1f (cumulative)\n", nTot, s.t_cpu,
                  s.tim.enc, s.tim.wait, s.tim.dec);
