@@ -217,6 +217,9 @@ class NpuRuntime {
  public:
   void EncodeAAtb(const float* x, std::uint32_t M, std::uint32_t K, Program& p);
   void DecodeCAtb(float* y, std::uint32_t M, std::uint32_t N, Program& p);
+  /// Scratch-free variants (thread-safe): A stream into dst, C stream from src.
+  void EncodeAAtbRaw(const float* x, std::uint32_t M, std::uint32_t K, std::uint8_t* dst) const;
+  void DecodeCAtbRaw(const std::uint8_t* src, float* y, std::uint32_t M, std::uint32_t N) const;
   /// One output row (N floats) straight from the C wire.
   void DecodeCRowAtb(const Program& p, std::uint32_t N, std::uint32_t row, float* out) const;
   /// Inverse of EncodeAAtb (reads p.ah).

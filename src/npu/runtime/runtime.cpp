@@ -443,12 +443,10 @@ WeightBuffer NpuRuntime::PackFfnDnAtb(const float* Wd, std::uint32_t hidden,
 }
 
 // M x K row-major activations -> ATB A stream (row-major 2x1 8x8 tiles).
-void NpuRuntime::EncodeAAtb(const float* x, std::uint32_t M, std::uint32_t K,
-                            Program& p) {
+void NpuRuntime::EncodeAAtbRaw(const float* x, std::uint32_t M, std::uint32_t K,
+                               std::uint8_t* dst) const {
   const std::uint32_t l1_rows = M / kAtbTileM;
   const std::uint32_t l1_cols = K / kAtbTileK;
-  atb_a_scratch_.resize(std::size_t{M} * K / 8 * 9);
-  std::uint8_t* const dst = atb_a_scratch_.data();
 #pragma omp parallel for collapse(2)
   for (std::uint32_t l1_row = 0; l1_row < l1_rows; ++l1_row) {
     for (std::uint32_t l1_col = 0; l1_col < l1_cols; ++l1_col) {
@@ -469,7 +467,14 @@ void NpuRuntime::EncodeAAtb(const float* x, std::uint32_t M, std::uint32_t K,
       }
     }
   }
-  std::memcpy(p.ah, dst, atb_a_scratch_.size());
+}
+
+
+void NpuRuntime::EncodeAAtb(const float* x, std::uint32_t M, std::uint32_t K,
+                            Program& p) {
+  atb_a_scratch_.resize(std::size_t{M} * K / 8 * 9);
+  EncodeAAtbRaw(x, M, K, atb_a_scratch_.data());
+  std::memcpy(p.ah, atb_a_scratch_.data(), atb_a_scratch_.size());
 }
 
 // ATB C stream -> M x N row-major floats.
@@ -481,15 +486,11 @@ void NpuRuntime::EncodeAAtb(const float* x, std::uint32_t M, std::uint32_t K,
 // Inside each tile the 8x8 blocks are 2x2-super-block ordered (row-pair
 // outer, 8 super-columns), i.e. layout_inverse_C_2x2_8x8block with a
 // 128x128 L1 block.
-void NpuRuntime::DecodeCAtb(float* y, std::uint32_t M, std::uint32_t N,
-                            Program& p) {
+void NpuRuntime::DecodeCAtbRaw(const std::uint8_t* src, float* y, std::uint32_t M, std::uint32_t N) const {
   constexpr std::uint32_t kAtbTileC = kAtbTileM * kAtbTileN / 8 * 9;  // 18432
   const std::uint32_t mtiles = M / kAtbTileM;
   const std::uint32_t ntiles = N / kAtbTileN;
   const std::uint32_t npass = ntiles / 8;  // N / 1024
-  atb_c_scratch_.resize(std::size_t{M} * N / 8 * 9);
-  std::memcpy(atb_c_scratch_.data(), p.ch, atb_c_scratch_.size());
-  const std::uint8_t* const src = atb_c_scratch_.data();
 #pragma omp parallel for collapse(2)
   for (std::uint32_t mt = 0; mt < mtiles; ++mt) {
     for (std::uint32_t nt = 0; nt < ntiles; ++nt) {
@@ -517,6 +518,14 @@ void NpuRuntime::DecodeCAtb(float* y, std::uint32_t M, std::uint32_t N,
       }
     }
   }
+}
+
+
+void NpuRuntime::DecodeCAtb(float* y, std::uint32_t M, std::uint32_t N,
+                            Program& p) {
+  atb_c_scratch_.resize(std::size_t{M} * N / 8 * 9);
+  std::memcpy(atb_c_scratch_.data(), p.ch, atb_c_scratch_.size());
+  DecodeCAtbRaw(atb_c_scratch_.data(), y, M, N);
 }
 
 void NpuRuntime::DecodeCRowAtb(const Program& p, std::uint32_t N, std::uint32_t row, float* out) const {

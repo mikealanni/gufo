@@ -169,6 +169,66 @@ class FfnAtbChain {
     c.pi.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
   }
 
+  // ---- split API: encode/decode run outside the caller's device lock, Exec* inside it ----
+  struct Job {
+    std::vector<std::uint8_t> a, c;
+  };
+  void EncodeJob(const float* z, std::uint32_t n, std::uint32_t k, Job& j) {
+    std::vector<float> pad;
+    const float* src = z;
+    if (n < kM) {
+      pad.assign(std::size_t{kM} * k, 0.f);
+      std::memcpy(pad.data(), z, std::size_t{n} * k * 4);
+      src = pad.data();
+    }
+    j.a.resize(std::size_t{kM} * k / 8 * 9);
+    gu_.EncodeAAtbRaw(src, kM, k, j.a.data());
+  }
+  void DecodeJob(const Job& j, std::uint32_t n, std::uint32_t nout, float* y) {
+    if (n == kM) {
+      gu_.DecodeCAtbRaw(j.c.data(), y, kM, nout);
+    } else {
+      std::vector<float> tmp(std::size_t{kM} * nout);
+      gu_.DecodeCAtbRaw(j.c.data(), tmp.data(), kM, nout);
+      std::memcpy(y, tmp.data(), std::size_t{n} * nout * 4);
+    }
+  }
+  void ExecGemm(Program& p, WeightBuffer& w, Job& j, std::uint32_t nout) {
+    std::memcpy(p.ah, j.a.data(), j.a.size());
+    p.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    Dispatch(gu_, w, p);
+    p.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    j.c.assign(p.ch, p.ch + std::size_t{kM} * nout / 8 * 9);
+  }
+  void ExecQkv(std::size_t l, Job& j) { ExecGemm(attn_[l]->pq, attn_[l]->wq, j, 3072); }
+  void ExecO(std::size_t l, Job& j) { ExecGemm(attn_[l]->po, attn_[l]->wo, j, kHid); }
+  void ExecFfn(std::size_t l, Job& j) {
+    Layer& ly = *layers_[l];
+    std::memcpy(ly.qa.ah, j.a.data(), j.a.size());
+    std::memcpy(ly.qb.ah, j.a.data(), j.a.size());
+    ly.qa.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    ly.qb.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    Dispatch(gu_, ly.wqa, ly.qa);
+    Dispatch(gu_, ly.wqb, ly.qb);
+    if (!ly.fused) Dispatch(*swp_, ly.fake, ly.sw);
+    Dispatch(*dnp_, ly.wd, ly.dn);
+    ly.dn.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    j.c.assign(ly.dn.ch, ly.dn.ch + std::size_t{kM} * kHid / 8 * 9);
+  }
+  void ExecConvIn(std::size_t l, Job& j) {
+    Conv& c = *conv_[l];
+    std::memcpy(c.pi.ah, j.a.data(), j.a.size());
+    c.pi.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    Dispatch(gu_, c.wi, c.pi);
+    c.pi.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+  }
+  void ExecConvOut(std::size_t l, Job& j) {
+    Conv& c = *conv_[l];
+    Dispatch(gu_, c.wo, c.po);
+    c.po.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    j.c.assign(c.po.ch, c.po.ch + std::size_t{kM} * kHid / 8 * 9);
+  }
+
   /// One in_proj wire row (6144 floats, model order B|C|x).
   void ConvWireRow(std::size_t layer, std::uint32_t row, float* out) {
     gu_.DecodeCRowAtb(conv_[layer]->pi, 3 * kHid, row, out);

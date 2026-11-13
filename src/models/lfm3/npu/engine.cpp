@@ -554,7 +554,12 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       QKV.resize(std::size_t{nTot} * 3072);
       ATT.resize(std::size_t{nTot} * qd);
       const auto tq0 = Clock::now();
-      { std::lock_guard<std::mutex> g_(npu_mu); s.atb->RunQkv(l, Z.data(), nTot, QKV.data()); }
+      {
+        gufo::npu::runtime::FfnAtbChain::Job jq;
+        s.atb->EncodeJob(Z.data(), nTot, 2048, jq);
+        { std::lock_guard<std::mutex> g_(npu_mu); s.atb->ExecQkv(l, jq); }
+        s.atb->DecodeJob(jq, nTot, 3072, QKV.data());
+      }
       g_t_qkv += Ms(tq0);
     }
     }
@@ -591,6 +596,10 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       RmsNorm(X.data(), static_cast<const float*>(lw.norm.data), Z.data(), nTot, H, c.eps);
       CIN.resize(std::size_t{nTot} * 6144);
       CY.resize(std::size_t{nTot} * H);
+      static const int conv_dev = std::getenv("GUFO_CONV_DEV") ? std::atoi(std::getenv("GUFO_CONV_DEV")) : 1;
+      const bool dev_conv = conv_dev && s.atb->HasConvDev(l) && s.taps == 7;
+      gufo::npu::runtime::FfnAtbChain::Job jc, jco;
+      if (dev_conv && conv_dev == 1) s.atb->EncodeJob(Z.data(), nTot, 2048, jc);
       std::unique_lock<std::mutex> cvlk;
       {
         std::unique_lock<std::mutex> tl(tick_mu);
@@ -603,8 +612,6 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
         tick_cv.notify_all();
       };
       const auto tcA = Clock::now();
-      static const int conv_dev = std::getenv("GUFO_CONV_DEV") ? std::atoi(std::getenv("GUFO_CONV_DEV")) : 1;
-      const bool dev_conv = conv_dev && s.atb->HasConvDev(l) && s.taps == 7;
       constexpr std::uint32_t kHist = 6;
       std::vector<float> wrow(6144);
       const auto bx_rows = [&](std::uint32_t first, std::uint16_t* dst) {
@@ -615,7 +622,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       };
       std::vector<float> devA;
       if (dev_conv && conv_dev == 1) {
-        s.atb->RunConvInRaw(l, Z.data(), nTot);
+        s.atb->ExecConvIn(l, jc);
         g_t_cin += Ms(tcA);
         const auto tcB1 = Clock::now();
         std::vector<std::uint16_t> h0(std::size_t{kHist} * H), nh(std::size_t{kHist} * H);
@@ -626,10 +633,11 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
         if (s.m_conv[l].hidden) s.rt.ConvCopyHistory(s.m_conv[l], s.m_conv64[l]);
         g_t_cmid += Ms(tcB1);
         const auto tcC1 = Clock::now();
-        s.atb->RunConvOutRaw(l, nTot, Br.data());
+        s.atb->ExecConvOut(l, jco);
         g_t_cout += Ms(tcC1);
         g_t_conv += Ms(tcv0);
         conv_done();
+        s.atb->DecodeJob(jco, nTot, 2048, Br.data());
         finish_all(Br.data());
       } else {
       s.atb->RunConvIn(l, Z.data(), nTot, CIN.data());
@@ -1065,18 +1073,26 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     if (seg == 0 || seg == 3) {
     if (big_attn) {
       const auto to0 = Clock::now();
-      { std::lock_guard<std::mutex> g_(npu_mu); s.atb->RunO(l, ATT.data(), nTot, Br.data()); }
+      {
+        gufo::npu::runtime::FfnAtbChain::Job jo;
+        s.atb->EncodeJob(ATT.data(), nTot, 2048, jo);
+        { std::lock_guard<std::mutex> g_(npu_mu); s.atb->ExecO(l, jo); }
+        s.atb->DecodeJob(jo, nTot, 2048, Br.data());
+      }
       g_t_oproj += Ms(to0);
       finish_all(Br.data());
     }
-    {
-    std::lock_guard<std::mutex> g_(npu_mu);
-    if (s.atb && nTot > 64)
-      s.atb->Run(l, Z.data(), nTot, Br.data());
-    else if (s.m64 && nTot > 16)
-      s.rt.Ffn64(s.m_ffn[l], s.pGu64[l], s.m_ffn_dn[l], s.pDn64[l], Z.data(), nTot, Br.data(), &s.tim);
-    else
-      s.rt.Ffn(s.pFfn[l], s.m_ffn[l], Z.data(), nTot, Br.data(), &s.tim);
+    if (s.atb && nTot > 64) {
+      gufo::npu::runtime::FfnAtbChain::Job jf;
+      s.atb->EncodeJob(Z.data(), nTot, 2048, jf);
+      { std::lock_guard<std::mutex> g_(npu_mu); s.atb->ExecFfn(l, jf); }
+      s.atb->DecodeJob(jf, nTot, 2048, Br.data());
+    } else {
+      std::lock_guard<std::mutex> g_(npu_mu);
+      if (s.m64 && nTot > 16)
+        s.rt.Ffn64(s.m_ffn[l], s.pGu64[l], s.m_ffn_dn[l], s.pDn64[l], Z.data(), nTot, Br.data(), &s.tim);
+      else
+        s.rt.Ffn(s.pFfn[l], s.m_ffn[l], Z.data(), nTot, Br.data(), &s.tim);
     }
     cpu0 = Clock::now();
     const auto tpost0 = Clock::now();
@@ -1113,7 +1129,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       return;
     }
     const int saved_threads = omp_get_max_threads();
-    static const int nw = std::getenv("GUFO_PAR_WORKERS") ? std::max(2, std::atoi(std::getenv("GUFO_PAR_WORKERS"))) : 2;
+    static const int nw = std::getenv("GUFO_PAR_WORKERS") ? std::max(2, std::atoi(std::getenv("GUFO_PAR_WORKERS"))) : 3;
     std::atomic<std::uint32_t> next{0};
     const auto worker = [&] {
       omp_set_num_threads(saved_threads / nw > 0 ? saved_threads / nw : 1);
