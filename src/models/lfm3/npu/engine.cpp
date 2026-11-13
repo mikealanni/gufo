@@ -496,6 +496,8 @@ void Engine::Reset() {
 std::uint32_t Engine::Position() const { return impl_->pos; }
 std::uint32_t Engine::PrefillRows() const { return impl_->atb ? gufo::npu::runtime::FfnAtbChain::kM * SuperChunks() : (impl_->m64 ? kMaxRows : 16); }
 
+static double g_lock_ms;
+static double g_busy[4];
 static double g_w_conv, g_w_a, g_w_b, g_w_c, g_f_enc, g_f_exe, g_f_dec;
 static double g_t_post, g_t_fin, g_t_cin, g_t_cmid, g_t_cout, g_t_norm, g_t_prep, g_t_attn_npu, g_t_attn_cpu, g_t_resid, g_t_conv, g_t_qkv, g_t_oproj;
 bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hidden) {
@@ -550,7 +552,8 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     const bool defer_sw = defer_any && s.m_attn[l].ring_tokens;
     const bool defer = defer_any && !defer_sw;
     if (defer_any) { QALL.resize(std::size_t{nTot} * qd); GATE.resize(std::size_t{nTot} * heads); }
-    if (defer_sw) { KALL.resize(std::size_t{nTot} * kvd); VALL.resize(std::size_t{nTot} * kvd); }
+    if (defer_any) KALL.resize(std::size_t{nTot} * kvd);
+    if (defer_sw) VALL.resize(std::size_t{nTot} * kvd);
     if (seg == 0 || seg == 1) {
     if (big_attn) {
       RmsNorm(X.data(), static_cast<const float*>(lw.norm.data), Z.data(), nTot, H, c.eps);
@@ -560,7 +563,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       {
         gufo::npu::runtime::FfnAtbChain::Job jq;
         s.atb->EncodeJob(Z.data(), nTot, 2048, jq);
-        { std::lock_guard<std::mutex> g_(npu_mu); s.atb->ExecQkv(l, jq); }
+        { std::lock_guard<std::mutex> g_(npu_mu); const auto tl0 = Clock::now(); s.atb->ExecQkv(l, jq); g_lock_ms += Ms(tl0); }
         s.atb->DecodeJob(jq, nTot, 3072, QKV.data());
       }
       g_t_qkv += Ms(tq0);
@@ -609,7 +612,9 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
         tick_cv.wait(tl, [&] { return conv_turn == ci_; });
       }
       cvlk = std::unique_lock<std::mutex>(npu_mu);
+      const auto tcl0 = Clock::now();
       const auto conv_done = [&] {
+        g_lock_ms += Ms(tcl0);
         cvlk.unlock();
         { std::lock_guard<std::mutex> tl(tick_mu); ++conv_turn; }
         tick_cv.notify_all();
@@ -702,10 +707,6 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       }
     }
     const bool ordered_append = (seg == 0 || seg == 1) && defer && !big_conv;
-    if (ordered_append) {
-      std::unique_lock<std::mutex> tl(tick_mu);
-      tick_cv.wait(tl, [&] { return app_turn == ci_; });
-    }
     for (std::uint32_t o = 0; !big_conv && o < nTot; o += 64) {
     const std::uint32_t n = std::min<std::uint32_t>(64, nTot - o);
     const bool use64 = s.m64 && (n > 16 || nTot > 64);
@@ -828,13 +829,8 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       bool npu_done = false;
       if (defer_any) {
         npu_done = true;
-        if (defer_sw) {
-          std::copy(k.begin(), k.end(), KALL.begin() + std::size_t{o} * kvd);
-          std::copy(v.begin(), v.end(), VALL.begin() + std::size_t{o} * kvd);
-        }
-        for (std::uint32_t o2 = 0; !defer_sw && o2 < n; o2 += 16)
-          s.rt.AttnAppend(s.m_attn[l], lpos + o2, std::min(16u, n - o2), k.data() + std::size_t{o2} * kvd,
-                          s.v_cache[l].data(), &s.tim);
+        std::copy(k.begin(), k.end(), KALL.begin() + std::size_t{o} * kvd);
+        if (defer_sw) std::copy(v.begin(), v.end(), VALL.begin() + std::size_t{o} * kvd);
         std::copy(q.begin(), q.end(), QALL.begin() + std::size_t{o} * qd);
         std::copy(gate.begin(), gate.end(), GATE.begin() + std::size_t{o} * heads);
       } else if (s.m_attn[l].host) {
@@ -1034,6 +1030,13 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     }
     lpos = pos0;
     if (ordered_append) {
+      {
+        std::unique_lock<std::mutex> tl(tick_mu);
+        tick_cv.wait(tl, [&] { return app_turn == ci_; });
+      }
+      for (std::uint32_t o2 = 0; o2 < nTot; o2 += 16)
+        s.rt.AttnAppend(s.m_attn[l], pos0 + o2, std::min(16u, nTot - o2), KALL.data() + std::size_t{o2} * kvd,
+                        s.v_cache[l].data(), &s.tim);
       { std::lock_guard<std::mutex> tl(tick_mu); ++app_turn; }
       tick_cv.notify_all();
     }
@@ -1101,7 +1104,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       {
         gufo::npu::runtime::FfnAtbChain::Job jo;
         s.atb->EncodeJob(ATT.data(), nTot, 2048, jo);
-        { std::lock_guard<std::mutex> g_(npu_mu); s.atb->ExecO(l, jo); }
+        { std::lock_guard<std::mutex> g_(npu_mu); const auto tl0 = Clock::now(); s.atb->ExecO(l, jo); g_lock_ms += Ms(tl0); }
         s.atb->DecodeJob(jo, nTot, 2048, Br.data());
       }
       g_t_oproj += Ms(to0);
@@ -1112,7 +1115,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       const auto tf0 = Clock::now();
       s.atb->EncodeJob(Z.data(), nTot, 2048, jf);
       const auto tf1 = Clock::now();
-      { std::lock_guard<std::mutex> g_(npu_mu); s.atb->ExecFfn(l, jf); }
+      { std::lock_guard<std::mutex> g_(npu_mu); const auto tl0 = Clock::now(); s.atb->ExecFfn(l, jf); g_lock_ms += Ms(tl0); }
       const auto tf2 = Clock::now();
       s.atb->DecodeJob(jf, nTot, 2048, Br.data());
       g_f_enc += std::chrono::duration<double, std::milli>(tf1 - tf0).count();
@@ -1176,20 +1179,29 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     for (auto& t : ts) t.join();
     omp_set_num_threads(saved_threads);
   };
+  const auto busy_now = [&] { return g_lock_ms + s.tim.attn_wait; };
   if (!attn_layer || nChunks == 1) {
     const auto tw = Clock::now();
+    const double b0 = busy_now();
     run_par(0);
     g_w_conv += Ms(tw);
+    g_busy[0] += busy_now() - b0;
   } else {
     auto tw = Clock::now();
+    double b0 = busy_now();
     run_par(1);
     g_w_a += Ms(tw);
+    g_busy[1] += busy_now() - b0;
     tw = Clock::now();
+    b0 = busy_now();
     for (auto& cs : css) layer_run(cs, 2);
     g_w_b += Ms(tw);
+    g_busy[2] += busy_now() - b0;
     tw = Clock::now();
+    b0 = busy_now();
     run_par(3);
     g_w_c += Ms(tw);
+    g_busy[3] += busy_now() - b0;
   }
   }
   s.pos = pos0;
@@ -1202,6 +1214,8 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
   s.t_cpu += Ms(cpu0);
   if (std::getenv("GUFO_ATB_STATS")) {
     std::fprintf(stderr, "[wall] conv-layers %.0f attn A %.0f B %.0f C %.0f ms\n", g_w_conv, g_w_a, g_w_b, g_w_c);
+    std::fprintf(stderr, "[busy] device-held: conv %.0f/%.0f  A %.0f/%.0f  B %.0f/%.0f  C %.0f/%.0f ms (held/wall)\n", g_busy[0], g_w_conv, g_busy[1], g_w_a, g_busy[2], g_w_b, g_busy[3], g_w_c);
+    std::fprintf(stderr, "[lock] exec-under-lock %.0f ms; attn run wait %.0f ms; conv-dev %.0f ms\n", g_lock_ms, s.tim.attn_wait, s.atb ? s.atb->cvdev_ms : 0.0);
     std::fprintf(stderr, "[ffn] enc %.0f exec %.0f dec %.0f ms\n", g_f_enc, g_f_exe, g_f_dec);
     std::fprintf(stderr, "[conv] in %.0f mid %.0f out %.0f post %.0f fin %.0f ms\n", g_t_cin, g_t_cmid, g_t_cout, g_t_post, g_t_fin);
     if (s.atb) std::fprintf(stderr, "[conv] device conv dispatch %.0f ms\n", s.atb->cvdev_ms);
