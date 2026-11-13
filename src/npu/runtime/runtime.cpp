@@ -841,6 +841,47 @@ void NpuRuntime::ConvCommit(ConvLayer& cl, std::uint32_t k, bool settle) {
   cl.last_n = 0;  // C rows now reflected in history; a repeat commit is a no-op.
 }
 
+void NpuRuntime::ConvGetHistory(const ConvLayer& cl, std::uint16_t* rows6) {
+  const std::uint32_t tk = cl.hidden / kTileK, groups = 3 * cl.hidden / kStrip / 8, hist = cl.taps - 1;
+  for (std::uint32_t g = 1; g < groups; g += 3) {
+    const std::uint32_t j = g / 3;
+    for (std::uint32_t col = 0; col < 8; ++col)
+      for (std::uint32_t r = 0; r < 4; ++r) {
+        const auto* src = reinterpret_cast<const std::uint16_t*>(
+            cl.w.host + ((std::size_t{g * 8 + col} * (tk + 1) + tk) * 4 + r) * kQuarterBytes + kConvHistOffset);
+        for (std::uint32_t cbk = 0; cbk < 4; ++cbk)
+          for (std::uint32_t row = 0; row < hist; ++row)
+            for (std::uint32_t i = 0; i < 8; ++i) {
+              const std::uint32_t chan = ((j * 8 + col) * 4 + r) * 32 + cbk * 8 + i;
+              rows6[std::size_t{row} * cl.hidden + chan] = src[(cbk * hist + row) * 8 + i];
+            }
+      }
+  }
+}
+
+void NpuRuntime::ConvSetHistory(ConvLayer& cl, const std::uint16_t* rows6) {
+  const std::uint32_t tk = cl.hidden / kTileK, groups = 3 * cl.hidden / kStrip / 8, hist = cl.taps - 1;
+  for (std::uint32_t g = 1; g < groups; g += 3) {
+    const std::uint32_t j = g / 3;
+    for (std::uint32_t col = 0; col < 8; ++col) {
+      for (std::uint32_t r = 0; r < 4; ++r) {
+        auto* dst = reinterpret_cast<std::uint16_t*>(
+            cl.w.host + ((std::size_t{g * 8 + col} * (tk + 1) + tk) * 4 + r) * kQuarterBytes + kConvHistOffset);
+        for (std::uint32_t cbk = 0; cbk < 4; ++cbk)
+          for (std::uint32_t row = 0; row < hist; ++row)
+            for (std::uint32_t i = 0; i < 8; ++i) {
+              const std::uint32_t chan = ((j * 8 + col) * 4 + r) * 32 + cbk * 8 + i;
+              dst[(cbk * hist + row) * 8 + i] = rows6[std::size_t{row} * cl.hidden + chan];
+            }
+        for (const char* q = reinterpret_cast<const char*>(dst); q < reinterpret_cast<const char*>(dst) + 4 * hist * 16 + 64; q += 64)
+          _mm_clflushopt(const_cast<char*>(q));
+      }
+      SyncToDevice(cl.w.bo, (std::size_t{(g * 8 + col)} * (tk + 1) + tk) * 4 * kQuarterBytes, 4 * kQuarterBytes);
+    }
+  }
+  _mm_mfence();
+}
+
 void NpuRuntime::ConvCopyHistory(ConvLayer& dst, const ConvLayer& src) {
   const std::uint32_t tk = dst.hidden / kTileK, groups = 3 * dst.hidden / kStrip / 8;
   for (std::uint32_t g = 1; g < groups; g += 3)

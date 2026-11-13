@@ -90,6 +90,11 @@ class FfnAtbChain {
       Dispatch(*swp_, l.fake, l.sw);
       Dispatch(*dnp_, l.wd, l.dn);
     }
+    for (auto& cp : conv_) {
+      if (!cp) continue;
+      Dispatch(gu_, cp->wi, cp->pi);
+      Dispatch(gu_, cp->wo, cp->po);
+    }
     for (auto& ap : attn_) {
       if (!ap) continue;
       Dispatch(gu_, ap->wq, ap->pq);
@@ -97,14 +102,38 @@ class FfnAtbChain {
     }
   }
 
+  bool AddConv(std::size_t layer, const float* w_in, const float* w_out, std::string* err) {
+    auto c = std::make_unique<Conv>();
+    if (conv_.size() <= layer) conv_.resize(layer + 1);
+    const std::uint32_t mrows = kM / 16;
+    c->wi = gu_.PackWeightAtb(w_in, 3 * kHid, kHid, 4);
+    c->wo = gu_.PackWeightAtb(w_out, kHid, kHid, 4);
+    c->pi = gu_.MakeProgram(kHid, 3 * kHid, dir_ + "/" + ip_ + "1024x2048x6144.txt",
+                            std::size_t{kM} * 3 * kHid / 8 * 9, err, 0, mrows, 3, 5);
+    c->po = gu_.MakeProgram(kHid, kHid, dir_ + "/" + ip_ + "1024x2048x2048.txt",
+                            std::size_t{kM} * kHid / 8 * 9, err, 0, mrows, 3, 5);
+    conv_[layer] = std::move(c);
+    return err == nullptr || err->empty();
+  }
+
+  bool HasConv(std::size_t layer) const { return layer < conv_.size() && conv_[layer] != nullptr; }
+
+  /// in_proj: z (n x 2048) -> y (n x 6144, model order [B|C|x]).
+  void RunConvIn(std::size_t layer, const float* z, std::uint32_t n, float* y) {
+    Gemm1024(conv_[layer]->pi, conv_[layer]->wi, z, n, kHid, 3 * kHid, y);
+  }
+  void RunConvOut(std::size_t layer, const float* a, std::uint32_t n, float* y) {
+    Gemm1024(conv_[layer]->po, conv_[layer]->wo, a, n, kHid, kHid, y);
+  }
+
   bool HasAttn(std::size_t layer) const { return layer < attn_.size() && attn_[layer] != nullptr; }
 
   /// Both run on the K=2048 context shared with the gate/up GEMM. n <= 1024 rows.
   void RunQkv(std::size_t layer, const float* z, std::uint32_t n, float* y) {
-    Gemm1024(*attn_[layer], true, z, n, kHid, 3072, y);
+    Gemm1024(attn_[layer]->pq, attn_[layer]->wq, z, n, kHid, 3072, y);
   }
   void RunO(std::size_t layer, const float* a, std::uint32_t n, float* y) {
-    Gemm1024(*attn_[layer], false, a, n, kHid, kHid, y);
+    Gemm1024(attn_[layer]->po, attn_[layer]->wo, a, n, kHid, kHid, y);
   }
 
   /// z: n x 2048 floats (n <= 1024). y: n x 2048 floats.
@@ -176,10 +205,13 @@ class FfnAtbChain {
     WeightBuffer wq, wo;
   };
 
-  void Gemm1024(Attn& a, bool qkv, const float* z, std::uint32_t n, std::uint32_t k, std::uint32_t nout,
-                float* y) {
-    Program& p = qkv ? a.pq : a.po;
-    WeightBuffer& w = qkv ? a.wq : a.wo;
+  struct Conv {
+    Program pi, po;
+    WeightBuffer wi, wo;
+  };
+
+  void Gemm1024(Program& p, WeightBuffer& w, const float* z, std::uint32_t n, std::uint32_t k,
+                std::uint32_t nout, float* y) {
     const float* src = z;
     if (n < kM) {
       pad_.assign(std::size_t{kM} * k, 0.f);
@@ -219,6 +251,7 @@ class FfnAtbChain {
   std::string ip_{"insts_atb_"};
   std::vector<std::unique_ptr<Layer>> layers_;
   std::vector<std::unique_ptr<Attn>> attn_;
+  std::vector<std::unique_ptr<Conv>> conv_;
   std::vector<float> pad_, out_;
 };
 

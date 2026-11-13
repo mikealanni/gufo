@@ -257,6 +257,9 @@ class NpuRuntime {
   void ConvCommit(ConvLayer& cl, std::uint32_t k, bool settle = false);
   void ConvReset(ConvLayer& cl);
   void ConvRefresh(ConvLayer& cl);
+  /// History rows (the last taps-1 B*x rows, bf16, [6][hidden]) held in a conv layer's weight buffer.
+  void ConvGetHistory(const ConvLayer& cl, std::uint16_t* rows6);
+  void ConvSetHistory(ConvLayer& cl, const std::uint16_t* rows6);
   /// Copy the conv history of `src` (e.g. the 64-row program) into `dst` (the 16-row program).
   void ConvCopyHistory(ConvLayer& dst, const ConvLayer& src);
 

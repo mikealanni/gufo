@@ -350,6 +350,13 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
         if (have_conv64)
           s.m_conv64[l] = s.rt.PackConv(buf.data(), static_cast<const float*>(lw.conv.data), s.taps,
                                         wout.data(), 2048, s.p_conv64);
+        if (s.atb) {
+          std::string cerr;
+          if (!s.atb->AddConv(l, buf.data(), wout.data(), &cerr)) {
+            std::fprintf(stderr, "GUFO_ATB conv init failed: %s\n", cerr.c_str());
+            s.atb.reset();
+          }
+        }
       } else {
         buf.resize(std::size_t{3072} * 2048);
         s.LoadRows(pre + "self_attn.q_proj.weight", lw.q, buf.data(), 2048, 2048);
@@ -498,6 +505,9 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     const auto& lw = s.w->layers[l];
     const bool big_attn = s.atb && nTot > 64 && c.layers[l] != LayerType::kConvolution && s.atb->HasAttn(l);
     std::vector<float> QKV, ATT, QALL, GATE;
+    static const bool no_bigconv = std::getenv("GUFO_NO_BIGCONV") != nullptr;
+    const bool big_conv = s.atb && !no_bigconv && nTot > 64 && c.layers[l] == LayerType::kConvolution &&
+                          s.atb->HasConv(l) && s.m_conv64[l].hidden;
     const bool defer_any = big_attn && s.apre && s.m_attn[l].host;
     const bool defer_sw = defer_any && s.m_attn[l].ring_tokens;
     const bool defer = defer_any && !defer_sw;
@@ -524,7 +534,49 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       std::copy(x.begin(), x.end(), X.begin() + std::size_t{o} * H);
       std::copy(z.begin(), z.end(), Z.begin() + std::size_t{o} * H);
     };
-    for (std::uint32_t o = 0; o < nTot; o += 64) {
+    if (big_conv) {
+      const auto tcv0 = Clock::now();
+      RmsNorm(X.data(), static_cast<const float*>(lw.norm.data), Z.data(), nTot, H, c.eps);
+      std::vector<float> CIN(std::size_t{nTot} * 6144), CY(std::size_t{nTot} * H);
+      s.atb->RunConvIn(l, Z.data(), nTot, CIN.data());
+      // Temporary host middle: Bx = bf16(B*x), 7-tap causal conv over [history | Bx], y = C * conv.
+      constexpr std::uint32_t kHist = 6;
+      std::vector<std::uint16_t> hist(std::size_t{kHist} * H);
+      s.rt.ConvGetHistory(s.m_conv64[l], hist.data());
+      const auto* taps = static_cast<const float*>(lw.conv.data);
+      const std::uint32_t nt = s.taps;
+      std::vector<float> bx(std::size_t{nTot + kHist} * H);
+      for (std::uint32_t r = 0; r < kHist; ++r)
+        for (std::uint32_t ch = 0; ch < H; ++ch) bx[std::size_t{r} * H + ch] = Bf16Float(hist[std::size_t{r} * H + ch]);
+#pragma omp parallel for
+      for (std::int64_t t = 0; t < nTot; ++t) {
+        const float* row = &CIN[std::size_t(t) * 6144];
+        float* dst = &bx[std::size_t(t + kHist) * H];
+        for (std::uint32_t ch = 0; ch < H; ++ch) dst[ch] = Bf16Float(Bf16Bits(row[ch] * row[2 * H + ch]));
+      }
+#pragma omp parallel for
+      for (std::int64_t t = 0; t < nTot; ++t) {
+        const float* row = &CIN[std::size_t(t) * 6144];
+        for (std::uint32_t ch = 0; ch < H; ++ch) {
+          float acc = 0;
+          for (std::uint32_t j = 0; j < nt; ++j) acc += Bf16Float(Bf16Bits(taps[std::size_t{ch} * nt + j])) * bx[std::size_t(t + j) * H + ch];
+          CY[std::size_t(t) * H + ch] = row[H + ch] * Bf16Float(Bf16Bits(acc));
+        }
+      }
+      std::vector<std::uint16_t> nh(std::size_t{kHist} * H);
+      for (std::uint32_t r = 0; r < kHist; ++r)
+        for (std::uint32_t ch = 0; ch < H; ++ch) nh[std::size_t{r} * H + ch] = Bf16Bits(bx[std::size_t{nTot + r} * H + ch]);
+      s.rt.ConvSetHistory(s.m_conv64[l], nh.data());
+      if (s.m_conv[l].hidden) s.rt.ConvCopyHistory(s.m_conv[l], s.m_conv64[l]);
+      s.atb->RunConvOut(l, CY.data(), nTot, Br.data());
+      g_t_conv += Ms(tcv0);
+      for (std::uint32_t o = 0; o < nTot; o += 64) {
+        const std::uint32_t n = std::min<std::uint32_t>(64, nTot - o);
+        std::vector<float> x(X.begin() + std::size_t{o} * H, X.begin() + std::size_t{o + n} * H), z(x.size()), z2(x.size());
+        finish(o, n, x, z, z2, Br.data() + std::size_t{o} * H);
+      }
+    }
+    for (std::uint32_t o = 0; !big_conv && o < nTot; o += 64) {
     const std::uint32_t n = std::min<std::uint32_t>(64, nTot - o);
     const bool use64 = s.m64 && (n > 16 || nTot > 64);
     s.pos = pos0 + o;
