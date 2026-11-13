@@ -485,7 +485,7 @@ void Engine::Reset() {
 std::uint32_t Engine::Position() const { return impl_->pos; }
 std::uint32_t Engine::PrefillRows() const { return impl_->atb ? gufo::npu::runtime::FfnAtbChain::kM : (impl_->m64 ? kMaxRows : 16); }
 
-static double g_t_cin, g_t_cmid, g_t_cout, g_t_norm, g_t_prep, g_t_attn_npu, g_t_attn_cpu, g_t_resid, g_t_conv, g_t_qkv, g_t_oproj;
+static double g_t_post, g_t_fin, g_t_cin, g_t_cmid, g_t_cout, g_t_norm, g_t_prep, g_t_attn_npu, g_t_attn_cpu, g_t_resid, g_t_conv, g_t_qkv, g_t_oproj;
 bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hidden) {
   Impl& s = *impl_;
   const auto& c = s.w->config;
@@ -523,6 +523,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     }
     const auto finish = [&](std::uint32_t o, std::uint32_t n, std::vector<float>& x, std::vector<float>& z,
                             std::vector<float>& z2, const float* branch) {
+      const auto tfin0 = Clock::now();
       if (lw.post_norm.data) {
         RmsNorm(branch, static_cast<const float*>(lw.post_norm.data), z2.data(), n, H, c.eps);
         for (std::size_t i = 0; i < x.size(); ++i) x[i] += z2[i];
@@ -532,6 +533,20 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       RmsNorm(x.data(), static_cast<const float*>(lw.ffn_norm.data), z.data(), n, H, c.eps);
       std::copy(x.begin(), x.end(), X.begin() + std::size_t{o} * H);
       std::copy(z.begin(), z.end(), Z.begin() + std::size_t{o} * H);
+      g_t_fin += Ms(tfin0);
+    };
+    const auto finish_all = [&](const float* branch) {
+      const auto tfin0 = Clock::now();
+      if (lw.post_norm.data) {
+        RmsNorm(branch, static_cast<const float*>(lw.post_norm.data), Z2.data(), nTot, H, c.eps);
+#pragma omp parallel for
+        for (std::int64_t i = 0; i < static_cast<std::int64_t>(X.size()); ++i) X[i] += Z2[i];
+      } else {
+#pragma omp parallel for
+        for (std::int64_t i = 0; i < static_cast<std::int64_t>(X.size()); ++i) X[i] += branch[i];
+      }
+      RmsNorm(X.data(), static_cast<const float*>(lw.ffn_norm.data), Z.data(), nTot, H, c.eps);
+      g_t_fin += Ms(tfin0);
     };
     if (big_conv) {
       const auto tcv0 = Clock::now();
@@ -577,11 +592,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       s.atb->RunConvOut(l, CY.data(), nTot, Br.data());
       g_t_cout += Ms(tcC);
       g_t_conv += Ms(tcv0);
-      for (std::uint32_t o = 0; o < nTot; o += 64) {
-        const std::uint32_t n = std::min<std::uint32_t>(64, nTot - o);
-        std::vector<float> x(X.begin() + std::size_t{o} * H, X.begin() + std::size_t{o + n} * H), z(x.size()), z2(x.size());
-        finish(o, n, x, z, z2, Br.data() + std::size_t{o} * H);
-      }
+      finish_all(Br.data());
     }
     for (std::uint32_t o = 0; !big_conv && o < nTot; o += 64) {
     const std::uint32_t n = std::min<std::uint32_t>(64, nTot - o);
@@ -945,11 +956,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       const auto to0 = Clock::now();
       s.atb->RunO(l, ATT.data(), nTot, Br.data());
       g_t_oproj += Ms(to0);
-      for (std::uint32_t o = 0; o < nTot; o += 64) {
-        const std::uint32_t n = std::min<std::uint32_t>(64, nTot - o);
-        std::vector<float> x(X.begin() + std::size_t{o} * H, X.begin() + std::size_t{o + n} * H), z(x.size()), z2(x.size());
-        finish(o, n, x, z, z2, Br.data() + std::size_t{o} * H);
-      }
+      finish_all(Br.data());
     }
     if (s.atb && nTot > 64)
       s.atb->Run(l, Z.data(), nTot, Br.data());
@@ -958,12 +965,16 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     else
       s.rt.Ffn(s.pFfn[l], s.m_ffn[l], Z.data(), nTot, Br.data(), &s.tim);
     cpu0 = Clock::now();
+    const auto tpost0 = Clock::now();
     if (lw.post_ffn_norm.data) {
       RmsNorm(Br.data(), static_cast<const float*>(lw.post_ffn_norm.data), Z2.data(), nTot, H, c.eps);
-      for (std::size_t i = 0; i < X.size(); ++i) X[i] += Z2[i];
+#pragma omp parallel for
+      for (std::int64_t i = 0; i < static_cast<std::int64_t>(X.size()); ++i) X[i] += Z2[i];
     } else {
-      for (std::size_t i = 0; i < X.size(); ++i) X[i] += Br[i];
+#pragma omp parallel for
+      for (std::int64_t i = 0; i < static_cast<std::int64_t>(X.size()); ++i) X[i] += Br[i];
     }
+    g_t_post += Ms(tpost0);
     if (std::getenv("GUFO_NANCHK")) {
       bool bad=false; for(size_t i=0;i<X.size()&&!bad;++i) if(!(X[i]==X[i])) bad=true;
       if(bad) { std::fprintf(stderr,"[nan] after layer %zu pos=%u\n", l, s.pos); }
@@ -982,7 +993,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
   s.pending = nTot;
   s.t_cpu += Ms(cpu0);
   if (std::getenv("GUFO_ATB_STATS")) {
-    std::fprintf(stderr, "[conv] in %.0f mid %.0f out %.0f ms\n", g_t_cin, g_t_cmid, g_t_cout);
+    std::fprintf(stderr, "[conv] in %.0f mid %.0f out %.0f post %.0f fin %.0f ms\n", g_t_cin, g_t_cmid, g_t_cout, g_t_post, g_t_fin);
     std::fprintf(stderr, "[cpu] norm %.0f prep %.0f attn_npu %.0f attn_cpu %.0f conv %.0f qkv %.0f oproj %.0f ms\n", g_t_norm, g_t_prep, g_t_attn_npu, g_t_attn_cpu, g_t_conv, g_t_qkv, g_t_oproj);
   }
   if (std::getenv("GUFO_ATB_STATS"))
