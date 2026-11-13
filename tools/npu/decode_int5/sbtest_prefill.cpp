@@ -474,18 +474,16 @@ int main(int argc, char** argv) {
       dispatch(rt, qa, wqa);
       dispatch(rt, qb, wqb);
       const double gu_ms = ms(t_g0, Clock::now());
-      // Device-only gu timing: second dispatch, start+wait only (no syncs).
+      double gu_dev_ms;  // device-only: warmed dispatch, start+wait, no syncs
       {
+        WeightBuffer& sa = rt.WeightSlot(wqa, qa);
+        WeightBuffer& sb = rt.WeightSlot(wqb, qb);
         const auto t_d0 = Clock::now();
-        qa.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-        wqa.run.start();
-        wqa.run.wait();
-        qb.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-        wqb.run.start();
-        wqb.run.wait();
-        const double gu_dev_ms = ms(t_d0, Clock::now());
-        std::printf("verify act(swresh)    relL2 %.4f  (plain gu pair %.2f ms, gu device-only %.2f ms, swresh %.2f ms)\n",
-                    std::sqrt(an / ad), gu_ms, gu_dev_ms, resh_ms);
+        sa.run.start();
+        sa.run.wait();
+        sb.run.start();
+        sb.run.wait();
+        gu_dev_ms = ms(t_d0, Clock::now());
       }
       if (std::getenv("GUFO_PMAP")) {  // where do gate/up live on the plain wire?
         const std::size_t nq = std::size_t{M} * 2 * na / 8 * 9;
@@ -661,8 +659,8 @@ int main(int argc, char** argv) {
             ad += w * w;
           }
         }
-      std::printf("verify act(swresh)    relL2 %.4f  (plain gu pair %.2f ms, swresh %.2f ms)\n",
-                  std::sqrt(an / ad), gu_ms, resh_ms);
+      std::printf("verify act(swresh)    relL2 %.4f  (plain gu pair %.2f ms, gu device-only %.2f ms, swresh %.2f ms)\n",
+                  std::sqrt(an / ad), gu_ms, gu_dev_ms, resh_ms);
       if (std::getenv("SWI31_ZMAP")) {  // which dn tiles came back all-zero?
         std::vector<int> zt;
         std::size_t zab = 0;  // tiles still 0xAB = never written by measured run

@@ -12,12 +12,12 @@ run_once() {
   local swi="$2"
   local env_extra="${3:-}"
   local output
-  output=$(cd ~/gufo-wp10 && \
-    export LD_LIBRARY_PATH=/opt/xilinx/xrt/lib:/home/majed/npu-work/boostshim \
+  output=$(cd ~/gufo-wp10 && env \
+    LD_LIBRARY_PATH=/opt/xilinx/xrt/lib:/home/majed/npu-work/boostshim \
     OMP_NUM_THREADS=8 \
     GUFO_PREFILL_SWI="$swi" \
     $env_extra \
-    ~/npu-lock.sh timeout 300 ./build/npu/sbtest-prefill tools/npu/decode_int5/prefill_probe 1024 1 2>&1) || true
+    ~/npu-lock.sh timeout 300 ./build/sbtest-prefill tools/npu/decode_int5/prefill_probe 1024 1 2>&1) || true
   echo "$output"
 }
 
@@ -28,9 +28,7 @@ check_mode8() {
 }
 
 check_mode10() {
-  local output="$1"
-  echo "$output" | grep -q "verify dn(swresh-A).*PASS" && \
-  echo "$output" | grep -q "zero tiles: 0"
+  echo "$1" | grep -q "verify dn(swresh-A).*PASS" && echo "$2" | grep -q "zero tiles: 0 "
 }
 
 for i in $(seq 1 "$N"); do
@@ -45,8 +43,9 @@ for i in $(seq 1 "$N"); do
     FAIL8=$((FAIL8 + 1))
   fi
 
-  out10=$(run_once 10 10 "SWI31_ZMAP=1")
-  if check_mode10 "$out10"; then
+  out10=$(run_once 10 10 "")
+  out10z=$(run_once 10 10 "SWI31_ZMAP=1")
+  if check_mode10 "$out10" "$out10z"; then
     echo "mode 10: PASS"
     PASS10=$((PASS10 + 1))
   else
