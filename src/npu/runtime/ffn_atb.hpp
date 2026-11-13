@@ -2,6 +2,7 @@
 // Device-resident FFN for 1024-row prefill chunks: ATB gate/up GEMM pair -> on-core
 // swiglu reshape -> ATB down GEMM. Only the FFN input is encoded and the output decoded on the host.
 #include <cstdint>
+#include <cstdlib>
 #include <chrono>
 #include <cstring>
 #include <memory>
@@ -18,8 +19,13 @@ class FfnAtbChain {
 
   bool Init(const std::string& dir, std::string* err) {
     dir_ = dir;
+    if (std::getenv("GUFO_ATB_KDYN")) {
+      dnp_ = &gu_;
+      ip_ = "insts_kd_";
+      return gu_.Init(dir + "/final_kd.xclbin", err) && sw_.Init(dir + "/final_swresh_k2048.xclbin", err);
+    }
     return gu_.Init(dir + "/final_atb_k2048.xclbin", err) &&
-           dn_.Init(dir + "/final_atb_k7680.xclbin", err) &&
+           dnp_->Init(dir + "/final_atb_k7680.xclbin", err) &&
            sw_.Init(dir + "/final_swresh_k2048.xclbin", err);
   }
 
@@ -38,10 +44,10 @@ class FfnAtbChain {
     const std::vector<float> wsa = pack_swi(0, kNa), wsb = pack_swi(kNa, kNb);
     l->wqa = gu_.PackWeightAtb(wsa.data(), 2 * kNa, kHid, 4);
     l->wqb = gu_.PackWeightAtb(wsb.data(), 2 * kNb, kHid, 4);
-    l->wd = dn_.PackWeightAtb(down, kHid, kInt, 4);
-    l->qa = gu_.MakeProgram(kHid, 2 * kNa, dir_ + "/insts_atb_1024x2048x8192.txt",
+    l->wd = dnp_->PackWeightAtb(down, kHid, kInt, 4);
+    l->qa = gu_.MakeProgram(kHid, 2 * kNa, dir_ + "/" + ip_ + "1024x2048x8192.txt",
                             std::size_t{kM} * 2 * kNa / 8 * 9, err, 0, mrows, 3, 5);
-    l->qb = gu_.MakeProgram(kHid, 2 * kNb, dir_ + "/insts_atb_1024x2048x7168.txt",
+    l->qb = gu_.MakeProgram(kHid, 2 * kNb, dir_ + "/" + ip_ + "1024x2048x7168.txt",
                             std::size_t{kM} * 2 * kNb / 8 * 9, err, 0, mrows, 3, 5);
     l->sw = sw_.MakeProgram(kInt, kHid, dir_ + "/insts_swresh_1024x7680x2048.txt",
                             std::size_t{kM} * kInt / 8 * 9, err, 0, mrows, 3, 5);
@@ -49,10 +55,10 @@ class FfnAtbChain {
     l->fake.bo = l->qb.c;
     l->fake.bytes = std::size_t{kM} * 2 * kNb / 8 * 9;
     sw_.WeightSlot(l->fake, l->sw);
-    l->dn = dn_.MakeProgram(kInt, kHid, dir_ + "/insts_atb_1024x7680x2048.txt",
+    l->dn = dnp_->MakeProgram(kInt, kHid, dir_ + "/" + ip_ + "1024x7680x2048.txt",
                             std::size_t{kM} * kHid / 8 * 9, err, 0, mrows, 3, 5);
-    dn_.RebindA(l->dn, l->sw.c);
-    dn_.WeightSlot(l->wd, l->dn);
+    dnp_->RebindA(l->dn, l->sw.c);
+    dnp_->WeightSlot(l->wd, l->dn);
     layers_.push_back(std::move(l));
     return err == nullptr || err->empty();
   }
@@ -63,9 +69,9 @@ class FfnAtbChain {
     const std::uint32_t mrows = kM / 16;
     a->wq = gu_.PackWeightAtb(qkv, 3072, kHid, 4);
     a->wo = gu_.PackWeightAtb(o, kHid, kHid, 4);
-    a->pq = gu_.MakeProgram(kHid, 3072, dir_ + "/insts_atb_1024x2048x3072.txt",
+    a->pq = gu_.MakeProgram(kHid, 3072, dir_ + "/" + ip_ + "1024x2048x3072.txt",
                             std::size_t{kM} * 3072 / 8 * 9, err, 0, mrows, 3, 5);
-    a->po = gu_.MakeProgram(kHid, kHid, dir_ + "/insts_atb_1024x2048x2048.txt",
+    a->po = gu_.MakeProgram(kHid, kHid, dir_ + "/" + ip_ + "1024x2048x2048.txt",
                             std::size_t{kM} * kHid / 8 * 9, err, 0, mrows, 3, 5);
     attn_[layer] = std::move(a);
     return err == nullptr || err->empty();
@@ -102,7 +108,7 @@ class FfnAtbChain {
     const auto d2 = std::chrono::steady_clock::now();
     Dispatch(sw_, l.fake, l.sw);
     const auto d3 = std::chrono::steady_clock::now();
-    Dispatch(dn_, l.wd, l.dn);
+    Dispatch(*dnp_, l.wd, l.dn);
     const auto d4 = std::chrono::steady_clock::now();
     ph_ms[0] += std::chrono::duration<double, std::milli>(d1 - t1).count();
     ph_ms[1] += std::chrono::duration<double, std::milli>(d2 - d1).count();
@@ -111,10 +117,10 @@ class FfnAtbChain {
     l.dn.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
     const auto t2 = std::chrono::steady_clock::now();
     if (n == kM) {
-      dn_.DecodeCAtb(y, kM, kHid, l.dn);
+      dnp_->DecodeCAtb(y, kM, kHid, l.dn);
     } else {
       out_.resize(std::size_t{kM} * kHid);
-      dn_.DecodeCAtb(out_.data(), kM, kHid, l.dn);
+      dnp_->DecodeCAtb(out_.data(), kM, kHid, l.dn);
       std::memcpy(y, out_.data(), std::size_t{n} * kHid * 4);
     }
     const auto t3 = std::chrono::steady_clock::now();
@@ -177,6 +183,8 @@ class FfnAtbChain {
 
   std::string dir_;
   NpuRuntime gu_, dn_, sw_;
+  NpuRuntime* dnp_{&dn_};
+  std::string ip_{"insts_atb_"};
   std::vector<std::unique_ptr<Layer>> layers_;
   std::vector<std::unique_ptr<Attn>> attn_;
   std::vector<float> pad_, out_;
