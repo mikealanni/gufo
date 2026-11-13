@@ -613,11 +613,13 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
         std::unique_lock<std::mutex> tl(tick_mu);
         tick_cv.wait(tl, [&] { return conv_turn[l] == ci_; });
       }
+      if (dev_conv && conv_dev == 1) s.atb->StageConvIn(l, jc);
       cvlk = std::unique_lock<std::mutex>(npu_mu);
       const auto tcl0 = Clock::now();
-      const auto conv_done = [&] {
+      const auto conv_done = [&](const auto& mid) {
         g_lock_ms += Ms(tcl0);
         cvlk.unlock();
+        mid();
         { std::lock_guard<std::mutex> tl(tick_mu); ++conv_turn[l]; }
         tick_cv.notify_all();
       };
@@ -643,10 +645,10 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
         if (s.m_conv[l].hidden) s.rt.ConvCopyHistory(s.m_conv[l], s.m_conv64[l]);
         g_t_cmid += Ms(tcB1);
         const auto tcC1 = Clock::now();
-        s.atb->ExecConvOut(l, jco);
+        s.atb->ExecConvOut(l, jco, true);
         g_t_cout += Ms(tcC1);
         g_t_conv += Ms(tcv0);
-        conv_done();
+        conv_done([&] { s.atb->FinishConvOut(l, jco); });
         s.atb->DecodeJob(jco, nTot, 2048, Br.data());
         finish_all(Br.data());
       } else {
@@ -704,7 +706,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       s.atb->RunConvOut(l, CY.data(), nTot, Br.data());
       g_t_cout += Ms(tcC);
       g_t_conv += Ms(tcv0);
-      conv_done();
+      conv_done([] {});
       finish_all(Br.data());
       }
     }

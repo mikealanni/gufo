@@ -247,17 +247,31 @@ class FfnAtbChain {
     ly.dn.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
     if (!j.staged) j.c.assign(ly.dn.ch, ly.dn.ch + std::size_t{kM} * kHid / 8 * 9);
   }
-  void ExecConvIn(std::size_t l, Job& j) {
+  /// Conv in/out run inside the caller's per-layer turn: A is copied in before the device lock is taken and C is copied
+  /// out after it is released.
+  void StageConvIn(std::size_t l, Job& j) {
     Conv& c = *conv_[l];
     std::memcpy(c.pi.ah, j.a.data(), j.a.size());
     c.pi.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    j.staged = true;
+  }
+  void ExecConvIn(std::size_t l, Job& j) {
+    Conv& c = *conv_[l];
+    if (!j.staged) {
+      std::memcpy(c.pi.ah, j.a.data(), j.a.size());
+      c.pi.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    }
     Dispatch(gu_, c.wi, c.pi);
     c.pi.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
   }
-  void ExecConvOut(std::size_t l, Job& j) {
+  void ExecConvOut(std::size_t l, Job& j, bool defer_copy = false) {
     Conv& c = *conv_[l];
     Dispatch(gu_, c.wo, c.po);
     c.po.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    if (!defer_copy) FinishConvOut(l, j);
+  }
+  void FinishConvOut(std::size_t l, Job& j) {
+    Conv& c = *conv_[l];
     j.c.assign(c.po.ch, c.po.ch + std::size_t{kM} * kHid / 8 * 9);
   }
 
