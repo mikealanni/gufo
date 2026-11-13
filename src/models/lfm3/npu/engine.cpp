@@ -80,9 +80,11 @@ void RmsNorm(const float* x, const float* w, float* out, std::uint32_t n,
   for (std::int64_t r = 0; r < n; ++r) {
     const float* xr = x + r * stride_in;
     float sum = 0;
+#pragma omp simd reduction(+ : sum)
     for (std::uint32_t i = 0; i < d; ++i) sum += xr[i] * xr[i];
     const float scale = 1.0f / std::sqrt(sum / d + eps);
     float* o = out + std::size_t(r) * d;
+#pragma omp simd
     for (std::uint32_t i = 0; i < d; ++i) o[i] = xr[i] * scale * w[i];
   }
 }
