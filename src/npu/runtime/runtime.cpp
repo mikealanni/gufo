@@ -1033,8 +1033,11 @@ void NpuRuntime::AttnAppend(AttnLayer& al, std::uint32_t pos, std::uint32_t n, c
     for (std::uint32_t t = 0; t < n; ++t) {
       float s2 = 0;
       for (std::uint32_t d = 0; d < kAttnHd; ++d) s2 += k[std::size_t{t} * kvd + r * kAttnHd + d] * k[std::size_t{t} * kvd + r * kAttnHd + d];
+#pragma omp critical(attn_kmax)
+      {
       al.kmax2[r] = std::max(al.kmax2[r], s2);
       if (!al.kpre.empty()) al.kpre[std::size_t{pos + t} * kAttnKvh + r] = al.kmax2[r];
+      }
     }
     for (std::uint32_t ci = 0; ci < nch; ++ci) {
       const std::uint32_t q = chunks[ci];
@@ -1465,7 +1468,41 @@ bool AttnPrefill::RunMany(AttnLayer& al, const Pass* ps, std::size_t np, const s
                           const std::uint16_t* v_hist, NpuRuntime::Timings* tm,
                           const std::function<void(std::size_t)>* pre) {
   if (np == 0) return true;
+  if (!pre && np > 1) {
+    // Independent passes: keep two runs queued so the device never waits for the host between passes.
+    auto t = Clock::now();
+    std::vector<std::uint32_t> mcs(np);
+    std::vector<xrt::run*> runs(np, nullptr);
+    bool ok = true;
+    const auto issue = [&](std::size_t i) {
+      if (!Prep(static_cast<int>(i & 1), al, ps[i].pos0, ps[i].n, ps[i].q, k_hist, v_hist, &mcs[i]) ||
+          !Launch(static_cast<int>(i & 1), al, mcs[i], &runs[i]))
+        return false;
+      runs[i]->start();
+      return true;
+    };
+    if (!issue(0) || !issue(1)) return false;
+    if (tm) tm->attn_prep += Ms(t);
+    for (std::size_t i = 0; i < np; ++i) {
+      const int slot = static_cast<int>(i & 1);
+      t = Clock::now();
+      runs[i]->wait();
+      c_[slot].sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+      if (tm) tm->attn_wait += Ms(t);
+      t = Clock::now();
+      ok = Merge(slot, ps[i].n, ps[i].out) && ok;
+      if (tm) { tm->attn_merge += Ms(t); ++tm->attn_calls; }
+      if (i + 2 < np) {
+        t = Clock::now();
+        if (!issue(i + 2)) return false;
+        if (tm) tm->attn_prep += Ms(t);
+      }
+    }
+    return ok;
+  }
   auto t = Clock::now();
+  const auto t_all = Clock::now();
+  double d_pre = 0, d_prep = 0, d_wait = 0, d_merge = 0;
   std::vector<std::uint32_t> mcs(np);
   xrt::run* run = nullptr;
   if (pre) (*pre)(0);
@@ -1488,20 +1525,26 @@ bool AttnPrefill::RunMany(AttnLayer& al, const Pass* ps, std::size_t np, const s
     run->wait();
     c_[slot].sync(XCL_BO_SYNC_BO_FROM_DEVICE);
     if (tm) tm->attn_wait += Ms(t);
+    d_wait += Ms(t);
     if (ahead && pre) {
       t = Clock::now();
       (*pre)(i + 1);
+      d_pre += Ms(t);
       nok = Prep(slot ^ 1, al, ps[i + 1].pos0, ps[i + 1].n, ps[i + 1].q, k_hist, v_hist, &mcs[i + 1]) &&
             Launch(slot ^ 1, al, mcs[i + 1], &next);
       if (tm) tm->attn_prep += Ms(t);
+      d_prep += Ms(t);
     }
     if (!nok) return false;
     if (next) next->start();
     t = Clock::now();
     ok = Merge(slot, ps[i].n, ps[i].out) && ok;
     if (tm) { tm->attn_merge += Ms(t); ++tm->attn_calls; }
+    d_merge += Ms(t);
     run = next;
   }
+  if (std::getenv("GUFO_ATTN_TRACE"))
+    std::fprintf(stderr, "[attn] np %zu ring %d total %.1f pre %.1f prep %.1f wait %.1f merge %.1f ms\n", np, int(al.ring_tokens != 0), Ms(t_all), d_pre, d_prep, d_wait, d_merge);
   return ok;
 }
 

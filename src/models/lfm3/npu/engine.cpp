@@ -516,6 +516,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
   struct ChunkState {
     std::vector<float> X, Z, Z2, Br, QKV, ATT, QALL, GATE, KALL, VALL, CIN, CY, BXB;
     std::uint32_t n{0}, pos0{0}, row0{0};
+    bool attn_done{false};
   };
   std::vector<ChunkState> css(nChunks);
   std::mutex npu_mu, tick_mu;
@@ -1044,8 +1045,9 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     if (seg == 0 || seg == 2) {
     if (defer_any) {
       const auto ta1 = Clock::now();
-      bool many_ok = false;
-      {
+      bool many_ok = cs.attn_done;
+      cs.attn_done = false;
+      if (!many_ok) {
         std::vector<gufo::npu::runtime::AttnPrefill::Pass> passes;
         for (std::uint32_t o = 0; o < nTot; o += 128)
           passes.push_back({pos0 + o, std::min(128u, nTot - o), QALL.data() + std::size_t{o} * qd,
@@ -1194,6 +1196,40 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     g_busy[1] += busy_now() - b0;
     tw = Clock::now();
     b0 = busy_now();
+    if (s.apre && s.m_attn[l].host && s.atb->HasAttn(l)) {
+      bool eligible = true;
+      for (auto& cs : css) eligible = eligible && cs.n > 64;
+      if (eligible) {
+        std::vector<gufo::npu::runtime::AttnPrefill::Pass> passes;
+        std::vector<std::pair<ChunkState*, std::uint32_t>> owner;
+        for (auto& cs : css)
+          for (std::uint32_t o = 0; o < cs.n; o += 128) {
+            passes.push_back({cs.pos0 + o, std::min(128u, cs.n - o), cs.QALL.data() + std::size_t{o} * qd,
+                              cs.ATT.data() + std::size_t{o} * qd});
+            owner.push_back({&cs, o});
+          }
+        const bool ring = s.m_attn[l].ring_tokens != 0;
+        std::function<void(std::size_t)> app = [&](std::size_t pi) {
+          ChunkState& cs = *owner[pi].first;
+          const std::uint32_t o = owner[pi].second, n2 = std::min(128u, cs.n - o);
+#pragma omp parallel for
+          for (std::int32_t t = 0; t < static_cast<std::int32_t>(n2); ++t) {
+            const std::size_t slot = (cs.pos0 + o + t) % s.capacity[l];
+            for (std::uint32_t i = 0; i < kvd; ++i) {
+              s.k_cache[l][slot * kvd + i] = Bf16Bits(cs.KALL[std::size_t{o + t} * kvd + i]);
+              s.v_cache[l][slot * kvd + i] = Bf16Bits(cs.VALL[std::size_t{o + t} * kvd + i]);
+            }
+          }
+#pragma omp parallel for schedule(static, 1)
+          for (std::int32_t o2 = 0; o2 < static_cast<std::int32_t>(n2); o2 += 16)
+            s.rt.AttnAppend(s.m_attn[l], cs.pos0 + o + o2, std::min(16u, n2 - o2),
+                            cs.KALL.data() + std::size_t{o + o2} * kvd, s.v_cache[l].data(), nullptr);
+        };
+        if (s.apre->RunMany(s.m_attn[l], passes.data(), passes.size(), s.k_cache[l].data(), s.v_cache[l].data(),
+                            &s.tim, ring ? &app : nullptr))
+          for (auto& cs : css) cs.attn_done = true;
+      }
+    }
     for (auto& cs : css) layer_run(cs, 2);
     g_w_b += Ms(tw);
     g_busy[2] += busy_now() - b0;
