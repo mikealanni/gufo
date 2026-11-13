@@ -1019,7 +1019,8 @@ void NpuRuntime::AttnAppend(AttnLayer& al, std::uint32_t pos, std::uint32_t n, c
     const std::uint32_t d = (q * 16 + tt + ring - (pos % ring)) % ring;
     return d < n ? pos + d : kInvalid;
   };
-  for (std::uint32_t r = 0; r < kAttnKvh; ++r) {
+#pragma omp parallel for
+  for (std::int32_t r = 0; r < static_cast<std::int32_t>(kAttnKvh); ++r) {
     for (std::uint32_t t = 0; t < n; ++t) {
       float s2 = 0;
       for (std::uint32_t d = 0; d < kAttnHd; ++d) s2 += k[std::size_t{t} * kvd + r * kAttnHd + d] * k[std::size_t{t} * kvd + r * kAttnHd + d];
