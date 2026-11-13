@@ -494,6 +494,7 @@ void Engine::Reset() {
 std::uint32_t Engine::Position() const { return impl_->pos; }
 std::uint32_t Engine::PrefillRows() const { return impl_->atb ? gufo::npu::runtime::FfnAtbChain::kM * SuperChunks() : (impl_->m64 ? kMaxRows : 16); }
 
+static double g_w_conv, g_w_a, g_w_b, g_w_c;
 static double g_t_post, g_t_fin, g_t_cin, g_t_cmid, g_t_cout, g_t_norm, g_t_prep, g_t_attn_npu, g_t_attn_cpu, g_t_resid, g_t_conv, g_t_qkv, g_t_oproj;
 bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hidden) {
   Impl& s = *impl_;
@@ -1146,11 +1147,19 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     omp_set_num_threads(saved_threads);
   };
   if (!attn_layer || nChunks == 1) {
+    const auto tw = Clock::now();
     run_par(0);
+    g_w_conv += Ms(tw);
   } else {
+    auto tw = Clock::now();
     run_par(1);
+    g_w_a += Ms(tw);
+    tw = Clock::now();
     for (auto& cs : css) layer_run(cs, 2);
+    g_w_b += Ms(tw);
+    tw = Clock::now();
     run_par(3);
+    g_w_c += Ms(tw);
   }
   }
   s.pos = pos0;
@@ -1162,6 +1171,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
   s.pending = nTot;
   s.t_cpu += Ms(cpu0);
   if (std::getenv("GUFO_ATB_STATS")) {
+    std::fprintf(stderr, "[wall] conv-layers %.0f attn A %.0f B %.0f C %.0f ms\n", g_w_conv, g_w_a, g_w_b, g_w_c);
     std::fprintf(stderr, "[conv] in %.0f mid %.0f out %.0f post %.0f fin %.0f ms\n", g_t_cin, g_t_cmid, g_t_cout, g_t_post, g_t_fin);
     if (s.atb) std::fprintf(stderr, "[conv] device conv dispatch %.0f ms\n", s.atb->cvdev_ms);
     if (s.atb) std::fprintf(stderr, "[conv] split in: enc %.0f dev %.0f dec %.0f | out: enc %.0f dev %.0f dec %.0f ms (all conv layers)\n", s.atb->acc_[0][0], s.atb->acc_[0][1], s.atb->acc_[0][2], s.atb->acc_[1][0], s.atb->acc_[1][1], s.atb->acc_[1][2]);
