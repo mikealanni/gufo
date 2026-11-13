@@ -194,6 +194,7 @@ struct Engine::Impl {
   std::vector<gufo::npu::runtime::WeightBuffer> m_ffn_dn;  // down proj packed for p_dn64
   bool m64 = false;  // m64 prefill programs available and in use for n > 16
   std::unique_ptr<gufo::npu::runtime::FfnAtbChain> atb;  // GUFO_ATB=1: 1024-row device-resident FFN
+  std::unique_ptr<gufo::npu::runtime::AttnPrefill> apre;  // 128-row prefill attention (full-attention layers)
   std::vector<gufo::npu::runtime::WeightBuffer> m_out, m_qkv, m_ffn;
   std::vector<gufo::npu::runtime::ConvLayer> m_conv;
   std::vector<gufo::npu::runtime::ConvLayer> m_conv64;
@@ -303,6 +304,11 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
       if (!s.atb->Init(options.programs, &aerr)) {
         std::fprintf(stderr, "GUFO_ATB init failed: %s\n", aerr.c_str());
         s.atb.reset();
+      } else if (!std::getenv("GUFO_NO_ATTNP")) {
+        auto ap = std::make_unique<gufo::npu::runtime::AttnPrefill>();
+        std::string perr;
+        if (ap->Init(options.programs, &perr)) s.apre = std::move(ap);
+        else std::fprintf(stderr, "prefill attention unavailable: %s\n", perr.c_str());
       }
     }
     const auto t0 = Clock::now();
@@ -416,6 +422,7 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
         (void)0;
       }
     }
+    if (s.atb) s.atb->Warm();
     // WP4: pack tied embedding as int5 head for NPU argmax, if program exists.
     s.npu_argmax = false;
     if (!std::getenv("GUFO_CPU_ARGMAX")) {
@@ -490,7 +497,15 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
   for (std::size_t l = 0; l < c.layers.size(); ++l) {
     const auto& lw = s.w->layers[l];
     const bool big_attn = s.atb && nTot > 64 && c.layers[l] != LayerType::kConvolution && s.atb->HasAttn(l);
-    std::vector<float> QKV, ATT;
+    std::vector<float> QKV, ATT, QALL, GATE;
+    // Sliding-window layers on the prefill kernel are opt-in: 93k NLL 2.2371 (gate 2.228) while the ring path is open.
+    static const bool use_sw = std::getenv("GUFO_ATTNP_SW") != nullptr;
+    const bool defer_any = big_attn && s.apre && s.m_attn[l].host && (use_sw || !s.m_attn[l].ring_tokens);
+    const bool defer_sw = defer_any && s.m_attn[l].ring_tokens;
+    const bool defer = defer_any && !defer_sw;
+    std::vector<float> KALL, VALL;
+    if (defer_any) { QALL.resize(std::size_t{nTot} * qd); GATE.resize(std::size_t{nTot} * heads); }
+    if (defer_sw) { KALL.resize(std::size_t{nTot} * kvd); VALL.resize(std::size_t{nTot} * kvd); }
     if (big_attn) {
       RmsNorm(X.data(), static_cast<const float*>(lw.norm.data), Z.data(), nTot, H, c.eps);
       QKV.resize(std::size_t{nTot} * 3072);
@@ -620,6 +635,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
         }
         const std::uint32_t P = s.pos + t;
         const std::uint32_t slot = P % s.capacity[l];
+        if (defer_sw) continue;
         // WP0: store KV as bf16 (halves memory traffic).
         for (std::uint32_t i = 0; i < kvd; ++i) {
           s.k_cache[l][std::size_t{slot} * kvd + i] = Bf16Bits(k[std::size_t{t} * kvd + i]);
@@ -629,7 +645,18 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       g_t_prep += Ms(tp0);
       const auto ta0 = Clock::now();
       bool npu_done = false;
-      if (s.m_attn[l].host) {
+      if (defer_any) {
+        npu_done = true;
+        if (defer_sw) {
+          std::copy(k.begin(), k.end(), KALL.begin() + std::size_t{o} * kvd);
+          std::copy(v.begin(), v.end(), VALL.begin() + std::size_t{o} * kvd);
+        }
+        for (std::uint32_t o2 = 0; !defer_sw && o2 < n; o2 += 16)
+          s.rt.AttnAppend(s.m_attn[l], s.pos + o2, std::min(16u, n - o2), k.data() + std::size_t{o2} * kvd,
+                          s.v_cache[l].data(), &s.tim);
+        std::copy(q.begin(), q.end(), QALL.begin() + std::size_t{o} * qd);
+        std::copy(gate.begin(), gate.end(), GATE.begin() + std::size_t{o} * heads);
+      } else if (s.m_attn[l].host) {
         // Attn kernel is m16: one append+run pass per 16-row block.
         npu_done = true;
         for (std::uint32_t o = 0; o < n; o += 16) {
@@ -825,6 +852,38 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     s.t_cpu += Ms(cpu0);
     }
     s.pos = pos0;
+    if (defer_any) {
+      const auto ta1 = Clock::now();
+      for (std::uint32_t o = 0; o < nTot; o += 128) {
+        const std::uint32_t n2 = std::min(128u, nTot - o);
+        if (defer_sw) {
+          for (std::uint32_t t = 0; t < n2; ++t) {
+            const std::size_t slot = (pos0 + o + t) % s.capacity[l];
+            for (std::uint32_t i = 0; i < kvd; ++i) {
+              s.k_cache[l][slot * kvd + i] = Bf16Bits(KALL[std::size_t{o + t} * kvd + i]);
+              s.v_cache[l][slot * kvd + i] = Bf16Bits(VALL[std::size_t{o + t} * kvd + i]);
+            }
+          }
+          for (std::uint32_t o2 = 0; o2 < n2; o2 += 16)
+            s.rt.AttnAppend(s.m_attn[l], pos0 + o + o2, std::min(16u, n2 - o2),
+                            KALL.data() + std::size_t{o + o2} * kvd, s.v_cache[l].data(), &s.tim);
+        }
+        bool ok = s.apre->Run(s.m_attn[l], pos0 + o, n2, QALL.data() + std::size_t{o} * qd, s.k_cache[l].data(),
+                              s.v_cache[l].data(), ATT.data() + std::size_t{o} * qd, &s.tim);
+        for (std::uint32_t o2 = 0; !ok && o2 < n2; o2 += 16)
+          ok = s.rt.AttnRun(s.m_attn[l], pos0 + o + o2, std::min(16u, n2 - o2),
+                            QALL.data() + std::size_t{o + o2} * qd, s.k_cache[l].data(), s.v_cache[l].data(),
+                            s.programs_dir, ATT.data() + std::size_t{o + o2} * qd, &s.tim);
+        if (!ok) std::fprintf(stderr, "prefill attention failed (layer %zu pos %u)\n", l, pos0 + o);
+      }
+      for (std::uint32_t t = 0; t < nTot; ++t)
+        for (std::uint32_t h = 0; h < heads; ++h) {
+          const float g = 1.0f / (1.0f + std::exp(-GATE[std::size_t(t) * heads + h]));
+          float* o = &ATT[std::size_t(t) * qd + h * hd];
+          for (std::uint32_t d = 0; d < hd; ++d) o[d] *= g;
+        }
+      g_t_attn_npu += Ms(ta1);
+    }
     if (big_attn) {
       const auto to0 = Clock::now();
       s.atb->RunO(l, ATT.data(), nTot, Br.data());

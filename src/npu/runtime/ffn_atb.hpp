@@ -81,6 +81,22 @@ class FfnAtbChain {
     return err == nullptr || err->empty();
   }
 
+  /// Run every program once so the throwaway first dispatch ("first C write is lost") happens at load time.
+  void Warm() {
+    for (auto& lp : layers_) {
+      Layer& l = *lp;
+      Dispatch(gu_, l.wqa, l.qa);
+      Dispatch(gu_, l.wqb, l.qb);
+      Dispatch(*swp_, l.fake, l.sw);
+      Dispatch(*dnp_, l.wd, l.dn);
+    }
+    for (auto& ap : attn_) {
+      if (!ap) continue;
+      Dispatch(gu_, ap->wq, ap->pq);
+      Dispatch(gu_, ap->wo, ap->po);
+    }
+  }
+
   bool HasAttn(std::size_t layer) const { return layer < attn_.size() && attn_[layer] != nullptr; }
 
   /// Both run on the K=2048 context shared with the gate/up GEMM. n <= 1024 rows.

@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -127,6 +128,7 @@ struct AttnLayer {
   std::uint32_t window{0};       // sliding window size (0 = full context)
   std::uint32_t hist_tokens{0};  // tokens held in v_hist/k_hist (cache bound for block writes)
   std::vector<float> kmax2;  // running max |k|^2 per kv head
+  std::vector<float> kpre;   // prefix max |k|^2 per (token, kv head), full-attention layers only
   std::unordered_map<std::uint32_t, xrt::run> runs;
 };
 
@@ -283,6 +285,30 @@ class NpuRuntime {
   std::uint8_t* attn_ah_{};
   std::uint8_t* attn_ch_{};
   std::unordered_map<std::uint32_t, std::pair<xrt::bo, std::size_t>> attn_insts_;
+};
+
+/// Prefill attention: one pass covers up to 128 query rows (8 columns x 16 tokens); every core
+/// streams the causal prefix of its own rows, so nothing is merged across columns.
+class AttnPrefill {
+ public:
+  bool Init(const std::string& dir, std::string* error);
+  bool ready() const { return ready_; }
+  /// q: n x 2048 rows [pos0, pos0+n), n <= 128. Writes normalized attention (n x 2048, before the gate).
+  /// Returns false when the pass cannot run on this program set or a row's softmax mass is unsafe.
+  bool Run(AttnLayer& al, std::uint32_t pos0, std::uint32_t n, const float* q, const std::uint16_t* k_hist,
+           const std::uint16_t* v_hist, float* out, NpuRuntime::Timings* tm);
+
+ private:
+  std::string dir_;
+  xrt::device dev_;
+  xrt::hw_context ctx_;
+  xrt::kernel kern_;
+  bool ready_{false};
+  xrt::bo a_, c_;
+  std::uint8_t* ah_{};
+  std::uint8_t* ch_{};
+  std::unordered_map<std::uint32_t, std::pair<xrt::bo, std::size_t>> insts_;
+  std::map<std::pair<const AttnLayer*, std::uint32_t>, xrt::run> runs_;
 };
 
 }  // namespace gufo::npu::runtime
