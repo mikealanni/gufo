@@ -20,8 +20,13 @@ __attribute__((noinline)) static void AttnFeedP(const uint8_t *pB) {
   CopyBytes(a_chunk + a_feed * 1536, pB, 1536);
   if (++a_feed < 3) return;
   a_feed = 0;
-  const int tokbase = a_chunk_idx * 16;
-  a_chunk_idx++;
+  const int slot = a_chunk_idx++;
+  if (a_win) {
+    const int d = a_tab[slot];
+    if (d >= 0) AttnChunk((a_qhi - d) * 16);
+    return;
+  }
+  const int tokbase = slot * 16;
   if (tokbase <= a_pos + a_n - 1) AttnChunk(tokbase);
 }
 

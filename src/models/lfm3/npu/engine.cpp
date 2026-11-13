@@ -498,9 +498,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     const auto& lw = s.w->layers[l];
     const bool big_attn = s.atb && nTot > 64 && c.layers[l] != LayerType::kConvolution && s.atb->HasAttn(l);
     std::vector<float> QKV, ATT, QALL, GATE;
-    // Sliding-window layers on the prefill kernel are opt-in: 93k NLL 2.2371 (gate 2.228) while the ring path is open.
-    static const bool use_sw = std::getenv("GUFO_ATTNP_SW") != nullptr;
-    const bool defer_any = big_attn && s.apre && s.m_attn[l].host && (use_sw || !s.m_attn[l].ring_tokens);
+    const bool defer_any = big_attn && s.apre && s.m_attn[l].host;
     const bool defer_sw = defer_any && s.m_attn[l].ring_tokens;
     const bool defer = defer_any && !defer_sw;
     std::vector<float> KALL, VALL;
