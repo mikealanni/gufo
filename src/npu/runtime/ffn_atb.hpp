@@ -1,4 +1,5 @@
 #pragma once
+#include <mutex>
 // Device-resident FFN for 1024-row prefill chunks: ATB gate/up GEMM pair -> on-core
 // swiglu reshape -> ATB down GEMM. Only the FFN input is encoded and the output decoded on the host.
 #include <cstdint>
@@ -172,6 +173,7 @@ class FfnAtbChain {
   // ---- split API: encode/decode run outside the caller's device lock, Exec* inside it ----
   struct Job {
     std::vector<std::uint8_t> a, c;
+    bool staged{false};
   };
   void EncodeJob(const float* z, std::uint32_t n, std::uint32_t k, Job& j) {
     std::vector<float> pad;
@@ -193,27 +195,57 @@ class FfnAtbChain {
       std::memcpy(y, tmp.data(), std::size_t{n} * nout * 4);
     }
   }
+  /// A program's A/C staging BOs are single-owner: Stage takes the owner lock and copies A in, Finish copies C out and
+  /// releases it, so both copies run outside the device lock while the device serves other layers.
+  struct Port {
+    std::mutex m;
+  };
+  void Stage(Port& pt, Program& p, const std::vector<Program*>& ins, Job& j) {
+    pt.m.lock();
+    for (Program* q : ins) {
+      std::memcpy(q->ah, j.a.data(), j.a.size());
+      q->a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    }
+    (void)p;
+    j.staged = true;
+  }
+  void Finish(Port& pt, Program& p, std::size_t cbytes, Job& j) {
+    j.c.assign(p.ch, p.ch + cbytes);
+    j.staged = false;
+    pt.m.unlock();
+  }
+  void StageQkv(std::size_t l, Job& j) { Stage(*attn_[l]->port_q, attn_[l]->pq, {&attn_[l]->pq}, j); }
+  void FinishQkv(std::size_t l, Job& j) { Finish(*attn_[l]->port_q, attn_[l]->pq, std::size_t{kM} * 3072 / 8 * 9, j); }
+  void StageO(std::size_t l, Job& j) { Stage(*attn_[l]->port_o, attn_[l]->po, {&attn_[l]->po}, j); }
+  void FinishO(std::size_t l, Job& j) { Finish(*attn_[l]->port_o, attn_[l]->po, std::size_t{kM} * kHid / 8 * 9, j); }
+  void StageFfn(std::size_t l, Job& j) { Stage(*layers_[l]->port, layers_[l]->dn, {&layers_[l]->qa, &layers_[l]->qb}, j); }
+  void FinishFfn(std::size_t l, Job& j) { Finish(*layers_[l]->port, layers_[l]->dn, std::size_t{kM} * kHid / 8 * 9, j); }
+
   void ExecGemm(Program& p, WeightBuffer& w, Job& j, std::uint32_t nout) {
-    std::memcpy(p.ah, j.a.data(), j.a.size());
-    p.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    if (!j.staged) {
+      std::memcpy(p.ah, j.a.data(), j.a.size());
+      p.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    }
     Dispatch(gu_, w, p);
     p.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-    j.c.assign(p.ch, p.ch + std::size_t{kM} * nout / 8 * 9);
+    if (!j.staged) j.c.assign(p.ch, p.ch + std::size_t{kM} * nout / 8 * 9);
   }
   void ExecQkv(std::size_t l, Job& j) { ExecGemm(attn_[l]->pq, attn_[l]->wq, j, 3072); }
   void ExecO(std::size_t l, Job& j) { ExecGemm(attn_[l]->po, attn_[l]->wo, j, kHid); }
   void ExecFfn(std::size_t l, Job& j) {
     Layer& ly = *layers_[l];
-    std::memcpy(ly.qa.ah, j.a.data(), j.a.size());
-    std::memcpy(ly.qb.ah, j.a.data(), j.a.size());
-    ly.qa.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    ly.qb.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    if (!j.staged) {
+      std::memcpy(ly.qa.ah, j.a.data(), j.a.size());
+      std::memcpy(ly.qb.ah, j.a.data(), j.a.size());
+      ly.qa.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      ly.qb.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    }
     Dispatch(gu_, ly.wqa, ly.qa);
     Dispatch(gu_, ly.wqb, ly.qb);
     if (!ly.fused) Dispatch(*swp_, ly.fake, ly.sw);
     Dispatch(*dnp_, ly.wd, ly.dn);
     ly.dn.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-    j.c.assign(ly.dn.ch, ly.dn.ch + std::size_t{kM} * kHid / 8 * 9);
+    if (!j.staged) j.c.assign(ly.dn.ch, ly.dn.ch + std::size_t{kM} * kHid / 8 * 9);
   }
   void ExecConvIn(std::size_t l, Job& j) {
     Conv& c = *conv_[l];
@@ -377,11 +409,13 @@ class FfnAtbChain {
     WeightBuffer wqa, wqb, wd, fake;
     xrt::bo swc;
     bool fused{false};
+    std::unique_ptr<Port> port = std::make_unique<Port>();
   };
 
   struct Attn {
     Program pq, po;
     WeightBuffer wq, wo;
+    std::unique_ptr<Port> port_q = std::make_unique<Port>(), port_o = std::make_unique<Port>();
   };
 
   struct Conv {

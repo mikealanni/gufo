@@ -563,7 +563,9 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       {
         gufo::npu::runtime::FfnAtbChain::Job jq;
         s.atb->EncodeJob(Z.data(), nTot, 2048, jq);
+        s.atb->StageQkv(l, jq);
         { std::lock_guard<std::mutex> g_(npu_mu); const auto tl0 = Clock::now(); s.atb->ExecQkv(l, jq); g_lock_ms += Ms(tl0); }
+        s.atb->FinishQkv(l, jq);
         s.atb->DecodeJob(jq, nTot, 3072, QKV.data());
       }
       g_t_qkv += Ms(tq0);
@@ -1105,7 +1107,9 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       {
         gufo::npu::runtime::FfnAtbChain::Job jo;
         s.atb->EncodeJob(ATT.data(), nTot, 2048, jo);
+        s.atb->StageO(l, jo);
         { std::lock_guard<std::mutex> g_(npu_mu); const auto tl0 = Clock::now(); s.atb->ExecO(l, jo); g_lock_ms += Ms(tl0); }
+        s.atb->FinishO(l, jo);
         s.atb->DecodeJob(jo, nTot, 2048, Br.data());
       }
       g_t_oproj += Ms(to0);
@@ -1116,7 +1120,9 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       const auto tf0 = Clock::now();
       s.atb->EncodeJob(Z.data(), nTot, 2048, jf);
       const auto tf1 = Clock::now();
+      s.atb->StageFfn(l, jf);
       { std::lock_guard<std::mutex> g_(npu_mu); const auto tl0 = Clock::now(); s.atb->ExecFfn(l, jf); g_lock_ms += Ms(tl0); }
+      s.atb->FinishFfn(l, jf);
       const auto tf2 = Clock::now();
       s.atb->DecodeJob(jf, nTot, 2048, Br.data());
       g_f_enc += std::chrono::duration<double, std::milli>(tf1 - tf0).count();
