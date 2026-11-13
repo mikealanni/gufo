@@ -203,7 +203,15 @@ def my_matmul(M, K, N, m, k, n, mode="gemm"):
         resh = external_func(
             "swi_half", inputs=[B_l1_ty, C_l1_ty, np.int32], link_with=f"mm_{m}x{k}x{n}.o"
         )
-        rtp_ty = np.ndarray[(3,), np.dtype[np.int32]]
+        cv_init = external_func(
+            "conv_init", inputs=[B_l1_ty], link_with=f"mm_{m}x{k}x{n}.o"
+        )
+        cv_strip = external_func(
+            "conv_strip",
+            inputs=[B_l1_ty, C_l1_ty, np.int32, np.int32, np.int32],
+            link_with=f"mm_{m}x{k}x{n}.o",
+        )
+        rtp_ty = np.ndarray[(5,), np.dtype[np.int32]]
         rtps = [[None] * n_aie_cols for _ in range(n_aie_rows)]
         rtp_locks = [[None] * n_aie_cols for _ in range(n_aie_rows)]
         for row in range(n_aie_rows):
@@ -229,6 +237,10 @@ def my_matmul(M, K, N, m, k, n, mode="gemm"):
                         kk = arith.index_cast(T.index(), kk_i32)
                         gr = arith.index_cast(T.index(), gr_i32)
                         rr = arith.index_cast(T.index(), rr_i32)
+                        i3 = arith.constant(T.index(), 3)
+                        i4 = arith.constant(T.index(), 4)
+                        cva = arith.index_cast(T.index(), memref.load(rtps[row][col], [i3]))
+                        cvp = arith.index_cast(T.index(), memref.load(rtps[row][col], [i4]))
                         set_k(kk_i32)
                         for _ in range_(gr):
                             elem_out = C_l1l2_fifos[row][col].acquire(
@@ -261,6 +273,23 @@ def my_matmul(M, K, N, m, k, n, mode="gemm"):
                                     resh(elem_in_b, elem_out, arith.constant(T.i32(), off))
                                 B_l2l1_fifos[col].release(ObjectFifoPort.Consume, 1)
                             C_l1l2_fifos[row][col].release(ObjectFifoPort.Produce, 1)
+                        ci = lambda v: arith.constant(T.i32(), v)
+                        for _ in range_(cva):
+                            for e in range(2):
+                                for rho in range(4):
+                                    aux = B_l2l1_fifos[col].acquire(ObjectFifoPort.Consume, 1)
+                                    if rho == row:
+                                        cv_init(aux)
+                                    B_l2l1_fifos[col].release(ObjectFifoPort.Consume, 1)
+                                for g in range(2):
+                                    elem_out = C_l1l2_fifos[row][col].acquire(ObjectFifoPort.Produce, 1)
+                                    for u in range_(4):
+                                        uoff = arith.muli(arith.index_cast(T.i32(), u), arith.constant(T.i32(), 4608))
+                                        for st in range(8):
+                                            e0 = B_l2l1_fifos[col].acquire(ObjectFifoPort.Consume, 1)
+                                            cv_strip(e0, elem_out, uoff, arith.constant(T.i32(), st), arith.constant(T.i32(), row))
+                                            B_l2l1_fifos[col].release(ObjectFifoPort.Consume, 1)
+                                    C_l1l2_fifos[row][col].release(ObjectFifoPort.Produce, 1)
 
         # To/from AIE-array data movement
         if mode == "resh":
@@ -278,6 +307,8 @@ def my_matmul(M, K, N, m, k, n, mode="gemm"):
                         npu_rtp_write(f"rtp_{row}_{col}", 0, 0)
                         npu_rtp_write(f"rtp_{row}_{col}", 1, 0)
                         npu_rtp_write(f"rtp_{row}_{col}", 2, RESH_R)
+                        npu_rtp_write(f"rtp_{row}_{col}", 3, 0)
+                        npu_rtp_write(f"rtp_{row}_{col}", 4, 0)
                         set_lock_value(rtp_locks[row][col], 1)
                 for rd in range(RESH_R):
                     outs, allins = [], []
@@ -315,6 +346,63 @@ def my_matmul(M, K, N, m, k, n, mode="gemm"):
                     for it in allins:
                         dma_free_task(it)
 
+        elif mode == "conv":
+            def lin4(full, offset, sizes, strides):
+                return TensorAccessPattern((1, full), offset, sizes, strides)
+
+            AE, BE, CE = M * 6144 // 8, 64 * 1024, M * 2048 // 8
+            TILE = 2048
+
+            @runtime_sequence(
+                np.ndarray[(AE,), np.dtype[dtype_in]],
+                np.ndarray[(BE,), np.dtype[dtype_in]],
+                np.ndarray[(CE,), np.dtype[dtype_out]],
+            )
+            def sequence_conv(A, B, C):
+                for row in range(n_aie_rows):
+                    for col in range(n_aie_cols):
+                        npu_rtp_write(f"rtp_{row}_{col}", 0, 0)
+                        npu_rtp_write(f"rtp_{row}_{col}", 1, 0)
+                        npu_rtp_write(f"rtp_{row}_{col}", 2, 0)
+                        npu_rtp_write(f"rtp_{row}_{col}", 3, 1)
+                        npu_rtp_write(f"rtp_{row}_{col}", 4, 0)
+                        set_lock_value(rtp_locks[row][col], 1)
+                for c in range(8):
+                    ins, outs = [], []
+                    for e in range(2):
+                        ins.append(shim_dma_single_bd_task(
+                            B_l3l2_fifos[c], B, tap=lin4(BE, (c * 2 + e) * 4 * 1024, [1, 1, 1, 4096], [0, 0, 0, 1]),
+                            issue_token=True))
+                        for g in range(2):
+                            toff = ((g * 6 + e) * 32 + c * 4) * TILE
+                            ins.append(shim_dma_single_bd_task(
+                                B_l3l2_fifos[c], A,
+                                tap=lin4(AE, toff, [4, 8, 4, 256], [TILE, 256, 64 * TILE, 1]),
+                                issue_token=True))
+                            for hi in range(2):
+                                ooff = ((4 * g) * 32 + 2 * (c + 8 * e) + hi) * 1024
+                                outs.append(shim_dma_single_bd_task(
+                                    C_l2l3_fifos[c], C,
+                                    tap=lin4(CE, ooff, [2, 4, 8, 64], [64, 32 * 1024, 128, 1]),
+                                    issue_token=True))
+                    for t in outs[:4]:
+                        dma_start_task(t)
+                    for t in ins[:4]:
+                        dma_start_task(t)
+                    for k in range(4, len(ins)):
+                        dma_await_task(ins[k - 4])
+                        dma_free_task(ins[k - 4])
+                        dma_start_task(ins[k])
+                    for k in range(4, len(outs)):
+                        dma_await_task(outs[k - 4])
+                        dma_free_task(outs[k - 4])
+                        dma_start_task(outs[k])
+                    for t in ins[len(ins) - 4:]:
+                        dma_await_task(t)
+                        dma_free_task(t)
+                    for t in outs[len(outs) - 4:]:
+                        dma_await_task(t)
+
         else:
             @runtime_sequence(
                 np.ndarray[(M * K // 8,), np.dtype[dtype_in]],
@@ -329,6 +417,8 @@ def my_matmul(M, K, N, m, k, n, mode="gemm"):
                         npu_rtp_write(f"rtp_{row}_{col}", 0, K // k)
                         npu_rtp_write(f"rtp_{row}_{col}", 1, (M // m) * (N // n) // (n_aie_cols * n_aie_rows))
                         npu_rtp_write(f"rtp_{row}_{col}", 2, 0)
+                        npu_rtp_write(f"rtp_{row}_{col}", 3, 0)
+                        npu_rtp_write(f"rtp_{row}_{col}", 4, 0)
                         set_lock_value(rtp_locks[row][col], 1)
 
                 if enable_tracing:

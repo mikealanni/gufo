@@ -562,4 +562,67 @@ __attribute__((noinline)) void swi_half(const bfp16ebs8 *__restrict w, bfp16ebs8
     out.push(silu_mul(g, u, idb, z, c_hi, c_lo, one).template to_vector<bfp16ebs8>());
   }
 }
+
+// ---- conv mode: gating + 7-tap causal depthwise conv on in_proj wire tiles ----
+// Each core owns 4 octets (32 channels) of every 128-channel unit. Scratch aliases c_bf16_2nd_half
+// (free in this mode): comb[4 octets][24 rows][8 ch] bf16 (rows 0..7 = previous token block,
+// 8..15 / 16..23 = current 16-token strip), then taps[4][7][64] (each tap pre-replicated over 8 rows).
+constexpr int CV_COMB = 768;
+constexpr int CV_TAPS = 1792;
+
+__attribute__((noinline)) void conv_init(const bfloat16 *__restrict aux) {
+  bfloat16 *taps = c_bf16_2nd_half + CV_COMB;
+  for (int i = 0; i < CV_TAPS; i += 64) aie::store_v(taps + i, aie::load_v<64>(aux + i));
+  const bfloat16 *h = aux + CV_TAPS;
+  for (int o = 0; o < 4; ++o) aie::store_v(c_bf16_2nd_half + o * 192, aie::load_v<64>(h + o * 64));
+}
+
+__attribute__((noinline)) void conv_strip(const bfp16ebs8 *__restrict e, bfp16ebs8 *__restrict out, int uoff, int s,
+                                          int rho) {
+  ::aie::set_rounding(::aie::rounding_mode::conv_even);
+  const uint8_t *eb = (const uint8_t *)e + rho * 576;
+  aie::block_vector_input_buffer_stream<bfp16ebs8, 64> pB((const bfp16ebs8 *)eb);
+  aie::block_vector_input_buffer_stream<bfp16ebs8, 64> pC((const bfp16ebs8 *)(eb + 2304));
+  aie::block_vector_input_buffer_stream<bfp16ebs8, 64> pX((const bfp16ebs8 *)(eb + 4608));
+  pB.seek(0);
+  pC.seek(0);
+  pX.seek(0);
+  aie::block_vector_input_buffer_stream<bfp16ebs8, 64> idst((bfp16ebs8 *)id_blk);
+  idst.seek(0);
+  const aie::block_vector<bfp16ebs8, 64> idb = idst.pop();
+  const aie::accum<accfloat, 64> z = aie::zeros<accfloat, 64>();
+  const bfloat16 *taps = c_bf16_2nd_half + CV_COMB;
+  uint8_t *ob0 = (uint8_t *)out + uoff + s * 576;
+  for (int sbl = 0; sbl < 2; ++sbl) {
+    for (int br = 0; br < 2; ++br) {
+      for (int bc = 0; bc < 2; ++bc) {
+        const int oo = sbl * 2 + bc;
+        const aie::block_vector<bfp16ebs8, 64> gB = pB.pop();
+        const aie::block_vector<bfp16ebs8, 64> gC = pC.pop();
+        const aie::block_vector<bfp16ebs8, 64> gX = pX.pop();
+        const aie::accum<accfloat, 64> aB = mac_8x8_8x8T(gB, idb, z);
+        const aie::accum<accfloat, 64> aC = mac_8x8_8x8T(gC, idb, z);
+        const aie::accum<accfloat, 64> aX = mac_8x8_8x8T(gX, idb, z);
+        const aie::vector<bfloat16, 64> vB = aB.template to_vector<bfloat16>();
+        const aie::vector<bfloat16, 64> vC = aC.template to_vector<bfloat16>();
+        const aie::vector<bfloat16, 64> vX = aX.template to_vector<bfloat16>();
+        bfloat16 *cb = c_bf16_2nd_half + oo * 192;
+        aie::store_v(cb + (8 + br * 8) * 8, aie::mul(vB, vX).template to_vector<bfloat16>());
+        const bfloat16 *tp = taps + oo * 448;
+        const bfloat16 *win = cb + (8 * (1 + br) - 6) * 8;
+        aie::accum<accfloat, 64> acc = aie::mul(aie::load_v<64>(tp), aie::load_unaligned_v<64>(win));
+        for (int j = 1; j < 7; ++j) acc = aie::mac(acc, aie::load_v<64>(tp + j * 64), aie::load_unaligned_v<64>(win + j * 8));
+        const aie::vector<bfloat16, 64> cv = acc.template to_vector<bfloat16>();
+        const aie::accum<accfloat, 64> y = aie::mul(cv, vC);
+        aie::block_vector_output_buffer_stream<bfp16ebs8, 64> os((bfp16ebs8 *)(ob0 + (oo * 2 + br) * 72));
+        os.seek(0);
+        os.push(y.template to_vector<bfp16ebs8>());
+      }
+    }
+  }
+  for (int o = 0; o < 4; ++o) {
+    bfloat16 *cb = c_bf16_2nd_half + o * 192;
+    aie::store_v(cb, aie::load_v<64>(cb + 128));
+  }
+}
 }

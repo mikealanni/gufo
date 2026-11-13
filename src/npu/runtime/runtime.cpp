@@ -527,6 +527,38 @@ void NpuRuntime::DecodeCAtb(float* y, std::uint32_t M, std::uint32_t N,
   }
 }
 
+void NpuRuntime::DecodeCRowAtb(const Program& p, std::uint32_t N, std::uint32_t row, float* out) const {
+  constexpr std::uint32_t kAtbTileC = kAtbTileM * kAtbTileN / 8 * 9;
+  const std::uint32_t mt = row / kAtbTileM, rr = row % kAtbTileM;
+  const std::uint32_t sbr = rr / 16, br = (rr % 16) / 8, rib = rr % 8;
+  const std::uint32_t ntiles = N / kAtbTileN, npass = ntiles / 8;
+  for (std::uint32_t nt = 0; nt < ntiles; ++nt) {
+    const std::size_t tile = std::size_t{(mt / 4) * npass + nt / 8} * 32 + (nt % 8) * 4 + (mt % 4);
+    const std::uint8_t* t = p.ch + tile * kAtbTileC;
+    for (std::uint32_t sbc = 0; sbc < 8; ++sbc)
+      for (std::uint32_t bc = 0; bc < 2; ++bc) {
+        const std::uint8_t* blk = t + (((sbr * 8 + sbc) * 4) + br * 2 + bc) * kAtbBlkBytes;
+        DecodeBlock8(blk + rib * 9, out + std::size_t{nt} * kAtbTileN + sbc * 16 + bc * 8);
+      }
+  }
+}
+
+void NpuRuntime::DecodeAAtb(float* x, std::uint32_t M, std::uint32_t K, const Program& p) const {
+  const std::uint32_t l1_rows = M / kAtbTileM, l1_cols = K / kAtbTileK;
+  for (std::uint32_t l1_row = 0; l1_row < l1_rows; ++l1_row)
+    for (std::uint32_t l1_col = 0; l1_col < l1_cols; ++l1_col) {
+      const std::uint8_t* tile = p.ah + (std::size_t{l1_row} * l1_cols + l1_col) * kAtbTileBytes;
+      for (std::uint32_t sbr = 0; sbr < 8; ++sbr)
+        for (std::uint32_t sbc = 0; sbc < 8; ++sbc)
+          for (std::uint32_t bis = 0; bis < 2; ++bis) {
+            const std::uint8_t* blk = tile + ((sbr * 8 + sbc) * 2 + bis) * kAtbBlkBytes;
+            const std::uint32_t row0 = l1_row * kAtbTileM + sbr * 16 + bis * 8;
+            const std::uint32_t col0 = l1_col * kAtbTileK + sbc * 8;
+            for (std::uint32_t rib = 0; rib < 8; ++rib) DecodeBlock8(blk + rib * 9, x + std::size_t(row0 + rib) * K + col0);
+          }
+    }
+}
+
 void NpuRuntime::GemmAtb(Program& p, WeightBuffer& wb, const float* x,
                          std::uint32_t M, float* y, Timings* t) {
   WeightBuffer& w = WeightSlot(wb, p);

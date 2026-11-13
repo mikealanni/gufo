@@ -94,6 +94,7 @@ class FfnAtbChain {
       if (!cp) continue;
       Dispatch(gu_, cp->wi, cp->pi);
       Dispatch(gu_, cp->wo, cp->po);
+      if (cp->dev) Dispatch(gu_, cp->wx, cp->pc);
     }
     for (auto& ap : attn_) {
       if (!ap) continue;
@@ -109,20 +110,116 @@ class FfnAtbChain {
     c->wi = gu_.PackWeightAtb(w_in, 3 * kHid, kHid, 4);
     c->wo = gu_.PackWeightAtb(w_out, kHid, kHid, 4);
     c->pi = gu_.MakeProgram(kHid, 3 * kHid, dir_ + "/" + ip_ + "1024x2048x6144.txt",
-                            std::size_t{kM} * 3 * kHid / 8 * 9, err, 0, mrows, 3, 5);
+                            std::size_t{448} * 18432, err, 0, mrows, 3, 5);
     c->po = gu_.MakeProgram(kHid, kHid, dir_ + "/" + ip_ + "1024x2048x2048.txt",
                             std::size_t{kM} * kHid / 8 * 9, err, 0, mrows, 3, 5);
+    try {
+      c->pc = gu_.MakeProgram(kHid, kHid, dir_ + "/" + ip_ + "conv_1024.txt", 1, err, 0, mrows, 3, 5);
+      c->pc.a = c->pi.c;
+      c->pc.ah = c->pi.ch;
+      c->pc.c = c->po.a;
+      c->pc.ch = c->po.ah;
+      c->wx.bytes = 64 * 9216;
+      c->wx.bo = gu_.MakeBo(c->wx.bytes, 3);
+      c->wx.host = c->wx.bo.map<std::uint8_t*>();
+      std::memset(c->wx.host, 0, c->wx.bytes);
+      c->wx.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      gu_.WeightSlot(c->wx, c->pc);
+      c->dev = kd_;
+    } catch (const std::exception&) {
+      c->dev = false;
+    }
     conv_[layer] = std::move(c);
     return err == nullptr || err->empty();
+  }
+
+  bool HasConvDev(std::size_t layer) const { return HasConv(layer) && conv_[layer]->dev; }
+
+  /// in_proj without the host decode: result stays on the C wire (program.ch).
+  void RunConvInRaw(std::size_t layer, const float* z, std::uint32_t n) {
+    Conv& c = *conv_[layer];
+    const float* src = z;
+    if (n < kM) {
+      pad_.assign(std::size_t{kM} * kHid, 0.f);
+      std::memcpy(pad_.data(), z, std::size_t{n} * kHid * 4);
+      src = pad_.data();
+    }
+    gu_.EncodeAAtb(src, kM, kHid, c.pi);
+    c.pi.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    Dispatch(gu_, c.wi, c.pi);
+    c.pi.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+  }
+
+  /// One in_proj wire row (6144 floats, model order B|C|x).
+  void ConvWireRow(std::size_t layer, std::uint32_t row, float* out) {
+    gu_.DecodeCRowAtb(conv_[layer]->pi, 3 * kHid, row, out);
+  }
+
+  /// Gating and 7-tap conv on the device: in_proj wire -> out_proj A wire.
+  /// taps: kHid x 7 floats; hist: 6 x kHid bf16 bit patterns (the history entering token 0).
+  void RunConvDev(std::size_t layer, const float* taps, const std::uint16_t* hist) {
+    Conv& c = *conv_[layer];
+    const auto bf = [](float f) {
+      std::uint32_t u;
+      std::memcpy(&u, &f, 4);
+      return static_cast<std::uint16_t>((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
+    };
+    for (std::uint32_t col = 0; col < 8; ++col)
+      for (std::uint32_t e = 0; e < 2; ++e)
+        for (std::uint32_t rho = 0; rho < 4; ++rho) {
+          auto* base = reinterpret_cast<std::uint16_t*>(c.wx.host + std::size_t{(col * 2 + e) * 4 + rho} * 9216);
+          std::uint16_t* tp = base;
+          std::uint16_t* hp = base + 1792;
+          const std::uint32_t nt = col + 8 * e;
+          for (std::uint32_t oo = 0; oo < 4; ++oo) {
+            const std::uint32_t o = rho * 4 + oo;
+            for (std::uint32_t e8 = 0; e8 < 8; ++e8) {
+              const std::uint32_t ch = nt * 128 + o * 8 + e8;
+              for (std::uint32_t j = 0; j < 7; ++j) {
+                const std::uint16_t v = bf(taps[std::size_t{ch} * 7 + j]);
+                for (std::uint32_t r = 0; r < 8; ++r) tp[(oo * 7 + j) * 64 + r * 8 + e8] = v;
+              }
+              for (std::uint32_t r = 0; r < 8; ++r) hp[oo * 64 + r * 8 + e8] = r < 2 ? 0 : hist[std::size_t{r - 2} * kHid + ch];
+            }
+          }
+        }
+    c.wx.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    const auto d0 = std::chrono::steady_clock::now();
+    Dispatch(gu_, c.wx, c.pc);
+    cvdev_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - d0).count();
+  }
+  double cvdev_ms{0};
+
+  /// out_proj on an A wire the device already filled.
+  void RunConvOutRaw(std::size_t layer, std::uint32_t n, float* y) {
+    Conv& c = *conv_[layer];
+    Dispatch(gu_, c.wo, c.po);
+    c.po.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    if (n == kM) {
+      gu_.DecodeCAtb(y, kM, kHid, c.po);
+    } else {
+      out_.resize(std::size_t{kM} * kHid);
+      gu_.DecodeCAtb(out_.data(), kM, kHid, c.po);
+      std::memcpy(y, out_.data(), std::size_t{n} * kHid * 4);
+    }
+  }
+
+  /// Debug: decode the A wire the conv kernel wrote.
+  void ConvDevA(std::size_t layer, float* x) {
+    Conv& c = *conv_[layer];
+    c.po.a.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    gu_.DecodeAAtb(x, kM, kHid, c.po);
   }
 
   bool HasConv(std::size_t layer) const { return layer < conv_.size() && conv_[layer] != nullptr; }
 
   /// in_proj: z (n x 2048) -> y (n x 6144, model order [B|C|x]).
   void RunConvIn(std::size_t layer, const float* z, std::uint32_t n, float* y) {
+    cv_ = 0;
     Gemm1024(conv_[layer]->pi, conv_[layer]->wi, z, n, kHid, 3 * kHid, y);
   }
   void RunConvOut(std::size_t layer, const float* a, std::uint32_t n, float* y) {
+    cv_ = 1;
     Gemm1024(conv_[layer]->po, conv_[layer]->wo, a, n, kHid, kHid, y);
   }
 
@@ -130,9 +227,11 @@ class FfnAtbChain {
 
   /// Both run on the K=2048 context shared with the gate/up GEMM. n <= 1024 rows.
   void RunQkv(std::size_t layer, const float* z, std::uint32_t n, float* y) {
+    cv_ = -1;
     Gemm1024(attn_[layer]->pq, attn_[layer]->wq, z, n, kHid, 3072, y);
   }
   void RunO(std::size_t layer, const float* a, std::uint32_t n, float* y) {
+    cv_ = -1;
     Gemm1024(attn_[layer]->po, attn_[layer]->wo, a, n, kHid, kHid, y);
   }
 
@@ -206,8 +305,9 @@ class FfnAtbChain {
   };
 
   struct Conv {
-    Program pi, po;
-    WeightBuffer wi, wo;
+    Program pi, po, pc;
+    WeightBuffer wi, wo, wx;
+    bool dev{false};
   };
 
   void Gemm1024(Program& p, WeightBuffer& w, const float* z, std::uint32_t n, std::uint32_t k,
@@ -218,10 +318,15 @@ class FfnAtbChain {
       std::memcpy(pad_.data(), z, std::size_t{n} * k * 4);
       src = pad_.data();
     }
+    const auto q0 = std::chrono::steady_clock::now();
     gu_.EncodeAAtb(src, kM, k, p);
     p.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    const auto q1 = std::chrono::steady_clock::now();
     Dispatch(gu_, w, p);
     p.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    const auto q2 = std::chrono::steady_clock::now();
+    last_[0] = std::chrono::duration<double, std::milli>(q1 - q0).count();
+    last_[1] = std::chrono::duration<double, std::milli>(q2 - q1).count();
     if (n == kM) {
       gu_.DecodeCAtb(y, kM, nout, p);
     } else {
@@ -229,6 +334,9 @@ class FfnAtbChain {
       gu_.DecodeCAtb(out_.data(), kM, nout, p);
       std::memcpy(y, out_.data(), std::size_t{n} * nout * 4);
     }
+    last_[2] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - q2).count();
+    if (cv_ >= 0)
+      for (int i = 0; i < 3; ++i) acc_[cv_][i] += last_[i];
   }
 
   static void Dispatch(NpuRuntime& r, WeightBuffer& w, Program& p) {
@@ -253,6 +361,9 @@ class FfnAtbChain {
   std::vector<std::unique_ptr<Attn>> attn_;
   std::vector<std::unique_ptr<Conv>> conv_;
   std::vector<float> pad_, out_;
+ public:
+  double last_[3]{}, acc_[2][3]{};
+  int cv_{-1};
 };
 
 }  // namespace gufo::npu::runtime

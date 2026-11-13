@@ -554,11 +554,45 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       CIN.resize(std::size_t{nTot} * 6144);
       CY.resize(std::size_t{nTot} * H);
       const auto tcA = Clock::now();
+      static const int conv_dev = std::getenv("GUFO_CONV_DEV") ? std::atoi(std::getenv("GUFO_CONV_DEV")) : 1;
+      const bool dev_conv = conv_dev && s.atb->HasConvDev(l) && s.taps == 7;
+      constexpr std::uint32_t kHist = 6;
+      std::vector<float> wrow(6144);
+      const auto bx_rows = [&](std::uint32_t first, std::uint16_t* dst) {
+        for (std::uint32_t r = 0; r < kHist; ++r) {
+          s.atb->ConvWireRow(l, first + r, wrow.data());
+          for (std::uint32_t ch = 0; ch < H; ++ch) dst[std::size_t{r} * H + ch] = Bf16Bits(wrow[ch] * wrow[2 * H + ch]);
+        }
+      };
+      std::vector<float> devA;
+      if (dev_conv && conv_dev == 1) {
+        s.atb->RunConvInRaw(l, Z.data(), nTot);
+        g_t_cin += Ms(tcA);
+        const auto tcB1 = Clock::now();
+        std::vector<std::uint16_t> h0(std::size_t{kHist} * H), nh(std::size_t{kHist} * H);
+        s.rt.ConvGetHistory(s.m_conv64[l], h0.data());
+        bx_rows(nTot - kHist, nh.data());
+        s.atb->RunConvDev(l, static_cast<const float*>(lw.conv.data), h0.data());
+        s.rt.ConvSetHistory(s.m_conv64[l], nh.data());
+        if (s.m_conv[l].hidden) s.rt.ConvCopyHistory(s.m_conv[l], s.m_conv64[l]);
+        g_t_cmid += Ms(tcB1);
+        const auto tcC1 = Clock::now();
+        s.atb->RunConvOutRaw(l, nTot, Br.data());
+        g_t_cout += Ms(tcC1);
+        g_t_conv += Ms(tcv0);
+        finish_all(Br.data());
+      } else {
       s.atb->RunConvIn(l, Z.data(), nTot, CIN.data());
       g_t_cin += Ms(tcA);
       const auto tcB = Clock::now();
+      if (dev_conv) {
+        std::vector<std::uint16_t> h0(std::size_t{kHist} * H);
+        s.rt.ConvGetHistory(s.m_conv64[l], h0.data());
+        s.atb->RunConvDev(l, static_cast<const float*>(lw.conv.data), h0.data());
+        devA.resize(std::size_t{1024} * H);
+        s.atb->ConvDevA(l, devA.data());
+      }
       // Temporary host middle: Bx = bf16(B*x), 7-tap causal conv over [history | Bx], y = C * conv.
-      constexpr std::uint32_t kHist = 6;
       std::vector<std::uint16_t> hist(std::size_t{kHist} * H);
       s.rt.ConvGetHistory(s.m_conv64[l], hist.data());
       const auto* taps = static_cast<const float*>(lw.conv.data);
@@ -588,11 +622,22 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       s.rt.ConvSetHistory(s.m_conv64[l], nh.data());
       if (s.m_conv[l].hidden) s.rt.ConvCopyHistory(s.m_conv[l], s.m_conv64[l]);
       g_t_cmid += Ms(tcB);
+      if (!devA.empty()) {
+        double num = 0, den = 0, mx = 0;
+        for (std::size_t i = 0; i < std::size_t{nTot} * H; ++i) {
+          const double d = devA[i] - CY[i];
+          num += d * d; den += double(CY[i]) * CY[i];
+          mx = std::max(mx, std::abs(d));
+        }
+        static int shown = 0;
+        if (shown++ < 12) std::fprintf(stderr, "[convdev] L%zu relL2 %.5f maxabs %.4g (ref rms %.4g)\n", l, std::sqrt(num / den), mx, std::sqrt(den / (double(nTot) * H)));
+      }
       const auto tcC = Clock::now();
       s.atb->RunConvOut(l, CY.data(), nTot, Br.data());
       g_t_cout += Ms(tcC);
       g_t_conv += Ms(tcv0);
       finish_all(Br.data());
+      }
     }
     for (std::uint32_t o = 0; !big_conv && o < nTot; o += 64) {
     const std::uint32_t n = std::min<std::uint32_t>(64, nTot - o);
@@ -994,6 +1039,8 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
   s.t_cpu += Ms(cpu0);
   if (std::getenv("GUFO_ATB_STATS")) {
     std::fprintf(stderr, "[conv] in %.0f mid %.0f out %.0f post %.0f fin %.0f ms\n", g_t_cin, g_t_cmid, g_t_cout, g_t_post, g_t_fin);
+    if (s.atb) std::fprintf(stderr, "[conv] device conv dispatch %.0f ms\n", s.atb->cvdev_ms);
+    if (s.atb) std::fprintf(stderr, "[conv] split in: enc %.0f dev %.0f dec %.0f | out: enc %.0f dev %.0f dec %.0f ms (all conv layers)\n", s.atb->acc_[0][0], s.atb->acc_[0][1], s.atb->acc_[0][2], s.atb->acc_[1][0], s.atb->acc_[1][1], s.atb->acc_[1][2]);
     std::fprintf(stderr, "[cpu] norm %.0f prep %.0f attn_npu %.0f attn_cpu %.0f conv %.0f qkv %.0f oproj %.0f ms\n", g_t_norm, g_t_prep, g_t_attn_npu, g_t_attn_cpu, g_t_conv, g_t_qkv, g_t_oproj);
   }
   if (std::getenv("GUFO_ATB_STATS"))

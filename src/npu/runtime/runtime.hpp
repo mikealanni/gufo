@@ -217,6 +217,10 @@ class NpuRuntime {
  public:
   void EncodeAAtb(const float* x, std::uint32_t M, std::uint32_t K, Program& p);
   void DecodeCAtb(float* y, std::uint32_t M, std::uint32_t N, Program& p);
+  /// One output row (N floats) straight from the C wire.
+  void DecodeCRowAtb(const Program& p, std::uint32_t N, std::uint32_t row, float* out) const;
+  /// Inverse of EncodeAAtb (reads p.ah).
+  void DecodeAAtb(float* x, std::uint32_t M, std::uint32_t K, const Program& p) const;
   /// Synchronous prefill GEMM: x (M x K) -> y (M x N), M = 16 * p.mrows.
   void GemmAtb(Program& p, WeightBuffer& wb, const float* x, std::uint32_t M,
                float* y, Timings* t = nullptr);
