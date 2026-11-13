@@ -73,9 +73,17 @@ class FfnAtbChain {
     l.qb.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     const auto t1 = std::chrono::steady_clock::now();
     Dispatch(gu_, l.wqa, l.qa);
+    const auto d1 = std::chrono::steady_clock::now();
     Dispatch(gu_, l.wqb, l.qb);
+    const auto d2 = std::chrono::steady_clock::now();
     Dispatch(sw_, l.fake, l.sw);
+    const auto d3 = std::chrono::steady_clock::now();
     Dispatch(dn_, l.wd, l.dn);
+    const auto d4 = std::chrono::steady_clock::now();
+    ph_ms[0] += std::chrono::duration<double, std::milli>(d1 - t1).count();
+    ph_ms[1] += std::chrono::duration<double, std::milli>(d2 - d1).count();
+    ph_ms[2] += std::chrono::duration<double, std::milli>(d3 - d2).count();
+    ph_ms[3] += std::chrono::duration<double, std::milli>(d4 - d3).count();
     l.dn.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
     const auto t2 = std::chrono::steady_clock::now();
     if (n == kM) {
@@ -93,7 +101,7 @@ class FfnAtbChain {
     ++calls;
   }
 
-  double enc_ms{0}, dev_ms{0}, dec_ms{0};
+  double enc_ms{0}, dev_ms{0}, dec_ms{0}, ph_ms[4]{0, 0, 0, 0};
   std::size_t calls{0};
 
   std::size_t Layers() const { return layers_.size(); }

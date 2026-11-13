@@ -460,6 +460,7 @@ void Engine::Reset() {
 std::uint32_t Engine::Position() const { return impl_->pos; }
 std::uint32_t Engine::PrefillRows() const { return impl_->atb ? gufo::npu::runtime::FfnAtbChain::kM : (impl_->m64 ? kMaxRows : 16); }
 
+static double g_t_norm, g_t_prep, g_t_attn_npu, g_t_attn_cpu, g_t_resid, g_t_conv, g_t_qkv, g_t_oproj;
 bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hidden) {
   Impl& s = *impl_;
   const auto& c = s.w->config;
@@ -484,12 +485,16 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     std::vector<float> x(X.begin() + std::size_t{o} * H, X.begin() + std::size_t{o + n} * H),
         z(x.size()), z2(x.size()), branch(x.size()), qkv(std::size_t{n} * 3072),
         attn(std::size_t{n} * qd);
+    { const auto tn0 = Clock::now();
     RmsNorm(x.data(), static_cast<const float*>(lw.norm.data), z.data(), n, H, c.eps);
+    g_t_norm += Ms(tn0); }
     s.t_cpu += Ms(cpu0);
     if (c.layers[l] == LayerType::kConvolution) {
       if (use64 && !s.m_conv64.empty() && s.m_conv64[l].hidden) {
         if (std::getenv("GUFO_REFRESH")) s.rt.ConvRefresh(s.m_conv64[l]);
+        const auto tcv0 = Clock::now();
         s.rt.ConvStep(s.m_conv64[l], z.data(), n, branch.data(), &s.tim);
+        g_t_conv += Ms(tcv0);
         if (const char* dd = std::getenv("GUFO_DUMP_DIR")) {
           if (s.pos < 192 && l < 4) {
             char fn[512]; std::snprintf(fn, sizeof fn, "%s/p%u_C%zu.f32", dd, s.pos, l);
@@ -530,13 +535,16 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       }
             cpu0 = Clock::now();
     } else {
+      { const auto tq0 = Clock::now();
       s.rt.Gemm(use64 ? s.pQkv64[l] : s.pQkv[l], s.m_qkv[l], z.data(), n, qkv.data(), &s.tim);
+      g_t_qkv += Ms(tq0); }
             cpu0 = Clock::now();
       const bool swa = c.layers[l] == LayerType::kSlidingAttention;
       const float theta = swa ? c.theta_swa : c.theta;
       const auto* fac = static_cast<const float*>(s.w->rope_freqs.data);
       const auto* qn = static_cast<const float*>(lw.q_norm.data);
       const auto* kn = static_cast<const float*>(lw.k_norm.data);
+      const auto tp0 = Clock::now();
       std::vector<float> q(std::size_t{n} * qd), k(std::size_t{n} * kvd), v(std::size_t{n} * kvd), gate(std::size_t{n} * heads);
       for (std::uint32_t t = 0; t < n; ++t) {
         std::memcpy(&q[std::size_t{t} * qd], &qkv[std::size_t{t} * 3072], qd * 4);
@@ -583,6 +591,8 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
           s.v_cache[l][std::size_t{slot} * kvd + i] = Bf16Bits(v[std::size_t{t} * kvd + i]);
         }
       }
+      g_t_prep += Ms(tp0);
+      const auto ta0 = Clock::now();
       bool npu_done = false;
       if (s.m_attn[l].host) {
         // Attn kernel is m16: one append+run pass per 16-row block.
@@ -606,6 +616,8 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
           if (!warned) { std::fprintf(stderr, "npu attention fallback (layer %zu)\n", l); warned = true; }
         }
       }
+      g_t_attn_npu += Ms(ta0);
+      const auto tc0 = Clock::now();
       static const bool check = std::getenv("GUFO_ATTN_CHECK") != nullptr;
       std::vector<float> attn_npu;
       if (check && npu_done) { attn_npu = attn; npu_done = false; }
@@ -760,13 +772,16 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
             _mm512_storeu_ps(o + d, _mm512_mul_ps(_mm512_loadu_ps(acco + d), gv));
         }
       }
+      g_t_attn_cpu += Ms(tc0);
       if (!attn_npu.empty()) {
         double num = 0, den = 0;
         for (std::size_t i = 0; i < std::size_t{n} * qd; ++i) { const double d = attn_npu[i] - attn[i]; num += d * d; den += double(attn[i]) * attn[i]; }
         std::fprintf(stderr, "attn check layer %zu pos %u n %u: rel err %.4f\n", l, s.pos, n, std::sqrt(num / den));
       }
       s.t_cpu += Ms(cpu0);
+      { const auto to0 = Clock::now();
       s.rt.Gemm(use64 ? s.pH64[l] : s.pH[l], s.m_out[l], attn.data(), n, branch.data(), &s.tim);
+      g_t_oproj += Ms(to0); }
     }
     cpu0 = Clock::now();
     if (lw.post_norm.data) {
@@ -812,11 +827,13 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
   s.pending = nTot;
   s.t_cpu += Ms(cpu0);
   if (std::getenv("GUFO_ATB_STATS"))
+    std::fprintf(stderr, "[cpu] norm %.0f prep %.0f attn_npu %.0f attn_cpu %.0f conv %.0f qkv %.0f oproj %.0f ms\n", g_t_norm, g_t_prep, g_t_attn_npu, g_t_attn_cpu, g_t_conv, g_t_qkv, g_t_oproj);
+  if (std::getenv("GUFO_ATB_STATS"))
     std::fprintf(stderr, "[step] n %u cpu %.1f ms  npu enc %.1f wait %.1f dec %.1f (cumulative)\n", nTot, s.t_cpu,
                  s.tim.enc, s.tim.wait, s.tim.dec);
   if (s.atb && std::getenv("GUFO_ATB_STATS") && s.atb->calls)
-    std::fprintf(stderr, "[atb] calls %zu enc %.1f dev %.1f dec %.1f ms (cumulative)\n", s.atb->calls,
-                 s.atb->enc_ms, s.atb->dev_ms, s.atb->dec_ms);
+    std::fprintf(stderr, "[atb] calls %zu enc %.1f dev %.1f dec %.1f ms | gu_a %.0f gu_b %.0f sw %.0f dn %.0f\n", s.atb->calls,
+                 s.atb->enc_ms, s.atb->dev_ms, s.atb->dec_ms, s.atb->ph_ms[0], s.atb->ph_ms[1], s.atb->ph_ms[2], s.atb->ph_ms[3]);
   return true;
 }
 

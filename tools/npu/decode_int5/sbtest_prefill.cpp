@@ -749,6 +749,31 @@ int main(int argc, char** argv) {
       }
       std::printf("verify dn(swresh-A)   relL2 %.4f  %s   (%.2f ms, zero host encode)\n",
                   std::sqrt(tn / td), tn / td < 0.08 * 0.08 ? "PASS" : "FAIL", dn2_ms);
+      if (const char* ch = std::getenv("SWI31_CHAIN")) {  // steady-state chain: per-phase ms with context switches
+        const int nch = std::atoi(ch);
+        WeightBuffer& sa = rt.WeightSlot(wqa, qa);
+        WeightBuffer& sb = rt.WeightSlot(wqb, qb);
+        double acc[4] = {0, 0, 0, 0};
+        for (int r = 0; r < nch; ++r) {
+          const auto a0 = Clock::now();
+          sa.run.start();
+          sa.run.wait();
+          const auto a1 = Clock::now();
+          sb.run.start();
+          sb.run.wait();
+          const auto a2 = Clock::now();
+          wr.run.start();
+          wr.run.wait();
+          const auto a3 = Clock::now();
+          wd2.run.start();
+          wd2.run.wait();
+          const auto a4 = Clock::now();
+          acc[0] += ms(a0, a1); acc[1] += ms(a1, a2); acc[2] += ms(a2, a3); acc[3] += ms(a3, a4);
+        }
+        std::printf("CHAIN loop x%d (gu_a %.2f gu_b %.2f swresh %.2f dn %.2f ms) total %.2f\n", nch,
+                    acc[0] / nch, acc[1] / nch, acc[2] / nch, acc[3] / nch,
+                    (acc[0] + acc[1] + acc[2] + acc[3]) / nch);
+      }
       std::printf("CHAIN TOTAL: %.2f ms (gu %.2f + swresh %.2f + dn %.2f)\n",
                   gu_ms + resh_ms + dn2_ms, gu_ms, resh_ms, dn2_ms);
       return 0;

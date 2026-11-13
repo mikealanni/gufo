@@ -17,7 +17,7 @@ run_once() {
     OMP_NUM_THREADS=8 \
     GUFO_PREFILL_SWI="$swi" \
     $env_extra \
-    ~/npu-lock.sh timeout 300 ./build/sbtest-prefill tools/npu/decode_int5/prefill_probe 1024 1 2>&1) || true
+    ~/npu-lock.sh timeout 300 ./build/npu/sbtest-prefill tools/npu/decode_int5/prefill_probe 1024 1 2>&1) || true
   echo "$output"
 }
 
