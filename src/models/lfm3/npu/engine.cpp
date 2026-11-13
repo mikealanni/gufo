@@ -497,6 +497,27 @@ std::uint32_t Engine::Position() const { return impl_->pos; }
 std::uint32_t Engine::PrefillRows() const { return impl_->atb ? gufo::npu::runtime::FfnAtbChain::kM * SuperChunks() : (impl_->m64 ? kMaxRows : 16); }
 
 static double g_lock_ms;
+struct TlEv { const char* n; std::size_t l; double a, b; };
+static std::vector<TlEv> g_tl;
+static std::mutex g_tl_mu;
+static const bool g_tl_on = std::getenv("GUFO_TL") != nullptr;
+static Clock::time_point g_tl0 = Clock::now();
+static void TlAdd(const char* n, std::size_t l, Clock::time_point t) {
+  if (!g_tl_on) return;
+  const auto e = Clock::now();
+  std::lock_guard<std::mutex> g(g_tl_mu);
+  g_tl.push_back({n, l, std::chrono::duration<double, std::milli>(t - g_tl0).count(), std::chrono::duration<double, std::milli>(e - g_tl0).count()});
+}
+struct TlScope {
+  const char* n; std::size_t l; Clock::time_point t;
+  TlScope(const char* n_, std::size_t l_) : n(n_), l(l_), t(Clock::now()) {}
+  ~TlScope() {
+    if (!g_tl_on) return;
+    const auto e = Clock::now();
+    std::lock_guard<std::mutex> g(g_tl_mu);
+    g_tl.push_back({n, l, std::chrono::duration<double, std::milli>(t - g_tl0).count(), std::chrono::duration<double, std::milli>(e - g_tl0).count()});
+  }
+};
 static double g_busy[4];
 static double g_w_conv, g_w_a, g_w_b, g_w_c, g_f_enc, g_f_exe, g_f_dec;
 static double g_t_post, g_t_fin, g_t_cin, g_t_cmid, g_t_cout, g_t_norm, g_t_prep, g_t_attn_npu, g_t_attn_cpu, g_t_resid, g_t_conv, g_t_qkv, g_t_oproj;
@@ -556,17 +577,16 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     if (defer_sw) VALL.resize(std::size_t{nTot} * kvd);
     if (seg == 0 || seg == 1) {
     if (big_attn) {
-      RmsNorm(X.data(), static_cast<const float*>(lw.norm.data), Z.data(), nTot, H, c.eps);
+      { TlScope tl_("norm", l); RmsNorm(X.data(), static_cast<const float*>(lw.norm.data), Z.data(), nTot, H, c.eps); }
       QKV.resize(std::size_t{nTot} * 3072);
       ATT.resize(std::size_t{nTot} * qd);
       const auto tq0 = Clock::now();
       {
         gufo::npu::runtime::FfnAtbChain::Job jq;
-        s.atb->EncodeJob(Z.data(), nTot, 2048, jq);
-        s.atb->StageQkv(l, jq);
-        { std::lock_guard<std::mutex> g_(npu_mu); const auto tl0 = Clock::now(); s.atb->ExecQkv(l, jq); g_lock_ms += Ms(tl0); }
-        s.atb->FinishQkv(l, jq);
-        s.atb->DecodeJob(jq, nTot, 3072, QKV.data());
+        { TlScope tl_("q.enc", l); s.atb->EncodeJob(Z.data(), nTot, 2048, jq); s.atb->StageQkv(l, jq); }
+        { TlScope tl_("q.exec", l); std::lock_guard<std::mutex> g_(npu_mu); const auto tl0 = Clock::now(); s.atb->ExecQkv(l, jq); g_lock_ms += Ms(tl0); }
+        { TlScope tl_("q.dec", l); s.atb->FinishQkv(l, jq);
+        s.atb->DecodeJob(jq, nTot, 3072, QKV.data()); }
       }
       g_t_qkv += Ms(tq0);
     }
@@ -647,7 +667,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
         const auto tcC1 = Clock::now();
         s.atb->ExecConvOut(l, jco, true);
         g_t_cout += Ms(tcC1);
-        g_t_conv += Ms(tcv0);
+        g_t_conv += Ms(tcv0); TlAdd("conv", l, tcv0);
         conv_done([&] { s.atb->FinishConvOut(l, jco); });
         s.atb->DecodeJob(jco, nTot, 2048, Br.data());
         finish_all(Br.data());
@@ -705,21 +725,30 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       const auto tcC = Clock::now();
       s.atb->RunConvOut(l, CY.data(), nTot, Br.data());
       g_t_cout += Ms(tcC);
-      g_t_conv += Ms(tcv0);
+      g_t_conv += Ms(tcv0); TlAdd("conv", l, tcv0);
       conv_done([] {});
       finish_all(Br.data());
       }
     }
     const bool ordered_append = (seg == 0 || seg == 1) && defer && !big_conv;
-    for (std::uint32_t o = 0; !big_conv && o < nTot; o += 64) {
-    const std::uint32_t n = std::min<std::uint32_t>(64, nTot - o);
+    const std::uint32_t blk = defer_any ? 512u : 64u;
+    for (std::uint32_t o = 0; !big_conv && o < nTot; o += blk) {
+    const std::uint32_t n = std::min<std::uint32_t>(blk, nTot - o);
     const bool use64 = s.m64 && (n > 16 || nTot > 64);
     lpos = pos0 + o;
-    std::vector<float> x(X.begin() + std::size_t{o} * H, X.begin() + std::size_t{o + n} * H),
-        z(x.size()), z2(x.size()), branch(x.size()), qkv(std::size_t{n} * 3072),
-        attn(std::size_t{n} * qd);
+    const bool lite = big_attn && defer_any;
+    std::vector<float> x, z, z2, branch, qkv, attn;
+    if (!lite) {
+      x.assign(X.begin() + std::size_t{o} * H, X.begin() + std::size_t{o + n} * H);
+      z.resize(x.size()); z2.resize(x.size()); branch.resize(x.size());
+      qkv.resize(std::size_t{n} * 3072);
+      attn.resize(std::size_t{n} * qd);
+    }
+    const float* zsrc = lite ? Z.data() + std::size_t{o} * H : z.data();
+    const float* qkvsrc = lite ? QKV.data() + std::size_t{o} * 3072 : qkv.data();
     { const auto tn0 = Clock::now();
-    if (big_attn) std::copy(Z.begin() + std::size_t{o} * H, Z.begin() + std::size_t{o + n} * H, z.begin());
+    if (lite) {}
+    else if (big_attn) std::copy(Z.begin() + std::size_t{o} * H, Z.begin() + std::size_t{o + n} * H, z.begin());
     else RmsNorm(x.data(), static_cast<const float*>(lw.norm.data), z.data(), n, H, c.eps);
     g_t_norm += Ms(tn0); }
     s.t_cpu += Ms(cpu0);
@@ -770,7 +799,8 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
             cpu0 = Clock::now();
     } else {
       { const auto tq0 = Clock::now();
-      if (big_attn) std::copy(QKV.begin() + std::size_t{o} * 3072, QKV.begin() + std::size_t{o + n} * 3072, qkv.begin());
+      if (lite) {}
+      else if (big_attn) std::copy(QKV.begin() + std::size_t{o} * 3072, QKV.begin() + std::size_t{o + n} * 3072, qkv.begin());
       else s.rt.Gemm(use64 ? s.pQkv64[l] : s.pQkv[l], s.m_qkv[l], z.data(), n, qkv.data(), &s.tim);
       g_t_qkv += Ms(tq0); }
             cpu0 = Clock::now();
@@ -782,15 +812,15 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       const auto tp0 = Clock::now();
       std::vector<float> q(std::size_t{n} * qd), k(std::size_t{n} * kvd), v(std::size_t{n} * kvd), gate(std::size_t{n} * heads);
       for (std::uint32_t t = 0; t < n; ++t) {
-        std::memcpy(&q[std::size_t{t} * qd], &qkv[std::size_t{t} * 3072], qd * 4);
-        std::memcpy(&k[std::size_t{t} * kvd], &qkv[std::size_t{t} * 3072 + qd], kvd * 4);
-        std::memcpy(&v[std::size_t{t} * kvd], &qkv[std::size_t{t} * 3072 + qd + kvd], kvd * 4);
+        std::memcpy(&q[std::size_t{t} * qd], &qkvsrc[std::size_t{t} * 3072], qd * 4);
+        std::memcpy(&k[std::size_t{t} * kvd], &qkvsrc[std::size_t{t} * 3072 + qd], kvd * 4);
+        std::memcpy(&v[std::size_t{t} * kvd], &qkvsrc[std::size_t{t} * 3072 + qd + kvd], kvd * 4);
       }
 #pragma omp parallel for collapse(2)
       for (std::int64_t t = 0; t < n; ++t)
         for (std::uint32_t h = 0; h < heads; ++h) {
           float sum = 0;
-          const float* zr = &z[std::size_t(t) * H];
+          const float* zr = &zsrc[std::size_t(t) * H];
           const float* gw = &s.gate_w[l][std::size_t{h} * H];
           for (std::uint32_t i = 0; i < H; ++i) sum += gw[i] * zr[i];
           gate[std::size_t(t) * heads + h] = sum;
@@ -828,7 +858,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
           s.v_cache[l][std::size_t{slot} * kvd + i] = Bf16Bits(v[std::size_t{t} * kvd + i]);
         }
       }
-      g_t_prep += Ms(tp0);
+      g_t_prep += Ms(tp0); TlAdd("prep", l, tp0);
       const auto ta0 = Clock::now();
       bool npu_done = false;
       if (defer_any) {
@@ -1057,16 +1087,18 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
                             ATT.data() + std::size_t{o} * qd});
         std::function<void(std::size_t)> app = [&](std::size_t pi) {
           const std::uint32_t o = static_cast<std::uint32_t>(pi) * 128, n2 = std::min(128u, nTot - o);
-          for (std::uint32_t t = 0; t < n2; ++t) {
+#pragma omp parallel for
+          for (std::int32_t t = 0; t < static_cast<std::int32_t>(n2); ++t) {
             const std::size_t slot = (pos0 + o + t) % s.capacity[l];
             for (std::uint32_t i = 0; i < kvd; ++i) {
               s.k_cache[l][slot * kvd + i] = Bf16Bits(KALL[std::size_t{o + t} * kvd + i]);
               s.v_cache[l][slot * kvd + i] = Bf16Bits(VALL[std::size_t{o + t} * kvd + i]);
             }
           }
-          for (std::uint32_t o2 = 0; o2 < n2; o2 += 16)
+#pragma omp parallel for schedule(static, 1)
+          for (std::int32_t o2 = 0; o2 < static_cast<std::int32_t>(n2); o2 += 16)
             s.rt.AttnAppend(s.m_attn[l], pos0 + o + o2, std::min(16u, n2 - o2),
-                            KALL.data() + std::size_t{o + o2} * kvd, s.v_cache[l].data(), &s.tim);
+                            KALL.data() + std::size_t{o + o2} * kvd, s.v_cache[l].data(), nullptr);
         };
         many_ok = s.apre->RunMany(s.m_attn[l], passes.data(), passes.size(), s.k_cache[l].data(),
                                   s.v_cache[l].data(), &s.tim, defer_sw ? &app : nullptr);
@@ -1100,7 +1132,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
           float* o = &ATT[std::size_t(t) * qd + h * hd];
           for (std::uint32_t d = 0; d < hd; ++d) o[d] *= g;
         }
-      g_t_attn_npu += Ms(ta1);
+      g_t_attn_npu += Ms(ta1); TlAdd("attn", l, ta1);
     }
     }
     if (seg == 0 || seg == 3) {
@@ -1114,8 +1146,8 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
         s.atb->FinishO(l, jo);
         s.atb->DecodeJob(jo, nTot, 2048, Br.data());
       }
-      g_t_oproj += Ms(to0);
-      finish_all(Br.data());
+      g_t_oproj += Ms(to0); TlAdd("oproj", l, to0);
+      { TlScope tl_("finish", l); finish_all(Br.data()); }
     }
     if (s.atb && nTot > 64) {
       gufo::npu::runtime::FfnAtbChain::Job jf;
@@ -1127,7 +1159,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       s.atb->FinishFfn(l, jf);
       const auto tf2 = Clock::now();
       s.atb->DecodeJob(jf, nTot, 2048, Br.data());
-      g_f_enc += std::chrono::duration<double, std::milli>(tf1 - tf0).count();
+      TlAdd("ffn.enc", l, tf0); g_f_enc += std::chrono::duration<double, std::milli>(tf1 - tf0).count();
       g_f_exe += std::chrono::duration<double, std::milli>(tf2 - tf1).count();
       g_f_dec += Ms(tf2);
     } else {
@@ -1147,7 +1179,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
 #pragma omp parallel for
       for (std::int64_t i = 0; i < static_cast<std::int64_t>(X.size()); ++i) X[i] += Br[i];
     }
-    g_t_post += Ms(tpost0);
+    g_t_post += Ms(tpost0); TlAdd("post", l, tpost0);
     if (std::getenv("GUFO_NANCHK")) {
       bool bad=false; for(size_t i=0;i<X.size()&&!bad;++i) if(!(X[i]==X[i])) bad=true;
       if(bad) { std::fprintf(stderr,"[nan] after layer %zu pos=%u\n", l, lpos); }
@@ -1238,6 +1270,8 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
             s.rt.AttnAppend(s.m_attn[l], cs.pos0 + o + o2, std::min(16u, n2 - o2),
                             cs.KALL.data() + std::size_t{o + o2} * kvd, s.v_cache[l].data(), nullptr);
         };
+        const auto tra_ = Clock::now();
+        struct RmEnd { std::size_t l; Clock::time_point t; ~RmEnd() { TlAdd("attnrun", l, t); } } rm_{l, tra_};
         if (s.apre->RunMany(s.m_attn[l], passes.data(), passes.size(), s.k_cache[l].data(), s.v_cache[l].data(),
                             &s.tim, ring ? &app : nullptr))
           for (auto& cs : css) cs.attn_done = true;
@@ -1256,6 +1290,10 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
   }
   s.pending = nTot;
   s.t_cpu += Ms(cpu0);
+  if (g_tl_on) {
+    std::sort(g_tl.begin(), g_tl.end(), [](const TlEv& a, const TlEv& b) { return a.a < b.a; });
+    for (const auto& e : g_tl) if (e.l < 6) std::fprintf(stderr, "[tl] L%zu %-8s %7.2f -> %7.2f (%.2f)\n", e.l, e.n, e.a, e.b, e.b - e.a);
+  }
   if (std::getenv("GUFO_ATB_STATS")) {
     std::fprintf(stderr, "[wall] conv-layers %.0f attn A %.0f B %.0f C %.0f ms\n", g_w_conv, g_w_a, g_w_b, g_w_c);
     std::fprintf(stderr, "[busy] device-held: conv %.0f/%.0f  A %.0f/%.0f  B %.0f/%.0f  C %.0f/%.0f ms (held/wall)\n", g_busy[0], g_w_conv, g_busy[1], g_w_a, g_busy[2], g_w_b, g_busy[3], g_w_c);
