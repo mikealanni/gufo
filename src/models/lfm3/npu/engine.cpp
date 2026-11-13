@@ -494,7 +494,7 @@ void Engine::Reset() {
 std::uint32_t Engine::Position() const { return impl_->pos; }
 std::uint32_t Engine::PrefillRows() const { return impl_->atb ? gufo::npu::runtime::FfnAtbChain::kM * SuperChunks() : (impl_->m64 ? kMaxRows : 16); }
 
-static double g_w_conv, g_w_a, g_w_b, g_w_c;
+static double g_w_conv, g_w_a, g_w_b, g_w_c, g_f_enc, g_f_exe, g_f_dec;
 static double g_t_post, g_t_fin, g_t_cin, g_t_cmid, g_t_cout, g_t_norm, g_t_prep, g_t_attn_npu, g_t_attn_cpu, g_t_resid, g_t_conv, g_t_qkv, g_t_oproj;
 bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hidden) {
   Impl& s = *impl_;
@@ -1039,7 +1039,29 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     if (seg == 0 || seg == 2) {
     if (defer_any) {
       const auto ta1 = Clock::now();
-      for (std::uint32_t o = 0; o < nTot; o += 128) {
+      bool many_ok = false;
+      {
+        std::vector<gufo::npu::runtime::AttnPrefill::Pass> passes;
+        for (std::uint32_t o = 0; o < nTot; o += 128)
+          passes.push_back({pos0 + o, std::min(128u, nTot - o), QALL.data() + std::size_t{o} * qd,
+                            ATT.data() + std::size_t{o} * qd});
+        std::function<void(std::size_t)> app = [&](std::size_t pi) {
+          const std::uint32_t o = static_cast<std::uint32_t>(pi) * 128, n2 = std::min(128u, nTot - o);
+          for (std::uint32_t t = 0; t < n2; ++t) {
+            const std::size_t slot = (pos0 + o + t) % s.capacity[l];
+            for (std::uint32_t i = 0; i < kvd; ++i) {
+              s.k_cache[l][slot * kvd + i] = Bf16Bits(KALL[std::size_t{o + t} * kvd + i]);
+              s.v_cache[l][slot * kvd + i] = Bf16Bits(VALL[std::size_t{o + t} * kvd + i]);
+            }
+          }
+          for (std::uint32_t o2 = 0; o2 < n2; o2 += 16)
+            s.rt.AttnAppend(s.m_attn[l], pos0 + o + o2, std::min(16u, n2 - o2),
+                            KALL.data() + std::size_t{o + o2} * kvd, s.v_cache[l].data(), &s.tim);
+        };
+        many_ok = s.apre->RunMany(s.m_attn[l], passes.data(), passes.size(), s.k_cache[l].data(),
+                                  s.v_cache[l].data(), &s.tim, defer_sw ? &app : nullptr);
+      }
+      for (std::uint32_t o = 0; !many_ok && o < nTot; o += 128) {
         const std::uint32_t n2 = std::min(128u, nTot - o);
         if (defer_sw) {
           for (std::uint32_t t = 0; t < n2; ++t) {
@@ -1085,9 +1107,15 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     }
     if (s.atb && nTot > 64) {
       gufo::npu::runtime::FfnAtbChain::Job jf;
+      const auto tf0 = Clock::now();
       s.atb->EncodeJob(Z.data(), nTot, 2048, jf);
+      const auto tf1 = Clock::now();
       { std::lock_guard<std::mutex> g_(npu_mu); s.atb->ExecFfn(l, jf); }
+      const auto tf2 = Clock::now();
       s.atb->DecodeJob(jf, nTot, 2048, Br.data());
+      g_f_enc += std::chrono::duration<double, std::milli>(tf1 - tf0).count();
+      g_f_exe += std::chrono::duration<double, std::milli>(tf2 - tf1).count();
+      g_f_dec += Ms(tf2);
     } else {
       std::lock_guard<std::mutex> g_(npu_mu);
       if (s.m64 && nTot > 16)
@@ -1172,6 +1200,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
   s.t_cpu += Ms(cpu0);
   if (std::getenv("GUFO_ATB_STATS")) {
     std::fprintf(stderr, "[wall] conv-layers %.0f attn A %.0f B %.0f C %.0f ms\n", g_w_conv, g_w_a, g_w_b, g_w_c);
+    std::fprintf(stderr, "[ffn] enc %.0f exec %.0f dec %.0f ms\n", g_f_enc, g_f_exe, g_f_dec);
     std::fprintf(stderr, "[conv] in %.0f mid %.0f out %.0f post %.0f fin %.0f ms\n", g_t_cin, g_t_cmid, g_t_cout, g_t_post, g_t_fin);
     if (s.atb) std::fprintf(stderr, "[conv] device conv dispatch %.0f ms\n", s.atb->cvdev_ms);
     if (s.atb) std::fprintf(stderr, "[conv] split in: enc %.0f dev %.0f dec %.0f | out: enc %.0f dev %.0f dec %.0f ms (all conv layers)\n", s.atb->acc_[0][0], s.atb->acc_[0][1], s.atb->acc_[0][2], s.atb->acc_[1][0], s.atb->acc_[1][1], s.atb->acc_[1][2]);

@@ -1,6 +1,8 @@
 #ifndef GUFO_NPU_RUNTIME_HPP_
 #define GUFO_NPU_RUNTIME_HPP_
 
+#include <functional>
+#include <tuple>
 #include <immintrin.h>
 #include <xrt/xrt_bo.h>
 #include <xrt/xrt_device.h>
@@ -308,17 +310,34 @@ class AttnPrefill {
   bool Run(AttnLayer& al, std::uint32_t pos0, std::uint32_t n, const float* q, const std::uint16_t* k_hist,
            const std::uint16_t* v_hist, float* out, NpuRuntime::Timings* tm);
 
+  struct Pass {
+    std::uint32_t pos0, n;
+    const float* q;
+    float* out;
+  };
+  /// Several independent passes of one layer (history already complete): host prep of pass i+1 and the merge of
+  /// pass i overlap the device run of the neighbouring pass. Returns false if any pass cannot run.
+  /// pre(i) (optional) runs before pass i is prepared; when it is set the prep of pass i+1 waits for pass i
+  /// (ring layers append history per pass) and only the merge overlaps the device.
+  bool RunMany(AttnLayer& al, const Pass* passes, std::size_t np, const std::uint16_t* k_hist,
+               const std::uint16_t* v_hist, NpuRuntime::Timings* tm,
+               const std::function<void(std::size_t)>* pre = nullptr);
+
  private:
+  bool Prep(int slot, AttnLayer& al, std::uint32_t pos0, std::uint32_t n, const float* q,
+            const std::uint16_t* k_hist, const std::uint16_t* v_hist, std::uint32_t* mc_out);
+  bool Launch(int slot, AttnLayer& al, std::uint32_t mc, xrt::run** run_out);
+  bool Merge(int slot, std::uint32_t n, float* out);
   std::string dir_;
   xrt::device dev_;
   xrt::hw_context ctx_;
   xrt::kernel kern_;
   bool ready_{false};
-  xrt::bo a_, c_;
-  std::uint8_t* ah_{};
-  std::uint8_t* ch_{};
+  xrt::bo a_[2], c_[2];
+  std::uint8_t* ah_[2]{};
+  std::uint8_t* ch_[2]{};
   std::unordered_map<std::uint32_t, std::pair<xrt::bo, std::size_t>> insts_;
-  std::map<std::pair<const AttnLayer*, std::uint32_t>, xrt::run> runs_;
+  std::map<std::tuple<const AttnLayer*, std::uint32_t, int>, xrt::run> runs_;
 };
 
 }  // namespace gufo::npu::runtime
