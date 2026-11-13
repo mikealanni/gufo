@@ -1398,11 +1398,12 @@ bool AttnPrefill::Run(AttnLayer& al, std::uint32_t pos0, std::uint32_t n, const 
   rit->second.wait();
   c_.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
   if (tm) { tm->attn_wait += Ms(t_start); t_start = Clock::now(); }
-  bool ok = true;
-  for (std::uint32_t c = 0; c < 8; ++c) {
-    const std::uint32_t nc = 16 * c >= n ? 0 : std::min(16u, n - 16 * c);
-    if (nc == 0) continue;
-    for (std::uint32_t r = 0; r < kAttnKvh; ++r) {
+  int bad = 0;
+#pragma omp parallel for collapse(2) reduction(+ : bad)
+  for (std::int32_t c = 0; c < 8; ++c) {
+    for (std::int32_t r = 0; r < static_cast<std::int32_t>(kAttnKvh); ++r) {
+      const std::uint32_t nc = 16 * c >= n ? 0 : std::min(16u, n - 16 * c);
+      if (nc == 0) continue;
       float tot[34 * 256];
       for (std::uint32_t i = 0; i < kAttnOutElems; ++i)
         std::memcpy(tot + std::size_t{i} * 256, ch_ + ((std::size_t{c} * kAttnOutElems + i) * 4 + r) * kRowBytes, 1024);
@@ -1414,7 +1415,7 @@ bool AttnPrefill::Run(AttnLayer& al, std::uint32_t pos0, std::uint32_t n, const 
         const std::uint32_t rb = i / 8, rib = i % 8;
         float l = 0;
         for (int cc = 0; cc < 8; ++cc) l += lt[rb * 64 + rib * 8 + cc];
-        if (!(l > 1e-30f) || !(l < 1e30f)) { ok = false; continue; }
+        if (!(l > 1e-30f) || !(l < 1e30f)) { ++bad; continue; }
         const float inv = 1.0f / l;
         for (std::uint32_t db = 0; db < 16; ++db)
           for (int cc = 0; cc < 8; ++cc)
@@ -1424,7 +1425,7 @@ bool AttnPrefill::Run(AttnLayer& al, std::uint32_t pos0, std::uint32_t n, const 
     }
   }
   if (tm) { tm->attn_merge += Ms(t_start); ++tm->attn_calls; }
-  return ok;
+  return bad == 0;
 }
 
 }  // namespace gufo::npu::runtime

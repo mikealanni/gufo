@@ -990,7 +990,8 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
                             s.programs_dir, ATT.data() + std::size_t{o + o2} * qd, &s.tim);
         if (!ok) std::fprintf(stderr, "prefill attention failed (layer %zu pos %u)\n", l, pos0 + o);
       }
-      for (std::uint32_t t = 0; t < nTot; ++t)
+#pragma omp parallel for
+      for (std::int64_t t = 0; t < nTot; ++t)
         for (std::uint32_t h = 0; h < heads; ++h) {
           const float g = 1.0f / (1.0f + std::exp(-GATE[std::size_t(t) * heads + h]));
           float* o = &ATT[std::size_t(t) * qd + h * hd];
