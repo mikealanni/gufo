@@ -49,7 +49,7 @@ int main(int argc, char** argv) {
     else if (k == "--context") opt.context = std::stoul(v);
   }
   if (!std::getenv("OMP_NUM_THREADS"))
-    omp_set_num_threads(8);
+    omp_set_num_threads(12);
   std::string err;
   auto engine = Engine::Create(opt, &err);
   if (!engine) {

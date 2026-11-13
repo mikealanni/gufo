@@ -521,7 +521,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
   std::vector<ChunkState> css(nChunks);
   std::mutex npu_mu, tick_mu;
   std::condition_variable tick_cv;
-  std::uint32_t conv_turn = 0, app_turn = 0;
+  std::vector<std::uint32_t> conv_turn(c.layers.size(), 0), app_turn(c.layers.size(), 0);
   for (std::uint32_t ci = 0; ci < nChunks; ++ci) {
     ChunkState& cs = css[ci];
     cs.row0 = ci * kChunk;
@@ -533,8 +533,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       DecodeRow(s.w->embedding, tokens[cs.row0 + i], std::span<float>(&cs.X[std::size_t{i} * H], H));
   }
   auto cpu0 = Clock::now();
-  for (std::size_t l = 0; l < c.layers.size(); ++l) {
-  const auto layer_run = [&](ChunkState& cs, int seg) {
+  const auto layer_run = [&](ChunkState& cs, int seg, std::size_t l) {
     const std::uint32_t nTot = cs.n;
     const std::uint32_t pos0 = cs.pos0;
     std::uint32_t lpos = pos0;
@@ -610,14 +609,14 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       std::unique_lock<std::mutex> cvlk;
       {
         std::unique_lock<std::mutex> tl(tick_mu);
-        tick_cv.wait(tl, [&] { return conv_turn == ci_; });
+        tick_cv.wait(tl, [&] { return conv_turn[l] == ci_; });
       }
       cvlk = std::unique_lock<std::mutex>(npu_mu);
       const auto tcl0 = Clock::now();
       const auto conv_done = [&] {
         g_lock_ms += Ms(tcl0);
         cvlk.unlock();
-        { std::lock_guard<std::mutex> tl(tick_mu); ++conv_turn; }
+        { std::lock_guard<std::mutex> tl(tick_mu); ++conv_turn[l]; }
         tick_cv.notify_all();
       };
       const auto tcA = Clock::now();
@@ -1033,12 +1032,12 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     if (ordered_append) {
       {
         std::unique_lock<std::mutex> tl(tick_mu);
-        tick_cv.wait(tl, [&] { return app_turn == ci_; });
+        tick_cv.wait(tl, [&] { return app_turn[l] == ci_; });
       }
       for (std::uint32_t o2 = 0; o2 < nTot; o2 += 16)
         s.rt.AttnAppend(s.m_attn[l], pos0 + o2, std::min(16u, nTot - o2), KALL.data() + std::size_t{o2} * kvd,
                         s.v_cache[l].data(), &s.tim);
-      { std::lock_guard<std::mutex> tl(tick_mu); ++app_turn; }
+      { std::lock_guard<std::mutex> tl(tick_mu); ++app_turn[l]; }
       tick_cv.notify_all();
     }
     }
@@ -1153,49 +1152,55 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     }
     }
   };
-  const bool attn_layer = c.layers[l] != LayerType::kConvolution;
-  conv_turn = 0;
-  app_turn = 0;
+  const std::size_t NL = c.layers.size();
   static const bool par_env = !(std::getenv("GUFO_PAR") && std::atoi(std::getenv("GUFO_PAR")) == 0);
   bool par_ok = par_env && nChunks > 1 && s.atb;
   for (auto& cs : css) par_ok = par_ok && cs.n > 64;
-  const auto run_par = [&](int seg) {
-    if (!par_ok) {
-      for (auto& cs : css) layer_run(cs, seg);
-      return;
-    }
-    const int saved_threads = omp_get_max_threads();
-    static const int nw = std::getenv("GUFO_PAR_WORKERS") ? std::max(2, std::atoi(std::getenv("GUFO_PAR_WORKERS"))) : 4;
-    std::atomic<std::uint32_t> next{0};
-    const auto worker = [&] {
-      omp_set_num_threads(saved_threads / nw > 0 ? saved_threads / nw : 1);
-      for (;;) {
-        const std::uint32_t i = next.fetch_add(1);
-        if (i >= nChunks) break;
-        layer_run(css[i], seg);
-      }
-    };
-    std::vector<std::thread> ts;
-    for (int w = 1; w < nw; ++w) ts.emplace_back(worker);
-    worker();
-    for (auto& t : ts) t.join();
-    omp_set_num_threads(saved_threads);
-  };
   const auto busy_now = [&] { return g_lock_ms + s.tim.attn_wait; };
-  if (!attn_layer || nChunks == 1) {
+  struct Stage { std::size_t l; int seg; };
+  std::vector<Stage> stages;
+  for (std::size_t l = 0; l < NL; ++l) {
+    if (c.layers[l] == LayerType::kConvolution || nChunks == 1) stages.push_back({l, 0});
+    else { stages.push_back({l, 1}); stages.push_back({l, 2}); stages.push_back({l, 3}); }
+  }
+  const auto run_group = [&](const Stage* st, std::size_t ns) {
     const auto tw = Clock::now();
     const double b0 = busy_now();
-    run_par(0);
+    if (!par_ok) {
+      for (std::size_t k = 0; k < ns; ++k)
+        for (auto& cs : css) layer_run(cs, st[k].seg, st[k].l);
+    } else {
+      const int saved_threads = omp_get_max_threads();
+      static const int nw = std::getenv("GUFO_PAR_WORKERS") ? std::max(2, std::atoi(std::getenv("GUFO_PAR_WORKERS"))) : 4;
+      std::atomic<std::uint32_t> next{0};
+      const auto worker = [&] {
+        omp_set_num_threads(saved_threads / nw > 0 ? saved_threads / nw : 1);
+        for (;;) {
+          const std::uint32_t i = next.fetch_add(1);
+          if (i >= nChunks) break;
+          for (std::size_t k = 0; k < ns; ++k) layer_run(css[i], st[k].seg, st[k].l);
+        }
+      };
+      std::vector<std::thread> ts;
+      for (int w = 1; w < nw; ++w) ts.emplace_back(worker);
+      worker();
+      for (auto& t : ts) t.join();
+      omp_set_num_threads(saved_threads);
+    }
     g_w_conv += Ms(tw);
     g_busy[0] += busy_now() - b0;
-  } else {
-    auto tw = Clock::now();
-    double b0 = busy_now();
-    run_par(1);
-    g_w_a += Ms(tw);
-    g_busy[1] += busy_now() - b0;
-    tw = Clock::now();
-    b0 = busy_now();
+  };
+  for (std::size_t si = 0; si < stages.size();) {
+    if (stages[si].seg != 2) {
+      std::size_t sj = si;
+      while (sj < stages.size() && stages[sj].seg != 2 && (par_ok || sj == si)) ++sj;
+      run_group(&stages[si], sj - si);
+      si = sj;
+      continue;
+    }
+    const std::size_t l = stages[si].l;
+    const auto tw = Clock::now();
+    const double b0 = busy_now();
     if (s.apre && s.m_attn[l].host && s.atb->HasAttn(l)) {
       bool eligible = true;
       for (auto& cs : css) eligible = eligible && cs.n > 64;
@@ -1230,15 +1235,10 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
           for (auto& cs : css) cs.attn_done = true;
       }
     }
-    for (auto& cs : css) layer_run(cs, 2);
+    for (auto& cs : css) layer_run(cs, 2, l);
     g_w_b += Ms(tw);
     g_busy[2] += busy_now() - b0;
-    tw = Clock::now();
-    b0 = busy_now();
-    run_par(3);
-    g_w_c += Ms(tw);
-    g_busy[3] += busy_now() - b0;
-  }
+    ++si;
   }
   s.pos = pos0;
   if (hidden) {
