@@ -34,9 +34,11 @@ def main():
     argparser.add_argument("-k", type=int, default=0)
     argparser.add_argument("-n", type=int, default=0)
     argparser.add_argument("--mode", default="gemm")
+    argparser.add_argument("--noff", type=int, default=0)
+    argparser.add_argument("--a2", type=int, default=0)
     args = argparser.parse_args()
     with mlir_mod_ctx() as ctx:
-        my_matmul(args.M, args.K, args.N, args.m, args.k, args.n, args.mode)
+        my_matmul(args.M, args.K, args.N, args.m, args.k, args.n, args.mode, args.noff, args.a2)
         print(ctx.module)
 
 
@@ -44,7 +46,7 @@ import os
 RESH_R = int(os.environ.get("RESH_R", "15"))
 
 
-def my_matmul(M, K, N, m, k, n, mode="gemm"):
+def my_matmul(M, K, N, m, k, n, mode="gemm", noff=0, a2=0):
 
     DIV = 4
     n_aie_cols = 8
@@ -200,6 +202,7 @@ def my_matmul(M, K, N, m, k, n, mode="gemm"):
             )
 
         set_k = external_func("set_k", inputs=[np.int32], link_with=f"mm_{m}x{k}x{n}.o")
+        set_swi = external_func("set_swi", inputs=[np.int32], link_with=f"mm_{m}x{k}x{n}.o")
         resh = external_func(
             "swi_half", inputs=[B_l1_ty, C_l1_ty, np.int32], link_with=f"mm_{m}x{k}x{n}.o"
         )
@@ -242,6 +245,7 @@ def my_matmul(M, K, N, m, k, n, mode="gemm"):
                         cva = arith.index_cast(T.index(), memref.load(rtps[row][col], [i3]))
                         cvp = arith.index_cast(T.index(), memref.load(rtps[row][col], [i4]))
                         set_k(kk_i32)
+                        set_swi(arith.index_cast(T.i32(), arith.index_cast(T.index(), memref.load(rtps[row][col], [i4]))))
                         for _ in range_(gr):
                             elem_out = C_l1l2_fifos[row][col].acquire(
                                 ObjectFifoPort.Produce, 1
@@ -405,11 +409,11 @@ def my_matmul(M, K, N, m, k, n, mode="gemm"):
 
         else:
             @runtime_sequence(
-                np.ndarray[(M * K // 8,), np.dtype[dtype_in]],
+                np.ndarray[((2 * M * K // 8) if a2 else (M * K // 8),), np.dtype[dtype_in]],
                 np.ndarray[
                     (K * N // 8,), np.dtype[v8bfp16ebs8]
                 ],  # B0 for core1 (odd columns)
-                np.ndarray[(M * N // 8,), np.dtype[dtype_out]],
+                np.ndarray[((2 * M * 7680 // 8) if mode == "swigu" else (M * N // 8),), np.dtype[dtype_out]],
             )
             def sequence(A, B, C):
                 for row in range(n_aie_rows):
@@ -418,7 +422,7 @@ def my_matmul(M, K, N, m, k, n, mode="gemm"):
                         npu_rtp_write(f"rtp_{row}_{col}", 1, (M // m) * (N // n) // (n_aie_cols * n_aie_rows))
                         npu_rtp_write(f"rtp_{row}_{col}", 2, 0)
                         npu_rtp_write(f"rtp_{row}_{col}", 3, 0)
-                        npu_rtp_write(f"rtp_{row}_{col}", 4, 0)
+                        npu_rtp_write(f"rtp_{row}_{col}", 4, 1 if mode == "swigu" else 0)
                         set_lock_value(rtp_locks[row][col], 1)
 
                 if enable_tracing:
@@ -446,10 +450,19 @@ def my_matmul(M, K, N, m, k, n, mode="gemm"):
                     # Create A tasks for this group (4 tasks per group)
                     a_base_idx = (group_idx // num_col_tile) * n_aie_rows
                     for row in range(n_aie_rows):
+                        if a2:
+                            a_tap = TensorAccessPattern(
+                                (1, 2 * M * K // 8),
+                                (a_base_idx + row) * (K // 64) * 2048,
+                                [K // 64 // 8, 8, 4, 256],
+                                [8 * 2048, 2048, 256, 1],
+                            )
+                        else:
+                            a_tap = A_taps[a_base_idx + row]
                         a_task = shim_dma_single_bd_task(
                             A_l3l2_fifos[row],
                             A,
-                            tap=A_taps[a_base_idx + row],
+                            tap=a_tap,
                             issue_token=False,
                         )
                         dma_start_task(a_task)
@@ -470,10 +483,20 @@ def my_matmul(M, K, N, m, k, n, mode="gemm"):
                     # Create C output tasks for this group (8 tasks per group)
                     c_base_idx = group_idx * 8
                     for col in range(n_aie_cols):
+                        if mode == "swigu":
+                            gm, gn = group_idx // num_col_tile, group_idx % num_col_tile
+                            c_tap = TensorAccessPattern(
+                                (1, 2 * M * 7680 // 8),
+                                (((4 * gm) * 120 + noff + gn * 8 + col) * 2) * 1024,
+                                [1, 4, 8, 256],
+                                [0, 240 * 1024, 256, 1],
+                            )
+                        else:
+                            c_tap = C_taps[c_base_idx + col]
                         c_task = shim_dma_single_bd_task(
                             C_l2l3_fifos[col],
                             C,
-                            tap=C_taps[c_base_idx + col],
+                            tap=c_tap,
                             issue_token=True,
                         )
                         dma_start_task(c_task)

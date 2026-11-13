@@ -115,6 +115,22 @@ __attribute__((always_inline)) static inline aie::accum<accfloat, 64> silu_mul(
 
 
 
+__attribute__((always_inline)) static inline aie::accum<accfloat, 64> silu_mul_bf(
+    const aie::vector<bfloat16, 64> &gb, const aie::vector<bfloat16, 64> &ub) {
+  const aie::vector<bfloat16, 64> half = aie::broadcast<bfloat16, 64>((bfloat16)0.5f);
+  const aie::accum<accfloat, 64> ah = aie::mul(gb, half);
+  const aie::vector<bfloat16, 64> th = aie::tanh<bfloat16>(ah.template to_vector<float>());
+  aie::accum<accfloat, 64> as = aie::accum<accfloat, 64>(half);
+  as = aie::mac(as, th, half);
+  const aie::vector<bfloat16, 64> sig = as.template to_vector<bfloat16>();
+  aie::accum<accfloat, 64> sa = aie::mul(gb, sig);
+  const aie::vector<bfloat16, 64> silu = sa.template to_vector<bfloat16>();
+  return aie::mul(silu, ub);
+}
+
+static int g_swi = 0;
+void set_swi(int f) { g_swi = f; }
+
 static int g_counter = 0;
 
 static int k_counter = 0;
@@ -513,7 +529,23 @@ void matmul_vectorized_bfp16(bfp16ebs8 *__restrict pA, bfp16ebs8 *__restrict pB,
     }
   }
 
-  if (k_counter == k_flush) { // // K / k  *  DIV
+  if (k_counter == k_flush && g_swi) {
+    k_counter = 0;
+    ::aie::set_rounding(::aie::rounding_mode::floor);
+    aie::block_vector_output_buffer_stream<bfp16ebs8, 64> os(pC_bfp16);
+    os.seek(0);
+    const bfloat16 *src = (const bfloat16 *)pC_bfp16;
+    for (int i = 0; i < 64; i++) {
+      const aie::vector<bfloat16, 64> gv = aie::load_v<64>(src + i * 128);
+      const aie::vector<bfloat16, 64> uv = aie::load_v<64>(src + i * 128 + 64);
+      os.push(silu_mul_bf(gv, uv).template to_vector<bfp16ebs8>());
+    }
+    for (int i = 0; i < 64; i++) {
+      const aie::vector<bfloat16, 64> gv = aie::load_v<64>(c_bf16_2nd_half + i * 128);
+      const aie::vector<bfloat16, 64> uv = aie::load_v<64>(c_bf16_2nd_half + i * 128 + 64);
+      os.push(silu_mul_bf(gv, uv).template to_vector<bfp16ebs8>());
+    }
+  } else if (k_counter == k_flush) { // // K / k  *  DIV
     k_counter = 0;
     // inplace convert the first half BF16 to pC_bfp16
     aie::block_vector_output_buffer_stream<bfp16ebs8, 64> pCOut_stream_first(

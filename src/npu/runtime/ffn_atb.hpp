@@ -49,6 +49,25 @@ class FfnAtbChain {
     l->wqa = gu_.PackWeightAtb(wsa.data(), 2 * kNa, kHid, 4);
     l->wqb = gu_.PackWeightAtb(wsb.data(), 2 * kNb, kHid, 4);
     l->wd = dnp_->PackWeightAtb(down, kHid, kInt, 4);
+    if (kd_ && !std::getenv("GUFO_NO_SWIFUSE") && swifuse_ok_) {
+      l->fused = true;
+      const std::size_t abytes = std::size_t{kM} * kInt / 8 * 9;
+      l->swc = gu_.MakeBo(2 * abytes, 3);
+      std::memset(l->swc.map<void*>(), 0, 2 * abytes);
+      l->swc.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      l->qa = gu_.MakeProgram(kHid, 2 * kNa, dir_ + "/" + ip_ + "swi_a_1024x2048x8192.txt", 64, err, 0, mrows, 3, 5);
+      l->qb = gu_.MakeProgram(kHid, 2 * kNb, dir_ + "/" + ip_ + "swi_b_1024x2048x7168.txt", 64, err, 0, mrows, 3, 5);
+      l->qa.c = l->swc;
+      l->qa.ch = l->swc.map<std::uint8_t*>();
+      l->qb.c = l->swc;
+      l->qb.ch = l->qa.ch;
+      l->dn = dnp_->MakeProgram(kInt, kHid, dir_ + "/" + ip_ + "dn2_1024x7680x2048.txt", std::size_t{kM} * kHid / 8 * 9, err, 0,
+                                mrows, 3, 5);
+      dnp_->RebindA(l->dn, l->swc);
+      dnp_->WeightSlot(l->wd, l->dn);
+      layers_.push_back(std::move(l));
+      return err == nullptr || err->empty();
+    }
     l->qa = gu_.MakeProgram(kHid, 2 * kNa, dir_ + "/" + ip_ + "1024x2048x8192.txt",
                             std::size_t{kM} * 2 * kNa / 8 * 9, err, 0, mrows, 3, 5);
     l->qb = gu_.MakeProgram(kHid, 2 * kNb, dir_ + "/" + ip_ + "1024x2048x7168.txt",
@@ -87,7 +106,7 @@ class FfnAtbChain {
       Layer& l = *lp;
       Dispatch(gu_, l.wqa, l.qa);
       Dispatch(gu_, l.wqb, l.qb);
-      Dispatch(*swp_, l.fake, l.sw);
+      if (!l.fused) Dispatch(*swp_, l.fake, l.sw);
       Dispatch(*dnp_, l.wd, l.dn);
     }
     for (auto& cp : conv_) {
@@ -256,8 +275,7 @@ class FfnAtbChain {
     if (dbg_) std::fprintf(stderr, "[atb] %s\n", "wqb");
     Dispatch(gu_, l.wqb, l.qb);
     const auto d2 = std::chrono::steady_clock::now();
-    if (dbg_) std::fprintf(stderr, "[atb] %s\n", "fake");
-    Dispatch(*swp_, l.fake, l.sw);
+    if (!l.fused) Dispatch(*swp_, l.fake, l.sw);
     const auto d3 = std::chrono::steady_clock::now();
     if (dbg_) std::fprintf(stderr, "[atb] %s\n", "wd");
     Dispatch(*dnp_, l.wd, l.dn);
@@ -297,6 +315,8 @@ class FfnAtbChain {
   struct Layer {
     Program qa, qb, sw, dn;
     WeightBuffer wqa, wqb, wd, fake;
+    xrt::bo swc;
+    bool fused{false};
   };
 
   struct Attn {
@@ -355,6 +375,7 @@ class FfnAtbChain {
   NpuRuntime* dnp_{&dn_};
   NpuRuntime* swp_{&sw_};
   bool kd_{false};
+  bool swifuse_ok_{true};
   bool dbg_{std::getenv("GUFO_ATB_DBG") != nullptr};
   std::string ip_{"insts_atb_"};
   std::vector<std::unique_ptr<Layer>> layers_;
