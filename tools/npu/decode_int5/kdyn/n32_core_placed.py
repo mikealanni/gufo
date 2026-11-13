@@ -14,7 +14,7 @@ from aie.dialects.aiex import v8bfp16ebs8
 from aie.dialects import arith, memref
 from aie.extras import types as T
 import aie.utils.trace as trace_utils
-from aie.helpers.taplib import TensorTiler2D
+from aie.helpers.taplib import TensorTiler2D, TensorAccessPattern
 from aie.helpers.dialects.scf import _for as range_
 
 
@@ -33,13 +33,18 @@ def main():
     argparser.add_argument("-m", type=int, default=0)
     argparser.add_argument("-k", type=int, default=0)
     argparser.add_argument("-n", type=int, default=0)
+    argparser.add_argument("--mode", default="gemm")
     args = argparser.parse_args()
     with mlir_mod_ctx() as ctx:
-        my_matmul(args.M, args.K, args.N, args.m, args.k, args.n)
+        my_matmul(args.M, args.K, args.N, args.m, args.k, args.n, args.mode)
         print(ctx.module)
 
 
-def my_matmul(M, K, N, m, k, n):
+import os
+RESH_R = int(os.environ.get("RESH_R", "15"))
+
+
+def my_matmul(M, K, N, m, k, n, mode="gemm"):
 
     DIV = 4
     n_aie_cols = 8
@@ -195,7 +200,10 @@ def my_matmul(M, K, N, m, k, n):
             )
 
         set_k = external_func("set_k", inputs=[np.int32], link_with=f"mm_{m}x{k}x{n}.o")
-        rtp_ty = np.ndarray[(2,), np.dtype[np.int32]]
+        resh = external_func(
+            "swi_half", inputs=[B_l1_ty, C_l1_ty, np.int32], link_with=f"mm_{m}x{k}x{n}.o"
+        )
+        rtp_ty = np.ndarray[(3,), np.dtype[np.int32]]
         rtps = [[None] * n_aie_cols for _ in range(n_aie_rows)]
         rtp_locks = [[None] * n_aie_cols for _ in range(n_aie_rows)]
         for row in range(n_aie_rows):
@@ -215,9 +223,12 @@ def my_matmul(M, K, N, m, k, n):
                         i1 = arith.constant(T.index(), 1)
                         kk_i32 = memref.load(rtps[row][col], [i0])
                         gr_i32 = memref.load(rtps[row][col], [i1])
+                        i2 = arith.constant(T.index(), 2)
+                        rr_i32 = memref.load(rtps[row][col], [i2])
                         use_lock(rtp_locks[row][col], LockAction.Release, value=1)
                         kk = arith.index_cast(T.index(), kk_i32)
                         gr = arith.index_cast(T.index(), gr_i32)
+                        rr = arith.index_cast(T.index(), rr_i32)
                         set_k(kk_i32)
                         for _ in range_(gr):
                             elem_out = C_l1l2_fifos[row][col].acquire(
@@ -236,108 +247,176 @@ def my_matmul(M, K, N, m, k, n):
                                     A_l2l1_fifos[row].release(ObjectFifoPort.Consume, 1)
                                 B_l2l1_fifos[col].release(ObjectFifoPort.Consume, 1)
                             C_l1l2_fifos[row][col].release(ObjectFifoPort.Produce, 1)
+                        for _ in range_(rr):
+                            elem_out = C_l1l2_fifos[row][col].acquire(
+                                ObjectFifoPort.Produce, 1
+                            )
+                            for j in range(16):
+                                elem_in_b = B_l2l1_fifos[col].acquire(
+                                    ObjectFifoPort.Consume, 1
+                                )
+                                if 4 * row <= j < 4 * row + 4:
+                                    jj = j - 4 * row
+                                    off = (jj // 2) * 1024 + (jj % 2) * 512
+                                    resh(elem_in_b, elem_out, arith.constant(T.i32(), off))
+                                B_l2l1_fifos[col].release(ObjectFifoPort.Consume, 1)
+                            C_l1l2_fifos[row][col].release(ObjectFifoPort.Produce, 1)
 
         # To/from AIE-array data movement
-        @runtime_sequence(
-            np.ndarray[(M * K // 8,), np.dtype[dtype_in]],
-            np.ndarray[
-                (K * N // 8,), np.dtype[v8bfp16ebs8]
-            ],  # B0 for core1 (odd columns)
-            np.ndarray[(M * N // 8,), np.dtype[dtype_out]],
-        )
-        def sequence(A, B, C):
-            for row in range(n_aie_rows):
-                for col in range(n_aie_cols):
-                    npu_rtp_write(f"rtp_{row}_{col}", 0, K // k)
-                    npu_rtp_write(f"rtp_{row}_{col}", 1, (M // m) * (N // n) // (n_aie_cols * n_aie_rows))
-                    set_lock_value(rtp_locks[row][col], 1)
+        if mode == "resh":
+            def lin(full, offset, nblk):
+                return TensorAccessPattern((1, full), offset, [1, 1, 1, nblk], [0, 0, 0, 1])
 
-            if enable_tracing:
-                trace_utils.configure_packet_tracing_aie2(
-                    tiles_to_trace,
-                    shim_tile_trace,
-                    trace_size,
-                )
-            # flat input (not correct, buf faster)
-            A_taps = TensorTiler2D.group_tiler((1, M * K // 8), (1, m * K // 8), (1, 1))
-            B_taps = TensorTiler2D.group_tiler((1, N * K // 8), (1, n * K // 8), (1, 1))
-            C_taps = TensorTiler2D.group_tiler(
-                (1, M * N // 8), (1, n_aie_rows * m * n // 8), (1, 1)
+            @runtime_sequence(
+                np.ndarray[(M * 1024,), np.dtype[dtype_in]],
+                np.ndarray[(M * 896,), np.dtype[dtype_in]],
+                np.ndarray[(M * 960,), np.dtype[dtype_out]],
             )
-            # Multi-group task lists for managing DMA IDs
-            num_row_tile = M // m // n_aie_rows
-            num_col_tile = N // n // n_aie_cols
-            num_groups = num_row_tile * num_col_tile
-            tb_max_n_rows = 4
-            input_task_groups = [[] for _ in range(tb_max_n_rows)]
-            output_task_groups = [[] for _ in range(tb_max_n_rows)]
-
-            # Create tasks for all groups using loops
-            for group_idx in range(num_groups):
-                # Create A tasks for this group (4 tasks per group)
-                a_base_idx = (group_idx // num_col_tile) * n_aie_rows
+            def sequence_resh(A, B, C):
                 for row in range(n_aie_rows):
-                    a_task = shim_dma_single_bd_task(
-                        A_l3l2_fifos[row],
-                        A,
-                        tap=A_taps[a_base_idx + row],
-                        issue_token=False,
+                    for col in range(n_aie_cols):
+                        npu_rtp_write(f"rtp_{row}_{col}", 0, 0)
+                        npu_rtp_write(f"rtp_{row}_{col}", 1, 0)
+                        npu_rtp_write(f"rtp_{row}_{col}", 2, RESH_R)
+                        set_lock_value(rtp_locks[row][col], 1)
+                for rd in range(RESH_R):
+                    outs, allins = [], []
+                    for half in range(2):
+                        ins = []
+                        for c in range(8):
+                            mt = c
+                            for w in range(half * 4, half * 4 + 4):
+                                kt = rd * 8 + w
+                                if kt < 64:
+                                    T_ = ((mt >> 2) * 8 + (kt >> 3)) * 32 + (kt & 7) * 4 + (mt & 3)
+                                    it = shim_dma_single_bd_task(
+                                        B_l3l2_fifos[c], A, tap=lin(M * 1024, T_ * 2048, 2048),
+                                        issue_token=True)
+                                else:
+                                    k2 = kt - 64
+                                    T_ = ((mt >> 2) * 7 + (k2 >> 3)) * 32 + (k2 & 7) * 4 + (mt & 3)
+                                    it = shim_dma_single_bd_task(
+                                        B_l3l2_fifos[c], B, tap=lin(M * 896, T_ * 2048, 2048),
+                                        issue_token=True)
+                                dma_start_task(it)
+                                ins.append(it)
+                            if half == 0:
+                                ct = shim_dma_single_bd_task(
+                                    C_l2l3_fifos[c], C,
+                                    tap=lin(M * 960, (mt * 120 + rd * 8) * 1024, 8192),
+                                    issue_token=True)
+                                dma_start_task(ct)
+                                outs.append(ct)
+                        for it in ins:
+                            dma_await_task(it)
+                        allins += ins
+                    for ct in outs:
+                        dma_await_task(ct)
+                    for it in allins:
+                        dma_free_task(it)
+
+        else:
+            @runtime_sequence(
+                np.ndarray[(M * K // 8,), np.dtype[dtype_in]],
+                np.ndarray[
+                    (K * N // 8,), np.dtype[v8bfp16ebs8]
+                ],  # B0 for core1 (odd columns)
+                np.ndarray[(M * N // 8,), np.dtype[dtype_out]],
+            )
+            def sequence(A, B, C):
+                for row in range(n_aie_rows):
+                    for col in range(n_aie_cols):
+                        npu_rtp_write(f"rtp_{row}_{col}", 0, K // k)
+                        npu_rtp_write(f"rtp_{row}_{col}", 1, (M // m) * (N // n) // (n_aie_cols * n_aie_rows))
+                        npu_rtp_write(f"rtp_{row}_{col}", 2, 0)
+                        set_lock_value(rtp_locks[row][col], 1)
+
+                if enable_tracing:
+                    trace_utils.configure_packet_tracing_aie2(
+                        tiles_to_trace,
+                        shim_tile_trace,
+                        trace_size,
                     )
-                    dma_start_task(a_task)
-                    input_task_groups[group_idx % tb_max_n_rows].append(a_task)
+                # flat input (not correct, buf faster)
+                A_taps = TensorTiler2D.group_tiler((1, M * K // 8), (1, m * K // 8), (1, 1))
+                B_taps = TensorTiler2D.group_tiler((1, N * K // 8), (1, n * K // 8), (1, 1))
+                C_taps = TensorTiler2D.group_tiler(
+                    (1, M * N // 8), (1, n_aie_rows * m * n // 8), (1, 1)
+                )
+                # Multi-group task lists for managing DMA IDs
+                num_row_tile = M // m // n_aie_rows
+                num_col_tile = N // n // n_aie_cols
+                num_groups = num_row_tile * num_col_tile
+                tb_max_n_rows = 4
+                input_task_groups = [[] for _ in range(tb_max_n_rows)]
+                output_task_groups = [[] for _ in range(tb_max_n_rows)]
 
-                # Create B tasks for this group (8 tasks per group)
-                b_base_idx = (group_idx % num_col_tile) * n_aie_cols
-                for col in range(n_aie_cols):
-                    b_task = shim_dma_single_bd_task(
-                        B_l3l2_fifos[col],
-                        B,
-                        tap=B_taps[b_base_idx + col],
-                        issue_token=False,
-                    )
-                    dma_start_task(b_task)
-                    input_task_groups[group_idx % tb_max_n_rows].append(b_task)
+                # Create tasks for all groups using loops
+                for group_idx in range(num_groups):
+                    # Create A tasks for this group (4 tasks per group)
+                    a_base_idx = (group_idx // num_col_tile) * n_aie_rows
+                    for row in range(n_aie_rows):
+                        a_task = shim_dma_single_bd_task(
+                            A_l3l2_fifos[row],
+                            A,
+                            tap=A_taps[a_base_idx + row],
+                            issue_token=False,
+                        )
+                        dma_start_task(a_task)
+                        input_task_groups[group_idx % tb_max_n_rows].append(a_task)
 
-                # Create C output tasks for this group (8 tasks per group)
-                c_base_idx = group_idx * 8
-                for col in range(n_aie_cols):
-                    c_task = shim_dma_single_bd_task(
-                        C_l2l3_fifos[col],
-                        C,
-                        tap=C_taps[c_base_idx + col],
-                        issue_token=True,
-                    )
-                    dma_start_task(c_task)
-                    output_task_groups[group_idx % tb_max_n_rows].append(c_task)
-                if (group_idx % tb_max_n_rows == 1) and (group_idx != 1):
-                    dma_await_task(*output_task_groups[2])
-                    output_task_groups[2] = []
-                    dma_free_task(*input_task_groups[2])
-                    input_task_groups[2] = []
-                    dma_await_task(*output_task_groups[3])
-                    output_task_groups[3] = []
-                    dma_free_task(*input_task_groups[3])
-                    input_task_groups[3] = []
-                if group_idx % tb_max_n_rows == 3:
-                    dma_await_task(*output_task_groups[0])
-                    output_task_groups[0] = []
-                    dma_free_task(*input_task_groups[0])
-                    input_task_groups[0] = []
-                    dma_await_task(*output_task_groups[1])
-                    output_task_groups[1] = []
-                    dma_free_task(*input_task_groups[1])
-                    input_task_groups[1] = []
+                    # Create B tasks for this group (8 tasks per group)
+                    b_base_idx = (group_idx % num_col_tile) * n_aie_cols
+                    for col in range(n_aie_cols):
+                        b_task = shim_dma_single_bd_task(
+                            B_l3l2_fifos[col],
+                            B,
+                            tap=B_taps[b_base_idx + col],
+                            issue_token=False,
+                        )
+                        dma_start_task(b_task)
+                        input_task_groups[group_idx % tb_max_n_rows].append(b_task)
 
-            for _i in range(tb_max_n_rows):
-                if len(output_task_groups[_i]) > 0:
-                    dma_await_task(*output_task_groups[_i])
-                    output_task_groups[_i] = []
-                    if len(input_task_groups[_i]) > 0:
-                        dma_free_task(*input_task_groups[_i])
-                        input_task_groups[_i] = []
+                    # Create C output tasks for this group (8 tasks per group)
+                    c_base_idx = group_idx * 8
+                    for col in range(n_aie_cols):
+                        c_task = shim_dma_single_bd_task(
+                            C_l2l3_fifos[col],
+                            C,
+                            tap=C_taps[c_base_idx + col],
+                            issue_token=True,
+                        )
+                        dma_start_task(c_task)
+                        output_task_groups[group_idx % tb_max_n_rows].append(c_task)
+                    if (group_idx % tb_max_n_rows == 1) and (group_idx != 1):
+                        dma_await_task(*output_task_groups[2])
+                        output_task_groups[2] = []
+                        dma_free_task(*input_task_groups[2])
+                        input_task_groups[2] = []
+                        dma_await_task(*output_task_groups[3])
+                        output_task_groups[3] = []
+                        dma_free_task(*input_task_groups[3])
+                        input_task_groups[3] = []
+                    if group_idx % tb_max_n_rows == 3:
+                        dma_await_task(*output_task_groups[0])
+                        output_task_groups[0] = []
+                        dma_free_task(*input_task_groups[0])
+                        input_task_groups[0] = []
+                        dma_await_task(*output_task_groups[1])
+                        output_task_groups[1] = []
+                        dma_free_task(*input_task_groups[1])
+                        input_task_groups[1] = []
 
-            if enable_tracing:
-                trace_utils.gen_trace_done_aie2(shim_tile_trace)
+                for _i in range(tb_max_n_rows):
+                    if len(output_task_groups[_i]) > 0:
+                        dma_await_task(*output_task_groups[_i])
+                        output_task_groups[_i] = []
+                        if len(input_task_groups[_i]) > 0:
+                            dma_free_task(*input_task_groups[_i])
+                            input_task_groups[_i] = []
+
+                if enable_tracing:
+                    trace_utils.gen_trace_done_aie2(shim_tile_trace)
 
 
 main()
