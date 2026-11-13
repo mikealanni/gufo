@@ -352,6 +352,17 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
         s.m_qkv[l] = s.rt.PackWeight(buf.data(), 3072, 2048);;
         s.LoadRows(pre + "self_attn.o_proj.weight", lw.attn_out, buf.data(), 2048, 2048);
         s.m_out[l] = s.rt.PackWeight(buf.data(), 2048, 2048);;
+        if (s.atb) {
+          std::string aerr;
+          std::vector<float> wqkv(std::size_t{3072} * 2048);
+          s.LoadRows(pre + "self_attn.q_proj.weight", lw.q, wqkv.data(), 2048, 2048);
+          s.LoadRows(pre + "self_attn.k_proj.weight", lw.k, wqkv.data() + std::size_t{2048} * 2048, 512, 2048);
+          s.LoadRows(pre + "self_attn.v_proj.weight", lw.v, wqkv.data() + std::size_t{2560} * 2048, 512, 2048);
+          if (!s.atb->AddAttn(l, wqkv.data(), buf.data(), &aerr)) {
+            std::fprintf(stderr, "GUFO_ATB attn layer %zu: %s\n", l, aerr.c_str());
+            s.atb.reset();
+          }
+        }
         s.gate_w[l].resize(std::size_t{s.heads} * s.H);
         for (std::uint32_t h = 0; h < s.heads; ++h)
           DecodeRow(lw.attn_gate, h, std::span<float>(s.gate_w[l].data() + std::size_t{h} * s.H, s.H));
@@ -478,6 +489,28 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
   auto cpu0 = Clock::now();
   for (std::size_t l = 0; l < c.layers.size(); ++l) {
     const auto& lw = s.w->layers[l];
+    const bool big_attn = s.atb && nTot > 64 && c.layers[l] != LayerType::kConvolution && s.atb->HasAttn(l);
+    std::vector<float> QKV, ATT;
+    if (big_attn) {
+      RmsNorm(X.data(), static_cast<const float*>(lw.norm.data), Z.data(), nTot, H, c.eps);
+      QKV.resize(std::size_t{nTot} * 3072);
+      ATT.resize(std::size_t{nTot} * qd);
+      const auto tq0 = Clock::now();
+      s.atb->RunQkv(l, Z.data(), nTot, QKV.data());
+      g_t_qkv += Ms(tq0);
+    }
+    const auto finish = [&](std::uint32_t o, std::uint32_t n, std::vector<float>& x, std::vector<float>& z,
+                            std::vector<float>& z2, const float* branch) {
+      if (lw.post_norm.data) {
+        RmsNorm(branch, static_cast<const float*>(lw.post_norm.data), z2.data(), n, H, c.eps);
+        for (std::size_t i = 0; i < x.size(); ++i) x[i] += z2[i];
+      } else {
+        for (std::size_t i = 0; i < x.size(); ++i) x[i] += branch[i];
+      }
+      RmsNorm(x.data(), static_cast<const float*>(lw.ffn_norm.data), z.data(), n, H, c.eps);
+      std::copy(x.begin(), x.end(), X.begin() + std::size_t{o} * H);
+      std::copy(z.begin(), z.end(), Z.begin() + std::size_t{o} * H);
+    };
     for (std::uint32_t o = 0; o < nTot; o += 64) {
     const std::uint32_t n = std::min<std::uint32_t>(64, nTot - o);
     const bool use64 = s.m64 && (n > 16 || nTot > 64);
@@ -486,7 +519,8 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
         z(x.size()), z2(x.size()), branch(x.size()), qkv(std::size_t{n} * 3072),
         attn(std::size_t{n} * qd);
     { const auto tn0 = Clock::now();
-    RmsNorm(x.data(), static_cast<const float*>(lw.norm.data), z.data(), n, H, c.eps);
+    if (big_attn) std::copy(Z.begin() + std::size_t{o} * H, Z.begin() + std::size_t{o + n} * H, z.begin());
+    else RmsNorm(x.data(), static_cast<const float*>(lw.norm.data), z.data(), n, H, c.eps);
     g_t_norm += Ms(tn0); }
     s.t_cpu += Ms(cpu0);
     if (c.layers[l] == LayerType::kConvolution) {
@@ -536,7 +570,8 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
             cpu0 = Clock::now();
     } else {
       { const auto tq0 = Clock::now();
-      s.rt.Gemm(use64 ? s.pQkv64[l] : s.pQkv[l], s.m_qkv[l], z.data(), n, qkv.data(), &s.tim);
+      if (big_attn) std::copy(QKV.begin() + std::size_t{o} * 3072, QKV.begin() + std::size_t{o + n} * 3072, qkv.begin());
+      else s.rt.Gemm(use64 ? s.pQkv64[l] : s.pQkv[l], s.m_qkv[l], z.data(), n, qkv.data(), &s.tim);
       g_t_qkv += Ms(tq0); }
             cpu0 = Clock::now();
       const bool swa = c.layers[l] == LayerType::kSlidingAttention;
@@ -780,22 +815,26 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       }
       s.t_cpu += Ms(cpu0);
       { const auto to0 = Clock::now();
-      s.rt.Gemm(use64 ? s.pH64[l] : s.pH[l], s.m_out[l], attn.data(), n, branch.data(), &s.tim);
+      if (big_attn) std::copy(attn.begin(), attn.end(), ATT.begin() + std::size_t{o} * qd);
+      else s.rt.Gemm(use64 ? s.pH64[l] : s.pH[l], s.m_out[l], attn.data(), n, branch.data(), &s.tim);
       g_t_oproj += Ms(to0); }
     }
+    if (big_attn) { cpu0 = Clock::now(); continue; }
     cpu0 = Clock::now();
-    if (lw.post_norm.data) {
-      RmsNorm(branch.data(), static_cast<const float*>(lw.post_norm.data), z2.data(), n, H, c.eps);
-      for (std::size_t i = 0; i < x.size(); ++i) x[i] += z2[i];
-    } else {
-      for (std::size_t i = 0; i < x.size(); ++i) x[i] += branch[i];
-    }
-    RmsNorm(x.data(), static_cast<const float*>(lw.ffn_norm.data), z.data(), n, H, c.eps);
+    finish(o, n, x, z, z2, branch.data());
     s.t_cpu += Ms(cpu0);
-    std::copy(x.begin(), x.end(), X.begin() + std::size_t{o} * H);
-    std::copy(z.begin(), z.end(), Z.begin() + std::size_t{o} * H);
     }
     s.pos = pos0;
+    if (big_attn) {
+      const auto to0 = Clock::now();
+      s.atb->RunO(l, ATT.data(), nTot, Br.data());
+      g_t_oproj += Ms(to0);
+      for (std::uint32_t o = 0; o < nTot; o += 64) {
+        const std::uint32_t n = std::min<std::uint32_t>(64, nTot - o);
+        std::vector<float> x(X.begin() + std::size_t{o} * H, X.begin() + std::size_t{o + n} * H), z(x.size()), z2(x.size());
+        finish(o, n, x, z, z2, Br.data() + std::size_t{o} * H);
+      }
+    }
     if (s.atb && nTot > 64)
       s.atb->Run(l, Z.data(), nTot, Br.data());
     else if (s.m64 && nTot > 16)

@@ -57,6 +57,30 @@ class FfnAtbChain {
     return err == nullptr || err->empty();
   }
 
+  bool AddAttn(std::size_t layer, const float* qkv, const float* o, std::string* err) {
+    auto a = std::make_unique<Attn>();
+    if (attn_.size() <= layer) attn_.resize(layer + 1);
+    const std::uint32_t mrows = kM / 16;
+    a->wq = gu_.PackWeightAtb(qkv, 3072, kHid, 4);
+    a->wo = gu_.PackWeightAtb(o, kHid, kHid, 4);
+    a->pq = gu_.MakeProgram(kHid, 3072, dir_ + "/insts_atb_1024x2048x3072.txt",
+                            std::size_t{kM} * 3072 / 8 * 9, err, 0, mrows, 3, 5);
+    a->po = gu_.MakeProgram(kHid, kHid, dir_ + "/insts_atb_1024x2048x2048.txt",
+                            std::size_t{kM} * kHid / 8 * 9, err, 0, mrows, 3, 5);
+    attn_[layer] = std::move(a);
+    return err == nullptr || err->empty();
+  }
+
+  bool HasAttn(std::size_t layer) const { return layer < attn_.size() && attn_[layer] != nullptr; }
+
+  /// Both run on the K=2048 context shared with the gate/up GEMM. n <= 1024 rows.
+  void RunQkv(std::size_t layer, const float* z, std::uint32_t n, float* y) {
+    Gemm1024(*attn_[layer], true, z, n, kHid, 3072, y);
+  }
+  void RunO(std::size_t layer, const float* a, std::uint32_t n, float* y) {
+    Gemm1024(*attn_[layer], false, a, n, kHid, kHid, y);
+  }
+
   /// z: n x 2048 floats (n <= 1024). y: n x 2048 floats.
   void Run(std::size_t layer, const float* z, std::uint32_t n, float* y) {
     Layer& l = *layers_[layer];
@@ -112,6 +136,34 @@ class FfnAtbChain {
     WeightBuffer wqa, wqb, wd, fake;
   };
 
+  struct Attn {
+    Program pq, po;
+    WeightBuffer wq, wo;
+  };
+
+  void Gemm1024(Attn& a, bool qkv, const float* z, std::uint32_t n, std::uint32_t k, std::uint32_t nout,
+                float* y) {
+    Program& p = qkv ? a.pq : a.po;
+    WeightBuffer& w = qkv ? a.wq : a.wo;
+    const float* src = z;
+    if (n < kM) {
+      pad_.assign(std::size_t{kM} * k, 0.f);
+      std::memcpy(pad_.data(), z, std::size_t{n} * k * 4);
+      src = pad_.data();
+    }
+    gu_.EncodeAAtb(src, kM, k, p);
+    p.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    Dispatch(gu_, w, p);
+    p.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    if (n == kM) {
+      gu_.DecodeCAtb(y, kM, nout, p);
+    } else {
+      out_.resize(std::size_t{kM} * nout);
+      gu_.DecodeCAtb(out_.data(), kM, nout, p);
+      std::memcpy(y, out_.data(), std::size_t{n} * nout * 4);
+    }
+  }
+
   static void Dispatch(NpuRuntime& r, WeightBuffer& w, Program& p) {
     WeightBuffer& ww = r.WeightSlot(w, p);
     ww.run.start();
@@ -126,6 +178,7 @@ class FfnAtbChain {
   std::string dir_;
   NpuRuntime gu_, dn_, sw_;
   std::vector<std::unique_ptr<Layer>> layers_;
+  std::vector<std::unique_ptr<Attn>> attn_;
   std::vector<float> pad_, out_;
 };
 
