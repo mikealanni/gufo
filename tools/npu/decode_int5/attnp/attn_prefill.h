@@ -30,4 +30,21 @@ __attribute__((noinline)) static void AttnFeedP(const uint8_t *pB) {
   if (tokbase <= a_pos + a_n - 1) AttnChunk(tokbase);
 }
 
+// Whole 4608 B chunk element (K then V^T) consumed in place from the broadcast fifo.
+__attribute__((noinline)) static void AttnFeedP2(const uint8_t *pB) {
+  const int slot = a_chunk_idx++;
+  int tokbase;
+  if (a_win) {
+    const int d = a_tab[slot];
+    if (d < 0) return;
+    tokbase = (a_qhi - d) * 16;
+  } else {
+    tokbase = slot * 16;
+    if (tokbase > a_pos + a_n - 1) return;
+  }
+  a_kvp = pB;
+  AttnChunk(tokbase);
+  a_kvp = a_chunk;
+}
+
 #endif

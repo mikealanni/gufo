@@ -22,8 +22,13 @@ constexpr int kAttnDimBlocks = 16;  // 128 dims
 
 alignas(128) bfp16ebs8 a_q[kAttnRowBlocks * 16 * 8];       // [rb][ks] blocks of 8 groups
 // a_chunk and a_o live in the shared arena (attn-only state; gemm dispatches alias a_o).
+#ifdef ATTN_ARENA_COMPACT
+uint8_t *const a_chunk = (uint8_t *)(arena + 35840);       // K (256 groups) then V^T (256 groups)
+float *const a_o = (float *)(arena + 3072);                // PV accumulator
+#else
 uint8_t *const a_chunk = (uint8_t *)(arena + 37888);       // K (256 groups) then V^T (256 groups)
 float *const a_o = (float *)(arena + 5120);                // PV accumulator
+#endif
 static float *const a_m = (float *)(arena + 0);       // 64 rows
 static int32_t *const a_hi = (int32_t *)(arena + 256);  // last token visible to the streamed (finalized-V) path
 static int32_t *const a_pp = (int32_t *)(arena + 512);  // row position (last token visible to the tail path)
@@ -97,48 +102,64 @@ __attribute__((noinline)) static void AttnQ(const uint8_t *pA, int idx, int row_
   CopyBytes(dst, pA, 1152);
 }
 
-__attribute__((noinline)) static void AttnChunk(int tokbase) {
-  const bfp16ebs8 *kv = (const bfp16ebs8 *)a_chunk;
+static const uint8_t *a_kvp = a_chunk;  // chunk source: the arena copy, or the fifo element in place (prefill)
+
+// Softmax part of one row block: exp, masks, row sums, bfp-encode of P.
+__attribute__((always_inline)) static inline void ChunkP(int rb, int tokbase, const aie::accum<accfloat, 64> &s0,
+                                                         const aie::accum<accfloat, 64> &s1,
+                                                         aie::block_vector<bfp16ebs8, 64> &pb0,
+                                                         aie::block_vector<bfp16ebs8, 64> &pb1) {
   const aie::vector<int32, 64> col = LaneCol();
   const aie::vector<bfloat16, 64> ones = aie::broadcast<bfloat16, 64>((bfloat16)1.0f);
   const aie::vector<bfloat16, 64> zero = aie::zeros<bfloat16, 64>();
-  for (int rb = 0; rb < kAttnRowBlocks; rb++) {
-    aie::block_vector_input_buffer_stream<bfp16ebs8, 64> qs(a_q);
-    qs.seek(rb * 16);
+  const aie::vector<float, 64> mv = RepEach8<float>(aie::load_v<8>(a_m + rb * 8));
+  aie::vector<bfloat16, 64> p0 = Exp2Wide(aie::sub(s0.template to_vector<float>(), mv));
+  aie::vector<bfloat16, 64> p1 = Exp2Wide(aie::sub(s1.template to_vector<float>(), mv));
+  const aie::vector<int32, 64> rel =
+      aie::sub(RepEach8<int32>(aie::load_v<8>(a_hi + rb * 8)), aie::broadcast<int32, 64>(tokbase));
+  p0 = aie::select(zero, p0, aie::ge(rel, col));
+  p1 = aie::select(zero, p1, aie::ge(rel, aie::add(col, aie::broadcast<int32, 64>(8))));
+  if (a_win) {
+    const aie::vector<int32, 64> flo =
+        aie::sub(RepEach8<int32>(aie::load_v<8>(a_lo + rb * 8)), aie::broadcast<int32, 64>(tokbase));
+    p0 = aie::select(zero, p0, aie::ge(col, flo));
+    p1 = aie::select(zero, p1, aie::ge(aie::add(col, aie::broadcast<int32, 64>(8)), flo));
+  }
+  aie::accum<accfloat, 64> la(aie::load_v<64>(a_l + rb * 64));
+  la = aie::mac(la, p0, ones);
+  la = aie::mac(la, p1, ones);
+  aie::store_v(a_l + rb * 64, la.template to_vector<float>());
+  aie::accum<accfloat, 64> pa0(p0), pa1(p1);
+  pb0 = pa0.template to_vector<bfp16ebs8>();
+  pb1 = pa1.template to_vector<bfp16ebs8>();
+}
+
+__attribute__((noinline)) static void AttnChunk(int tokbase) {
+  const bfp16ebs8 *kv = (const bfp16ebs8 *)a_kvp;
+  for (int rb = 0; rb < kAttnRowBlocks; rb += 2) {
+    aie::block_vector_input_buffer_stream<bfp16ebs8, 64> qa(a_q);
+    aie::block_vector_input_buffer_stream<bfp16ebs8, 64> qb(a_q);
+    qa.seek(rb * 16);
+    qb.seek((rb + 1) * 16);
     aie::block_vector_input_buffer_stream<bfp16ebs8, 64> k0(kv);
     aie::block_vector_input_buffer_stream<bfp16ebs8, 64> k1(kv);
     k0.seek(0);
     k1.seek(16);
-    aie::accum<accfloat, 64> s0 = aie::zeros<accfloat, 64>();
-    aie::accum<accfloat, 64> s1 = aie::zeros<accfloat, 64>();
+    aie::accum<accfloat, 64> s0a = aie::zeros<accfloat, 64>(), s1a = aie::zeros<accfloat, 64>();
+    aie::accum<accfloat, 64> s0b = aie::zeros<accfloat, 64>(), s1b = aie::zeros<accfloat, 64>();
     for (int ks = 0; ks < 16; ks++) {
-      aie::block_vector<bfp16ebs8, 64> a = qs.pop();
       aie::block_vector<bfp16ebs8, 64> b0 = k0.pop();
       aie::block_vector<bfp16ebs8, 64> b1 = k1.pop();
-      s0 = mac_8x8_8x8T(a, b0, s0);
-      s1 = mac_8x8_8x8T(a, b1, s1);
+      aie::block_vector<bfp16ebs8, 64> xa = qa.pop();
+      aie::block_vector<bfp16ebs8, 64> xb = qb.pop();
+      s0a = mac_8x8_8x8T(xa, b0, s0a);
+      s1a = mac_8x8_8x8T(xa, b1, s1a);
+      s0b = mac_8x8_8x8T(xb, b0, s0b);
+      s1b = mac_8x8_8x8T(xb, b1, s1b);
     }
-    const aie::vector<float, 64> mv = RepEach8<float>(aie::load_v<8>(a_m + rb * 8));
-    aie::vector<bfloat16, 64> p0 = Exp2Wide(aie::sub(s0.template to_vector<float>(), mv));
-    aie::vector<bfloat16, 64> p1 = Exp2Wide(aie::sub(s1.template to_vector<float>(), mv));
-    const aie::vector<int32, 64> rel =
-        aie::sub(RepEach8<int32>(aie::load_v<8>(a_hi + rb * 8)), aie::broadcast<int32, 64>(tokbase));
-    p0 = aie::select(zero, p0, aie::ge(rel, col));
-    p1 = aie::select(zero, p1, aie::ge(rel, aie::add(col, aie::broadcast<int32, 64>(8))));
-    // window floor: drop keys strictly before this row's window
-    if (a_win) {
-      const aie::vector<int32, 64> flo =
-          aie::sub(RepEach8<int32>(aie::load_v<8>(a_lo + rb * 8)), aie::broadcast<int32, 64>(tokbase));
-      p0 = aie::select(zero, p0, aie::ge(col, flo));
-      p1 = aie::select(zero, p1, aie::ge(aie::add(col, aie::broadcast<int32, 64>(8)), flo));
-    }
-    aie::accum<accfloat, 64> la(aie::load_v<64>(a_l + rb * 64));
-    la = aie::mac(la, p0, ones);
-    la = aie::mac(la, p1, ones);
-    aie::store_v(a_l + rb * 64, la.template to_vector<float>());
-    aie::accum<accfloat, 64> pa0(p0), pa1(p1);
-    aie::block_vector<bfp16ebs8, 64> pb0 = pa0.template to_vector<bfp16ebs8>();
-    aie::block_vector<bfp16ebs8, 64> pb1 = pa1.template to_vector<bfp16ebs8>();
+    aie::block_vector<bfp16ebs8, 64> pa0, pa1, pc0, pc1;
+    ChunkP(rb, tokbase, s0a, s1a, pa0, pa1);
+    ChunkP(rb + 1, tokbase, s0b, s1b, pc0, pc1);
     aie::block_vector_input_buffer_stream<bfp16ebs8, 64> v0(kv);
     aie::block_vector_input_buffer_stream<bfp16ebs8, 64> v1(kv);
     v0.seek(32);
@@ -146,11 +167,16 @@ __attribute__((noinline)) static void AttnChunk(int tokbase) {
     for (int db = 0; db < kAttnDimBlocks; db++) {
       aie::block_vector<bfp16ebs8, 64> vb0 = v0.pop();
       aie::block_vector<bfp16ebs8, 64> vb1 = v1.pop();
-      float *op = a_o + (rb * kAttnDimBlocks + db) * 64;
-      aie::accum<accfloat, 64> o(aie::load_v<64>(op));
-      o = mac_8x8_8x8T(pb0, vb0, o);
-      o = mac_8x8_8x8T(pb1, vb1, o);
-      aie::store_v(op, o.template to_vector<float>());
+      float *opa = a_o + (rb * kAttnDimBlocks + db) * 64;
+      float *opb = a_o + ((rb + 1) * kAttnDimBlocks + db) * 64;
+      aie::accum<accfloat, 64> oa(aie::load_v<64>(opa));
+      aie::accum<accfloat, 64> ob(aie::load_v<64>(opb));
+      oa = mac_8x8_8x8T(pa0, vb0, oa);
+      ob = mac_8x8_8x8T(pc0, vb0, ob);
+      oa = mac_8x8_8x8T(pa1, vb1, oa);
+      ob = mac_8x8_8x8T(pc1, vb1, ob);
+      aie::store_v(opa, oa.template to_vector<float>());
+      aie::store_v(opb, ob.template to_vector<float>());
     }
   }
 }

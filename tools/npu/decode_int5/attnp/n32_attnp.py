@@ -36,13 +36,14 @@ def design(m, k, n, mc):
     def device_body():
         B_l2_ty = np.ndarray[(ROWS * BQ,), np.dtype[np.uint8]]
         B_l1_ty = np.ndarray[(BQ,), np.dtype[np.uint8]]
+        B_chunk_ty = np.ndarray[(3 * BQ,), np.dtype[np.uint8]]
         C_l1_ty = np.ndarray[(CB,), np.dtype[np.uint8]]
         C_l2_ty = np.ndarray[(ROWS * CB,), np.dtype[np.uint8]]
         lw = f"mm_{m}x{k}x{n}.o"
         attn_begin = external_func("attn_begin_p", inputs=[B_l1_ty], link_with=lw)
         attn_q = external_func("attn_q_p", inputs=[B_l1_ty, np.int32], link_with=lw)
         attn_tail = external_func("attn_tail_p", inputs=[B_l1_ty, np.int32], link_with=lw)
-        attn_feed = external_func("attn_feed_p", inputs=[B_l1_ty], link_with=lw)
+        attn_feed = external_func("attn_feed_p", inputs=[B_chunk_ty], link_with=lw)
         attn_out = external_func("attn_out", inputs=[C_l1_ty, np.int32], link_with=lw)
 
         tiles = [[tile(col, row) for col in range(COLS)] for row in range(ROWS + 2)]
@@ -56,7 +57,7 @@ def design(m, k, n, mc):
             B_l3l2[col] = object_fifo(f"B_L3L2_{col}", shim_tiles[col], mem_tiles[col], 2, B_l2_ty)
             for row in range(ROWS):
                 B_l2l1[row][col] = object_fifo(
-                    f"B_L2L1_{col}_{row}", mem_tiles[col], core_tiles[row][col], 2, B_l1_ty
+                    f"B_L2L1_{col}_{row}", mem_tiles[col], core_tiles[row][col], 1, B_l1_ty
                 )
             object_fifo_link(
                 B_l3l2[col], [B_l2l1[row][col] for row in range(ROWS)], [], [BQ * row for row in range(ROWS)]
@@ -70,6 +71,10 @@ def design(m, k, n, mc):
                 [C_l1l2[row][col] for row in range(ROWS)], C_l2l3[col], [CB * row for row in range(ROWS)], []
             )
 
+        BC = [
+            object_fifo(f"BC_{r}", shim_tiles[r], [core_tiles[r][c] for c in range(COLS)], 2, B_chunk_ty)
+            for r in range(ROWS)
+        ]
         rtp_ty = np.ndarray[(1,), np.dtype[np.int32]]
         rtps = [[None] * COLS for _ in range(ROWS)]
         rtp_locks = [[None] * COLS for _ in range(ROWS)]
@@ -101,9 +106,9 @@ def design(m, k, n, mc):
                             attn_tail(e, arith.index_cast(T.i32(), ti))
                             B_l2l1[row][col].release(ObjectFifoPort.Consume, 1)
                         for _ in range_(feeds):
-                            e = B_l2l1[row][col].acquire(ObjectFifoPort.Consume, 1)
+                            e = BC[row].acquire(ObjectFifoPort.Consume, 1)
                             attn_feed(e)
-                            B_l2l1[row][col].release(ObjectFifoPort.Consume, 1)
+                            BC[row].release(ObjectFifoPort.Consume, 1)
                         for oi in range_(OUT_ELEMS):
                             o = C_l1l2[row][col].acquire(ObjectFifoPort.Produce, 1)
                             attn_out(o, arith.index_cast(T.i32(), oi))
@@ -124,7 +129,7 @@ def design(m, k, n, mc):
         def sequence(A, B, C):
             for row in range(ROWS):
                 for col in range(COLS):
-                    npu_rtp_write(f"rtp_{row}_{col}", 0, 3 * mc)
+                    npu_rtp_write(f"rtp_{row}_{col}", 0, mc)
                     set_lock_value(rtp_locks[row][col], 1)
             in_tasks, c_tasks = [], []
             for col in range(COLS):
@@ -133,13 +138,13 @@ def design(m, k, n, mc):
                 )
                 in_tasks.append(shim_dma_single_bd_task(B_l3l2[col], A, tap=p_tap, issue_token=False))
                 dma_start_task(in_tasks[-1])
+            for r in range(ROWS):
                 for bi in range(n_bd):
                     inner = min(per_bd, mc - bi * per_bd)
                     b_tap = TensorAccessPattern(
-                        (1, b_total), bi * per_bd * CHUNK, [1, inner, CHUNK // 1024, 1024],
-                        [1, CHUNK, 1024, 1],
+                        (1, b_total), bi * per_bd * CHUNK + r * BQ, [1, inner, 3, BQ], [0, CHUNK, ROWS * BQ, 1]
                     )
-                    in_tasks.append(shim_dma_single_bd_task(B_l3l2[col], B, tap=b_tap, issue_token=False))
+                    in_tasks.append(shim_dma_single_bd_task(BC[r], B, tap=b_tap, issue_token=False))
                     dma_start_task(in_tasks[-1])
             for col in range(COLS):
                 c_tap = TensorAccessPattern((1, c_total), col * c_per_col, [1, 1, 1, c_per_col], [0, 0, 0, 1])
