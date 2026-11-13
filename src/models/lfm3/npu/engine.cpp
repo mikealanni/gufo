@@ -723,7 +723,8 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
           for (std::uint32_t i = 0; i < H; ++i) sum += gw[i] * zr[i];
           gate[std::size_t(t) * heads + h] = sum;
         }
-      for (std::uint32_t t = 0; t < n; ++t) {
+#pragma omp parallel for
+      for (std::int64_t t = 0; t < n; ++t) {
         float cs[64], sn[64];
         {
           const float position = static_cast<float>(s.pos + t);
