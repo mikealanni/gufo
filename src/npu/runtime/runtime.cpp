@@ -1,3 +1,4 @@
+#include <immintrin.h>
 #include "src/npu/runtime/runtime.hpp"
 #include "src/npu/runtime/atb_layout.hpp"
 
@@ -354,31 +355,22 @@ constexpr std::uint32_t kAtbBlkBytes = 8 * 9;  // 72
 
 // v8bfp16ebs8 encoder for one 8-value block (AIE2p truncation semantics).
 inline void EncodeBlock8(const float* x, std::uint8_t* out) {
-  std::uint32_t u[8];
-  std::uint32_t max_exp = 0;
-  for (int i = 0; i < 8; ++i) {
-    std::memcpy(&u[i], x + i, 4);
-    const std::uint32_t e = (u[i] >> 23) & 0xFFu;
-    max_exp = e > max_exp ? e : max_exp;
-  }
-  out[0] = static_cast<std::uint8_t>(max_exp);
-  for (int i = 0; i < 8; ++i) {
-    const std::uint32_t sign = u[i] & 0x80000000u;
-    const std::uint32_t exp = (u[i] >> 23) & 0xFFu;
-    std::uint32_t mant = u[i] & 0x007FFFFFu;
-    if (exp) mant |= 0x00800000u;
-    if (exp >= 255) {
-      out[1 + i] = 0;
-      continue;
-    }
-    mant = sign ? (~mant + 1u) : mant;
-    std::uint8_t v = static_cast<std::uint8_t>(mant >> 17);
-    std::int8_t sv = static_cast<std::int8_t>(v);
-    if (max_exp - exp >= 32)
-      out[1 + i] = sign ? 0xFF : 0x00;
-    else
-      out[1 + i] = static_cast<std::uint8_t>(sv >> (max_exp - exp));
-  }
+  const __m256i u = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x));
+  const __m256i ex = _mm256_and_si256(_mm256_srli_epi32(u, 23), _mm256_set1_epi32(0xFF));
+  __m256i m = _mm256_max_epu32(ex, _mm256_shuffle_epi32(ex, 0xB1));
+  m = _mm256_max_epu32(m, _mm256_shuffle_epi32(m, 0x4E));
+  m = _mm256_max_epu32(m, _mm256_permute2x128_si256(m, m, 1));
+  out[0] = static_cast<std::uint8_t>(_mm256_cvtsi256_si32(m));
+  __m256i mant = _mm256_and_si256(u, _mm256_set1_epi32(0x007FFFFF));
+  const __m256i hasexp = _mm256_cmpgt_epi32(ex, _mm256_setzero_si256());
+  mant = _mm256_or_si256(mant, _mm256_and_si256(hasexp, _mm256_set1_epi32(0x00800000)));
+  const __m256i sgn = _mm256_srai_epi32(u, 31);
+  mant = _mm256_sub_epi32(_mm256_xor_si256(mant, sgn), sgn);
+  __m256i sv = _mm256_srai_epi32(_mm256_slli_epi32(_mm256_srli_epi32(mant, 17), 24), 24);
+  const __m256i dsh = _mm256_sub_epi32(m, ex);
+  sv = _mm256_blendv_epi8(_mm256_srav_epi32(sv, dsh), sgn, _mm256_cmpgt_epi32(dsh, _mm256_set1_epi32(31)));
+  sv = _mm256_andnot_si256(_mm256_cmpeq_epi32(ex, _mm256_set1_epi32(255)), sv);
+  _mm_storel_epi64(reinterpret_cast<__m128i*>(out + 1), _mm256_cvtepi32_epi8(sv));
 }
 
 // Decode one 8-value block into dst[0..7].
@@ -389,8 +381,8 @@ inline float BlockScale(std::uint8_t e) {
 }
 inline void DecodeBlock8(const std::uint8_t* in, float* dst) {
   const float mult = BlockScale(in[0]);
-  for (int i = 0; i < 8; ++i)
-    dst[i] = static_cast<float>(static_cast<std::int8_t>(in[1 + i])) * mult;
+  const __m256i v = _mm256_cvtepi8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(in + 1)));
+  _mm256_storeu_ps(dst, _mm256_mul_ps(_mm256_cvtepi32_ps(v), _mm256_set1_ps(mult)));
 }
 }  // namespace
 
