@@ -474,6 +474,11 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
   }
 }
 
+static std::uint32_t SuperChunks() {
+  static const std::uint32_t v = std::getenv("GUFO_SUPER") ? static_cast<std::uint32_t>(std::atoi(std::getenv("GUFO_SUPER"))) : 4;
+  return v < 1 ? 1 : v;
+}
+
 void Engine::Reset() {
   Impl& s = *impl_; s.pos = 0;
   for (auto& cl : s.m_conv) if (cl.hidden) s.rt.ConvReset(cl);
@@ -483,7 +488,7 @@ void Engine::Reset() {
   for (auto& v : s.v_cache) std::fill(v.begin(), v.end(), std::uint16_t{0});
 }
 std::uint32_t Engine::Position() const { return impl_->pos; }
-std::uint32_t Engine::PrefillRows() const { return impl_->atb ? gufo::npu::runtime::FfnAtbChain::kM : (impl_->m64 ? kMaxRows : 16); }
+std::uint32_t Engine::PrefillRows() const { return impl_->atb ? gufo::npu::runtime::FfnAtbChain::kM * SuperChunks() : (impl_->m64 ? kMaxRows : 16); }
 
 static double g_t_post, g_t_fin, g_t_cin, g_t_cmid, g_t_cout, g_t_norm, g_t_prep, g_t_attn_npu, g_t_attn_cpu, g_t_resid, g_t_conv, g_t_qkv, g_t_oproj;
 bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hidden) {
@@ -493,16 +498,37 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
   // m64 prefill (WP10): 17..64 rows run on the m64 programs; EncodeA zero-pads and
   // DecodeC skips rows >= n, so n need not be a multiple of 16.
   if (nTot == 0 || s.pos + nTot > s.opt.context) return false;
-  const std::uint32_t max_rows = s.atb ? gufo::npu::runtime::FfnAtbChain::kM : 64;
+  const std::uint32_t max_rows = s.atb ? gufo::npu::runtime::FfnAtbChain::kM * SuperChunks() : 64;
   if (nTot > max_rows || (nTot > 16 && !s.m64)) return false;
   const std::uint32_t pos0 = s.pos;
   const std::uint32_t H = s.H, I = s.I, hd = s.hd, heads = s.heads, kvh = s.kvh, kvd = s.kvd, qd = s.qd;
-  std::vector<float> X(std::size_t{nTot} * H), Z(X.size()), Z2(X.size()), Br(X.size());
-  for (std::uint32_t i = 0; i < nTot; ++i)
-    DecodeRow(s.w->embedding, tokens[i], std::span<float>(&X[std::size_t{i} * H], H));
+  const std::uint32_t kChunk = 1024;
+  const std::uint32_t nChunks = (nTot + kChunk - 1) / kChunk;
+  struct ChunkState {
+    std::vector<float> X, Z, Z2, Br, QKV, ATT, QALL, GATE, KALL, VALL, CIN, CY, BXB;
+    std::uint32_t n{0}, pos0{0}, row0{0};
+  };
+  std::vector<ChunkState> css(nChunks);
+  for (std::uint32_t ci = 0; ci < nChunks; ++ci) {
+    ChunkState& cs = css[ci];
+    cs.row0 = ci * kChunk;
+    cs.n = std::min(kChunk, nTot - cs.row0);
+    cs.pos0 = pos0 + cs.row0;
+    cs.X.resize(std::size_t{cs.n} * H);
+    cs.Z.resize(cs.X.size()); cs.Z2.resize(cs.X.size()); cs.Br.resize(cs.X.size());
+    for (std::uint32_t i = 0; i < cs.n; ++i)
+      DecodeRow(s.w->embedding, tokens[cs.row0 + i], std::span<float>(&cs.X[std::size_t{i} * H], H));
+  }
   auto cpu0 = Clock::now();
-  std::vector<float> QKV, ATT, QALL, GATE, KALL, VALL, CIN, CY, BXB;
   for (std::size_t l = 0; l < c.layers.size(); ++l) {
+  const auto layer_run = [&](ChunkState& cs, int seg) {
+    const std::uint32_t nTot = cs.n;
+    const std::uint32_t pos0 = cs.pos0;
+    auto& X = cs.X; auto& Z = cs.Z; auto& Z2 = cs.Z2; auto& Br = cs.Br;
+    auto& QKV = cs.QKV; auto& ATT = cs.ATT; auto& QALL = cs.QALL; auto& GATE = cs.GATE;
+    auto& KALL = cs.KALL; auto& VALL = cs.VALL; auto& CIN = cs.CIN; auto& CY = cs.CY; auto& BXB = cs.BXB;
+    auto cpu0 = Clock::now();
+    (void)cpu0;
     const auto& lw = s.w->layers[l];
     const bool big_attn = s.atb && nTot > 64 && c.layers[l] != LayerType::kConvolution && s.atb->HasAttn(l);
     static const bool no_bigconv = std::getenv("GUFO_NO_BIGCONV") != nullptr;
@@ -513,6 +539,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     const bool defer = defer_any && !defer_sw;
     if (defer_any) { QALL.resize(std::size_t{nTot} * qd); GATE.resize(std::size_t{nTot} * heads); }
     if (defer_sw) { KALL.resize(std::size_t{nTot} * kvd); VALL.resize(std::size_t{nTot} * kvd); }
+    if (seg == 0 || seg == 1) {
     if (big_attn) {
       RmsNorm(X.data(), static_cast<const float*>(lw.norm.data), Z.data(), nTot, H, c.eps);
       QKV.resize(std::size_t{nTot} * 3072);
@@ -520,6 +547,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       const auto tq0 = Clock::now();
       s.atb->RunQkv(l, Z.data(), nTot, QKV.data());
       g_t_qkv += Ms(tq0);
+    }
     }
     const auto finish = [&](std::uint32_t o, std::uint32_t n, std::vector<float>& x, std::vector<float>& z,
                             std::vector<float>& z2, const float* branch) {
@@ -548,6 +576,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       RmsNorm(X.data(), static_cast<const float*>(lw.ffn_norm.data), Z.data(), nTot, H, c.eps);
       g_t_fin += Ms(tfin0);
     };
+    if (seg == 0 || seg == 1) {
     if (big_conv) {
       const auto tcv0 = Clock::now();
       RmsNorm(X.data(), static_cast<const float*>(lw.norm.data), Z.data(), nTot, H, c.eps);
@@ -966,6 +995,8 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     s.t_cpu += Ms(cpu0);
     }
     s.pos = pos0;
+    }
+    if (seg == 0 || seg == 2) {
     if (defer_any) {
       const auto ta1 = Clock::now();
       for (std::uint32_t o = 0; o < nTot; o += 128) {
@@ -999,6 +1030,8 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
         }
       g_t_attn_npu += Ms(ta1);
     }
+    }
+    if (seg == 0 || seg == 3) {
     if (big_attn) {
       const auto to0 = Clock::now();
       s.atb->RunO(l, ATT.data(), nTot, Br.data());
@@ -1032,10 +1065,22 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
         if (FILE* f = std::fopen(fn, "wb")) { std::fwrite(X.data(), 4, X.size(), f); std::fclose(f); }
       }
     }
-      }
+    }
+  };
+  const bool attn_layer = c.layers[l] != LayerType::kConvolution;
+  if (!attn_layer || nChunks == 1) {
+    for (auto& cs : css) layer_run(cs, 0);
+  } else {
+    for (auto& cs : css) layer_run(cs, 1);
+    for (auto& cs : css) layer_run(cs, 2);
+    for (auto& cs : css) layer_run(cs, 3);
+  }
+  }
+  s.pos = pos0;
   if (hidden) {
     hidden->resize(std::size_t{nTot} * H);
-    RmsNorm(X.data(), static_cast<const float*>(s.w->output_norm.data), hidden->data(), nTot, H, c.eps);
+    for (auto& cs : css)
+      RmsNorm(cs.X.data(), static_cast<const float*>(s.w->output_norm.data), hidden->data() + std::size_t{cs.row0} * H, cs.n, H, c.eps);
   }
   s.pending = nTot;
   s.t_cpu += Ms(cpu0);
