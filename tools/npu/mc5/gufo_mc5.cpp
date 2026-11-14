@@ -368,6 +368,31 @@ int main(int argc, char** argv) {
   }
   const std::string cmd = argv[1];
   const auto toks = ReadTokens(argv[4]);
+  if (cmd == "judge") {
+    Engine je;
+    if (!je.Init(argv[2], argv[3], 512)) return 1;
+    std::size_t at = 3;
+    const std::uint32_t yes = static_cast<std::uint32_t>(toks[0]), no = static_cast<std::uint32_t>(toks[1]), cases = static_cast<std::uint32_t>(toks[2]);
+    std::vector<float> lg(je.c.vocab), hd;
+    const auto t0 = Clock::now();
+    std::uint32_t total = 0;
+    for (std::uint32_t k = 0; k < cases; ++k) {
+      const std::uint32_t len = static_cast<std::uint32_t>(toks[at++]);
+      je.Reset();
+      for (std::uint32_t o = 0; o < len; o += kRows) {
+        const std::uint32_t m = std::min(kRows, len - o);
+        std::vector<std::uint32_t> in(m);
+        for (std::uint32_t i = 0; i < m; ++i) in[i] = static_cast<std::uint32_t>(toks[at + o + i]);
+        je.Step(in.data(), m, &hd);
+        if (o + m == len) je.Logits(&hd[std::size_t{m - 1} * je.c.hidden], lg.data());
+      }
+      at += len;
+      total += len;
+      std::printf("%+8.3f\n", lg[yes] - lg[no]);
+    }
+    std::fprintf(stderr, "judge: %u cases %u tokens %.1f ms (%.1f ms/case)\n", cases, total, Ms(t0), Ms(t0) / cases);
+    return 0;
+  }
   std::uint32_t n_tok = static_cast<std::uint32_t>(toks.size());
   if (argc > 5) n_tok = std::min<std::uint32_t>(n_tok, static_cast<std::uint32_t>(std::atoi(argv[5])));
   Engine e;
