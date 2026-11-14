@@ -3,6 +3,7 @@
 #include <iterator>
 #include <omp.h>
 #include <chrono>
+#include <cmath>
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -39,6 +40,8 @@ int main(int argc, char** argv) {
   std::size_t maxtok = 512, maxnew = 128;
   std::string prompt, heads_path;
   std::size_t head_k = 2;
+  // Passes above 16 rows run the m64 programs, which corrupt decode state; speculation stays on the m16 programs.
+  const std::size_t max_fed = std::getenv("GUFO_MAXFED") ? std::stoul(std::getenv("GUFO_MAXFED")) : 16;
   bool spec = std::getenv("GUFO_NO_SPEC") == nullptr;
   for (int i = 2; i + 1 < argc; i += 2) {
     std::string k = argv[i];
@@ -138,6 +141,52 @@ int main(int argc, char** argv) {
     }
     engine->LimitHeads(static_cast<std::uint32_t>(head_k));
     std::vector<std::uint32_t> head_draft;
+    if (const char* rc = std::getenv("GUFO_ROWCHECK")) {
+      const std::size_t R = std::max<std::size_t>(2, std::stoul(rc));
+      std::vector<std::uint32_t> tk;
+      for (std::size_t i = 0; i < R; ++i) tk.push_back(static_cast<std::uint32_t>(1000 + 37 * i));
+      auto prefill = [&](std::vector<float>* hh) {
+        engine->Reset();
+        for (std::size_t at = 0; at < ids.size();) {
+          const std::size_t n = std::min<std::size_t>(engine->PrefillRows(), ids.size() - at);
+          if (!engine->Step(std::span<const std::uint32_t>(ids.data() + at, n), hh)) std::exit(1);
+          engine->Commit(n);
+          at += n;
+        }
+        const std::size_t pad = std::getenv("GUFO_ROWCHECK_PAD") ? std::stoul(std::getenv("GUFO_ROWCHECK_PAD")) : 0;
+        for (std::size_t i = 0; i < pad; ++i) {
+          const std::uint32_t f = 500 + static_cast<std::uint32_t>(i);
+          if (!engine->Step(std::span<const std::uint32_t>(&f, 1), hh)) std::exit(1);
+          engine->Commit(1);
+        }
+      };
+      std::vector<float> hm, hs, hb;
+      prefill(&hm);
+      engine->Step(std::span<const std::uint32_t>(tk.data(), tk.size()), &hm);
+      engine->Commit(static_cast<std::uint32_t>(R));
+      prefill(&hs);
+      for (std::size_t i = 0; i < R; ++i) {
+        engine->Step(std::span<const std::uint32_t>(tk.data() + i, 1), &hb);
+        engine->Commit(1);
+        hs.assign(hb.begin(), hb.end());
+        double num = 0, den = 0;
+        for (std::size_t c = 0; c < 2048; ++c) { const double d = hm[i * 2048 + c] - hs[c]; num += d * d; den += double(hs[c]) * hs[c]; }
+        std::fprintf(stderr, "[rowcheck] row %zu of %zu: multi-row vs single-row rel err %.5f\n", i, R, std::sqrt(num / den));
+      }
+      {
+        // rollback: run R rows, keep all but the last, then feed the last token again as a single row
+        std::vector<float> hlast = hs, hr, hr2;
+        prefill(&hr);
+        engine->Step(std::span<const std::uint32_t>(tk.data(), tk.size()), &hr);
+        engine->Commit(static_cast<std::uint32_t>(R - 1));
+        engine->Step(std::span<const std::uint32_t>(tk.data() + R - 1, 1), &hr2);
+        engine->Commit(1);
+        double num = 0, den = 0;
+        for (std::size_t c = 0; c < 2048; ++c) { const double d = hr2[c] - hlast[c]; num += d * d; den += double(hlast[c]) * hlast[c]; }
+        std::fprintf(stderr, "[rowcheck] rollback (commit %zu of %zu, redo last): rel err %.5f\n", R - 1, R, std::sqrt(num / den));
+      }
+      return 0;
+    }
     engine->Reset();
     const auto t0 = std::chrono::steady_clock::now();
     for (std::size_t at = 0; at < ids.size();) {
@@ -170,7 +219,7 @@ int main(int argc, char** argv) {
             for (std::size_t q = 0; q < m && same; ++q)
               same = hist[p - q] == hist[hn - 1 - q];
             if (same) {
-              for (std::size_t q = p + 1; q < hn - 1 + 1 && fed.size() < Engine::kMaxRows && q < hn; ++q)
+              for (std::size_t q = p + 1; q < hn - 1 + 1 && fed.size() < max_fed && q < hn; ++q)
                 fed.push_back(hist[q]);
               break;
             }
@@ -179,7 +228,7 @@ int main(int argc, char** argv) {
       }
       if (spec && fed.size() == 1)
         for (auto t : head_draft)
-          if (fed.size() < Engine::kMaxRows)
+          if (fed.size() < max_fed)
             fed.push_back(t);
       auto ts = std::chrono::steady_clock::now();
       if (!engine->Step(std::span<const std::uint32_t>(fed.data(), fed.size()), &h))
@@ -308,7 +357,7 @@ int main(int argc, char** argv) {
               for (std::size_t q = 0; q < m && same; ++q)
                 same = hist[p - q] == hist[hn - 1 - q];
               if (same) {
-                for (std::size_t q = p + 1; q < hn && fed.size() < Engine::kMaxRows; ++q)
+                for (std::size_t q = p + 1; q < hn && fed.size() < max_fed; ++q)
                   fed.push_back(hist[q]);
                 break;
               }
@@ -317,7 +366,7 @@ int main(int argc, char** argv) {
         }
         if (spec && fed.size() == 1)
           for (auto t : head_draft)
-            if (fed.size() < Engine::kMaxRows)
+            if (fed.size() < max_fed)
               fed.push_back(t);
         if (!engine->Step(std::span<const std::uint32_t>(fed.data(), fed.size()), &h))
           return 1;

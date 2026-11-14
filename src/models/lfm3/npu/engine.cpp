@@ -968,8 +968,9 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       } else if (s.m_attn[l].host) {
         // Attn kernel is m16: one append+run pass per 16-row block.
         npu_done = true;
-        for (std::uint32_t o = 0; o < n; o += 16) {
-          const std::uint32_t m = std::min(16u, n - o);
+        // A pass never crosses a 16-token chunk boundary (multi-row passes that do come back wrong).
+        for (std::uint32_t o = 0, m = 0; o < n; o += m) {
+          m = std::min({16u, n - o, 16u - (lpos + o) % 16u});
           s.rt.AttnAppend(s.m_attn[l], lpos + o, m, k.data() + std::size_t{o} * kvd, s.v_cache[l].data(), &s.tim);
           npu_done = s.rt.AttnRun(s.m_attn[l], lpos + o, m, q.data() + std::size_t{o} * qd,
                                   s.k_cache[l].data(), s.v_cache[l].data(), s.programs_dir,
@@ -1579,7 +1580,10 @@ void Engine::ArgmaxRows(const float* hidden, std::uint32_t rows, std::uint32_t* 
     }
     return;
   }
-  Sweep(static_cast<const std::uint8_t*>(s.w->embedding.data), s.w->embedding.rows, s.H, hidden, rows, out);
+  // Sweep keeps one 16-row accumulator block.
+  for (std::uint32_t off = 0; off < rows; off += 16)
+    Sweep(static_cast<const std::uint8_t*>(s.w->embedding.data), s.w->embedding.rows, s.H, hidden + std::size_t{off} * s.H,
+          std::min(16u, rows - off), out + off);
 }
 
 bool Engine::LoadHeads(const std::string& path, std::string* error) {
