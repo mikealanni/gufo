@@ -10,10 +10,13 @@ from aie.dialects.aiex import *
 from aie.helpers.taplib import TensorAccessPattern
 from aie.helpers.dialects.scf import _for as range_
 
-COLS, ROWS = 8, 4
+ROWS = 4
+COLS = int(os.environ.get("COLS", "8"))
 CH = int(os.environ.get("CH", "1"))
 NI = int(os.environ.get("NI", "256"))
 ELEM = int(os.environ.get("ELEM", "4096"))
+AELEM = int(os.environ.get("AELEM", "0"))  # >0: also multicast an activation tile of this many bytes per iteration to every core
+ADEPTH = int(os.environ.get("ADEPTH", "2"))
 
 
 def main():
@@ -46,6 +49,11 @@ def design():
                     l2l1[row][col] = object_fifo(f"B_L2L1_{col}_{row}", mem_tiles[col], core_tiles[row][col], 2, L1_ty)
                     outs.append(l2l1[row][col])
                 object_fifo_link(l3l2[col][h], outs, [], [ELEM * rr for rr in range(rows_per)])
+        if AELEM:
+            A_ty = np.ndarray[(AELEM,), np.dtype[np.uint8]]
+            A_l3l2 = object_fifo("A_L3L2", shim_tiles[0], mem_tiles[0], 2, A_ty)
+            A_l2l1 = object_fifo("A_L2L1", mem_tiles[0], [core_tiles[r][c] for r in range(ROWS) for c in range(COLS)], ADEPTH, A_ty)
+            object_fifo_link(A_l3l2, A_l2l1)
         for row in range(ROWS):
             for col in range(COLS):
 
@@ -53,12 +61,17 @@ def design():
                 def core_body():
                     for _ in range_(0xFFFFFFFF):
                         for _ in range_(NI):
+                            if AELEM:
+                                ea = A_l2l1.acquire(ObjectFifoPort.Consume, 1)
                             e = l2l1[row][col].acquire(ObjectFifoPort.Consume, 1)
                             l2l1[row][col].release(ObjectFifoPort.Consume, 1)
+                            if AELEM:
+                                A_l2l1.release(ObjectFifoPort.Consume, 1)
 
         per_col = NI * ROWS * ELEM
         per_ch = per_col // CH
-        total = COLS * per_col
+        a_bytes = NI * AELEM
+        total = COLS * per_col + a_bytes
         nk = per_ch // 1024
         d2 = next(d for d in range(min(nk, 1023), 0, -1) if nk % d == 0)
         d1 = nk // d2
@@ -73,6 +86,13 @@ def design():
                     t = shim_dma_single_bd_task(l3l2[col][h], B, tap=tap, issue_token=True)
                     dma_start_task(t)
                     tasks.append(t)
+            if AELEM:
+                nka = a_bytes // 1024
+                da2 = next(d for d in range(min(nka, 1023), 0, -1) if nka % d == 0)
+                da1 = nka // da2
+                ta = shim_dma_single_bd_task(A_l3l2, B, tap=TensorAccessPattern((1, total), COLS * per_col, [1, da1, da2, 1024], [0, da2 * 1024, 1024, 1]), issue_token=True)
+                dma_start_task(ta)
+                tasks.append(ta)
             dma_await_task(*tasks)
             dma_free_task(*tasks)
 

@@ -19,6 +19,8 @@ from aie.ir import DenseElementsAttr
 import os
 
 RTP_BLOCK = os.environ.get("RTP_BLOCK", "1") == "1"
+TRACE = os.environ.get("TRACE", "0") == "1"  # hardware trace of a few tiles into the tail of the C buffer
+TRACE_SIZE = 65536
 _rtp_globals = {}
 
 
@@ -111,6 +113,12 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None, 
         shim_tiles = tiles[0]
         mem_tiles = tiles[1]
         core_tiles = tiles[2:]
+
+        trace_col = int(os.environ.get("TRACE_COL", "0"))
+        shim_tile_trace = shim_tiles[trace_col]
+        tiles_to_trace = {"shim": [shim_tiles[trace_col]], "mem": [mem_tiles[trace_col]], "mc": [mem_tiles[trace_col], core_tiles[0][trace_col]], "core": [core_tiles[0][trace_col]], "all": [mem_tiles[trace_col], core_tiles[0][trace_col], shim_tiles[trace_col]]}[os.environ.get("TRACE_WHAT", "mem")]
+        if TRACE:
+            trace_utils.configure_packet_tracing_flow(tiles_to_trace, shim_tile_trace)
 
         A_l3l2 = object_fifo("A_L3L2", shim_tiles[0], mem_tiles[0], 2, A_ty)
         A_l2l1 = object_fifo(
@@ -325,9 +333,11 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None, 
         @runtime_sequence(
             np.ndarray[(a_groups,), np.dtype[dtype]],
             np.ndarray[(gu_bytes + dn_bytes,), np.dtype[np.uint8]],
-            np.ndarray[(c_total,), np.dtype[np.uint8]],
+            np.ndarray[(c_total + (TRACE_SIZE if TRACE else 0),), np.dtype[np.uint8]],
         )
         def sequence(A, B, C):
+            if TRACE:
+                trace_utils.configure_packet_tracing_aie2(tiles_to_trace, shim_tile_trace, TRACE_SIZE, trace_offset=c_total, ddr_id=2)
             for row in range(n_aie_rows):
                 for col in range(n_aie_cols):
                     write_rtps(row, col, (k1t, N1 // n // n_aie_cols if N1 else 0, K2 // k, N2 // n // n_aie_cols, rtp_mode, 0, 0, 2 if mode == "argmax" else 0, mrows))
@@ -412,6 +422,8 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None, 
                 (K2 // k) * n_aie_rows * BQ_,
                 lambda s: (N1 // n + s) * SB,
             )
+            if TRACE:
+                trace_utils.gen_trace_done_aie2(shim_tile_trace)
 
 
 main()
