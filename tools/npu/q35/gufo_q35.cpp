@@ -205,6 +205,8 @@ struct Engine {
   Weights w;
   double t_npu{0}, t_host{0}, ph[4]{0, 0, 0, 0}, mx[8]{0, 0, 0, 0, 0, 0, 0, 0};
   const char* qdir{std::getenv("Q35_QDIR")};
+  bool bf16_state{std::getenv("Q35_BF16_STATE") != nullptr};
+  bool gdn_emu{std::getenv("Q35_GDN_EMU") != nullptr};
 
   bool Init(const std::string& model_dir, const std::string& programs) {
     if (!w.s[0].Open(model_dir + "/model-00001-of-00002.safetensors") || !w.s[1].Open(model_dir + "/model-00002-of-00002.safetensors")) {
@@ -536,6 +538,34 @@ struct Engine {
         const float sp = x > 20.f ? x : std::log1p(std::exp(x));
         const float decay = std::exp(-a_exp * sp);
         const float beta = 1.0f / (1.0f + std::exp(-bv));
+        if (gdn_emu) {
+          std::vector<float> qb(kKD), kb(kKD), vb(kVD), kvr(kVD, 0.f), sqr(kVD, 0.f), dh(kVD), dl(kVD);
+          for (std::uint32_t i = 0; i < kKD; ++i) {
+            qb[i] = Bf(Bf16Bits(q[i]));
+            kb[i] = Bf(Bf16Bits(k[i]));
+          }
+          for (std::uint32_t j = 0; j < kVD; ++j) vb[j] = Bf(Bf16Bits(v[j]));
+          float kq = 0;
+          for (std::uint32_t i = 0; i < kKD; ++i) {
+            kq += kb[i] * qb[i];
+            const float* Si = &S[std::size_t{i} * kVD];
+            for (std::uint32_t j = 0; j < kVD; ++j) {
+              kvr[j] += Si[j] * kb[i];
+              sqr[j] += Si[j] * qb[i];
+            }
+          }
+          const float d_hi = Bf(Bf16Bits(decay)), d_lo = Bf(Bf16Bits(decay - d_hi));
+          for (std::uint32_t j = 0; j < kVD; ++j) {
+            const float delta = (vb[j] - decay * kvr[j]) * beta;
+            dh[j] = Bf(Bf16Bits(delta));
+            dl[j] = Bf(Bf16Bits(delta - dh[j]));
+            o[j] = decay * sqr[j] + kq * delta;
+          }
+          for (std::uint32_t i = 0; i < kKD; ++i) {
+            float* Si = &S[std::size_t{i} * kVD];
+            for (std::uint32_t j = 0; j < kVD; ++j) Si[j] = Bf(Bf16Bits(d_hi * Si[j] + d_lo * Si[j] + kb[i] * dh[j] + kb[i] * dl[j]));
+          }
+        } else {
         std::fill(kv.begin(), kv.end(), 0.f);
         for (std::uint32_t i = 0; i < kKD; ++i) {
           float* Si = &S[std::size_t{i} * kVD];
@@ -550,8 +580,10 @@ struct Engine {
           float* Si = &S[std::size_t{i} * kVD];
           for (std::uint32_t j = 0; j < kVD; ++j) {
             Si[j] += k[i] * kv[j];
+            if (bf16_state) Si[j] = Bf(Bf16Bits(Si[j]));
             o[j] += Si[j] * q[i];
           }
+        }
         }
         float ss = 0;
         for (std::uint32_t j = 0; j < kVD; ++j) ss += o[j] * o[j];
