@@ -1291,7 +1291,7 @@ bool AttnPrefill::Prep(int slot, AttnLayer& al, std::uint32_t pos0, std::uint32_
   const std::uint32_t kvd = kAttnKvh * kAttnHd, qd = 16 * kAttnHd;
   const float qscale = 1.4426950408889634f / std::sqrt(static_cast<float>(kAttnHd));
   const std::uint32_t total = pos0 + n;
-  static const std::uint32_t kMc[] = {8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096};
+  static const std::uint32_t kMc[] = {8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192};
   std::uint32_t mc = 0;
   if (ring) {
     mc = al.capacity_chunks;  // ring: the whole ring is streamed, 24 chunks per column
