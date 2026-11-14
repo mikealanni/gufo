@@ -166,6 +166,35 @@ int main(int argc, char** argv) {
     best = std::min(best, ms);
     tot += ms;
   }
+  {
+    // queued submission: K runs in flight, one wait per batch; and reuse of one run object
+    for (int K : {2, 4}) {
+      std::vector<xrt::run> runs;
+      for (int i = 0; i < K; ++i) {
+        xrt::run r(kern);
+        r.set_arg(0, 3u); r.set_arg(1, ib); r.set_arg(2, (unsigned)(isz / 4)); r.set_arg(3, ba); r.set_arg(4, bb); r.set_arg(5, bc);
+        runs.push_back(std::move(r));
+      }
+      double bestq = 1e9;
+      for (int rep = 0; rep < 10; ++rep) {
+        auto t0 = std::chrono::steady_clock::now();
+        for (auto& r : runs) r.start();
+        for (auto& r : runs) r.wait();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / K;
+        bestq = std::min(bestq, ms);
+      }
+      std::printf("queued %d runs in flight: best %.4f ms per dispatch\n", K, bestq);
+    }
+    xrt::run r1(kern);
+    r1.set_arg(0, 3u); r1.set_arg(1, ib); r1.set_arg(2, (unsigned)(isz / 4)); r1.set_arg(3, ba); r1.set_arg(4, bb); r1.set_arg(5, bc);
+    double bestr = 1e9;
+    for (int rep = 0; rep < 20; ++rep) {
+      auto t0 = std::chrono::steady_clock::now();
+      r1.start(); r1.wait();
+      bestr = std::min(bestr, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    }
+    std::printf("one reused run, start+wait: best %.4f ms\n", bestr);
+  }
   bc.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
   std::memcpy(C.data(), bc.map<void*>(), C.size());
   // reference

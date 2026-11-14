@@ -694,6 +694,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     }
     const auto finish = [&](std::uint32_t o, std::uint32_t n, std::vector<float>& x, std::vector<float>& z,
                             std::vector<float>& z2, const float* branch) {
+      TlScope tl_fin_("finish", l);
       const auto tfin0 = Clock::now();
       if (lw.post_norm.data) {
         RmsNorm(branch, static_cast<const float*>(lw.post_norm.data), z2.data(), n, H, c.eps);
@@ -892,6 +893,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
         s.rt.ConvCommit(s.m_conv64[l], n, /*settle=*/false);
         if (s.m_conv[l].hidden) s.rt.ConvCopyHistory(s.m_conv[l], s.m_conv64[l]);
       } else {
+        TlScope tl_conv_("conv", l);
         for (std::uint32_t o = 0; o < n; o += 16) {
           const std::uint32_t m = std::min(16u, n - o);
           s.rt.ConvStep(s.m_conv[l], z.data() + std::size_t{o} * H, m, branch.data() + std::size_t{o} * H, &s.tim);
@@ -909,7 +911,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       { const auto tq0 = Clock::now();
       if (lite) {}
       else if (big_attn) std::copy(QKV.begin() + std::size_t{o} * 3072, QKV.begin() + std::size_t{o + n} * 3072, qkv.begin());
-      else s.rt.Gemm(use64 ? s.pQkv64[l] : s.pQkv[l], s.m_qkv[l], z.data(), n, qkv.data(), &s.tim);
+      else { TlScope tl_("qkv", l); s.rt.Gemm(use64 ? s.pQkv64[l] : s.pQkv[l], s.m_qkv[l], z.data(), n, qkv.data(), &s.tim); }
       g_t_qkv += Ms(tq0); }
             cpu0 = Clock::now();
       const bool swa = c.layers[l] == LayerType::kSlidingAttention;
@@ -982,6 +984,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       } else if (s.m_attn[l].host) {
         // Attn kernel is m16: one append+run pass per 16-row block.
         npu_done = true;
+        TlScope tl_attn_("attn", l);
         // A pass never crosses a 16-token chunk boundary (multi-row passes that do come back wrong).
         for (std::uint32_t o = 0, m = 0; o < n; o += m) {
           m = std::min({16u, n - o, 16u - (lpos + o) % 16u});
@@ -1167,7 +1170,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       s.t_cpu += Ms(cpu0);
       { const auto to0 = Clock::now();
       if (big_attn) std::copy(attn.begin(), attn.end(), ATT.begin() + std::size_t{o} * qd);
-      else s.rt.Gemm(use64 ? s.pH64[l] : s.pH[l], s.m_out[l], attn.data(), n, branch.data(), &s.tim);
+      else { TlScope tl_("oproj", l); s.rt.Gemm(use64 ? s.pH64[l] : s.pH[l], s.m_out[l], attn.data(), n, branch.data(), &s.tim); }
       g_t_oproj += Ms(to0); }
     }
     if (big_attn) { cpu0 = Clock::now(); continue; }
@@ -1314,7 +1317,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       if (s.m64 && nTot > 16)
         s.rt.Ffn64(s.m_ffn[l], s.pGu64[l], s.m_ffn_dn[l], s.pDn64[l], Z.data(), nTot, Br.data(), &s.tim);
       else
-        s.rt.Ffn(s.pFfn[l], s.m_ffn[l], Z.data(), nTot, Br.data(), &s.tim);
+        { TlScope tl_("ffn", l); s.rt.Ffn(s.pFfn[l], s.m_ffn[l], Z.data(), nTot, Br.data(), &s.tim); }
     }
     cpu0 = Clock::now();
     const auto tpost0 = Clock::now();
@@ -1482,6 +1485,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
   if (g_tl_on) {
     std::sort(g_tl.begin(), g_tl.end(), [](const TlEv& a, const TlEv& b) { return a.a < b.a; });
     for (const auto& e : g_tl) if (e.l < 6) std::fprintf(stderr, "[tl] L%zu %-8s %7.2f -> %7.2f (%.2f)\n", e.l, e.n, e.a, e.b, e.b - e.a);
+    g_tl.clear();
   }
   if (std::getenv("GUFO_ATB_STATS")) {
     std::fprintf(stderr, "[wall] conv-layers %.0f attn A %.0f B %.0f C %.0f ms\n", g_w_conv, g_w_a, g_w_b, g_w_c);
