@@ -58,7 +58,7 @@ int main(int argc, char** argv) {
   const int NT = 8, reps = argc > 3 ? atoi(argv[3]) : 10;
   const size_t TILE = 18432, PIECE = 1536, TE = 5120, PASS = 8 * 98304, PCOL = 98304;
   const size_t QKV_BYTES = (size_t)8 * 3 * 32 * TILE, TAB_BYTES = (size_t)NT * 8 * TE;
-  const size_t Q_BYTES = (NT - 1) * PASS + 8 * PCOL, KV_BYTES = (size_t)NT * 8 * 18432;
+  const size_t Q_BYTES = (NT - 1) * PASS + 8 * PCOL, KV_BYTES = (size_t)NT * 8 * 18432, KN_BYTES = (size_t)NT * 8 * 6144;
   const float eps = 1e-5f, theta = 1000000.f;
   const int pos_base = 4096;
   std::mt19937 rng(11);
@@ -66,7 +66,7 @@ int main(int argc, char** argv) {
   std::vector<float> wq(128), wk(128);
   for (auto& v : wq) v = (0.5f + std::fabs(nd(rng))) * 0.1275f;
   for (auto& v : wk) v = 0.5f + std::fabs(nd(rng));
-  std::vector<uint8_t> QKV(QKV_BYTES, 0), TAB(TAB_BYTES, 0), OUT(Q_BYTES + KV_BYTES, 0);
+  std::vector<uint8_t> QKV(QKV_BYTES, 0), TAB(TAB_BYTES, 0), OUT(Q_BYTES + KV_BYTES + KN_BYTES, 0);
   std::vector<std::vector<float>> xd((size_t)NT * 24);
   for (int mt = 0; mt < NT; ++mt) for (int nt = 0; nt < 24; ++nt) {
     auto& X = xd[(size_t)mt * 24 + nt];
@@ -115,7 +115,8 @@ int main(int argc, char** argv) {
   }
   bc.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
   const uint8_t* C = bc.map<uint8_t*>();
-  double nq = 0, dq = 0, nk = 0, dk = 0, nv = 0, dv = 0;
+  double nq = 0, dq = 0, nk = 0, dk = 0, nv = 0, dv = 0, ntv = 0, dtv = 0, nkn = 0, dkn = 0;
+  long tail_k_bad = 0;
   std::vector<float> ref(16 * 128), sub(16 * 128);
   for (int mt = 0; mt < NT; ++mt) for (int c = 0; c < 8; ++c) for (int r = 0; r < 4; ++r) {
     const int g = mt * 8 + c;
@@ -140,12 +141,32 @@ int main(int argc, char** argv) {
       const float* rr = &ref[(br * 8 + rib) * 128 + ks * 8];
       for (int i = 0; i < 8; ++i) { nk += (double)(d8[i] - rr[i]) * (d8[i] - rr[i]); dk += (double)rr[i] * rr[i]; }
     }
+    stripe(16 + r, sub.data());
+    RefNR(sub.data(), wk, pos_base + g * 16, eps, theta, ref.data());
+    {
+      const float* kn = (const float*)(C + Q_BYTES + KV_BYTES + (size_t)g * 6144 + r * PIECE);
+      for (int t = 0; t < 16; ++t) {
+        double ss = 0; for (int d = 0; d < 128; ++d) ss += (double)ref[t * 128 + d] * ref[t * 128 + d];
+        double got = kn[(t / 8) * 64 + (t % 8) * 8];
+        nkn += (got - ss) * (got - ss); dkn += ss * ss;
+      }
+    }
     stripe(20 + r, sub.data());
+    for (int tb = 0; tb < 2; ++tb) {
+      uint8_t tl[4608];
+      for (int e = 0; e < 3; ++e) std::memcpy(tl + e * 1536, C + (size_t)mt * PASS + (size_t)c * PCOL + (size_t)(7 + tb * 3 + e) * 6144 + r * PIECE, 1536);
+      if (std::memcmp(tl, ch + tb * 1152, 1152) != 0) ++tail_k_bad;
+      const uint16_t* vd = (const uint16_t*)(tl + 1152);
+      for (int db = 0; db < 16; ++db) for (int tt = 0; tt < 8; ++tt) for (int d = 0; d < 8; ++d) {
+        double rr = sub[(tb * 8 + tt) * 128 + db * 8 + d], got = BfF(vd[(db * 8 + tt) * 8 + d]);
+        ntv += (got - rr) * (got - rr); dtv += rr * rr;
+      }
+    }
     for (int br = 0; br < 2; ++br) for (int db = 0; db < 16; ++db) for (int gg = 0; gg < 8; ++gg) {
       float d8[8]; DecGroup(ch + 2304 + (br * 16 + db) * 72 + gg * 9, d8);
       for (int i8 = 0; i8 < 8; ++i8) { double rr = sub[(br * 8 + i8) * 128 + db * 8 + gg]; nv += (d8[i8] - rr) * (d8[i8] - rr); dv += rr * rr; }
     }
   }
-  std::printf("prep NT=%d (%d tokens): rel err Q %.5f K %.5f V %.5f; best %.4f ms\n", NT, NT * 128, std::sqrt(nq / dq), std::sqrt(nk / dk), std::sqrt(nv / dv), best);
+  std::printf("prep NT=%d (%d tokens): rel err Q %.5f K %.5f V %.5f tailV %.5f |k|^2 %.5f; tail K mismatches %ld; best %.4f ms\n", NT, NT * 128, std::sqrt(nq / dq), std::sqrt(nk / dk), std::sqrt(nv / dv), std::sqrt(ntv / dtv), std::sqrt(nkn / dkn), tail_k_bad, best);
   return 0;
 }

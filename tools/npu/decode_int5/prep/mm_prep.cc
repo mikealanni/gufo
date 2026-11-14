@@ -16,7 +16,10 @@ __attribute__((aligned(64))) const uint8_t id_blk[72] = {
 
 
 alignas(64) static bfloat16 dec[32 * 64];
-alignas(64) static uint8_t scratch[9216];
+alignas(64) static uint8_t scratch[9216];   // Q block, 4 head stripes
+alignas(64) static uint8_t skv[4608];       // K/V chunk
+alignas(64) static uint8_t stl[9216];       // two tail blocks (K bfp 1152 + V bf16 2048, rest zero)
+alignas(64) static float knorm[128];       // |k|^2 of the 16 tokens, lane row*8 of each 64-lane row sum
 
 static inline aie::vector<bfloat16, 64> rep8(const bfloat16 *p) {
   const aie::vector<bfloat16, 8> g8 = aie::load_v<8>(p);
@@ -46,7 +49,7 @@ static inline void decode_stripe(const uint8_t *e) {
 }
 
 // dec holds one decoded stripe; out receives 2304 B in destination order (br*16 + ks).
-static inline void norm_rope(const bfloat16 *tab, const bfloat16 *w, bfloat16 eps_b, uint8_t *out) {
+static inline void norm_rope(const bfloat16 *tab, const bfloat16 *w, bfloat16 eps_b, uint8_t *out, float *kn) {
   const aie::accum<accfloat, 64> z = aie::zeros<accfloat, 64>();
   const aie::vector<bfloat16, 64> one = aie::broadcast<bfloat16, 64>((bfloat16)1.0f);
   const aie::block_vector<bfp16ebs8, 64> ob = aie::accum<accfloat, 64>(one).template to_vector<bfp16ebs8>();
@@ -70,6 +73,7 @@ static inline void norm_rope(const bfloat16 *tab, const bfloat16 *w, bfloat16 ep
     const aie::vector<bfloat16, 64> hm = aie::mul(ms, half).template to_vector<bfloat16>();
     const aie::vector<bfloat16, 64> t = aie::mul(aie::mul(y, y).template to_vector<bfloat16>(), hm).template to_vector<bfloat16>();
     y = aie::mul(y, aie::sub(c15, t)).template to_vector<bfloat16>();
+    aie::accum<accfloat, 64> ns = aie::zeros<accfloat, 64>();
     for (int sbc = 0; sbc < 4; ++sbc)
       for (int bc = 0; bc < 2; ++bc) {
         const int ia = sbc * 4 + br * 2 + bc, ib = (sbc + 4) * 4 + br * 2 + bc;
@@ -78,6 +82,10 @@ static inline void norm_rope(const bfloat16 *tab, const bfloat16 *w, bfloat16 ep
         const aie::vector<bfloat16, 64> wb = rep8(w + 64 + sbc * 16 + bc * 8);
         const aie::vector<bfloat16, 64> a = aie::mul(aie::mul(aie::load_v<64>(dec + ia * 64), y).template to_vector<bfloat16>(), wa).template to_vector<bfloat16>();
         const aie::vector<bfloat16, 64> b = aie::mul(aie::mul(aie::load_v<64>(dec + ib * 64), y).template to_vector<bfloat16>(), wb).template to_vector<bfloat16>();
+        if (kn) {
+          ns = aie::mac(ns, a, a);
+          ns = aie::mac(ns, b, b);
+        }
         const aie::vector<bfloat16, 64> cs = aie::load_v<64>(tab + ((br * 8 + ib8) * 2) * 64);
         const aie::vector<bfloat16, 64> sn = aie::load_v<64>(tab + ((br * 8 + ib8) * 2 + 1) * 64);
         aie::accum<accfloat, 64> lo = aie::mul(a, cs);
@@ -87,6 +95,10 @@ static inline void norm_rope(const bfloat16 *tab, const bfloat16 *w, bfloat16 ep
         put(out + (br * 16 + ib8) * 72, lo);
         put(out + (br * 16 + ib8 + 8) * 72, hi);
       }
+    if (kn) {
+      const aie::accum<accfloat, 64> rs = mac_8x8_8x8T(ns.template to_vector<bfp16ebs8>(), ob, z);
+      aie::store_v(kn + br * 64, rs.template to_vector<float>());
+    }
   }
 }
 
@@ -98,15 +110,15 @@ __attribute__((noinline)) void prep_q2(const uint8_t *s, const uint8_t *t, int p
   ::aie::set_rounding(::aie::rounding_mode::conv_even);
   for (int i = 0; i < 2; ++i) {
     decode_stripe(s + i * 2304);
-    norm_rope((const bfloat16 *)t, (const bfloat16 *)(t + kTW), *(const bfloat16 *)(t + kTEps), scratch + (pair * 2 + i) * 2304);
+    norm_rope((const bfloat16 *)t, (const bfloat16 *)(t + kTW), *(const bfloat16 *)(t + kTEps), scratch + (pair * 2 + i) * 2304, nullptr);
   }
 }
 
-// K stripe then V stripe; emits the 4608 B K/V chunk of the 16 tokens into scratch.
+// K stripe then V stripe: K/V chunk (4608 B) into skv, two tail blocks into stl, |k|^2 into knorm.
 __attribute__((noinline)) void prep_kv2(const uint8_t *s, const uint8_t *t) {
   ::aie::set_rounding(::aie::rounding_mode::conv_even);
   decode_stripe(s);
-  norm_rope((const bfloat16 *)t, (const bfloat16 *)(t + kTWK), *(const bfloat16 *)(t + kTEps), scratch);
+  norm_rope((const bfloat16 *)t, (const bfloat16 *)(t + kTWK), *(const bfloat16 *)(t + kTEps), skv, knorm);
   aie::block_vector_input_buffer_stream<bfp16ebs8, 64> idst((bfp16ebs8 *)id_blk);
   idst.seek(0);
   const aie::block_vector<bfp16ebs8, 64> idb = idst.pop();
@@ -118,12 +130,26 @@ __attribute__((noinline)) void prep_kv2(const uint8_t *s, const uint8_t *t) {
       for (int bc = 0; bc < 2; ++bc) {
         const aie::block_vector<bfp16ebs8, 64> g = in.pop();
         const aie::accum<accfloat, 64> tv = mac_8x8_8x8T(idb, g, z);
-        put(scratch + 2304 + (br * 16 + sbc * 2 + bc) * 72, tv);
+        put(skv + 2304 + (br * 16 + sbc * 2 + bc) * 72, tv);
+        const aie::accum<accfloat, 64> dv = mac_8x8_8x8T(g, idb, z);
+        aie::store_v((bfloat16 *)(stl + br * 4608 + 1152 + (sbc * 2 + bc) * 128), dv.template to_vector<bfloat16>());
       }
+  for (int br = 0; br < 2; ++br) {
+    uint8_t *tl = stl + br * 4608;
+    for (int i = 0; i < 1152; i += 64) aie::store_v(tl + i, aie::load_v<64>(skv + br * 1152 + i));
+    const aie::vector<uint8_t, 64> zv = aie::zeros<uint8_t, 64>();
+    for (int i = 3200; i < 4608; i += 64) aie::store_v(tl + i, zv);
+  }
 }
 
-__attribute__((noinline)) void prep_emit(uint8_t *out, int idx) {
-  const uint8_t *s = scratch + idx * 1536;
+// kind 0: K/V chunk piece, 1: Q block piece, 2: tail piece, 3: |k|^2 vector.
+__attribute__((noinline)) void prep_emit(uint8_t *out, int kind, int idx) {
+  if (kind == 3) {
+    for (int i = 0; i < 1536; i += 64) aie::store_v(out + i, aie::zeros<uint8_t, 64>());
+    for (int i = 0; i < 128; i += 16) aie::store_v((float *)out + i, aie::load_v<16>(knorm + i));
+    return;
+  }
+  const uint8_t *s = (kind == 0 ? skv : kind == 1 ? scratch : stl) + idx * 1536;
   for (int i = 0; i < 1536; i += 64) aie::store_v(out + i, aie::load_v<64>(s + i));
 }
 }

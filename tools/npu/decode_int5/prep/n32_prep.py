@@ -43,7 +43,7 @@ def design(m, k, n):
         lw = f"mm_{m}x{k}x{n}.o"
         prep_q2 = external_func("prep_q2", inputs=[S_l1_ty, T_ty, np.int32], link_with=lw)
         prep_kv2 = external_func("prep_kv2", inputs=[S_l1_ty, T_ty], link_with=lw)
-        prep_emit = external_func("prep_emit", inputs=[C_l1_ty, np.int32], link_with=lw)
+        prep_emit = external_func("prep_emit", inputs=[C_l1_ty, np.int32, np.int32], link_with=lw)
 
         tiles = [[tile(col, row) for col in range(COLS)] for row in range(ROWS + 2)]
         shim_tiles, mem_tiles, core_tiles = tiles[0], tiles[1], tiles[2:]
@@ -84,31 +84,30 @@ def design(m, k, n):
                         nt = arith.index_cast(T.index(), nt_i32)
                         for _ in range_(nt):
                             t = T_f[col].acquire(ObjectFifoPort.Consume, 1)
+                            s = S_l2l1[row][col].acquire(ObjectFifoPort.Consume, 1)
+                            prep_kv2(s, t)
+                            S_l2l1[row][col].release(ObjectFifoPort.Consume, 1)
                             for pr in range_(2):
                                 s = S_l2l1[row][col].acquire(ObjectFifoPort.Consume, 1)
                                 prep_q2(s, t, arith.index_cast(T.i32(), pr))
                                 S_l2l1[row][col].release(ObjectFifoPort.Consume, 1)
-                            for u in range_(6):
-                                o = C_l1l2[row][col].acquire(ObjectFifoPort.Produce, 1)
-                                prep_emit(o, arith.index_cast(T.i32(), u))
-                                C_l1l2[row][col].release(ObjectFifoPort.Produce, 1)
-                            s = S_l2l1[row][col].acquire(ObjectFifoPort.Consume, 1)
-                            prep_kv2(s, t)
-                            S_l2l1[row][col].release(ObjectFifoPort.Consume, 1)
-                            for u in range_(3):
-                                o = C_l1l2[row][col].acquire(ObjectFifoPort.Produce, 1)
-                                prep_emit(o, arith.index_cast(T.i32(), u))
-                                C_l1l2[row][col].release(ObjectFifoPort.Produce, 1)
                             T_f[col].release(ObjectFifoPort.Consume, 1)
+                            for kind, cnt in ((0, 3), (1, 6), (2, 6), (3, 1)):
+                                for u in range_(cnt):
+                                    o = C_l1l2[row][col].acquire(ObjectFifoPort.Produce, 1)
+                                    prep_emit(o, arith.constant(T.i32(), kind), arith.index_cast(T.i32(), u))
+                                    C_l1l2[row][col].release(ObjectFifoPort.Produce, 1)
 
         TAB_BYTES = NT * 8 * TE
         Q_BYTES = (NT - 1) * PASS + 8 * PCOL
         KV_BYTES = NT * 8 * 18432
+        KN_BYTES = NT * 8 * 6144
+        OUT_BYTES = Q_BYTES + KV_BYTES + KN_BYTES
 
         @runtime_sequence(
             np.ndarray[(QKV_BYTES,), np.dtype[np.uint8]],
             np.ndarray[(TAB_BYTES,), np.dtype[np.uint8]],
-            np.ndarray[(Q_BYTES + KV_BYTES,), np.dtype[np.uint8]],
+            np.ndarray[(OUT_BYTES,), np.dtype[np.uint8]],
         )
         def sequence(QKV, TAB, OUT):
             def lin(full, offset, sizes, strides):
@@ -122,14 +121,15 @@ def design(m, k, n):
                 sin, tin, outs = [], [], []
                 for mt in range(NT):
                     base = ((mt // 4) * 96 + mt % 4) * TILE + c * 2304
+                    # K (nt 16+r) and V (nt 20+r): tile (mt/4)*96 + 64 + 4r + mt%4, V = K + 16 tiles
+                    sin.append((S_l3l2[c], lin(QKV_BYTES, base + 64 * TILE, [4, 2, 9, 256], [4 * TILE, 16 * TILE, 256, 1])))
                     # Q heads hq 0,1 and 2,3 of every kv head r: tile (mt/4)*96 + 16r + 4hq + mt%4
                     sin.append((S_l3l2[c], lin(QKV_BYTES, base, [4, 2, 9, 256], [16 * TILE, 4 * TILE, 256, 1])))
                     sin.append((S_l3l2[c], lin(QKV_BYTES, base + 8 * TILE, [4, 2, 9, 256], [16 * TILE, 4 * TILE, 256, 1])))
-                    # K (nt 16+r) and V (nt 20+r): tile (mt/4)*96 + 64 + 4r + mt%4, V = K + 16 tiles
-                    sin.append((S_l3l2[c], lin(QKV_BYTES, base + 64 * TILE, [4, 2, 9, 256], [4 * TILE, 16 * TILE, 256, 1])))
                     tin.append((T_f[c], lin(TAB_BYTES, (mt * 8 + c) * TE, [1, 1, 5, 1024], [0, 0, 1024, 1])))
-                    outs.append((C_l2l3[c], lin(Q_BYTES + KV_BYTES, mt * PASS + c * PCOL + 6144, [1, 1, 36, 1024], [0, 0, 1024, 1])))
-                    outs.append((C_l2l3[c], lin(Q_BYTES + KV_BYTES, Q_BYTES + (mt * 8 + c) * 18432, [1, 1, 18, 1024], [0, 0, 1024, 1])))
+                    outs.append((C_l2l3[c], lin(OUT_BYTES, Q_BYTES + (mt * 8 + c) * 18432, [1, 1, 18, 1024], [0, 0, 1024, 1])))
+                    outs.append((C_l2l3[c], lin(OUT_BYTES, mt * PASS + c * PCOL + 6144, [1, 1, 72, 1024], [0, 0, 1024, 1])))
+                    outs.append((C_l2l3[c], lin(OUT_BYTES, Q_BYTES + KV_BYTES + (mt * 8 + c) * 6144, [1, 1, 6, 1024], [0, 0, 1024, 1])))
                 chans = [sin, tin, outs]
                 tasks = [dict() for _ in chans]
 
@@ -146,7 +146,7 @@ def design(m, k, n):
                         nxt[ci] = k + 1
                 # keep windows full in dependency order: per mt the core needs 1 table, 3 stripe objects, 2 outputs
                 for mt in range(NT):
-                    need = [(mt + 1) * 3, (mt + 1), (mt + 1) * 2]
+                    need = [(mt + 1) * 3, (mt + 1), (mt + 1) * 3]
                     for ci in range(3):
                         while nxt[ci] < len(chans[ci]) and nxt[ci] - WIN < need[ci] and nxt[ci] - WIN < len(chans[ci]):
                             kk = nxt[ci]
