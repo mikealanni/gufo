@@ -118,9 +118,49 @@ struct Weights {
   }
 };
 
+std::vector<char> ReadNpy(const std::string& path, std::size_t* bytes) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) {
+    std::fprintf(stderr, "cannot open %s\n", path.c_str());
+    std::exit(1);
+  }
+  std::vector<char> b((std::istreambuf_iterator<char>(f)), {});
+  std::uint16_t hl;
+  std::memcpy(&hl, b.data() + 8, 2);
+  const std::size_t off = 10 + hl;
+  *bytes = b.size() - off;
+  return std::vector<char>(b.begin() + off, b.end());
+}
+
 struct QMat {
   std::vector<std::int8_t> q;
   std::vector<std::uint16_t> s;
+  std::uint32_t N{0}, K{0};
+  void Resize(std::uint32_t n, std::uint32_t k) {
+    N = n;
+    K = k;
+    q.assign(std::size_t{n} * k, 0);
+    s.assign(std::size_t{n} * (k / 32), 0x3F80);
+  }
+  void Load(const std::string& dir, const std::string& name, std::uint32_t row0, std::uint32_t rows) {
+    std::size_t nb = 0;
+    auto qb = ReadNpy(dir + "/" + name + ".q.npy", &nb);
+    if (nb != std::size_t{rows} * K) {
+      std::fprintf(stderr, "%s q size mismatch\n", name.c_str());
+      std::exit(1);
+    }
+    std::memcpy(&q[std::size_t{row0} * K], qb.data(), nb);
+    auto sb = ReadNpy(dir + "/" + name + ".s.npy", &nb);
+    if (nb != std::size_t{rows} * (K / 32) * 2) {
+      std::fprintf(stderr, "%s s size mismatch\n", name.c_str());
+      std::exit(1);
+    }
+    std::memcpy(&s[std::size_t{row0} * (K / 32)], sb.data(), nb);
+  }
+  void CopyRows(const QMat& src, std::uint32_t srow, std::uint32_t drow, std::uint32_t rows) {
+    std::memcpy(&q[std::size_t{drow} * K], &src.q[std::size_t{srow} * K], std::size_t{rows} * K);
+    std::memcpy(&s[std::size_t{drow} * (K / 32)], &src.s[std::size_t{srow} * (K / 32)], std::size_t{rows} * (K / 32) * 2);
+  }
 };
 
 void RmsNormRows(const float* x, const float* w, float* out, std::uint32_t rows, std::uint32_t d) {
@@ -198,11 +238,26 @@ struct Engine {
         buf.resize(std::size_t{kGdnInN} * kH);
         w.Load(a + "in_proj_qkv.weight", buf.data(), std::size_t{kConvDim} * kH);
         w.Load(a + "in_proj_z.weight", buf.data() + std::size_t{kConvDim} * kH, std::size_t{kValDim} * kH);
-        L.w_in = rt.PackWeight(buf.data(), kGdnInN, kH);
+        if (qdir) {
+          QMat m;
+          m.Resize(kGdnInN, kH);
+          m.Load(qdir, std::to_string(l) + ".qkv", 0, kConvDim);
+          m.Load(qdir, std::to_string(l) + ".z", kConvDim, kValDim);
+          L.w_in = rt.PackWeightQ(m.q.data(), m.s.data(), kGdnInN, kH);
+        } else {
+          L.w_in = rt.PackWeight(buf.data(), kGdnInN, kH);
+        }
         L.p_out = rt.MakeProgram(kValDim, kOutN, programs + "/insts_plain_4096x3072_m64.txt", 0, &err, 0, 4);
         buf.assign(std::size_t{kOutN} * kValDim, 0.f);
         w.Load(a + "out_proj.weight", buf.data(), std::size_t{kH} * kValDim);
-        L.w_out = rt.PackWeight(buf.data(), kOutN, kValDim);
+        if (qdir) {
+          QMat m;
+          m.Resize(kOutN, kValDim);
+          m.Load(qdir, std::to_string(l) + ".out", 0, kH);
+          L.w_out = rt.PackWeightQ(m.q.data(), m.s.data(), kOutN, kValDim);
+        } else {
+          L.w_out = rt.PackWeight(buf.data(), kOutN, kValDim);
+        }
       } else {
         const std::string a = pre + "self_attn.";
         L.qn = w.Vec(a + "q_norm.weight", kHeadDim, 1.0f);
@@ -212,11 +267,27 @@ struct Engine {
         w.Load(a + "q_proj.weight", buf.data(), std::size_t{2 * kQDim} * kH);
         w.Load(a + "k_proj.weight", buf.data() + std::size_t{2 * kQDim} * kH, std::size_t{kKvDim} * kH);
         w.Load(a + "v_proj.weight", buf.data() + std::size_t{2 * kQDim + kKvDim} * kH, std::size_t{kKvDim} * kH);
-        L.w_in = rt.PackWeight(buf.data(), kAttnInN, kH);
+        if (qdir) {
+          QMat m;
+          m.Resize(kAttnInN, kH);
+          m.Load(qdir, std::to_string(l) + ".q", 0, 2 * kQDim);
+          m.Load(qdir, std::to_string(l) + ".k", 2 * kQDim, kKvDim);
+          m.Load(qdir, std::to_string(l) + ".v", 2 * kQDim + kKvDim, kKvDim);
+          L.w_in = rt.PackWeightQ(m.q.data(), m.s.data(), kAttnInN, kH);
+        } else {
+          L.w_in = rt.PackWeight(buf.data(), kAttnInN, kH);
+        }
         L.p_out = rt.MakeProgram(kQDim, kOutN, programs + "/insts_plain_4096x3072_m64.txt", 0, &err, 0, 4);
         buf.assign(std::size_t{kOutN} * kQDim, 0.f);
         w.Load(a + "o_proj.weight", buf.data(), std::size_t{kH} * kQDim);
-        L.w_out = rt.PackWeight(buf.data(), kOutN, kQDim);
+        if (qdir) {
+          QMat m;
+          m.Resize(kOutN, kQDim);
+          m.Load(qdir, std::to_string(l) + ".o", 0, kH);
+          L.w_out = rt.PackWeightQ(m.q.data(), m.s.data(), kOutN, kQDim);
+        } else {
+          L.w_out = rt.PackWeight(buf.data(), kOutN, kQDim);
+        }
       }
       L.p_gu = rt.MakeProgram(kH, 2 * kI, programs + "/insts_ffngu64_2560.txt", 0, &err, 0, 4);
       L.p_dn = rt.MakeProgram(kI, kOutN, programs + "/insts_plain_9216x3072_m64.txt", 0, &err, 0, 4);
@@ -229,10 +300,31 @@ struct Engine {
           std::memcpy(&buf[(f * 16 + i) * kH], &gate[(f * 8 + i) * kH], kH * 4);
           std::memcpy(&buf[(f * 16 + 8 + i) * kH], &up[(f * 8 + i) * kH], kH * 4);
         }
-      L.w_gu = rt.PackWeight(buf.data(), 2 * kI, kH);
+      if (qdir) {
+        QMat g, u, gu;
+        g.Resize(kI, kH);
+        u.Resize(kI, kH);
+        gu.Resize(2 * kI, kH);
+        g.Load(qdir, std::to_string(l) + ".gate", 0, kI);
+        u.Load(qdir, std::to_string(l) + ".up", 0, kI);
+        for (std::size_t f = 0; f < kI / 8; ++f) {
+          gu.CopyRows(g, f * 8, f * 16, 8);
+          gu.CopyRows(u, f * 8, f * 16 + 8, 8);
+        }
+        L.w_gu = rt.PackWeightQ(gu.q.data(), gu.s.data(), 2 * kI, kH);
+      } else {
+        L.w_gu = rt.PackWeight(buf.data(), 2 * kI, kH);
+      }
       buf.assign(std::size_t{kOutN} * kI, 0.f);
       w.Load(pre + "mlp.down_proj.weight", buf.data(), std::size_t{kH} * kI);
-      L.w_dn = rt.PackWeight(buf.data(), kOutN, kI);
+      if (qdir) {
+        QMat m;
+        m.Resize(kOutN, kI);
+        m.Load(qdir, std::to_string(l) + ".down", 0, kH);
+        L.w_dn = rt.PackWeightQ(m.q.data(), m.s.data(), kOutN, kI);
+      } else {
+        L.w_dn = rt.PackWeight(buf.data(), kOutN, kI);
+      }
       if (l % 8 == 0) std::fprintf(stderr, "q35: packed layer %u (%.1f s)\n", l, Ms(t0) / 1000.0);
     }
     std::fprintf(stderr, "q35: packed %u layers in %.1f s\n", kLayers, Ms(t0) / 1000.0);
