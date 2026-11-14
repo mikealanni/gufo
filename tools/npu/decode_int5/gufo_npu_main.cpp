@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <sys/resource.h>
 #include <unistd.h>
 #include <fstream>
 #include <string>
@@ -18,6 +19,12 @@
 #include "src/models/lfm3/tokenizer.hpp"
 
 using gufo::models::lfm3::npu::Engine;
+
+static double CpuSeconds() {
+  rusage u;
+  getrusage(RUSAGE_SELF, &u);
+  return u.ru_utime.tv_sec + u.ru_stime.tv_sec + 1e-6 * (u.ru_utime.tv_usec + u.ru_stime.tv_usec);
+}
 
 static std::vector<std::uint8_t> Slurp(const std::string& p) {
   std::ifstream f(p, std::ios::binary | std::ios::ate);
@@ -35,11 +42,18 @@ int main(int argc, char** argv) {
     setenv("OMP_WAIT_POLICY", "passive", 1);
     execv("/proc/self/exe", argv);
   }
+  // Decode threads mostly wait on the NPU: a short spin keeps per-token latency and sleeps through the long waits.
+  if ((cmd == "generate" || cmd == "chat") && !std::getenv("OMP_WAIT_POLICY") && !std::getenv("GOMP_SPINCOUNT")) {
+    setenv("GOMP_SPINCOUNT", "1000", 1);
+    execv("/proc/self/exe", argv);
+  }
   gufo::models::lfm3::npu::Options opt;
   std::string in, out;
   std::size_t maxtok = 512, maxnew = 128;
   std::string prompt, heads_path;
   std::size_t head_k = 2;
+  const int dec_threads = std::getenv("GUFO_DECODE_THREADS") ? std::atoi(std::getenv("GUFO_DECODE_THREADS")) : 2;
+  const int pre_threads = std::getenv("OMP_NUM_THREADS") ? std::atoi(std::getenv("OMP_NUM_THREADS")) : 12;
   // Passes above 16 rows run the m64 programs, which corrupt decode state; speculation stays on the m16 programs.
   const std::size_t max_fed = std::getenv("GUFO_MAXFED") ? std::stoul(std::getenv("GUFO_MAXFED")) : 16;
   bool spec = std::getenv("GUFO_NO_SPEC") == nullptr;
@@ -187,6 +201,7 @@ int main(int argc, char** argv) {
       }
       return 0;
     }
+    omp_set_num_threads(pre_threads);
     engine->Reset();
     const auto t0 = std::chrono::steady_clock::now();
     for (std::size_t at = 0; at < ids.size();) {
@@ -199,6 +214,8 @@ int main(int argc, char** argv) {
       at += n;
     }
     const auto t1 = std::chrono::steady_clock::now();
+    const double cpu1 = CpuSeconds();
+    omp_set_num_threads(dec_threads);
     std::uint32_t next = engine->Argmax(h.data() + (h.size() - 2048));
     std::vector<std::uint32_t> hist = ids;
     std::size_t passes = 0, drafted = 0, accepted = 0;
@@ -286,6 +303,7 @@ int main(int argc, char** argv) {
     const double dec = std::chrono::duration<double>(t2 - t1).count();
     std::fprintf(stderr, "prompt %zu tokens in %.3f s (%.0f tok/s); %zu new tokens in %.3f s (%.2f tok/s)\n",
                  ids.size(), pre, ids.size() / pre, out.size(), dec, out.size() / dec);
+    std::fprintf(stderr, "decode cpu: %.2f s over %.2f s = %.1f cores busy\n", CpuSeconds() - cpu1, dec, (CpuSeconds() - cpu1) / dec);
     std::printf("ids:");
     for (auto t : out) std::printf(" %u", t);
     std::printf("\n");
@@ -320,6 +338,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[context full: %zu tokens]\n", ids.size());
         break;
       }
+      omp_set_num_threads(pre_threads);
       engine->Reset();
       std::vector<float> h;
       const auto t0 = std::chrono::steady_clock::now();
@@ -332,6 +351,7 @@ int main(int argc, char** argv) {
         at += n;
       }
       const auto t1 = std::chrono::steady_clock::now();
+      omp_set_num_threads(dec_threads);
       std::uint32_t next = engine->Argmax(h.data() + (h.size() - 2048));
       std::vector<std::uint32_t> out, hist = ids, head_draft;
       std::printf("npu> ");
