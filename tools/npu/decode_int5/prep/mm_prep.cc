@@ -1,7 +1,7 @@
 // Attention prep on the C wire layout of the QKV GEMM: QK-norm + RoPE (+ V block transpose), emitting the
 // attention kernel's Q block (9216 B) and K/V chunk (4608 B) as 1536 B pieces.
-// Q element (13824 B): 4 head stripes (2304 B each, blocks sbc*4+br*2+bc), rope table @9216 (4096), norm weight @13312, eps @13568.
-// KV element (9216 B): K stripe, V stripe, rope table @4608, norm weight @8704, eps @8960.
+// Stripe objects (4608 B): two head stripes of a Q block, or the K and V stripe of a chunk.
+// Table object (5120 B): rope table @0 (4096), q norm weight @4096, k norm weight @4352, eps (bf16) @4608.
 // Table: [br 2][iblock 8][cos,sin] bf16 vectors (lane = row*8+col): cos/sin of token (br*8+row), i = iblock*8+col.
 #include "aie_kernel_utils.h"
 #include <aie_api/aie.hpp>
@@ -14,8 +14,6 @@ __attribute__((aligned(64))) const uint8_t id_blk[72] = {
     127, 0,  0,  0,  0,  64, 0,  0,  0,  127, 0,  0,  0,  0,  0,  64, 0,  0,
     127, 0,  0,  0,  0,  0,  0,  64, 0,  127, 0,  0,  0,  0,  0,  0,  0,  64};
 
-constexpr int kQTab = 9216, kQW = 13312, kQEps = 13568;
-constexpr int kKTab = 4608, kKW = 8704, kKEps = 8960;
 
 alignas(64) static bfloat16 dec[32 * 64];
 alignas(64) static uint8_t scratch[9216];
@@ -92,29 +90,33 @@ static inline void norm_rope(const bfloat16 *tab, const bfloat16 *w, bfloat16 ep
   }
 }
 
+constexpr int kTW = 4096, kTWK = 4352, kTEps = 4608;
+
 extern "C" {
-__attribute__((noinline)) void prep_q(const uint8_t *e) {
+// Two head stripes (hq = 2*pair, 2*pair+1) of a Q block; t: table object (rope table, q/k norm weights, eps).
+__attribute__((noinline)) void prep_q2(const uint8_t *s, const uint8_t *t, int pair) {
   ::aie::set_rounding(::aie::rounding_mode::conv_even);
-  for (int hq = 0; hq < 4; ++hq) {
-    decode_stripe(e + hq * 2304);
-    norm_rope((const bfloat16 *)(e + kQTab), (const bfloat16 *)(e + kQW), *(const bfloat16 *)(e + kQEps), scratch + hq * 2304);
+  for (int i = 0; i < 2; ++i) {
+    decode_stripe(s + i * 2304);
+    norm_rope((const bfloat16 *)t, (const bfloat16 *)(t + kTW), *(const bfloat16 *)(t + kTEps), scratch + (pair * 2 + i) * 2304);
   }
 }
 
-__attribute__((noinline)) void prep_kv(const uint8_t *e) {
+// K stripe then V stripe; emits the 4608 B K/V chunk of the 16 tokens into scratch.
+__attribute__((noinline)) void prep_kv2(const uint8_t *s, const uint8_t *t) {
   ::aie::set_rounding(::aie::rounding_mode::conv_even);
-  decode_stripe(e);
-  norm_rope((const bfloat16 *)(e + kKTab), (const bfloat16 *)(e + kKW), *(const bfloat16 *)(e + kKEps), scratch);
+  decode_stripe(s);
+  norm_rope((const bfloat16 *)t, (const bfloat16 *)(t + kTWK), *(const bfloat16 *)(t + kTEps), scratch);
   aie::block_vector_input_buffer_stream<bfp16ebs8, 64> idst((bfp16ebs8 *)id_blk);
   idst.seek(0);
   const aie::block_vector<bfp16ebs8, 64> idb = idst.pop();
   const aie::accum<accfloat, 64> z = aie::zeros<accfloat, 64>();
-  aie::block_vector_input_buffer_stream<bfp16ebs8, 64> in((const bfp16ebs8 *)(e + 2304));
+  aie::block_vector_input_buffer_stream<bfp16ebs8, 64> in((const bfp16ebs8 *)(s + 2304));
   in.seek(0);
   for (int sbc = 0; sbc < 8; ++sbc)
     for (int br = 0; br < 2; ++br)
       for (int bc = 0; bc < 2; ++bc) {
-        const aie::block_vector<bfp16ebs8, 64> g = in.pop();  // block order sbc*4 + br*2 + bc
+        const aie::block_vector<bfp16ebs8, 64> g = in.pop();
         const aie::accum<accfloat, 64> tv = mac_8x8_8x8T(idb, g, z);
         put(scratch + 2304 + (br * 16 + sbc * 2 + bc) * 72, tv);
       }
