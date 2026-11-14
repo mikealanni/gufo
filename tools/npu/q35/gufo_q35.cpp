@@ -452,7 +452,36 @@ struct Engine {
 
 }  // namespace
 
+int EvalBatch(const char* model, const char* programs, const char* path) {
+  std::ifstream f(path, std::ios::binary);
+  std::vector<char> b((std::istreambuf_iterator<char>(f)), {});
+  std::vector<std::int32_t> d(b.size() / 4);
+  std::memcpy(d.data(), b.data(), d.size() * 4);
+  Engine e;
+  if (!e.Init(model, programs)) return 1;
+  std::size_t at = 0;
+  const std::int32_t cases = d[at++];
+  const auto t0 = Clock::now();
+  std::uint64_t total = 0;
+  for (std::int32_t c = 0; c < cases; ++c) {
+    const std::uint32_t len = static_cast<std::uint32_t>(d[at++]), marker = static_cast<std::uint32_t>(d[at++]), cnt = static_cast<std::uint32_t>(d[at++]);
+    std::vector<float> hid;
+    e.Forward(&d[at], len, {marker}, &hid);
+    at += len;
+    total += len;
+    for (std::uint32_t k = 0; k < cnt; ++k) {
+      float s = 0;
+      for (std::uint32_t i = 0; i < kH; ++i) s += e.readout[std::size_t{k} * kH + i] * hid[i];
+      std::printf("%.5f ", s);
+    }
+    std::printf("\n");
+  }
+  std::fprintf(stderr, "eval: %d cases %llu tokens %.1f ms (%.1f ms/case, npu %.0f host %.0f)\n", cases, static_cast<unsigned long long>(total), Ms(t0), Ms(t0) / cases, e.t_npu, e.t_host);
+  return 0;
+}
+
 int main(int argc, char** argv) {
+  if (argc == 5 && std::string(argv[1]) == "eval") return EvalBatch(argv[2], argv[3], argv[4]);
   if (argc < 6) {
     std::fprintf(stderr, "usage: gufo-q35 logits MODEL_DIR PROGRAMS TOKENS.i32 MARKER[,MARKER...] [COUNT]\n");
     return 2;
@@ -473,6 +502,7 @@ int main(int argc, char** argv) {
   const auto t0 = Clock::now();
   e.Forward(toks.data(), static_cast<std::uint32_t>(toks.size()), markers, &hid);
   std::fprintf(stderr, "forward %zu tokens %.1f ms (npu %.0f ms, host %.0f ms)\n", toks.size(), Ms(t0), e.t_npu, e.t_host);
+  std::fprintf(stderr, "npu: enc %.0f syncA %.0f submit %.0f wait %.0f syncC %.0f dec %.0f ms\n", e.tim.enc, e.tim.syncA, e.tim.submit, e.tim.wait, e.tim.syncC, e.tim.dec);
   for (std::size_t m = 0; m < markers.size(); ++m) {
     for (std::uint32_t c = 0; c < count; ++c) {
       float s = 0;
