@@ -181,7 +181,7 @@ struct Layer {
   bool linear{false};
   std::vector<float> ln1, ln2;
   // gated delta net
-  std::vector<float> conv, a_log, dt_bias, gnorm, w_a, w_b;
+  std::vector<float> conv, convT, a_log, dt_bias, gnorm, w_a, w_b;
   // attention
   std::vector<float> qn, kn;
   WeightBuffer w_in, w_out, w_gu, w_dn;
@@ -203,7 +203,7 @@ struct Engine {
   std::vector<std::uint16_t> embed_raw;
   const std::uint16_t* embed{nullptr};
   Weights w;
-  double t_npu{0}, t_host{0}, ph[4]{0, 0, 0, 0};
+  double t_npu{0}, t_host{0}, ph[4]{0, 0, 0, 0}, mx[8]{0, 0, 0, 0, 0, 0, 0, 0};
   const char* qdir{std::getenv("Q35_QDIR")};
 
   bool Init(const std::string& model_dir, const std::string& programs) {
@@ -424,7 +424,7 @@ struct Engine {
     L.kw_d = rk.PackWeightAtb(buf.data(), kOutN, kI, 4);
   }
 
-  std::vector<float> kx, ky;
+  std::vector<float> kx, ky, s_proj, s_gated, s_outp, s_att, s_qkv, s_ab;
 
   void KGemm(Program& p, WeightBuffer& wb, const float* z, std::uint32_t T, std::uint32_t K, float* out) {
     const auto t0 = Clock::now();
@@ -454,19 +454,30 @@ struct Engine {
   }
 
   void Gdn(Layer& L, const float* z, std::uint32_t Tt, const std::vector<std::pair<std::uint32_t, std::uint32_t>>& segs, float* out_h) {
-    std::vector<float> proj(std::size_t{Tt} * kGdnInN), gated(std::size_t{Tt} * kValDim);
+    auto ta = Clock::now();
+    s_proj.resize(std::size_t{Tt} * kGdnInN);
+    s_gated.resize(std::size_t{Tt} * kValDim);
+    std::vector<float>& proj = s_proj;
+    std::vector<float>& gated = s_gated;
+    mx[4] += Ms(ta); ta = Clock::now();
     if (kd) KGemm(L.kp_in, L.kw_in, z, Tt, kH, proj.data());
     else Gemm(L.p_in, L.w_in, z, Tt, kH, proj.data());
+    mx[0] += Ms(ta);
     const auto t0 = Clock::now();
     for (const auto& sg : segs) GdnHost(L, proj.data() + std::size_t{sg.first} * kGdnInN, z + std::size_t{sg.first} * kH, sg.second, gated.data() + std::size_t{sg.first} * kValDim);
     t_host += Ms(t0);
-    std::vector<float> outp(std::size_t{Tt} * kOutN);
+    mx[1] += Ms(t0);
+    ta = Clock::now();
+    s_outp.resize(std::size_t{Tt} * kOutN);
+    std::vector<float>& outp = s_outp;
     if (kd) KGemm(L.kp_out, L.kw_out, gated.data(), Tt, kValDim, outp.data());
     else Gemm(L.p_out, L.w_out, gated.data(), Tt, kValDim, outp.data());
+    mx[2] += Ms(ta);
     for (std::uint32_t t = 0; t < Tt; ++t) std::memcpy(out_h + std::size_t{t} * kH, &outp[std::size_t{t} * kOutN], kH * 4);
   }
 
   void GdnHost(Layer& L, const float* proj, const float* z, std::uint32_t T, float* gated) {
+    auto tq = Clock::now();
     std::vector<float> ab(std::size_t{T} * 2 * kVH);
 #pragma omp parallel for collapse(2)
     for (std::int64_t t = 0; t < T; ++t)
@@ -477,19 +488,29 @@ struct Engine {
         for (std::uint32_t i = 0; i < kH; ++i) s += wrow[i] * zr[i];
         ab[std::size_t(t) * 2 * kVH + h] = s;
       }
+    mx[5] += Ms(tq); tq = Clock::now();
+    mx[5] += Ms(tq); tq = Clock::now();
     std::vector<float> qkv(std::size_t{T} * kConvDim);
-#pragma omp parallel for
-    for (std::int64_t c = 0; c < kConvDim; ++c) {
-      const float* wc = &L.conv[std::size_t(c) * kConvK];
-      for (std::uint32_t t = 0; t < T; ++t) {
-        float s = 0;
-        for (std::uint32_t j = 0; j < kConvK; ++j) {
-          const std::int64_t src = static_cast<std::int64_t>(t) - (kConvK - 1) + j;
-          if (src >= 0) s += wc[j] * proj[std::size_t(src) * kGdnInN + c];
-        }
-        qkv[std::size_t{t} * kConvDim + c] = Silu(s);
-      }
+    if (L.convT.empty()) {
+      L.convT.resize(std::size_t{kConvK} * kConvDim);
+      for (std::uint32_t c = 0; c < kConvDim; ++c)
+        for (std::uint32_t j = 0; j < kConvK; ++j) L.convT[std::size_t{j} * kConvDim + c] = L.conv[std::size_t{c} * kConvK + j];
     }
+#pragma omp parallel for
+    for (std::int64_t t = 0; t < T; ++t) {
+      float* o = &qkv[std::size_t(t) * kConvDim];
+      std::fill(o, o + kConvDim, 0.f);
+      for (std::uint32_t j = 0; j < kConvK; ++j) {
+        const std::int64_t src = t - (kConvK - 1) + j;
+        if (src < 0) continue;
+        const float* in = proj + std::size_t(src) * kGdnInN;
+        const float* wj = &L.convT[std::size_t{j} * kConvDim];
+#pragma omp simd
+        for (std::uint32_t c = 0; c < kConvDim; ++c) o[c] += wj[c] * in[c];
+      }
+      for (std::uint32_t c = 0; c < kConvDim; ++c) o[c] = Silu(o[c]);
+    }
+    mx[6] += Ms(tq); tq = Clock::now();
 #pragma omp parallel for
     for (std::int64_t h = 0; h < kVH; ++h) {
       const std::uint32_t kh = static_cast<std::uint32_t>(h) / (kVH / kKH);
@@ -543,13 +564,19 @@ struct Engine {
   }
 
   void Attn(Layer& L, const float* z, std::uint32_t Tt, const std::vector<std::pair<std::uint32_t, std::uint32_t>>& segs, float* out_h) {
-    std::vector<float> proj(std::size_t{Tt} * kAttnInN), att(std::size_t{Tt} * kQDim);
+    s_proj.resize(std::size_t{Tt} * kAttnInN);
+    s_att.resize(std::size_t{Tt} * kQDim);
+    std::vector<float>& proj = s_proj;
+    std::vector<float>& att = s_att;
+    auto ta = Clock::now();
     if (kd) KGemm(L.kp_in, L.kw_in, z, Tt, kH, proj.data());
     else Gemm(L.p_in, L.w_in, z, Tt, kH, proj.data());
+    mx[3] += Ms(ta);
     const auto t0 = Clock::now();
     for (const auto& sg : segs) AttnHost(L, proj.data() + std::size_t{sg.first} * kAttnInN, sg.second, att.data() + std::size_t{sg.first} * kQDim);
     t_host += Ms(t0);
-    std::vector<float> outp(std::size_t{Tt} * kOutN);
+    s_outp.resize(std::size_t{Tt} * kOutN);
+    std::vector<float>& outp = s_outp;
     if (kd) KGemm(L.kp_out, L.kw_out, att.data(), Tt, kQDim, outp.data());
     else Gemm(L.p_out, L.w_out, att.data(), Tt, kQDim, outp.data());
     for (std::uint32_t t = 0; t < Tt; ++t) std::memcpy(out_h + std::size_t{t} * kH, &outp[std::size_t{t} * kOutN], kH * 4);
@@ -817,6 +844,7 @@ int EvalBatch(const char* model, const char* programs, const char* path) {
     e.tim = {};
     e.t_npu = e.t_host = 0;
     for (auto& v : e.ph) v = 0;
+    for (auto& v : e.mx) v = 0;
   }
   for (std::size_t g = 0; g < items.size(); g += group) {
     std::vector<Engine::Seq> sq;
@@ -837,6 +865,7 @@ int EvalBatch(const char* model, const char* programs, const char* path) {
   }
   }
   std::fprintf(stderr, "npu: enc %.0f syncA %.0f submit %.0f wait %.0f syncC %.0f dec %.0f ms\n", e.tim.enc, e.tim.syncA, e.tim.submit, e.tim.wait, e.tim.syncC, e.tim.dec);
+  std::fprintf(stderr, "mixer: gdn in %.0f host %.0f out %.0f alloc %.0f | attn in %.0f | ab %.0f conv %.0f\n", e.mx[0], e.mx[1], e.mx[2], e.mx[4], e.mx[3], e.mx[5], e.mx[6]);
   std::fprintf(stderr, "phases: norm1 %.0f mixer %.0f resid+norm2 %.0f mlp %.0f ms\n", e.ph[0], e.ph[1], e.ph[2], e.ph[3]);
   std::fprintf(stderr, "eval: %d cases %llu tokens %.1f ms (%.1f ms/case, npu %.0f host %.0f) group %u\n", cases, static_cast<unsigned long long>(total), Ms(t0), Ms(t0) / cases, e.t_npu, e.t_host, group);
   return 0;
