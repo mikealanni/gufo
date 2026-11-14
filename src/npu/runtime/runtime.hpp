@@ -309,6 +309,8 @@ class AttnPrefill {
  public:
   bool Init(const std::string& dir, std::string* error);
   bool ready() const { return ready_; }
+  /// Picks the exact-exp2 kernel (short contexts, no speed cost) or the hardware-exp2 kernel for later passes.
+  void SetExact(bool exact) { exact_ = exact && have_exact_; }
   /// q: n x 2048 rows [pos0, pos0+n), n <= 128. Writes normalized attention (n x 2048, before the gate).
   /// Returns false when the pass cannot run on this program set or a row's softmax mass is unsafe.
   bool Run(AttnLayer& al, std::uint32_t pos0, std::uint32_t n, const float* q, const std::uint16_t* k_hist,
@@ -336,6 +338,9 @@ class AttnPrefill {
   xrt::device dev_;
   xrt::hw_context ctx_;
   xrt::kernel kern_;
+  xrt::hw_context ctx_x_;
+  xrt::kernel kern_x_;
+  bool exact_{false}, have_exact_{false};
   bool ready_{false};
   xrt::bo a_[2], c_[2];
   std::uint8_t* ah_[2]{};

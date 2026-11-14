@@ -550,6 +550,8 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
   const std::uint32_t max_rows = s.atb ? gufo::npu::runtime::FfnAtbChain::kM * SuperChunks() : 64;
   if (nTot > max_rows || (nTot > 16 && !s.m64)) return false;
   const std::uint32_t pos0 = s.pos;
+  constexpr std::uint32_t kExactAttnCtx = 4096;
+  if (s.apre) s.apre->SetExact(s.pos + nTot <= kExactAttnCtx || std::getenv("GUFO_ATTN_EXACT"));
   const std::uint32_t H = s.H, I = s.I, hd = s.hd, heads = s.heads, kvh = s.kvh, kvd = s.kvd, qd = s.qd;
   const bool devres = s.devres_ok && nTot > 64;
   std::uint32_t kChunk = 1024;

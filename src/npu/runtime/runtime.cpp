@@ -1263,10 +1263,16 @@ bool AttnPrefill::Init(const std::string& dir, std::string* error) {
   try {
     dir_ = dir;
     dev_ = xrt::device(0u);
-    const xrt::xclbin xb{dir + (std::getenv("GUFO_ATTN_EXACT") ? "/final_attnp_exact.xclbin" : "/final_attnp.xclbin")};
+    const xrt::xclbin xb{dir + "/final_attnp.xclbin"};
     dev_.register_xclbin(xb);
     ctx_ = xrt::hw_context(dev_, xb.get_uuid());
     kern_ = xrt::kernel(ctx_, xb.get_kernels().at(0).get_name());
+    const xrt::xclbin xe{dir + "/final_attnp_exact.xclbin"};
+    dev_.register_xclbin(xe);
+    ctx_x_ = xrt::hw_context(dev_, xe.get_uuid());
+    kern_x_ = xrt::kernel(ctx_x_, xe.get_kernels().at(0).get_name());
+    have_exact_ = true;
+    exact_ = std::getenv("GUFO_ATTN_EXACT") != nullptr;
     for (int s = 0; s < 2; ++s) {
       a_[s] = xrt::bo(dev_, kAttnPrefixCol * 8, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(3));
       c_[s] = xrt::bo(dev_, std::size_t{8} * kAttnOutElems * 4 * kRowBytes, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(3));
@@ -1400,16 +1406,16 @@ bool AttnPrefill::Launch(int slot, AttnLayer& al, std::uint32_t mc, xrt::run** r
     bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     it = insts_.emplace(mc, std::make_pair(bo, sz / 4)).first;
   }
-  auto rit = runs_.find({&al, mc, slot});
+  auto rit = runs_.find({&al, mc, slot + (exact_ ? 2 : 0)});
   if (rit == runs_.end()) {
-    xrt::run run(kern_);
+    xrt::run run(exact_ ? kern_x_ : kern_);
     run.set_arg(0, 3u);
     run.set_arg(1, it->second.first);
     run.set_arg(2, static_cast<unsigned>(it->second.second));
     run.set_arg(3, a_[slot]);
     run.set_arg(4, al.kv);
     run.set_arg(5, c_[slot]);
-    rit = runs_.emplace(std::make_tuple(&al, mc, slot), std::move(run)).first;
+    rit = runs_.emplace(std::make_tuple(&al, mc, slot + (exact_ ? 2 : 0)), std::move(run)).first;
   }
   *run_out = &rit->second;
   return true;
