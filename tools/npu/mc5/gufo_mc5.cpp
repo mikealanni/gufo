@@ -130,6 +130,9 @@ struct Engine {
   NpuRuntime::Timings tim{};
   std::vector<Layer> layers;
   std::vector<float> norm_w;
+  Program p_argmax;
+  WeightBuffer w_argmax;
+  bool npu_argmax{false};
   std::vector<std::uint16_t> embed, head;
   std::uint32_t pos{0}, ctx{0};
   std::uint32_t gu_strips{0};
@@ -218,6 +221,15 @@ struct Engine {
       L.ffn = std::move(m);
       L.k.assign(std::size_t{ctx} * kvd, 0.f);
       L.v.assign(std::size_t{ctx} * kvd, 0.f);
+    }
+    if (!std::getenv("MC5_CPU_ARGMAX")) {
+      const std::uint32_t vp = PadN(c.vocab);
+      p_argmax = rt.MakeProgram(H, vp, programs + "/insts_argmax_1536x131072.txt", 0, &err);
+      buf.assign(std::size_t{vp} * H, 0.f);
+#pragma omp parallel for
+      for (std::int64_t i = 0; i < static_cast<std::int64_t>(std::size_t{c.vocab} * H); ++i) buf[i] = Bf(head[i]);
+      w_argmax = rt.PackWeight(buf.data(), vp, H);
+      npu_argmax = true;
     }
     std::fprintf(stderr, "mc5: packed %u layers in %.1f s\n", c.layers, Ms(t0) / 1000.0);
     return true;
@@ -329,6 +341,24 @@ struct Engine {
     }
   }
 
+  std::uint32_t Argmax(const float* h) {
+    std::uint32_t id = 0;
+    if (npu_argmax) {
+      rt.Argmax(p_argmax, w_argmax, h, 1, &id, &tim);
+      if (id < c.vocab) return id;
+    }
+    std::vector<float> lg(c.vocab);
+    Logits(h, lg.data());
+    return static_cast<std::uint32_t>(std::max_element(lg.begin(), lg.end()) - lg.begin());
+  }
+
+  float LogitAt(const float* h, std::uint32_t id) const {
+    const std::uint16_t* w = &head[std::size_t{id} * c.hidden];
+    float s = 0;
+    for (std::uint32_t i = 0; i < c.hidden; ++i) s += Bf(w[i]) * h[i];
+    return s;
+  }
+
   void Logits(const float* h, float* out) const {
     const std::uint32_t H = c.hidden;
 #pragma omp parallel for schedule(static)
@@ -399,12 +429,17 @@ int main(int argc, char** argv) {
         std::vector<std::uint32_t> in(m);
         for (std::uint32_t i = 0; i < m; ++i) in[i] = static_cast<std::uint32_t>(toks[at + o + i]);
         je.Step(in.data(), m, &hd);
-        if (o + m == len) je.Logits(&hd[std::size_t{m - 1} * je.c.hidden], lg.data());
+        if (o + m == len) {
+          const float* last = &hd[std::size_t{m - 1} * je.c.hidden];
+          lg[yes] = je.LogitAt(last, yes);
+          lg[no] = je.LogitAt(last, no);
+        }
       }
       at += len;
       total += len;
       std::printf("%+8.3f\n", lg[yes] - lg[no]);
     }
+    std::fprintf(stderr, "npu total %.0f ms (enc %.0f syncA %.0f submit %.0f wait %.0f syncC %.0f dec %.0f), host attn+rope %.0f ms\n", je.t_npu, je.tim.enc, je.tim.syncA, je.tim.submit, je.tim.wait, je.tim.syncC, je.tim.dec, je.t_cpu);
     std::fprintf(stderr, "judge: %u cases %u tokens %.1f ms (%.1f ms/case)\n", cases, total, Ms(t0), Ms(t0) / cases);
     return 0;
   }
@@ -433,6 +468,34 @@ int main(int argc, char** argv) {
       }
     }
     std::printf("tokens %u nll %.10f time %.1f s (npu %.0f ms, host attn %.0f ms)\n", count, total / count, Ms(t0) / 1000.0, e.t_npu, e.t_cpu);
+    return 0;
+  }
+  if (cmd == "generate") {
+    const std::uint32_t gen = argc > 5 ? static_cast<std::uint32_t>(std::atoi(argv[5])) : 64;
+    Engine g;
+    if (!g.Init(argv[2], argv[3], static_cast<std::uint32_t>(toks.size()) + gen + kRows64)) return 1;
+    std::vector<float> hd;
+    const auto t0 = Clock::now();
+    const std::uint32_t len = static_cast<std::uint32_t>(toks.size());
+    for (std::uint32_t o = 0; o < len; o += kPrefillRows) {
+      const std::uint32_t m = std::min(kPrefillRows, len - o);
+      std::vector<std::uint32_t> in(m);
+      for (std::uint32_t i = 0; i < m; ++i) in[i] = static_cast<std::uint32_t>(toks[o + i]);
+      g.Step(in.data(), m, &hd);
+    }
+    std::uint32_t next = g.Argmax(&hd[hd.size() - g.c.hidden]);
+    const double pf = Ms(t0);
+    const auto t1 = Clock::now();
+    std::vector<std::uint32_t> out{next};
+    for (std::uint32_t i = 1; i < gen; ++i) {
+      g.Step(&next, 1, &hd);
+      next = g.Argmax(hd.data());
+      out.push_back(next);
+    }
+    const double dc = Ms(t1);
+    for (auto t : out) std::printf("%u ", t);
+    std::printf("\n");
+    std::fprintf(stderr, "prefill %u tok %.1f ms (%.0f tok/s); decode %u tok %.1f ms (%.2f tok/s, %.1f ms/tok)\n", len, pf, len / pf * 1000, gen - 1, dc, (gen - 1) / dc * 1000, dc / (gen - 1));
     return 0;
   }
   if (cmd == "top") {
