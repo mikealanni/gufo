@@ -1,4 +1,5 @@
 #include <immintrin.h>
+#include <map>
 #include "src/npu/runtime/runtime.hpp"
 #include "src/npu/runtime/atb_layout.hpp"
 
@@ -978,10 +979,12 @@ AttnLayer NpuRuntime::MakeAttnLayer(std::uint32_t capacity_tokens, std::uint32_t
     al.capacity_chunks = mc * 8;
   }
   const std::size_t bytes = std::size_t{al.capacity_chunks} * kAttnChunkBytes;
-  al.kv = xrt::bo(dev_, bytes, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(3));
-  al.host = al.kv.map<std::uint8_t*>();
-  std::memset(al.host, 0, bytes);
-  al.kv.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  constexpr std::size_t kPad = 2 * kAttnChunkBytes;
+  al.kv_full = xrt::bo(dev_, bytes + kPad, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(3));
+  std::memset(al.kv_full.map<std::uint8_t*>(), 0, bytes + kPad);
+  al.kv_full.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  al.kv = xrt::bo(al.kv_full, bytes, kPad);
+  al.host = al.kv_full.map<std::uint8_t*>() + kPad;
   al.kmax2.assign(kAttnKvh, 0.f);
   if (!ring_tokens) al.kpre.assign(std::size_t{al.capacity_chunks} * 16 * kAttnKvh, 0.f);
   if (!attn_a_) {
@@ -1595,4 +1598,296 @@ Program NpuRuntime::MakeBareProgram(const std::string& insts_path) {
   p.insts.sync(XCL_BO_SYNC_BO_TO_DEVICE);
   return p;
 }
+}  // namespace gufo::npu::runtime
+
+namespace gufo::npu::runtime {
+
+namespace {
+struct RopeKey {
+  float theta;
+  bool fac;
+  bool operator<(const RopeKey& o) const { return theta != o.theta ? theta < o.theta : fac < o.fac; }
+};
+std::vector<char> ReadFileBytes(const std::string& path) {
+  std::ifstream f(path, std::ios::binary | std::ios::ate);
+  if (!f) throw std::runtime_error("missing " + path);
+  std::vector<char> b(static_cast<std::size_t>(f.tellg()));
+  f.seekg(0);
+  f.read(b.data(), static_cast<std::streamsize>(b.size()));
+  return b;
+}
+}  // namespace
+
+bool AttnDevPrep::Init(const std::string& dir, xrt::device& dev, std::string* error) {
+  try {
+    dev_ = dev;
+    const xrt::xclbin xb{dir + "/final_prep.xclbin"};
+    dev_.register_xclbin(xb);
+    ctx_ = xrt::hw_context(dev_, xb.get_uuid());
+    kern_ = xrt::kernel(ctx_, xb.get_kernels().at(0).get_name());
+    auto mk = [&](const char* name, std::size_t* words) {
+      const auto buf = ReadFileBytes(dir + "/" + name);
+      xrt::bo b(dev_, buf.size(), XCL_BO_FLAGS_CACHEABLE, kern_.group_id(1));
+      std::memcpy(b.map<void*>(), buf.data(), buf.size());
+      b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      *words = buf.size() / 4;
+      return b;
+    };
+    ib_kv_ = mk("insts_prep_kv.txt", &n_kv_);
+    ib_q_ = mk("insts_prep_q.txt", &n_q_);
+    pass_ = xrt::bo(dev_, std::size_t{kPasses} * kPassBytes, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(5));
+    std::memset(pass_.map<std::uint8_t*>(), 0, std::size_t{kPasses} * kPassBytes);
+    pass_.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    for (std::uint32_t i = 0; i < kPasses; ++i) pass_sub_.emplace_back(pass_, kPassBytes, std::size_t{i} * kPassBytes);
+    for (std::uint32_t i = 0; i < kPasses / 8; ++i) pass_win_.emplace_back(pass_, 8 * kPassBytes, std::size_t{i} * 8 * kPassBytes);
+    kn_ = xrt::bo(dev_, std::size_t{kGroups} * 6144, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(7));
+    ready_ = true;
+    return true;
+  } catch (const std::exception& e) {
+    if (error) *error = e.what();
+    return false;
+  }
+}
+
+bool AttnDevPrep::SetupLayer(std::size_t id, std::uint32_t max_tokens, const float* qn, const float* kn, float eps,
+                             float theta, const float* fac) {
+  if (!ready_) return false;
+  if (tabs_.size() <= id) tabs_.resize(id + 1);
+  LayerTab& t = tabs_[id];
+  t.max_groups = (max_tokens + 15) / 16 + kGroups;
+  t.bo = xrt::bo(dev_, std::size_t{t.max_groups} * kTabBytes, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(4));
+  t.h = t.bo.map<std::uint8_t*>();
+  std::memset(t.h, 0, std::size_t{t.max_groups} * kTabBytes);
+  const float qscale = 1.4426950408889634f / std::sqrt(128.0f);
+  t.wq.resize(128);
+  t.wk.resize(128);
+  for (int d = 0; d < 128; ++d) {
+    t.wq[d] = Bf16Bits(qn[d] * qscale);
+    t.wk[d] = Bf16Bits(kn[d]);
+  }
+  t.eps = Bf16Bits(eps);
+  t.theta = theta;
+  t.fac.assign(fac ? fac : nullptr, fac ? fac + 64 : nullptr);
+  t.filled = 0;
+  return true;
+}
+
+bool AttnDevPrep::Run(AttnLayer& al, std::size_t id, xrt::bo& qkv_c, std::uint32_t pos0, std::uint32_t n,
+                      std::uint32_t pass0, std::string* error) {
+  int stage = 0;
+  try {
+    if (!ready_ || id >= tabs_.size() || tabs_[id].h == nullptr || pos0 % 16 != 0 || n == 0 || n > 1024 || al.ring_tokens ||
+        pass0 % 8 != 0 || pass0 / 8 >= pass_win_.size()) {
+      if (error) *error = "precondition ready=" + std::to_string(ready_) + " id=" + std::to_string(id) + " tabs=" + std::to_string(tabs_.size()) + " h=" + std::to_string(id < tabs_.size() && tabs_[id].h != nullptr) + " ring=" + std::to_string(al.ring_tokens);
+      return false;
+    }
+    LayerTab& lt = tabs_[id];
+    const std::uint32_t q0 = pos0 / 16;
+    if (q0 + kGroups > lt.max_groups) {
+      if (error) *error = "window beyond table";
+      return false;
+    }
+    const auto th0 = Clock::now();
+    // static table + norm weights for groups not yet filled
+    static std::map<RopeKey, std::vector<std::uint16_t>> rope;
+    auto& rp = rope[RopeKey{lt.theta, !lt.fac.empty()}];
+    const std::uint32_t need = q0 + kGroups;
+    if (rp.size() < std::size_t{need} * 2048) {
+      const std::size_t g0 = rp.size() / 2048;
+      rp.resize(std::size_t{need} * 2048);
+#pragma omp parallel for
+      for (std::int64_t g = static_cast<std::int64_t>(g0); g < need; ++g)
+        for (int br = 0; br < 2; ++br)
+          for (int ib = 0; ib < 8; ++ib)
+            for (int row = 0; row < 8; ++row)
+              for (int col = 0; col < 8; ++col) {
+                const double pos = static_cast<double>(g) * 16 + br * 8 + row;
+                const int i = ib * 8 + col;
+                double ang = pos * std::pow(static_cast<double>(lt.theta), -2.0 * i / 128.0);
+                if (!lt.fac.empty()) ang /= lt.fac[i];
+                const std::size_t base = static_cast<std::size_t>(g) * 2048 + static_cast<std::size_t>((br * 8 + ib) * 2) * 64 + row * 8 + col;
+                rp[base] = Bf16Bits(static_cast<float>(std::cos(ang)));
+                rp[base + 64] = Bf16Bits(static_cast<float>(std::sin(ang)));
+              }
+    }
+    for (std::uint32_t g = lt.filled; g < need; ++g) {
+      std::uint8_t* te = lt.h + std::size_t{g} * kTabBytes;
+      std::memcpy(te, &rp[std::size_t{g} * 2048], 4096);
+      std::memcpy(te + 4096, lt.wq.data(), 256);
+      std::memcpy(te + 4352, lt.wk.data(), 256);
+      std::memcpy(te + 4608, &lt.eps, 2);
+    }
+    const std::uint32_t f0 = lt.filled;
+    lt.filled = std::max(lt.filled, need);
+    for (std::uint32_t w = 0; w < kGroups; ++w) {
+      std::uint8_t* te = lt.h + std::size_t{q0 + w} * kTabBytes;
+      const std::uint32_t nc = n > 16 * w ? std::min(16u, n - 16 * w) : 0;
+      const std::int32_t pos = static_cast<std::int32_t>((q0 + w) * 16);
+      const std::int32_t hdr[4] = {pos, static_cast<std::int32_t>(nc), static_cast<std::int32_t>(q0 + w), 0};
+      std::memcpy(te + 4864, hdr, 16);
+      std::memset(te + 4992, 0, 16);
+    }
+    const std::uint32_t s0 = std::min(f0, q0);
+    lt.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE, std::size_t{need - s0} * kTabBytes, std::size_t{s0} * kTabBytes);
+    ms_host += Ms(th0);
+    stage = 1;
+    xrt::bo tab_win(lt.bo, std::size_t{kGroups} * kTabBytes, std::size_t{q0} * kTabBytes);
+    xrt::bo kv_w(al.kv_full, std::size_t{kGroups} * kChunkBytes, std::size_t{2 + q0} * kChunkBytes);
+    xrt::bo& pass_w = pass_win_[pass0 / 8];
+    auto t = Clock::now();
+    stage = 2;
+    {
+      xrt::run run(kern_);
+      run.set_arg(0, 3u);
+      run.set_arg(1, ib_kv_);
+      run.set_arg(2, static_cast<unsigned>(n_kv_));
+      run.set_arg(3, qkv_c);
+      run.set_arg(4, tab_win);
+      run.set_arg(5, pass_w);
+      run.set_arg(6, kv_w);
+      run.set_arg(7, kn_);
+      run.start();
+      run.wait();
+    }
+    ms_kv += Ms(t);
+    t = Clock::now();
+    stage = 3;
+    kn_.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    const std::uint8_t* kn = kn_.map<std::uint8_t*>();
+    if (al.kpre.size() < std::size_t{q0 + kGroups} * 16 * kAttnKvh) al.kpre.resize(std::size_t{q0 + kGroups} * 16 * kAttnKvh, 0.f);
+    for (std::uint32_t w = 0; w < kGroups; ++w) {
+      const std::uint32_t nc = n > 16 * w ? std::min(16u, n - 16 * w) : 0;
+      float kb[4];
+      for (std::uint32_t r = 0; r < kAttnKvh; ++r) {
+        const float* kv = reinterpret_cast<const float*>(kn + (std::size_t{w} * 4 + r) * 1536);
+        for (std::uint32_t tt = 0; tt < nc; ++tt) {
+          al.kmax2[r] = std::max(al.kmax2[r], kv[(tt / 8) * 64 + (tt % 8) * 8] * 1.02f);
+          al.kpre[std::size_t{pos0 + 16 * w + tt} * kAttnKvh + r] = al.kmax2[r];
+        }
+        kb[r] = std::sqrt(al.kmax2[r]);
+      }
+      std::memcpy(lt.h + std::size_t{q0 + w} * kTabBytes + 4992, kb, 16);
+    }
+    lt.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE, std::size_t{kGroups} * kTabBytes, std::size_t{q0} * kTabBytes);
+    ms_host += Ms(t);
+    t = Clock::now();
+    stage = 4;
+    {
+      xrt::bo kv_h(al.kv_full, std::size_t{kGroups + 2} * kChunkBytes, std::size_t{q0} * kChunkBytes);
+      xrt::bo c0(al.kv_full, kChunkBytes, std::size_t{2} * kChunkBytes);
+      xrt::run run(kern_);
+      run.set_arg(0, 3u);
+      run.set_arg(1, ib_q_);
+      run.set_arg(2, static_cast<unsigned>(n_q_));
+      run.set_arg(3, qkv_c);
+      run.set_arg(4, tab_win);
+      run.set_arg(5, pass_w);
+      run.set_arg(6, kv_h);
+      run.set_arg(7, c0);
+      run.start();
+      run.wait();
+    }
+    ms_q += Ms(t);
+    ++calls;
+    return true;
+  } catch (const std::exception& e) {
+    if (error) *error = std::string("stage ") + std::to_string(stage) + ": " + e.what();
+    return false;
+  }
+}
+
+void AttnDevPrep::ReadHist(const AttnLayer& al, std::uint32_t t0, std::uint32_t n, std::uint16_t* k_out,
+                           std::uint16_t* v_out, std::uint32_t kvd, std::uint32_t cap) {
+  (void)kvd;
+  const_cast<AttnLayer&>(al).kv.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+  for (std::uint32_t tok = t0; tok < t0 + n; ++tok) {
+    const std::uint32_t q = tok / 16, tt = tok % 16, kb = tt / 8, i8 = tt % 8, slot = tok % cap;
+    for (std::uint32_t r = 0; r < kAttnKvh; ++r) {
+      alignas(64) std::uint8_t chunk[4608];
+      AttnLoadChunk(al.host, q, r, chunk);
+      for (std::uint32_t ks = 0; ks < 16; ++ks) {
+        float v8[8];
+        DecGroup(chunk + (std::size_t{kb} * 16 + ks) * 72 + i8 * 9, v8);
+        for (int i = 0; i < 8; ++i) k_out[std::size_t{slot} * kAttnKvh * kAttnHd + r * kAttnHd + ks * 8 + i] = Bf16Bits(v8[i]);
+      }
+      for (std::uint32_t db = 0; db < 16; ++db)
+        for (std::uint32_t g = 0; g < 8; ++g) {
+          float v8[8];
+          DecGroup(chunk + 2304 + (std::size_t{kb} * 16 + db) * 72 + g * 9, v8);
+          v_out[std::size_t{slot} * kAttnKvh * kAttnHd + r * kAttnHd + db * 8 + g] = Bf16Bits(v8[i8]);
+        }
+    }
+  }
+}
+
+bool AttnPrefill::DebugPrep(AttnLayer& al, std::uint32_t pos0, std::uint32_t n, const float* q, const std::uint16_t* k_hist, const std::uint16_t* v_hist, std::vector<std::uint8_t>* out) {
+  std::uint32_t mc = 0;
+  if (!Prep(0, al, pos0, n, q, k_hist, v_hist, &mc)) return false;
+  out->assign(ah_[0], ah_[0] + kAttnPrefixCol * 8);
+  return true;
+}
+
+bool AttnPrefill::LaunchDev(int slot, AttnLayer& al, AttnDevPrep& dp, std::uint32_t pass_idx, std::uint32_t mc,
+                            xrt::run** run_out) {
+  auto it = insts_.find(mc);
+  if (it == insts_.end()) {
+    const std::string path = dir_ + "/insts_attnp_" + std::to_string(mc) + ".txt";
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) return false;
+    const std::size_t sz = static_cast<std::size_t>(f.tellg());
+    f.seekg(0);
+    std::vector<char> buf(sz);
+    f.read(buf.data(), static_cast<std::streamsize>(sz));
+    xrt::bo bo(dev_, sz, XCL_BO_FLAGS_CACHEABLE, kern_.group_id(1));
+    std::memcpy(bo.map<void*>(), buf.data(), sz);
+    bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    it = insts_.emplace(mc, std::make_pair(bo, sz / 4)).first;
+  }
+  const int key = 1000 + ((static_cast<int>(pass_idx) * 2 + slot) * 2 + (exact_ ? 1 : 0));
+  auto rit = runs_.find({&al, mc, key});
+  if (rit == runs_.end()) {
+    xrt::run run(exact_ ? kern_x_ : kern_);
+    run.set_arg(0, 3u);
+    run.set_arg(1, it->second.first);
+    run.set_arg(2, static_cast<unsigned>(it->second.second));
+    run.set_arg(3, dp.PassBo(pass_idx));
+    run.set_arg(4, al.kv);
+    run.set_arg(5, c_[slot]);
+    rit = runs_.emplace(std::make_tuple(&al, mc, key), std::move(run)).first;
+  }
+  *run_out = &rit->second;
+  return true;
+}
+
+bool AttnPrefill::RunManyDev(AttnLayer& al, AttnDevPrep& dp, const DevPass* ps, std::size_t np, NpuRuntime::Timings* tm) {
+  if (np == 0) return true;
+  static const std::uint32_t kMc[] = {8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192};
+  std::vector<xrt::run*> runs(np, nullptr);
+  bool ok = true;
+  const auto issue = [&](std::size_t i) {
+    const std::uint32_t total = ps[i].pos0 + ps[i].n;
+    std::uint32_t mc = 0;
+    for (std::uint32_t v : kMc)
+      if (v * 16 >= total) { mc = v; break; }
+    if (mc == 0 || mc > al.capacity_chunks) return false;
+    if (!LaunchDev(static_cast<int>(i & 1), al, dp, ps[i].pass_idx, mc, &runs[i])) return false;
+    runs[i]->start();
+    return true;
+  };
+  for (std::size_t i = 0; i < std::min<std::size_t>(2, np); ++i)
+    if (!issue(i)) return false;
+  for (std::size_t i = 0; i < np; ++i) {
+    const int slot = static_cast<int>(i & 1);
+    auto t = Clock::now();
+    runs[i]->wait();
+    c_[slot].sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    if (tm) tm->attn_wait += Ms(t);
+    t = Clock::now();
+    ok = Merge(slot, ps[i].n, ps[i].out) && ok;
+    if (tm) { tm->attn_merge += Ms(t); ++tm->attn_calls; }
+    if (i + 2 < np && !issue(i + 2)) return false;
+  }
+  return ok;
+}
+
 }  // namespace gufo::npu::runtime

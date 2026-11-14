@@ -168,6 +168,7 @@ int main(int argc, char** argv) {
   }
   b_pass.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
   const uint8_t* C = b_pass.map<uint8_t*>();
+  double worst = 0, wd = 0, wr = 0; long wb = 0, wmt = 0;
   double nq = 0, dq = 0, mdiff = 0, mref_max = 0, msum = 0; long hdr_bad = 0, mcount = 0;
   std::vector<float> ref(16 * 128), sub(16 * 128);
   for (int mt = 0; mt < NT; ++mt) for (int c = 0; c < 8; ++c) for (int r = 0; r < 4; ++r) {
@@ -185,7 +186,7 @@ int main(int argc, char** argv) {
       for (int br = 0; br < 2; ++br) for (int ks = 0; ks < 16; ++ks) for (int rib = 0; rib < 8; ++rib) {
         float d8[8]; DecGroup(qb + ((hq * 2 + br) * 16 + ks) * 72 + rib * 9, d8);
         const float* rr = &ref[(br * 8 + rib) * 128 + ks * 8];
-        for (int i = 0; i < 8; ++i) { nq += (double)(d8[i] - rr[i]) * (d8[i] - rr[i]); dq += (double)rr[i] * rr[i]; }
+        for (int i = 0; i < 8; ++i) { double df = std::fabs((double)d8[i] - rr[i]); if (!(df <= worst)) { worst = df; wb = hq * 1000000 + br * 100000 + ks * 100 + rib; wmt = mt * 100 + c * 10 + r; wd = d8[i]; wr = rr[i]; } nq += (double)(d8[i] - rr[i]) * (d8[i] - rr[i]); dq += (double)rr[i] * rr[i]; }
       }
       for (int t = 0; t < 16; ++t) {
         const int pos = q * 16, last = pos + t, lo = std::max(0, last - 31);
@@ -209,6 +210,9 @@ int main(int argc, char** argv) {
       }
     }
   }
+  { const float* d = (const float*)(C + 384); std::printf("dbg yh %g %g | yl %g %g | y %g %g | ns %g %g\n", d[0], d[8], d[64], d[72], d[128], d[136], d[192], d[200]); }
+  std::printf("worst Q elem: diff %g dev %g ref %g at hq/br/ks/rib code %ld (mt*100+c*10+r %ld)\n", worst, wd, wr, wb, wmt);
+  { uint8_t qb0[9216]; for (int u = 0; u < 6; ++u) std::memcpy(qb0 + u * 1536, C + (size_t)(1 + u) * 6144, 1536); float d8[8]; DecGroup(qb0, d8); std::printf("q blk0 row0: "); for (int i = 0; i < 8; ++i) std::printf("%g ", d8[i]); std::printf("(exp byte %d)\n", qb0[0]); }
   std::printf("prep NT=%d: kv dispatch %.3f ms, q dispatch %.4f ms; Q rel err %.5f; header mismatches %ld; M max abs diff %.4f (mean %.4f, |M| max %.2f)\n", NT, kv_ms, best, std::sqrt(nq / dq), hdr_bad, mdiff, msum / mcount, mref_max);
   return 0;
 }

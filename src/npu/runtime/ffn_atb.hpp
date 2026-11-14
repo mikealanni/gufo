@@ -325,6 +325,11 @@ class FfnAtbChain {
     p.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
     j.c.assign(p.ch, p.ch + std::size_t{kM} * 3072 / 8 * 9);
   }
+  xrt::bo& QkvBo(std::size_t l) { return attn_[l]->pq.c; }
+  void ReleaseQkv(std::size_t l, Job& j) {
+    j.staged = false;
+    attn_[l]->port_q->m.unlock();
+  }
   void ReleaseO(std::size_t l, Job& j) {
     j.staged = false;
     attn_[l]->port_o->m.unlock();

@@ -25,9 +25,9 @@ alignas(64) static uint8_t hdrbuf[1536];
 alignas(64) static float mtmp[64];
 alignas(64) static const int32_t rowv[64] = {0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,3,3,3,3,3,3,3,3,4,4,4,4,4,4,4,4,5,5,5,5,5,5,5,5,6,6,6,6,6,6,6,6,7,7,7,7,7,7,7,7};
 alignas(64) static const int32_t colv[64] = {0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7};
-alignas(64) static float knorm[128];       // |k|^2 of the 16 tokens, lane row*8 of each 64-lane row sum
+alignas(64) static float knorm[128];
 
-static inline aie::vector<bfloat16, 64> rep8(const bfloat16 *p) {
+__attribute__((noinline)) static aie::vector<bfloat16, 64> rep8(const bfloat16 *p) {
   const aie::vector<bfloat16, 8> g8 = aie::load_v<8>(p);
   const aie::vector<bfloat16, 16> g16 = aie::concat(g8, g8);
   const aie::vector<bfloat16, 32> g32 = aie::concat(g16, g16);
@@ -54,15 +54,37 @@ static inline void decode_stripe(const uint8_t *e) {
   }
 }
 
-// dec holds one decoded stripe; out receives 2304 B in destination order (br*16 + ks).
+// dec holds one decoded stripe; out receives 2304 B in destination order (br*16 + ks). Float arithmetic throughout:
+// the products of bf16 values are exact in the accumulator and only the final bfp encode rounds.
+alignas(64) static bfloat16 yhv[64];
+alignas(64) static bfloat16 ylv[64];
+
+static inline aie::vector<float, 64> fv(const aie::vector<bfloat16, 64> &v) {
+  aie::accum<accfloat, 64> a;
+  a.from_vector(v);
+  return a.template to_vector<float>();
+}
+
+// Float product from bf16 pieces: hi*hi + hi*lo + lo*hi, exact products accumulated in the float accumulator.
+static inline aie::vector<float, 64> fmulv(const aie::vector<float, 64> &a, const aie::vector<float, 64> &b) {
+  const aie::vector<bfloat16, 64> ah = aie::accum<accfloat, 64>(a).template to_vector<bfloat16>();
+  const aie::vector<bfloat16, 64> bh = aie::accum<accfloat, 64>(b).template to_vector<bfloat16>();
+  const aie::vector<bfloat16, 64> al = aie::accum<accfloat, 64>(aie::sub(a, fv(ah))).template to_vector<bfloat16>();
+  const aie::vector<bfloat16, 64> bl = aie::accum<accfloat, 64>(aie::sub(b, fv(bh))).template to_vector<bfloat16>();
+  aie::accum<accfloat, 64> acc = aie::mul(ah, bh);
+  acc = aie::mac(acc, ah, bl);
+  acc = aie::mac(acc, al, bh);
+  return acc.template to_vector<float>();
+}
+
 static inline void norm_rope(const bfloat16 *tab, const bfloat16 *w, bfloat16 eps_b, uint8_t *out, float *kn) {
   const aie::accum<accfloat, 64> z = aie::zeros<accfloat, 64>();
   const aie::vector<bfloat16, 64> one = aie::broadcast<bfloat16, 64>((bfloat16)1.0f);
   const aie::block_vector<bfp16ebs8, 64> ob = aie::accum<accfloat, 64>(one).template to_vector<bfp16ebs8>();
-  const aie::vector<bfloat16, 64> inv_n = aie::broadcast<bfloat16, 64>((bfloat16)(1.0f / 128.0f));
-  const aie::vector<bfloat16, 64> eps = aie::broadcast<bfloat16, 64>(eps_b);
-  const aie::vector<bfloat16, 64> half = aie::broadcast<bfloat16, 64>((bfloat16)0.5f);
-  const aie::vector<bfloat16, 64> c15 = aie::broadcast<bfloat16, 64>((bfloat16)1.5f);
+  const aie::vector<float, 64> eps = fv(aie::broadcast<bfloat16, 64>(eps_b));
+  const aie::vector<float, 64> inv_n = aie::broadcast<float, 64>(1.0f / 128.0f);
+  const aie::vector<float, 64> c05 = aie::broadcast<float, 64>(0.5f);
+  const aie::vector<float, 64> c15 = aie::broadcast<float, 64>(1.5f);
   for (int br = 0; br < 2; ++br) {
     aie::accum<accfloat, 64> acc = aie::zeros<accfloat, 64>();
     for (int sbc = 0; sbc < 8; ++sbc)
@@ -70,15 +92,17 @@ static inline void norm_rope(const bfloat16 *tab, const bfloat16 *w, bfloat16 ep
         const aie::vector<bfloat16, 64> v = aie::load_v<64>(dec + (sbc * 4 + br * 2 + bc) * 64);
         acc = aie::mac(acc, v, v);
       }
-    const aie::accum<accfloat, 64> sacc = mac_8x8_8x8T(acc.template to_vector<bfp16ebs8>(), ob, z);
-    const aie::vector<bfloat16, 64> sv = sacc.template to_vector<bfloat16>();
-    const aie::vector<bfloat16, 64> ms = aie::add(aie::mul(sv, inv_n).template to_vector<bfloat16>(), eps);
-    const aie::vector<int16, 64> bi = ms.template cast_to<int16>();
-    const aie::vector<int16, 64> yi = aie::sub(aie::broadcast<int16, 64>(0x5f37), aie::downshift(bi, 1));
-    aie::vector<bfloat16, 64> y = yi.template cast_to<bfloat16>();
-    const aie::vector<bfloat16, 64> hm = aie::mul(ms, half).template to_vector<bfloat16>();
-    const aie::vector<bfloat16, 64> t = aie::mul(aie::mul(y, y).template to_vector<bfloat16>(), hm).template to_vector<bfloat16>();
-    y = aie::mul(y, aie::sub(c15, t)).template to_vector<bfloat16>();
+    aie::store_v(mtmp, acc.template to_vector<float>());
+    float rs[8];
+    for (int r = 0; r < 8; ++r) rs[r] = aie::reduce_add(aie::load_v<8>(mtmp + r * 8));
+    const aie::vector<float, 64> sv = aie::concat(aie::broadcast<float, 8>(rs[0]), aie::broadcast<float, 8>(rs[1]), aie::broadcast<float, 8>(rs[2]), aie::broadcast<float, 8>(rs[3]), aie::broadcast<float, 8>(rs[4]), aie::broadcast<float, 8>(rs[5]), aie::broadcast<float, 8>(rs[6]), aie::broadcast<float, 8>(rs[7]));
+    const aie::vector<float, 64> ms = aie::add(fmulv(sv, inv_n), eps);
+    const aie::vector<int32, 64> bi = ms.template cast_to<int32>();
+    aie::vector<float, 64> y = aie::sub(aie::broadcast<int32, 64>(0x5f3759df), aie::downshift(bi, 1)).template cast_to<float>();
+    const aie::vector<float, 64> hm = fmulv(ms, c05);
+    for (int it = 0; it < 3; ++it) y = fmulv(y, aie::sub(c15, fmulv(fmulv(y, y), hm)));
+    const aie::vector<bfloat16, 64> yh = aie::accum<accfloat, 64>(y).template to_vector<bfloat16>();
+    const aie::vector<bfloat16, 64> yl = aie::accum<accfloat, 64>(aie::sub(y, fv(yh))).template to_vector<bfloat16>();
     aie::accum<accfloat, 64> ns = aie::zeros<accfloat, 64>();
     for (int sbc = 0; sbc < 4; ++sbc)
       for (int bc = 0; bc < 2; ++bc) {
@@ -86,8 +110,14 @@ static inline void norm_rope(const bfloat16 *tab, const bfloat16 *w, bfloat16 ep
         const int ib8 = sbc * 2 + bc;
         const aie::vector<bfloat16, 64> wa = rep8(w + sbc * 16 + bc * 8);
         const aie::vector<bfloat16, 64> wb = rep8(w + 64 + sbc * 16 + bc * 8);
-        const aie::vector<bfloat16, 64> a = aie::mul(aie::mul(aie::load_v<64>(dec + ia * 64), y).template to_vector<bfloat16>(), wa).template to_vector<bfloat16>();
-        const aie::vector<bfloat16, 64> b = aie::mul(aie::mul(aie::load_v<64>(dec + ib * 64), y).template to_vector<bfloat16>(), wb).template to_vector<bfloat16>();
+        const aie::vector<bfloat16, 64> xa = aie::mul(aie::load_v<64>(dec + ia * 64), wa).template to_vector<bfloat16>();
+        const aie::vector<bfloat16, 64> xb = aie::mul(aie::load_v<64>(dec + ib * 64), wb).template to_vector<bfloat16>();
+        aie::accum<accfloat, 64> aa = aie::mul(xa, yh);
+        aa = aie::mac(aa, xa, yl);
+        aie::accum<accfloat, 64> ab = aie::mul(xb, yh);
+        ab = aie::mac(ab, xb, yl);
+        const aie::vector<bfloat16, 64> a = aa.template to_vector<bfloat16>();
+        const aie::vector<bfloat16, 64> b = ab.template to_vector<bfloat16>();
         if (kn) {
           ns = aie::mac(ns, a, a);
           ns = aie::mac(ns, b, b);
@@ -102,8 +132,8 @@ static inline void norm_rope(const bfloat16 *tab, const bfloat16 *w, bfloat16 ep
         put(out + (br * 16 + ib8 + 8) * 72, hi);
       }
     if (kn) {
-      const aie::accum<accfloat, 64> rs = mac_8x8_8x8T(ns.template to_vector<bfp16ebs8>(), ob, z);
-      aie::store_v(kn + br * 64, rs.template to_vector<float>());
+      const aie::accum<accfloat, 64> rs2 = mac_8x8_8x8T(ns.template to_vector<bfp16ebs8>(), ob, z);
+      aie::store_v(kn + br * 64, rs2.template to_vector<float>());
     }
   }
 }
@@ -182,49 +212,51 @@ __attribute__((noinline)) void prep_mbegin() {
   for (int rb = 0; rb < 8; ++rb) aie::store_v(vmax + rb * 64, neg);
 }
 
+alignas(64) static float mkb[64];
+
+__attribute__((noinline)) static void mfin_rb(int rb, int32_t nrows) {
+  const aie::vector<float, 64> kbv = aie::load_v<64>(mkb);
+  const aie::vector<float, 64> c100 = aie::broadcast<float, 64>(100.0f);
+  const aie::vector<float, 64> zero = aie::zeros<float, 64>();
+  const aie::vector<int32, 64> rv = aie::load_v<64>(rowv);
+  const aie::vector<float, 64> vm = aie::load_v<64>(vmax + rb * 64);
+  float m8[8];
+  for (int r = 0; r < 8; ++r) m8[r] = aie::reduce_max(vm.template extract<8>(r));
+  const aie::vector<float, 64> mrow = aie::concat(aie::broadcast<float, 8>(m8[0]), aie::broadcast<float, 8>(m8[1]), aie::broadcast<float, 8>(m8[2]), aie::broadcast<float, 8>(m8[3]), aie::broadcast<float, 8>(m8[4]), aie::broadcast<float, 8>(m8[5]), aie::broadcast<float, 8>(m8[6]), aie::broadcast<float, 8>(m8[7]));
+  const aie::vector<float, 64> q2 = aie::load_v<64>(qn + (rb >> 1) * 128 + (rb & 1) * 64);
+  const aie::vector<float, 64> qb = aie::sqrt(q2);
+  const aie::vector<float, 64> bound = aie::mul(qb, kbv).template to_vector<float>();
+  aie::vector<float, 64> m = aie::max(mrow, aie::sub(bound, c100));
+  m = aie::min(m, bound);
+  const aie::vector<int32, 64> trow = aie::add(aie::broadcast<int32, 64>((rb & 1) * 8), rv);
+  m = aie::select(zero, m, aie::lt(trow, aie::broadcast<int32, 64>(nrows)));
+  aie::store_v(mtmp, m);
+  for (int r = 0; r < 8; ++r) ((float *)(hdrbuf + 128))[rb * 8 + r] = mtmp[r * 8];
+}
+
 // Header piece: [128 B ints from the table object][M[64] floats]; row = kv head index for the key bound.
 __attribute__((noinline)) void prep_mfin(const uint8_t *t, int row) {
   ::aie::set_rounding(::aie::rounding_mode::conv_even);
   for (int i = 0; i < 1536; i += 64) aie::store_v(hdrbuf + i, aie::zeros<uint8_t, 64>());
   for (int i = 0; i < 128; i += 64) aie::store_v(hdrbuf + i, aie::load_v<64>(t + kTHdr + i));
   const int32_t nrows = *(const int32_t *)(t + kTHdr + 4);
-  const float kb = *(const float *)(t + kTKb + row * 4);
-  const aie::vector<float, 64> kbv = aie::broadcast<float, 64>(kb);
-  const aie::vector<float, 64> c100 = aie::broadcast<float, 64>(100.0f);
-  const aie::vector<float, 64> zero = aie::zeros<float, 64>();
-  const aie::vector<int32, 64> rv = aie::load_v<64>(rowv);
-  for (int rb = 0; rb < 8; ++rb) {
-    const aie::vector<float, 64> vm = aie::load_v<64>(vmax + rb * 64);
-    float m8[8];
-    for (int r = 0; r < 8; ++r) m8[r] = aie::reduce_max(vm.template extract<8>(r));
-    aie::vector<float, 8> a0 = aie::load_v<8>(m8);
-    aie::vector<float, 64> mrow = aie::concat(aie::broadcast<float, 8>(m8[0]), aie::broadcast<float, 8>(m8[1]), aie::broadcast<float, 8>(m8[2]), aie::broadcast<float, 8>(m8[3]), aie::broadcast<float, 8>(m8[4]), aie::broadcast<float, 8>(m8[5]), aie::broadcast<float, 8>(m8[6]), aie::broadcast<float, 8>(m8[7]));
-    (void)a0;
-    const aie::vector<float, 64> q2 = aie::load_v<64>(qn + (rb >> 1) * 128 + (rb & 1) * 64);
-    const aie::vector<float, 64> qb = aie::sqrt(q2);
-    const aie::accum<accfloat, 64> bacc = aie::mul(qb, kbv);
-    const aie::vector<float, 64> bound = bacc.template to_vector<float>();
-    aie::vector<float, 64> m = aie::max(mrow, aie::sub(bound, c100));
-    m = aie::min(m, bound);
-    const aie::vector<int32, 64> trow = aie::add(aie::broadcast<int32, 64>((rb & 1) * 8), rv);
-    m = aie::select(zero, m, aie::lt(trow, aie::broadcast<int32, 64>(nrows)));
-    aie::store_v(mtmp, m);
-    for (int r = 0; r < 8; ++r) ((float *)(hdrbuf + 128))[rb * 8 + r] = mtmp[r * 8];
-  }
+  aie::store_v(mkb, aie::broadcast<float, 64>(*(const float *)(t + kTKb + row * 4)));
+  for (int rb = 0; rb < 8; ++rb) mfin_rb(rb, nrows);
 }
 
-// kind 0: K/V chunk piece, 1: Q block piece, 2: tail piece, 3: |k|^2 vector.
-__attribute__((noinline)) void prep_emit(uint8_t *out, int kind, int idx) {
-  if (kind == 4) {
-    for (int i = 0; i < 1536; i += 64) aie::store_v(out + i, aie::load_v<64>(hdrbuf + i));
-    return;
+// mode 0 (K/V dispatch) pieces 0..15: chunk(3), Q block(6), tails(6), |k|^2(1); mode 1 (Q dispatch) pieces 0..6: header, Q block(6).
+__attribute__((noinline)) void prep_emit(uint8_t *out, int mode, int idx) {
+  const uint8_t *s;
+  if (mode == 0) {
+    if (idx == 15) {
+      for (int i = 0; i < 1536; i += 64) aie::store_v(out + i, aie::zeros<uint8_t, 64>());
+      for (int i = 0; i < 128; i += 16) aie::store_v((float *)out + i, aie::load_v<16>(knorm + i));
+      return;
+    }
+    s = idx < 3 ? skv + idx * 1536 : idx < 9 ? scratch + (idx - 3) * 1536 : stl + (idx - 9) * 1536;
+  } else {
+    s = idx == 0 ? hdrbuf : scratch + (idx - 1) * 1536;
   }
-  if (kind == 3) {
-    for (int i = 0; i < 1536; i += 64) aie::store_v(out + i, aie::zeros<uint8_t, 64>());
-    for (int i = 0; i < 128; i += 16) aie::store_v((float *)out + i, aie::load_v<16>(knorm + i));
-    return;
-  }
-  const uint8_t *s = (kind == 0 ? skv : kind == 1 ? scratch : stl) + idx * 1536;
   for (int i = 0; i < 1536; i += 64) aie::store_v(out + i, aie::load_v<64>(s + i));
 }
 }

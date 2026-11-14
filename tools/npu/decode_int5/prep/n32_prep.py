@@ -80,7 +80,7 @@ def design(m, k, n):
         for row in range(ROWS):
             for col in range(COLS):
 
-                @core(core_tiles[row][col], stack_size=0xD00)
+                @core(core_tiles[row][col], stack_size=0x1500)
                 def core_body():
                     for _ in range_(0xFFFFFFFF):
                         use_lock(rtp_locks[row][col], LockAction.Acquire, value=1)
@@ -99,11 +99,10 @@ def design(m, k, n):
                                 prep_q2(s, t, arith.index_cast(T.i32(), pr))
                                 S_l2l1[row][col].release(ObjectFifoPort.Consume, 1)
                             T_f[col].release(ObjectFifoPort.Consume, 1)
-                            for kind, cnt in ((0, 3), (1, 6), (2, 6), (3, 1)):
-                                for u in range_(cnt):
-                                    o = C_l1l2[row][col].acquire(ObjectFifoPort.Produce, 1)
-                                    prep_emit(o, arith.constant(T.i32(), kind), arith.index_cast(T.i32(), u))
-                                    C_l1l2[row][col].release(ObjectFifoPort.Produce, 1)
+                            for u in range_(16):
+                                o = C_l1l2[row][col].acquire(ObjectFifoPort.Produce, 1)
+                                prep_emit(o, arith.constant(T.i32(), 0), arith.index_cast(T.i32(), u))
+                                C_l1l2[row][col].release(ObjectFifoPort.Produce, 1)
                         for _ in range_(nq):
                             t = T_f[col].acquire(ObjectFifoPort.Consume, 1)
                             prep_mbegin()
@@ -117,11 +116,10 @@ def design(m, k, n):
                                 S_l2l1[row][col].release(ObjectFifoPort.Consume, 1)
                             prep_mfin(t, arith.constant(T.i32(), row))
                             T_f[col].release(ObjectFifoPort.Consume, 1)
-                            for kind, cnt in ((4, 1), (1, 6)):
-                                for u in range_(cnt):
-                                    o = C_l1l2[row][col].acquire(ObjectFifoPort.Produce, 1)
-                                    prep_emit(o, arith.constant(T.i32(), kind), arith.index_cast(T.i32(), u))
-                                    C_l1l2[row][col].release(ObjectFifoPort.Produce, 1)
+                            for u in range_(7):
+                                o = C_l1l2[row][col].acquire(ObjectFifoPort.Produce, 1)
+                                prep_emit(o, arith.constant(T.i32(), 1), arith.index_cast(T.i32(), u))
+                                C_l1l2[row][col].release(ObjectFifoPort.Produce, 1)
 
         TAB_BYTES = NT * 8 * TE
         PASS_BYTES = (NT - 1) * PASS + 8 * PCOL

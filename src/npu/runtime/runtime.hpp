@@ -123,6 +123,7 @@ struct ConvLayer {
 // Sliding-window layers use a ring: token t lives at slot t % ring_tokens, the kernel
 // gets a slot->absolute map (tab) in the header and masks by absolute position.
 struct AttnLayer {
+  xrt::bo kv_full;  // 2 chunks of zero padding in front of the attention view, so key-history reads never underflow
   xrt::bo kv;
   std::uint8_t* host{};
   std::uint32_t capacity_chunks{};
@@ -132,6 +133,54 @@ struct AttnLayer {
   std::vector<float> kmax2;  // running max |k|^2 per kv head
   std::vector<float> kpre;   // prefix max |k|^2 per (token, kv head), full-attention layers only
   std::unordered_map<std::uint32_t, xrt::run> runs;
+};
+
+
+/// Device attention prep: QK-norm, RoPE, K/V chunk build, tail blocks and softmax bounds from the QKV GEMM wire.
+class AttnDevPrep {
+ public:
+  static constexpr std::uint32_t kGroups = 64;          // 16-token groups per dispatch (one 1024-row GEMM result)
+  static constexpr std::size_t kTabBytes = 5120, kChunkBytes = 18432, kPassBytes = 786432, kPassCol = 98304;
+  static constexpr std::uint32_t kPasses = 128;         // pass buffers held for one super-chunk (16 x 8)
+  bool Init(const std::string& dir, xrt::device& dev, std::string* error);
+  bool ready() const { return ready_; }
+  /// Per-layer rope/norm constants. fac: per-frequency divisor (null for sliding-window layers).
+  bool SetupLayer(std::size_t id, std::uint32_t max_tokens, const float* qn, const float* kn, float eps, float theta,
+                  const float* fac);
+  /// Runs both dispatches for rows [pos0, pos0 + n) of the QKV result in qkv_c (pos0 % 16 == 0, n <= 1024).
+  /// pass0: index of the first of the 8 pass buffers this chunk fills. Updates al.kmax2 / al.kpre.
+  bool Run(AttnLayer& al, std::size_t id, xrt::bo& qkv_c, std::uint32_t pos0, std::uint32_t n, std::uint32_t pass0,
+           std::string* error);
+  xrt::bo& PassBo(std::uint32_t i) { return pass_sub_[i]; }
+  const std::uint8_t* PassHost(std::uint32_t i) {
+    pass_.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    return pass_.map<std::uint8_t*>() + std::size_t{i} * kPassBytes;
+  }
+  /// bf16 K and V of tokens [t0, t0 + n) decoded from the chunk layout (host history repair).
+  static void ReadHist(const AttnLayer& al, std::uint32_t t0, std::uint32_t n, std::uint16_t* k_out, std::uint16_t* v_out,
+                       std::uint32_t kvd, std::uint32_t cap);
+  double ms_kv{0}, ms_q{0}, ms_host{0};
+  int calls{0};
+
+ private:
+  struct LayerTab {
+    xrt::bo bo;
+    std::uint8_t* h{};
+    std::uint32_t max_groups{0}, filled{0};
+    std::vector<std::uint16_t> wq, wk;
+    std::uint16_t eps{0};
+    float theta{0};
+    std::vector<float> fac;
+  };
+  bool ready_{false};
+  xrt::device dev_;
+  xrt::hw_context ctx_;
+  xrt::kernel kern_;
+  xrt::bo ib_kv_, ib_q_;
+  std::size_t n_kv_{0}, n_q_{0};
+  xrt::bo pass_, kn_;
+  std::vector<xrt::bo> pass_sub_, pass_win_;
+  std::vector<LayerTab> tabs_;
 };
 
 
@@ -325,6 +374,16 @@ class AttnPrefill {
   /// pass i overlap the device run of the neighbouring pass. Returns false if any pass cannot run.
   /// pre(i) (optional) runs before pass i is prepared; when it is set the prep of pass i+1 waits for pass i
   /// (ring layers append history per pass) and only the merge overlaps the device.
+  struct DevPass {
+    std::uint32_t pos0, n;
+    float* out;
+    std::uint32_t pass_idx;  // pass buffer index in AttnDevPrep
+  };
+  /// Passes whose Q, header, bounds, tails and K/V chunks were built on the device by AttnDevPrep.
+  bool RunManyDev(AttnLayer& al, AttnDevPrep& dp, const DevPass* passes, std::size_t np, NpuRuntime::Timings* tm);
+  xrt::device& device() { return dev_; }
+  /// Host reference of the A prefix of one pass (debug): the bytes Prep would send.
+  bool DebugPrep(AttnLayer& al, std::uint32_t pos0, std::uint32_t n, const float* q, const std::uint16_t* k_hist, const std::uint16_t* v_hist, std::vector<std::uint8_t>* out);
   bool RunMany(AttnLayer& al, const Pass* passes, std::size_t np, const std::uint16_t* k_hist,
                const std::uint16_t* v_hist, NpuRuntime::Timings* tm,
                const std::function<void(std::size_t)>* pre = nullptr);
@@ -333,6 +392,7 @@ class AttnPrefill {
   bool Prep(int slot, AttnLayer& al, std::uint32_t pos0, std::uint32_t n, const float* q,
             const std::uint16_t* k_hist, const std::uint16_t* v_hist, std::uint32_t* mc_out);
   bool Launch(int slot, AttnLayer& al, std::uint32_t mc, xrt::run** run_out);
+  bool LaunchDev(int slot, AttnLayer& al, AttnDevPrep& dp, std::uint32_t pass_idx, std::uint32_t mc, xrt::run** run_out);
   bool Merge(int slot, std::uint32_t n, float* out);
   std::string dir_;
   xrt::device dev_;
