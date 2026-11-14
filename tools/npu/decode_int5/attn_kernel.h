@@ -34,7 +34,7 @@ static int32_t *const a_hi = (int32_t *)(arena + 256);  // last token visible to
 static int32_t *const a_pp = (int32_t *)(arena + 512);  // row position (last token visible to the tail path)
 static int32_t *const a_lo = (int32_t *)(arena + 768);  // row window floor: first key valid for the row
 static float *const a_l = (float *)(arena + 1024);
-static int a_pos = 0, a_n = 0, a_feed = 0, a_chunk_idx = 0;
+static int a_pos = 0, a_n = 0, a_feed = 0, a_chunk_idx = 0, a_hi0 = -1;
 static int a_qhi = 0, a_win = 0;      // ring: absolute chunk of newest tokens; sliding window size (0 = full ctx)
 static int a_tab[32];                 // ring: slot chunk -> qhi - absolute chunk (-1 = stale slot)
 
@@ -55,17 +55,10 @@ static inline aie::vector<int32, 64> LaneCol() {
   return aie::load_v<64>(tbl);
 }
 
-// 2^a for a <= 0 with bf16 result: split a = n + f (n integer) so the bf16 exp2 argument stays small.
+// 2^a for a <= 0 with bf16 result. The hardware exp2 takes the float argument directly; below -100 the result
+// is clamped to 2^-100, far under bf16 resolution of the row sum.
 static inline aie::vector<bfloat16, 64> Exp2Wide(const aie::vector<float, 64> &a) {
-  aie::vector<int32, 64> n = aie::to_fixed<int32>(a, 0);
-  aie::vector<float, 64> f = aie::sub(a, aie::to_float<float>(n, 0));
-  aie::vector<bfloat16, 64> p = aie::exp2<bfloat16>(f);
-  aie::vector<int32, 64> lim = aie::broadcast<int32, 64>(-120);
-  aie::vector<int32, 64> nc = aie::max(n, lim);
-  aie::vector<int16, 64> n16 = aie::pack(nc);
-  aie::vector<int16, 64> bits = aie::add(p.cast_to<int16>(), aie::upshift(n16, 7));
-  aie::vector<bfloat16, 64> r = bits.cast_to<bfloat16>();
-  return aie::select(r, aie::zeros<bfloat16, 64>(), aie::lt(n, lim));
+  return aie::exp2<bfloat16>(aie::max(a, aie::broadcast<float, 64>(-100.0f)));
 }
 
 // hdr: int32[0]=pos, [1]=n; float M rows for this kv head at byte offset 128 + row_id*256.
@@ -79,6 +72,7 @@ __attribute__((noinline)) static void AttnBegin(const uint8_t *hdr, int row_id) 
   a_win = ih[3];
   a_feed = 0;
   a_chunk_idx = 0;
+  a_hi0 = (a_pos & ~7) - 1;  // last key visible to every row of the pass
   const int32_t *tab = ih + 4;  // ring slot->absolute map, 24 entries (unused when a_win==0)
   for (int s = 0; s < 24; s++) a_tab[s] = tab[s];
   const float *mrow = (const float *)(hdr + 128 + row_id * 256);
@@ -115,10 +109,13 @@ __attribute__((always_inline)) static inline void ChunkP(int rb, int tokbase, co
   const aie::vector<float, 64> mv = RepEach8<float>(aie::load_v<8>(a_m + rb * 8));
   aie::vector<bfloat16, 64> p0 = Exp2Wide(aie::sub(s0.template to_vector<float>(), mv));
   aie::vector<bfloat16, 64> p1 = Exp2Wide(aie::sub(s1.template to_vector<float>(), mv));
-  const aie::vector<int32, 64> rel =
-      aie::sub(RepEach8<int32>(aie::load_v<8>(a_hi + rb * 8)), aie::broadcast<int32, 64>(tokbase));
-  p0 = aie::select(zero, p0, aie::ge(rel, col));
-  p1 = aie::select(zero, p1, aie::ge(rel, aie::add(col, aie::broadcast<int32, 64>(8))));
+  // Chunks wholly below every row's causal bound need no masks (padded rows are discarded by the host).
+  if (a_win || tokbase + 15 > a_hi0) {
+    const aie::vector<int32, 64> rel =
+        aie::sub(RepEach8<int32>(aie::load_v<8>(a_hi + rb * 8)), aie::broadcast<int32, 64>(tokbase));
+    p0 = aie::select(zero, p0, aie::ge(rel, col));
+    p1 = aie::select(zero, p1, aie::ge(rel, aie::add(col, aie::broadcast<int32, 64>(8))));
+  }
   if (a_win) {
     const aie::vector<int32, 64> flo =
         aie::sub(RepEach8<int32>(aie::load_v<8>(a_lo + rb * 8)), aie::broadcast<int32, 64>(tokbase));

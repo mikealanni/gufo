@@ -1263,7 +1263,7 @@ bool AttnPrefill::Init(const std::string& dir, std::string* error) {
   try {
     dir_ = dir;
     dev_ = xrt::device(0u);
-    const xrt::xclbin xb{dir + "/final_attnp.xclbin"};
+    const xrt::xclbin xb{dir + (std::getenv("GUFO_ATTN_EXACT") ? "/final_attnp_exact.xclbin" : "/final_attnp.xclbin")};
     dev_.register_xclbin(xb);
     ctx_ = xrt::hw_context(dev_, xb.get_uuid());
     kern_ = xrt::kernel(ctx_, xb.get_kernels().at(0).get_name());
