@@ -280,8 +280,8 @@ def my_matmul(M, K, N, m, k, n, mode="gemm", noff=0, a2=0):
                         for _ in range_(nrm):
                             for gg in range_(9):
                                 elem_out = C_l1l2_fifos[row][col].acquire(ObjectFifoPort.Produce, 1)
-                                for jj in range_(8):
-                                    kt = arith.addi(arith.muli(arith.index_cast(T.i32(), gg), ci(8)), arith.index_cast(T.i32(), jj))
+                                for jj in range_(16):
+                                    kt = arith.addi(arith.muli(arith.index_cast(T.i32(), gg), ci(16)), arith.index_cast(T.i32(), jj))
                                     e0 = B_l2l1_fifos[col].acquire(ObjectFifoPort.Consume, 1)
                                     nm_step(e0, elem_out, kt, ci(row))
                                     B_l2l1_fifos[col].release(ObjectFifoPort.Consume, 1)
@@ -363,7 +363,9 @@ def my_matmul(M, K, N, m, k, n, mode="gemm", noff=0, a2=0):
             def lin4(full, offset, sizes, strides):
                 return TensorAccessPattern((1, full), offset, sizes, strides)
 
-            AE, BE, CE = M * 2048 // 8, 8192, M * 2048 // 8
+            RG = M * 2048 // 8
+            AE, BE, CE = 3 * RG, 16 * 1024, RG
+            IN0, PB = (RG, 0) if noff == 0 else (0, 2 * RG)
 
             @runtime_sequence(
                 np.ndarray[(AE,), np.dtype[dtype_in]],
@@ -382,30 +384,53 @@ def my_matmul(M, K, N, m, k, n, mode="gemm", noff=0, a2=0):
                         set_lock_value(rtp_locks[row][col], 1)
                 for c in range(8):
                     ins, outs = [], []
-                    ins.append(shim_dma_single_bd_task(
-                        B_l3l2_fifos[c], B, tap=lin4(BE, 0, [1, 1, 1, 8192], [0, 0, 0, 1]), issue_token=True))
-                    for _p in range(2):
-                        ins.append(shim_dma_single_bd_task(
-                            B_l3l2_fifos[c], A, tap=lin4(AE, c * 32 * 1024, [1, 1, 1, 32 * 1024], [0, 0, 0, 1]),
-                            issue_token=True))
+                    ins.append((B_l3l2_fifos[c], B, lin4(BE, 0, [1, 1, 1, BE], [0, 0, 0, 1])))
+                    for ph in range(2):
+                        for nt in range(16):
+                            tix = ((c // 4) * 2 + nt // 8) * 32 + (nt % 8) * 4 + (c % 4)
+                            ins.append((B_l3l2_fifos[c], A, lin4(AE, IN0 + tix * 2048, [2, 2, 8, 128], [128, RG, 256, 1])))
                     for g in range(9):
-                        outs.append(shim_dma_single_bd_task(
-                            C_l2l3_fifos[c], C,
-                            tap=lin4(CE, (c * 32 + 8 * max(g - 5, 0)) * 1024, [4, 8, 1, 256], [256, 1024, 0, 1]),
-                            issue_token=True))
-                    for t in outs[:4]:
-                        dma_start_task(t)
-                    for t in ins:
-                        dma_start_task(t)
-                    for k in range(4, len(outs)):
-                        dma_await_task(outs[k - 4])
-                        dma_free_task(outs[k - 4])
-                        dma_start_task(outs[k])
-                    for t in ins:
-                        dma_await_task(t)
-                        dma_free_task(t)
-                    for t in outs[len(outs) - 4:]:
-                        dma_await_task(t)
+                        if g < 5:
+                            gp = max(g - 1, 0)
+                            tix = ((c // 4) * 2 + (4 * gp) // 8) * 32 + ((4 * gp) % 8) * 4 + (c % 4)
+                            outs.append((C_l2l3_fifos[c], A, lin4(AE, PB + tix * 2048, [8, 4, 2, 128], [256, 8192, 128, 1])))
+                        else:
+                            outs.append((C_l2l3_fifos[c], C, lin4(CE, (c * 32 + 8 * (g - 5)) * 1024, [4, 8, 1, 256], [256, 1024, 0, 1])))
+                    it, ot = {}, {}
+
+                    def start_in(k):
+                        f_, b_, t_ = ins[k]
+                        it[k] = shim_dma_single_bd_task(f_, b_, tap=t_, issue_token=True)
+                        dma_start_task(it[k])
+
+                    def start_out(k):
+                        f_, b_, t_ = outs[k]
+                        ot[k] = shim_dma_single_bd_task(f_, b_, tap=t_, issue_token=True)
+                        dma_start_task(ot[k])
+
+                    for k in range(4):
+                        start_out(k)
+                        start_in(k)
+                    o_next = 4
+                    for k in range(4, len(ins)):
+                        dma_await_task(it[k - 4])
+                        dma_free_task(it[k - 4])
+                        start_in(k)
+                        while o_next < 9 and (k - 4) >= 4 * (o_next - 3):
+                            dma_await_task(ot[o_next - 4])
+                            dma_free_task(ot[o_next - 4])
+                            start_out(o_next)
+                            o_next += 1
+                    for k in range(len(ins) - 4, len(ins)):
+                        dma_await_task(it[k])
+                        dma_free_task(it[k])
+                    while o_next < 9:
+                        dma_await_task(ot[o_next - 4])
+                        dma_free_task(ot[o_next - 4])
+                        start_out(o_next)
+                        o_next += 1
+                    for k in range(5, 9):
+                        dma_await_task(ot[k])
 
         elif mode == "conv":
             def lin4(full, offset, sizes, strides):
