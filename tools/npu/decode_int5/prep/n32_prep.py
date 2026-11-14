@@ -11,9 +11,11 @@ from aie.helpers.taplib import TensorAccessPattern
 from aie.helpers.dialects.scf import _for as range_
 
 COLS, ROWS = 8, 4
-ELEM = 6912
-CELEM = 2304
-NE = int(os.environ.get("PREP_NE", "8"))
+QE = 13824
+KE = QE
+PIECE = 1536
+NQ = int(os.environ.get("PREP_NQ", "8"))
+NKV = int(os.environ.get("PREP_NKV", "8"))
 
 
 def main():
@@ -29,39 +31,33 @@ def main():
 def design(m, k, n):
     @device(AIEDevice.npu2)
     def device_body():
-        B_l2_ty = np.ndarray[(ROWS * ELEM,), np.dtype[np.uint8]]
-        B_l1_ty = np.ndarray[(ELEM,), np.dtype[np.uint8]]
-        C_l1_ty = np.ndarray[(CELEM,), np.dtype[np.uint8]]
-        C_l2_ty = np.ndarray[(ROWS * CELEM,), np.dtype[np.uint8]]
+        Q_l2_ty = np.ndarray[(ROWS * QE,), np.dtype[np.uint8]]
+        Q_l1_ty = np.ndarray[(QE,), np.dtype[np.uint8]]
+        C_l1_ty = np.ndarray[(PIECE,), np.dtype[np.uint8]]
+        C_l2_ty = np.ndarray[(ROWS * PIECE,), np.dtype[np.uint8]]
         lw = f"mm_{m}x{k}x{n}.o"
-        prep = external_func("prep_elem", inputs=[B_l1_ty, C_l1_ty], link_with=lw)
+        prep_q = external_func("prep_q", inputs=[Q_l1_ty], link_with=lw)
+        prep_kv = external_func("prep_kv", inputs=[Q_l1_ty], link_with=lw)
+        prep_emit = external_func("prep_emit", inputs=[C_l1_ty, np.int32], link_with=lw)
 
         tiles = [[tile(col, row) for col in range(COLS)] for row in range(ROWS + 2)]
         shim_tiles, mem_tiles, core_tiles = tiles[0], tiles[1], tiles[2:]
 
-        B_l3l2 = [None] * COLS
-        B_l2l1 = [[None] * COLS for _ in range(ROWS)]
+        Q_l3l2 = [None] * COLS
+        Q_l2l1 = [[None] * COLS for _ in range(ROWS)]
         C_l1l2 = [[None] * COLS for _ in range(ROWS)]
         C_l2l3 = [None] * COLS
         for col in range(COLS):
-            B_l3l2[col] = object_fifo(f"B_L3L2_{col}", shim_tiles[col], mem_tiles[col], 2, B_l2_ty)
+            Q_l3l2[col] = object_fifo(f"Q_L3L2_{col}", shim_tiles[col], mem_tiles[col], 2, Q_l2_ty)
             for row in range(ROWS):
-                B_l2l1[row][col] = object_fifo(
-                    f"B_L2L1_{col}_{row}", mem_tiles[col], core_tiles[row][col], 2, B_l1_ty
-                )
-            object_fifo_link(
-                B_l3l2[col], [B_l2l1[row][col] for row in range(ROWS)], [], [ELEM * row for row in range(ROWS)]
-            )
+                Q_l2l1[row][col] = object_fifo(f"Q_L2L1_{col}_{row}", mem_tiles[col], core_tiles[row][col], 2, Q_l1_ty)
+            object_fifo_link(Q_l3l2[col], [Q_l2l1[row][col] for row in range(ROWS)], [], [QE * row for row in range(ROWS)])
             for row in range(ROWS):
-                C_l1l2[row][col] = object_fifo(
-                    f"C_L1L2_{col}_{row}", core_tiles[row][col], mem_tiles[col], 2, C_l1_ty
-                )
+                C_l1l2[row][col] = object_fifo(f"C_L1L2_{col}_{row}", core_tiles[row][col], mem_tiles[col], 2, C_l1_ty)
             C_l2l3[col] = object_fifo(f"C_L2L3_{col}", mem_tiles[col], shim_tiles[col], 2, C_l2_ty)
-            object_fifo_link(
-                [C_l1l2[row][col] for row in range(ROWS)], C_l2l3[col], [CELEM * row for row in range(ROWS)], []
-            )
+            object_fifo_link([C_l1l2[row][col] for row in range(ROWS)], C_l2l3[col], [PIECE * row for row in range(ROWS)], [])
 
-        rtp_ty = np.ndarray[(1,), np.dtype[np.int32]]
+        rtp_ty = np.ndarray[(2,), np.dtype[np.int32]]
         rtps = [[None] * COLS for _ in range(ROWS)]
         rtp_locks = [[None] * COLS for _ in range(ROWS)]
         for row in range(ROWS):
@@ -76,40 +72,56 @@ def design(m, k, n):
                 def core_body():
                     for _ in range_(0xFFFFFFFF):
                         use_lock(rtp_locks[row][col], LockAction.Acquire, value=1)
-                        i0 = arith.constant(T.index(), 0)
-                        ne_i32 = memref.load(rtps[row][col], [i0])
+                        nq_i32 = memref.load(rtps[row][col], [arith.constant(T.index(), 0)])
+                        nk_i32 = memref.load(rtps[row][col], [arith.constant(T.index(), 1)])
                         use_lock(rtp_locks[row][col], LockAction.Release, value=1)
-                        ne = arith.index_cast(T.index(), ne_i32)
-                        for _ in range_(ne):
-                            e = B_l2l1[row][col].acquire(ObjectFifoPort.Consume, 1)
-                            o = C_l1l2[row][col].acquire(ObjectFifoPort.Produce, 1)
-                            prep(e, o)
-                            C_l1l2[row][col].release(ObjectFifoPort.Produce, 1)
-                            B_l2l1[row][col].release(ObjectFifoPort.Consume, 1)
+                        nq = arith.index_cast(T.index(), nq_i32)
+                        nk = arith.index_cast(T.index(), nk_i32)
+                        for _ in range_(nq):
+                            e = Q_l2l1[row][col].acquire(ObjectFifoPort.Consume, 1)
+                            prep_q(e)
+                            Q_l2l1[row][col].release(ObjectFifoPort.Consume, 1)
+                            for u in range_(6):
+                                o = C_l1l2[row][col].acquire(ObjectFifoPort.Produce, 1)
+                                prep_emit(o, arith.index_cast(T.i32(), u))
+                                C_l1l2[row][col].release(ObjectFifoPort.Produce, 1)
+                        for _ in range_(nk):
+                            e = Q_l2l1[row][col].acquire(ObjectFifoPort.Consume, 1)
+                            prep_kv(e)
+                            Q_l2l1[row][col].release(ObjectFifoPort.Consume, 1)
+                            for u in range_(3):
+                                o = C_l1l2[row][col].acquire(ObjectFifoPort.Produce, 1)
+                                prep_emit(o, arith.index_cast(T.i32(), u))
+                                C_l1l2[row][col].release(ObjectFifoPort.Produce, 1)
+
+        q_col_in, k_col_in = NQ * ROWS * QE, NKV * ROWS * KE
+        col_in = q_col_in + k_col_in
+        q_col_out, k_col_out = NQ * 6 * ROWS * PIECE, NKV * 3 * ROWS * PIECE
 
         @runtime_sequence(
-            np.ndarray[(COLS * NE * ROWS * ELEM,), np.dtype[np.uint8]],
+            np.ndarray[(COLS * col_in,), np.dtype[np.uint8]],
             np.ndarray[(4,), np.dtype[np.uint8]],
-            np.ndarray[(COLS * NE * ROWS * CELEM,), np.dtype[np.uint8]],
+            np.ndarray[(COLS * (q_col_out + k_col_out),), np.dtype[np.uint8]],
         )
-        def sequence(A, B, C):
-            ne = NE
+        def sequence(QI, KI, OUT):
             for row in range(ROWS):
                 for col in range(COLS):
-                    npu_rtp_write(f"rtp_{row}_{col}", 0, ne)
+                    npu_rtp_write(f"rtp_{row}_{col}", 0, NQ)
+                    npu_rtp_write(f"rtp_{row}_{col}", 1, NKV)
                     set_lock_value(rtp_locks[row][col], 1)
             in_tasks, c_tasks = [], []
             for col in range(COLS):
-                a_tap = TensorAccessPattern(
-                    (1, COLS * ne * ROWS * ELEM), col * ne * ROWS * ELEM, [1, ne, ROWS * ELEM // 1024, 1024], [0, ROWS * ELEM, 1024, 1]
+                q_tap = TensorAccessPattern(
+                    (1, COLS * col_in), col * col_in, [1, NQ + NKV, ROWS * QE // 1024, 1024], [0, ROWS * QE, 1024, 1]
                 )
-                in_tasks.append(shim_dma_single_bd_task(B_l3l2[col], A, tap=a_tap, issue_token=False))
+                in_tasks.append(shim_dma_single_bd_task(Q_l3l2[col], QI, tap=q_tap, issue_token=False))
                 dma_start_task(in_tasks[-1])
             for col in range(COLS):
-                c_tap = TensorAccessPattern(
-                    (1, COLS * ne * ROWS * CELEM), col * ne * ROWS * CELEM, [1, ne, ROWS * CELEM // 1024, 1024], [0, ROWS * CELEM, 1024, 1]
+                o_tap = TensorAccessPattern(
+                    (1, COLS * (q_col_out + k_col_out)), col * (q_col_out + k_col_out),
+                    [1, 1, (q_col_out + k_col_out) // 1024, 1024], [0, 0, 1024, 1]
                 )
-                c_tasks.append(shim_dma_single_bd_task(C_l2l3[col], C, tap=c_tap, issue_token=True))
+                c_tasks.append(shim_dma_single_bd_task(C_l2l3[col], OUT, tap=o_tap, issue_token=True))
                 dma_start_task(c_tasks[-1])
             dma_await_task(*c_tasks)
             dma_free_task(*in_tasks)
