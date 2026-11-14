@@ -221,6 +221,119 @@ class FfnAtbChain {
   void StageFfn(std::size_t l, Job& j) { Stage(*layers_[l]->port, layers_[l]->dn, {&layers_[l]->qa, &layers_[l]->qb}, j); }
   void FinishFfn(std::size_t l, Job& j) { Finish(*layers_[l]->port, layers_[l]->dn, std::size_t{kM} * kHid / 8 * 9, j); }
 
+
+  // ---- device-resident residual stream: x, branch and the normalized A wire never leave the device ----
+  static constexpr std::size_t kRegionBytes = std::size_t{kM} * kHid / 8 * 9;
+  bool DevRes() const { return devres_; }
+  bool SetupDevRes(const std::vector<const float*>& g_a, const std::vector<const float*>& g_f, const float* g_final,
+                   const std::vector<const float*>& p_a, const std::vector<const float*>& p_f, const float* p_final, float eps,
+                   std::string* err) {
+    try {
+      const std::size_t nl = layers_.size();
+      if (g_a.size() != nl || g_f.size() != nl) throw std::runtime_error("norm weight count");
+      resc_ = gu_.MakeBo(3 * kRegionBytes, 3);
+      resa_ = gu_.MakeBo(kRegionBytes, 3);
+      resc_h_ = resc_.map<std::uint8_t*>();
+      resa_h_ = resa_.map<std::uint8_t*>();
+      std::memset(resc_h_, 0, 3 * kRegionBytes);
+      std::memset(resa_h_, 0, kRegionBytes);
+      resc_.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      resa_.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      br_ = xrt::bo(resc_, kRegionBytes, kRegionBytes);
+      const auto bind_c = [&](Program& p) {
+        p.c = br_;
+        p.ch = resc_h_ + kRegionBytes;
+      };
+      for (auto& lp : layers_) {
+        gu_.RebindA(lp->qa, resa_);
+        gu_.RebindA(lp->qb, resa_);
+        bind_c(lp->dn);
+      }
+      for (auto& ap : attn_) {
+        if (!ap) continue;
+        gu_.RebindA(ap->pq, resa_);
+        bind_c(ap->po);
+      }
+      for (auto& cp : conv_) {
+        if (!cp) continue;
+        gu_.RebindA(cp->pi, resa_);
+        bind_c(cp->po);
+      }
+      const auto bf = [](float f) {
+        std::uint32_t u;
+        std::memcpy(&u, &f, 4);
+        return static_cast<std::uint16_t>((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
+      };
+      const auto mk = [&](const float* g, const float* gp, int variant) {
+        auto np = std::make_unique<NormP>();
+        np->p = gu_.MakeBareProgram(dir_ + "/insts_kd_norm" + std::to_string(variant) + "_1024.txt");
+        np->p.a = resc_;
+        np->p.c = resa_;
+        np->w.bytes = std::size_t{16} * 9216;
+        np->w.bo = gu_.MakeBo(np->w.bytes, 3);
+        np->w.host = np->w.bo.map<std::uint8_t*>();
+        std::memset(np->w.host, 0, np->w.bytes);
+        auto* h = reinterpret_cast<std::uint16_t*>(np->w.host);
+        for (std::size_t i = 0; i < kHid; ++i) h[i] = bf(g[i]);
+        h[kHid] = bf(eps);
+        for (std::size_t i = 0; i < kHid; ++i) h[2112 + i] = bf(gp[i]);
+        for (std::size_t q = 1; q < 16; ++q) std::memcpy(np->w.host + q * 9216, np->w.host, 9216);
+        np->w.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        return np;
+      };
+      norms_.clear();
+      for (std::size_t l = 0; l < nl; ++l) {
+        norms_.push_back(mk(g_a[l], p_a[l], 0));
+        norms_.push_back(mk(g_f[l], p_f[l], 1));
+      }
+      norms_.push_back(mk(g_final, p_final, 0));
+      devres_ = true;
+    } catch (const std::exception& e) {
+      if (err) *err = e.what();
+      return false;
+    }
+    return true;
+  }
+  /// Chunk start: x (n rows) in C wire into region X0, branch region zeroed.
+  void DevResInit(const float* x, std::uint32_t n) {
+    std::vector<float> pad;
+    const float* src = x;
+    if (n < kM) {
+      pad.assign(std::size_t{kM} * kHid, 0.f);
+      std::memcpy(pad.data(), x, std::size_t{n} * kHid * 4);
+      src = pad.data();
+    }
+    gu_.EncodeCAtbRaw(src, kM, kHid, resc_h_ + 2 * kRegionBytes);
+    std::memset(resc_h_ + kRegionBytes, 0, kRegionBytes);
+    resc_.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  }
+  /// site 0: before the attention/conv block, 1: before the FFN, l == layers: final norm. Caller holds the device lock.
+  void ExecNorm(std::size_t l, int site) {
+    NormP& np = *norms_[l == layers_.size() ? 2 * l : 2 * l + site];
+    Dispatch(gu_, np.w, np.p);
+  }
+  void DevResFinal(std::uint32_t n, float* z) {
+    resa_.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    Program view;
+    view.ah = resa_h_;
+    std::vector<float> tmp(std::size_t{kM} * kHid);
+    gu_.DecodeAAtb(tmp.data(), kM, kHid, view);
+    std::memcpy(z, tmp.data(), std::size_t{n} * kHid * 4);
+  }
+  void QkvOut(std::size_t l, Job& j) {
+    Program& p = attn_[l]->pq;
+    p.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    j.c.assign(p.ch, p.ch + std::size_t{kM} * 3072 / 8 * 9);
+  }
+  void ReleaseO(std::size_t l, Job& j) {
+    j.staged = false;
+    attn_[l]->port_o->m.unlock();
+  }
+  void ReleaseFfn(std::size_t l, Job& j) {
+    j.staged = false;
+    layers_[l]->port->m.unlock();
+  }
+
   void ExecGemm(Program& p, WeightBuffer& w, Job& j, std::uint32_t nout) {
     if (!j.staged) {
       std::memcpy(p.ah, j.a.data(), j.a.size());
@@ -431,6 +544,15 @@ class FfnAtbChain {
     WeightBuffer wq, wo;
     std::unique_ptr<Port> port_q = std::make_unique<Port>(), port_o = std::make_unique<Port>();
   };
+
+  struct NormP {
+    Program p;
+    WeightBuffer w;
+  };
+  std::vector<std::unique_ptr<NormP>> norms_;
+  xrt::bo resc_, resa_, br_;
+  std::uint8_t *resc_h_{}, *resa_h_{};
+  bool devres_{false};
 
   struct Conv {
     Program pi, po, pc;

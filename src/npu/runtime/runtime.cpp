@@ -1549,3 +1549,44 @@ bool AttnPrefill::RunMany(AttnLayer& al, const Pass* ps, std::size_t np, const s
 }
 
 }  // namespace gufo::npu::runtime
+
+namespace gufo::npu::runtime {
+void NpuRuntime::EncodeCAtbRaw(const float* x, std::uint32_t M, std::uint32_t N, std::uint8_t* dst) const {
+  constexpr std::uint32_t kAtbTileC = kAtbTileM * kAtbTileN / 8 * 9;
+  const std::uint32_t mtiles = M / kAtbTileM;
+  const std::uint32_t ntiles = N / kAtbTileN;
+  const std::uint32_t npass = ntiles / 8;
+#pragma omp parallel for collapse(2)
+  for (std::uint32_t mt = 0; mt < mtiles; ++mt) {
+    for (std::uint32_t nt = 0; nt < ntiles; ++nt) {
+      const std::size_t tile = (std::size_t{(mt / 4) * npass + nt / 8} * 32 + (nt % 8) * 4 + (mt % 4));
+      std::uint8_t* t = dst + tile * kAtbTileC;
+      for (std::uint32_t sbr = 0; sbr < 8; ++sbr)
+        for (std::uint32_t sbc = 0; sbc < 8; ++sbc)
+          for (std::uint32_t br = 0; br < 2; ++br)
+            for (std::uint32_t bc = 0; bc < 2; ++bc) {
+              std::uint8_t* blk = t + (((sbr * 8 + sbc) * 4) + br * 2 + bc) * kAtbBlkBytes;
+              const std::uint32_t row0 = mt * kAtbTileM + sbr * 16 + br * 8;
+              const std::uint32_t col0 = nt * kAtbTileN + sbc * 16 + bc * 8;
+              for (std::uint32_t rib = 0; rib < 8; ++rib)
+                EncodeBlock8(x + std::size_t(row0 + rib) * N + col0, blk + rib * 9);
+            }
+    }
+  }
+}
+
+Program NpuRuntime::MakeBareProgram(const std::string& insts_path) {
+  Program p;
+  std::ifstream f(insts_path, std::ios::binary | std::ios::ate);
+  if (!f) throw std::runtime_error("missing " + insts_path);
+  const std::size_t sz = static_cast<std::size_t>(f.tellg());
+  f.seekg(0);
+  std::vector<char> buf(sz);
+  f.read(buf.data(), static_cast<std::streamsize>(sz));
+  p.words = sz / 4;
+  p.insts = xrt::bo(dev_, sz, XCL_BO_FLAGS_CACHEABLE, kern_.group_id(1));
+  std::memcpy(p.insts.map<void*>(), buf.data(), sz);
+  p.insts.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  return p;
+}
+}  // namespace gufo::npu::runtime

@@ -214,7 +214,7 @@ def my_matmul(M, K, N, m, k, n, mode="gemm", noff=0, a2=0):
             inputs=[B_l1_ty, C_l1_ty, np.int32, np.int32, np.int32],
             link_with=f"mm_{m}x{k}x{n}.o",
         )
-        nm_step = external_func("norm_step", inputs=[B_l1_ty, C_l1_ty, np.int32, np.int32], link_with=f"mm_{m}x{k}x{n}.o")
+        nm_step = external_func("norm_step", inputs=[B_l1_ty, C_l1_ty, np.int32, np.int32, np.int32], link_with=f"mm_{m}x{k}x{n}.o")
         rtp_ty = np.ndarray[(6,), np.dtype[np.int32]]
         rtps = [[None] * n_aie_cols for _ in range(n_aie_rows)]
         rtp_locks = [[None] * n_aie_cols for _ in range(n_aie_rows)]
@@ -278,12 +278,12 @@ def my_matmul(M, K, N, m, k, n, mode="gemm", noff=0, a2=0):
                         ci = lambda v: arith.constant(T.i32(), v)
                         nrm = arith.index_cast(T.index(), memref.load(rtps[row][col], [arith.constant(T.index(), 5)]))
                         for _ in range_(nrm):
-                            for gg in range_(9):
+                            for gg in range_(13):
                                 elem_out = C_l1l2_fifos[row][col].acquire(ObjectFifoPort.Produce, 1)
                                 for jj in range_(16):
                                     kt = arith.addi(arith.muli(arith.index_cast(T.i32(), gg), ci(16)), arith.index_cast(T.i32(), jj))
                                     e0 = B_l2l1_fifos[col].acquire(ObjectFifoPort.Consume, 1)
-                                    nm_step(e0, elem_out, kt, ci(row))
+                                    nm_step(e0, elem_out, kt, ci(row), arith.index_cast(T.i32(), cvp))
                                     B_l2l1_fifos[col].release(ObjectFifoPort.Consume, 1)
                                 C_l1l2_fifos[row][col].release(ObjectFifoPort.Produce, 1)
                         for _ in range_(cva):
@@ -379,23 +379,23 @@ def my_matmul(M, K, N, m, k, n, mode="gemm", noff=0, a2=0):
                         npu_rtp_write(f"rtp_{row}_{col}", 1, 0)
                         npu_rtp_write(f"rtp_{row}_{col}", 2, 0)
                         npu_rtp_write(f"rtp_{row}_{col}", 3, 0)
-                        npu_rtp_write(f"rtp_{row}_{col}", 4, 0)
+                        npu_rtp_write(f"rtp_{row}_{col}", 4, noff)
                         npu_rtp_write(f"rtp_{row}_{col}", 5, 1)
                         set_lock_value(rtp_locks[row][col], 1)
                 for c in range(8):
                     ins, outs = [], []
                     ins.append((B_l3l2_fifos[c], B, lin4(BE, 0, [1, 1, 1, BE], [0, 0, 0, 1])))
-                    for ph in range(2):
+                    for ph in range(3):
                         for nt in range(16):
                             tix = ((c // 4) * 2 + nt // 8) * 32 + (nt % 8) * 4 + (c % 4)
                             ins.append((B_l3l2_fifos[c], A, lin4(AE, IN0 + tix * 2048, [2, 2, 8, 128], [128, RG, 256, 1])))
-                    for g in range(9):
-                        if g < 5:
-                            gp = max(g - 1, 0)
+                    for g in range(13):
+                        if g < 9:
+                            gp = max(g - 5, 0)
                             tix = ((c // 4) * 2 + (4 * gp) // 8) * 32 + ((4 * gp) % 8) * 4 + (c % 4)
                             outs.append((C_l2l3_fifos[c], A, lin4(AE, PB + tix * 2048, [8, 4, 2, 128], [256, 8192, 128, 1])))
                         else:
-                            outs.append((C_l2l3_fifos[c], C, lin4(CE, (c * 32 + 8 * (g - 5)) * 1024, [4, 8, 1, 256], [256, 1024, 0, 1])))
+                            outs.append((C_l2l3_fifos[c], C, lin4(CE, (c * 32 + 8 * (g - 9)) * 1024, [4, 8, 1, 256], [256, 1024, 0, 1])))
                     it, ot = {}, {}
 
                     def start_in(k):
@@ -416,7 +416,7 @@ def my_matmul(M, K, N, m, k, n, mode="gemm", noff=0, a2=0):
                         dma_await_task(it[k - 4])
                         dma_free_task(it[k - 4])
                         start_in(k)
-                        while o_next < 9 and (k - 4) >= 4 * (o_next - 3):
+                        while o_next < 13 and (k - 4) >= 4 * (o_next - 3):
                             dma_await_task(ot[o_next - 4])
                             dma_free_task(ot[o_next - 4])
                             start_out(o_next)
@@ -424,12 +424,12 @@ def my_matmul(M, K, N, m, k, n, mode="gemm", noff=0, a2=0):
                     for k in range(len(ins) - 4, len(ins)):
                         dma_await_task(it[k])
                         dma_free_task(it[k])
-                    while o_next < 9:
+                    while o_next < 13:
                         dma_await_task(ot[o_next - 4])
                         dma_free_task(ot[o_next - 4])
                         start_out(o_next)
                         o_next += 1
-                    for k in range(5, 9):
+                    for k in range(9, 13):
                         dma_await_task(ot[k])
 
         elif mode == "conv":

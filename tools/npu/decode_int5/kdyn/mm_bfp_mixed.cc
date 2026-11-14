@@ -664,28 +664,28 @@ __attribute__((noinline)) void conv_strip(const bfp16ebs8 *__restrict e, bfp16eb
 }
 
 extern "C" {
-// ---- norm mode: row RMSNorm over A-wire tiles, two passes (sumsq, then scale*g) ----
-// Scratch aliases c_bf16_2nd_half: g[2048] bf16, acc[4][64] f32, srep[4][64] bf16, eps f32 after g in aux.
-constexpr int NM_ACC = 2048;
-constexpr int NM_SREP = NM_ACC + 512;
-
+// ---- norm mode: x += rmsnorm(branch)*gp ; z = rmsnorm(x)*g, three passes over (branch, x) tile pairs ----
+// Scratch aliases c_bf16_2nd_half (bf16 units): g[2048] gp[2048] acc0[256f] acc1[256f] sB[256] sZ[256] eps stash.
+constexpr int NM_GP = 2048, NM_A0 = 4096, NM_A1 = 4608, NM_SB = 5120, NM_SZ = 5376, NM_EPS = 5632, NM_STASH = 5760;
+extern "C" {
 static inline void norm_init(const bfloat16 *__restrict aux) {
-  for (int i = 0; i < 2048; i += 64) aie::store_v(c_bf16_2nd_half + i, aie::load_v<64>(aux + i));
-  float *acc = (float *)(c_bf16_2nd_half + NM_ACC);
+  for (int i = 0; i < 2048; i += 64) {
+    aie::store_v(c_bf16_2nd_half + i, aie::load_v<64>(aux + i));
+    aie::store_v(c_bf16_2nd_half + NM_GP + i, aie::load_v<64>(aux + 2112 + i));
+  }
+  float *acc = (float *)(c_bf16_2nd_half + NM_A0);
   const aie::vector<float, 16> z = aie::zeros<float, 16>();
-  for (int i = 0; i < 256; i += 16) aie::store_v(acc + i, z);
-  c_bf16_2nd_half[NM_SREP + 256] = aux[2048];
+  for (int i = 0; i < 512; i += 16) aie::store_v(acc + i, z);
+  c_bf16_2nd_half[NM_EPS] = aux[2048];
 }
 
-static inline void norm_fin() {
+static inline void norm_fin(const float *__restrict acc, bfloat16 *__restrict dst) {
   ::aie::set_rounding(::aie::rounding_mode::conv_even);
-  const float *acc = (const float *)(c_bf16_2nd_half + NM_ACC);
-  bfloat16 *srep = c_bf16_2nd_half + NM_SREP;
   const aie::vector<bfloat16, 64> one = aie::broadcast<bfloat16, 64>((bfloat16)1.0f);
   const aie::block_vector<bfp16ebs8, 64> ob = aie::accum<accfloat, 64>(one).template to_vector<bfp16ebs8>();
   const aie::accum<accfloat, 64> z = aie::zeros<accfloat, 64>();
   const aie::vector<bfloat16, 64> inv_n = aie::broadcast<bfloat16, 64>((bfloat16)(1.0f / 2048.0f));
-  const aie::vector<bfloat16, 64> eps = aie::broadcast<bfloat16, 64>(c_bf16_2nd_half[NM_SREP + 256]);
+  const aie::vector<bfloat16, 64> eps = aie::broadcast<bfloat16, 64>(c_bf16_2nd_half[NM_EPS]);
   const aie::vector<bfloat16, 64> half = aie::broadcast<bfloat16, 64>((bfloat16)0.5f);
   const aie::vector<bfloat16, 64> c15 = aie::broadcast<bfloat16, 64>((bfloat16)1.5f);
   for (int q = 0; q < 4; ++q) {
@@ -697,63 +697,73 @@ static inline void norm_fin() {
     const aie::vector<int16, 64> yi = aie::sub(aie::broadcast<int16, 64>(0x5f37), aie::downshift(bi, 1));
     aie::vector<bfloat16, 64> y = yi.template cast_to<bfloat16>();
     const aie::vector<bfloat16, 64> hm = aie::mul(ms, half).template to_vector<bfloat16>();
-    for (int it = 0; it < 1; ++it) {
-      const aie::vector<bfloat16, 64> t = aie::mul(aie::mul(y, y).template to_vector<bfloat16>(), hm).template to_vector<bfloat16>();
-      y = aie::mul(y, aie::sub(c15, t)).template to_vector<bfloat16>();
-    }
-    aie::store_v(srep + q * 64, y);
+    const aie::vector<bfloat16, 64> t = aie::mul(aie::mul(y, y).template to_vector<bfloat16>(), hm).template to_vector<bfloat16>();
+    y = aie::mul(y, aie::sub(c15, t)).template to_vector<bfloat16>();
+    aie::store_v(dst + q * 64, y);
   }
 }
 
-constexpr int NM_STASH = 3072;
+static inline aie::vector<bfloat16, 64> norm_rep(const bfloat16 *p) {
+  const aie::vector<bfloat16, 8> g8 = aie::load_v<8>(p);
+  const aie::vector<bfloat16, 16> g16 = aie::concat(g8, g8);
+  const aie::vector<bfloat16, 32> g32 = aie::concat(g16, g16);
+  return aie::concat(g32, g32);
+}
 
-static inline void norm_addn(const bfloat16 *__restrict stash, const bfp16ebs8 *__restrict bs, bfp16ebs8 *__restrict out, int kt, int ph) {
+static inline void norm_addn(const bfloat16 *__restrict stash, const bfp16ebs8 *__restrict bs, bfp16ebs8 *__restrict out, int kt, int ph, int swap) {
   ::aie::set_rounding(::aie::rounding_mode::conv_even);
   aie::block_vector_input_buffer_stream<bfp16ebs8, 64> idst((bfp16ebs8 *)id_blk);
   idst.seek(0);
   const aie::block_vector<bfp16ebs8, 64> idb = idst.pop();
   const aie::accum<accfloat, 64> z = aie::zeros<accfloat, 64>();
-  float *acc = (float *)(c_bf16_2nd_half + NM_ACC);
-  const bfloat16 *srep = c_bf16_2nd_half + NM_SREP;
-  const uint8_t *xb = (const uint8_t *)stash;
-  const uint8_t *bb = (const uint8_t *)bs;
+  float *acc0 = (float *)(c_bf16_2nd_half + NM_A0);
+  float *acc1 = (float *)(c_bf16_2nd_half + NM_A1);
+  const bfloat16 *sB = c_bf16_2nd_half + NM_SB;
+  const bfloat16 *sZ = c_bf16_2nd_half + NM_SZ;
+  const uint8_t *bb = swap ? (const uint8_t *)bs : (const uint8_t *)stash;
+  const uint8_t *xb = swap ? (const uint8_t *)stash : (const uint8_t *)bs;
   uint8_t *ob = (uint8_t *)out + (kt & 7) * 2304;
   for (int sbr = 0; sbr < 2; ++sbr) {
     for (int sbc = 0; sbc < 8; ++sbc) {
-      aie::vector<bfloat16, 64> gv;
-      if (ph) {
-        const aie::vector<bfloat16, 8> g8 = aie::load_v<8>(c_bf16_2nd_half + kt * 64 + sbc * 8);
-        const aie::vector<bfloat16, 16> g16 = aie::concat(g8, g8);
-        const aie::vector<bfloat16, 32> g32 = aie::concat(g16, g16);
-        gv = aie::concat(g32, g32);
-      }
       for (int bis = 0; bis < 2; ++bis) {
         const int ci = sbr * 16 + (sbc >> 1) * 4 + bis * 2 + (sbc & 1);
-        aie::block_vector_input_buffer_stream<bfp16ebs8, 64> px((const bfp16ebs8 *)(bb + ci * 72));
-        aie::block_vector_input_buffer_stream<bfp16ebs8, 64> pb((const bfp16ebs8 *)(xb + ci * 72));
-        px.seek(0);
+        const int q = sbr * 2 + bis;
+        aie::block_vector_input_buffer_stream<bfp16ebs8, 64> pb((const bfp16ebs8 *)(bb + ci * 72));
         pb.seek(0);
+        const aie::accum<accfloat, 64> ab = mac_8x8_8x8T(pb.pop(), idb, z);
+        const aie::vector<bfloat16, 64> bv = ab.template to_vector<bfloat16>();
+        if (ph == 0) {
+          float *ap = acc0 + q * 64;
+          aie::store_v(ap, aie::mac(aie::accum<accfloat, 64>(aie::load_v<64>(ap)), bv, bv).template to_vector<float>());
+          continue;
+        }
+        aie::block_vector_input_buffer_stream<bfp16ebs8, 64> px((const bfp16ebs8 *)(xb + ci * 72));
+        px.seek(0);
+        const aie::vector<bfloat16, 64> pbv =
+            aie::mul(norm_rep(c_bf16_2nd_half + NM_GP + kt * 64 + sbc * 8), aie::load_v<64>(sB + q * 64)).template to_vector<bfloat16>();
         const aie::accum<accfloat, 64> a1 = mac_8x8_8x8T(px.pop(), idb, z);
-        const aie::accum<accfloat, 64> a2 = mac_8x8_8x8T(pb.pop(), idb, a1);
+        const aie::accum<accfloat, 64> a2 = aie::mac(a1, bv, pbv);
         const aie::vector<bfloat16, 64> v = a2.template to_vector<bfloat16>();
-        aie::block_vector_output_buffer_stream<bfp16ebs8, 64> os(
-            (bfp16ebs8 *)(ph ? ob + (sbr * 16 + sbc * 2 + bis) * 72 : (uint8_t *)out + ((sbr * 8 + (kt & 7)) * 16 + (ci & 15)) * 72));
-        os.seek(0);
-        if (ph) {
-          const aie::vector<bfloat16, 64> p =
-              aie::mul(gv, aie::load_v<64>(srep + (sbr * 2 + bis) * 64)).template to_vector<bfloat16>();
-          os.push(aie::mul(v, p).template to_vector<bfp16ebs8>());
-        } else {
-          float *ap = acc + (sbr * 2 + bis) * 64;
+        if (ph == 1) {
+          float *ap = acc1 + q * 64;
           aie::store_v(ap, aie::mac(aie::accum<accfloat, 64>(aie::load_v<64>(ap)), v, v).template to_vector<float>());
+          aie::block_vector_output_buffer_stream<bfp16ebs8, 64> os(
+              (bfp16ebs8 *)((uint8_t *)out + ((sbr * 8 + (kt & 7)) * 16 + (ci & 15)) * 72));
+          os.seek(0);
           os.push(a2.template to_vector<bfp16ebs8>());
+        } else {
+          const aie::vector<bfloat16, 64> pz =
+              aie::mul(norm_rep(c_bf16_2nd_half + kt * 64 + sbc * 8), aie::load_v<64>(sZ + q * 64)).template to_vector<bfloat16>();
+          aie::block_vector_output_buffer_stream<bfp16ebs8, 64> os((bfp16ebs8 *)(ob + (sbr * 16 + sbc * 2 + bis) * 72));
+          os.seek(0);
+          os.push(aie::mul(v, pz).template to_vector<bfp16ebs8>());
         }
       }
     }
   }
 }
 
-__attribute__((noinline)) void norm_step(const bfp16ebs8 *__restrict e, bfp16ebs8 *__restrict out, int idx, int rho) {
+__attribute__((noinline)) void norm_step(const bfp16ebs8 *__restrict e, bfp16ebs8 *__restrict out, int idx, int rho, int swap) {
   if (idx < 16) {
     if (idx == 0) norm_init((const bfloat16 *)e);
     return;
@@ -762,11 +772,12 @@ __attribute__((noinline)) void norm_step(const bfp16ebs8 *__restrict e, bfp16ebs
   const int jj = j & 63;
   bfloat16 *stash = c_bf16_2nd_half + NM_STASH;
   if (!(jj & 1)) {
-    if (j == 64) norm_fin();
+    if (jj == 0 && j) norm_fin((const float *)(c_bf16_2nd_half + (j == 64 ? NM_A0 : NM_A1)), c_bf16_2nd_half + (j == 64 ? NM_SB : NM_SZ));
     const uint8_t *src = (const uint8_t *)e + rho * 2304;
     for (int i = 0; i < 2304; i += 64) aie::store_v((uint8_t *)stash + i, aie::load_v<64>(src + i));
   } else {
-    norm_addn(stash, (const bfp16ebs8 *)((const uint8_t *)e + rho * 2304), out, jj >> 1, j >> 6);
+    norm_addn(stash, (const bfp16ebs8 *)((const uint8_t *)e + rho * 2304), out, jj >> 1, j >> 6, swap);
   }
+}
 }
 }

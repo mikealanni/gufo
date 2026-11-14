@@ -226,6 +226,10 @@ class NpuRuntime {
   void DecodeCRowAtb(const Program& p, std::uint32_t N, std::uint32_t row, float* out) const;
   /// Inverse of EncodeAAtb (reads p.ah).
   void DecodeAAtb(float* x, std::uint32_t M, std::uint32_t K, const Program& p) const;
+  /// C-wire encoder (inverse of DecodeCAtbRaw) for the device-resident residual stream.
+  void EncodeCAtbRaw(const float* x, std::uint32_t M, std::uint32_t N, std::uint8_t* dst) const;
+  /// Program that carries only an instruction stream; the caller binds A/C.
+  Program MakeBareProgram(const std::string& insts_path);
   /// Synchronous prefill GEMM: x (M x K) -> y (M x N), M = 16 * p.mrows.
   void GemmAtb(Program& p, WeightBuffer& wb, const float* x, std::uint32_t M,
                float* y, Timings* t = nullptr);

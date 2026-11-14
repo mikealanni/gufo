@@ -191,6 +191,7 @@ struct Engine::Impl {
   Safetensors st;
   bool have_st{false};
   Options opt;
+  bool devres_ok{false};
   gufo::npu::runtime::NpuRuntime rt;
   gufo::npu::runtime::Program p_conv;
   gufo::npu::runtime::Program p_conv64;
@@ -435,6 +436,23 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
         (void)0;
       }
     }
+    if (s.atb && std::getenv("GUFO_DEVRES")) {
+      bool ok = s.apre != nullptr && !s.w->layers.empty();
+      std::vector<const float*> ga, gf, pa, pf;
+      for (std::size_t l = 0; l < L && ok; ++l) {
+        const auto& lw = s.w->layers[l];
+        ok = ok && lw.norm.data && lw.ffn_norm.data && lw.post_norm.data && lw.post_ffn_norm.data && s.atb->Layers() == L;
+        if (c.layers[l] == LayerType::kConvolution) ok = ok && s.atb->HasConvDev(l) && s.taps == 7 && s.m_conv64[l].hidden;
+        else ok = ok && s.atb->HasAttn(l) && s.m_attn[l].host;
+        ga.push_back(static_cast<const float*>(lw.norm.data));
+        gf.push_back(static_cast<const float*>(lw.ffn_norm.data));
+        pf.push_back(static_cast<const float*>(lw.post_norm.data));
+        pa.push_back(static_cast<const float*>(s.w->layers[l ? l - 1 : 0].post_ffn_norm.data));
+      }
+      std::string derr;
+      if (ok && s.atb->SetupDevRes(ga, gf, static_cast<const float*>(s.w->output_norm.data), pa, pf, static_cast<const float*>(s.w->layers[L - 1].post_ffn_norm.data), c.eps, &derr)) s.devres_ok = true;
+      else std::fprintf(stderr, "GUFO_DEVRES unavailable: %s\n", derr.c_str());
+    }
     if (s.atb) s.atb->Warm();
     // WP4: pack tied embedding as int5 head for NPU argmax, if program exists.
     s.npu_argmax = false;
@@ -532,8 +550,11 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
   if (nTot > max_rows || (nTot > 16 && !s.m64)) return false;
   const std::uint32_t pos0 = s.pos;
   const std::uint32_t H = s.H, I = s.I, hd = s.hd, heads = s.heads, kvh = s.kvh, kvd = s.kvd, qd = s.qd;
-  const std::uint32_t kChunk = 1024;
+  const bool devres = s.devres_ok && nTot > 64;
+  std::uint32_t kChunk = 1024;
   const std::uint32_t nChunks = (nTot + kChunk - 1) / kChunk;
+  if (devres) kChunk = (nTot + nChunks - 1) / nChunks;
+  if (devres && kChunk <= 64) return false;
   struct ChunkState {
     std::vector<float> X, Z, Z2, Br, QKV, ATT, QALL, GATE, KALL, VALL, CIN, CY, BXB;
     std::uint32_t n{0}, pos0{0}, row0{0};
@@ -576,7 +597,16 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     if (defer_any) KALL.resize(std::size_t{nTot} * kvd);
     if (defer_sw) VALL.resize(std::size_t{nTot} * kvd);
     if (seg == 0 || seg == 1) {
-    if (big_attn) {
+    if (big_attn && devres) {
+      QKV.resize(std::size_t{nTot} * 3072);
+      ATT.resize(std::size_t{nTot} * qd);
+      gufo::npu::runtime::FfnAtbChain::Job jq;
+      jq.staged = true;
+      { std::lock_guard<std::mutex> g_(npu_mu); const auto tl0 = Clock::now(); s.atb->ExecNorm(l, 0); s.atb->ExecQkv(l, jq); g_lock_ms += Ms(tl0); }
+      s.atb->QkvOut(l, jq);
+      s.atb->DecodeJob(jq, nTot, 3072, QKV.data());
+      s.atb->DevResFinal(nTot, Z.data());
+    } else if (big_attn) {
       { TlScope tl_("norm", l); RmsNorm(X.data(), static_cast<const float*>(lw.norm.data), Z.data(), nTot, H, c.eps); }
       QKV.resize(std::size_t{nTot} * 3072);
       ATT.resize(std::size_t{nTot} * qd);
@@ -621,20 +651,22 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     if (seg == 0 || seg == 1) {
     if (big_conv) {
       const auto tcv0 = Clock::now();
-      RmsNorm(X.data(), static_cast<const float*>(lw.norm.data), Z.data(), nTot, H, c.eps);
+      if (!devres) RmsNorm(X.data(), static_cast<const float*>(lw.norm.data), Z.data(), nTot, H, c.eps);
       CIN.resize(std::size_t{nTot} * 6144);
       CY.resize(std::size_t{nTot} * H);
       static const int conv_dev = std::getenv("GUFO_CONV_DEV") ? std::atoi(std::getenv("GUFO_CONV_DEV")) : 1;
       const bool dev_conv = conv_dev && s.atb->HasConvDev(l) && s.taps == 7;
       gufo::npu::runtime::FfnAtbChain::Job jc, jco;
-      if (dev_conv && conv_dev == 1) s.atb->EncodeJob(Z.data(), nTot, 2048, jc);
+      if (dev_conv && conv_dev == 1 && !devres) s.atb->EncodeJob(Z.data(), nTot, 2048, jc);
+      if (devres) jc.staged = true;
       std::unique_lock<std::mutex> cvlk;
       {
         std::unique_lock<std::mutex> tl(tick_mu);
         tick_cv.wait(tl, [&] { return conv_turn[l] == ci_; });
       }
-      if (dev_conv && conv_dev == 1) s.atb->StageConvIn(l, jc);
+      if (dev_conv && conv_dev == 1 && !devres) s.atb->StageConvIn(l, jc);
       cvlk = std::unique_lock<std::mutex>(npu_mu);
+      if (devres) { s.atb->ExecNorm(l, 0); }
       const auto tcl0 = Clock::now();
       const auto conv_done = [&](const auto& mid) {
         g_lock_ms += Ms(tcl0);
@@ -668,9 +700,14 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
         s.atb->ExecConvOut(l, jco, true);
         g_t_cout += Ms(tcC1);
         g_t_conv += Ms(tcv0); TlAdd("conv", l, tcv0);
-        conv_done([&] { s.atb->FinishConvOut(l, jco); });
-        s.atb->DecodeJob(jco, nTot, 2048, Br.data());
-        finish_all(Br.data());
+        if (devres) {
+          s.atb->ExecNorm(l, 1);
+          conv_done([] {});
+        } else {
+          conv_done([&] { s.atb->FinishConvOut(l, jco); });
+          s.atb->DecodeJob(jco, nTot, 2048, Br.data());
+          finish_all(Br.data());
+        }
       } else {
       s.atb->RunConvIn(l, Z.data(), nTot, CIN.data());
       g_t_cin += Ms(tcA);
@@ -1142,14 +1179,22 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
         gufo::npu::runtime::FfnAtbChain::Job jo;
         s.atb->EncodeJob(ATT.data(), nTot, 2048, jo);
         s.atb->StageO(l, jo);
-        { std::lock_guard<std::mutex> g_(npu_mu); const auto tl0 = Clock::now(); s.atb->ExecO(l, jo); g_lock_ms += Ms(tl0); }
-        s.atb->FinishO(l, jo);
-        s.atb->DecodeJob(jo, nTot, 2048, Br.data());
+        { std::lock_guard<std::mutex> g_(npu_mu); const auto tl0 = Clock::now(); s.atb->ExecO(l, jo); if (devres) s.atb->ExecNorm(l, 1); g_lock_ms += Ms(tl0); }
+        if (devres) {
+          s.atb->ReleaseO(l, jo);
+        } else {
+          s.atb->FinishO(l, jo);
+          s.atb->DecodeJob(jo, nTot, 2048, Br.data());
+        }
       }
       g_t_oproj += Ms(to0); TlAdd("oproj", l, to0);
-      { TlScope tl_("finish", l); finish_all(Br.data()); }
+      if (!devres) { TlScope tl_("finish", l); finish_all(Br.data()); }
     }
-    if (s.atb && nTot > 64) {
+    if (devres) {
+      gufo::npu::runtime::FfnAtbChain::Job jf;
+      jf.staged = true;
+      { std::lock_guard<std::mutex> g_(npu_mu); const auto tl0 = Clock::now(); s.atb->ExecFfn(l, jf); g_lock_ms += Ms(tl0); }
+    } else if (s.atb && nTot > 64) {
       gufo::npu::runtime::FfnAtbChain::Job jf;
       const auto tf0 = Clock::now();
       s.atb->EncodeJob(Z.data(), nTot, 2048, jf);
@@ -1171,7 +1216,8 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     }
     cpu0 = Clock::now();
     const auto tpost0 = Clock::now();
-    if (lw.post_ffn_norm.data) {
+    if (devres) {
+    } else if (lw.post_ffn_norm.data) {
       RmsNorm(Br.data(), static_cast<const float*>(lw.post_ffn_norm.data), Z2.data(), nTot, H, c.eps);
 #pragma omp parallel for
       for (std::int64_t i = 0; i < static_cast<std::int64_t>(X.size()); ++i) X[i] += Z2[i];
@@ -1230,7 +1276,16 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     g_w_conv += Ms(tw);
     g_busy[0] += busy_now() - b0;
   };
-  for (std::size_t si = 0; si < stages.size();) {
+  if (devres) {
+    if (hidden) hidden->resize(std::size_t{nTot} * H);
+    for (auto& cs : css) {
+      s.atb->DevResInit(cs.X.data(), cs.n);
+      for (std::size_t l = 0; l < NL; ++l) layer_run(cs, 0, l);
+      { std::lock_guard<std::mutex> g_(npu_mu); s.atb->ExecNorm(NL, 0); }
+      if (hidden) s.atb->DevResFinal(cs.n, hidden->data() + std::size_t{cs.row0} * H);
+    }
+  }
+  for (std::size_t si = 0; !devres && si < stages.size();) {
     if (stages[si].seg != 2) {
       std::size_t sj = si;
       while (sj < stages.size() && stages[sj].seg != 2 && (par_ok || sj == si)) ++sj;
@@ -1283,7 +1338,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     ++si;
   }
   s.pos = pos0;
-  if (hidden) {
+  if (hidden && !devres) {
     hidden->resize(std::size_t{nTot} * H);
     for (auto& cs : css)
       RmsNorm(cs.X.data(), static_cast<const float*>(s.w->output_norm.data), hidden->data() + std::size_t{cs.row0} * H, cs.n, H, c.eps);
