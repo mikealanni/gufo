@@ -27,11 +27,13 @@ static std::vector<std::uint8_t> Slurp(const std::string& p) {
 }
 
 int main(int argc, char** argv) {
-  if (!std::getenv("OMP_WAIT_POLICY") && !std::getenv("GUFO_OMP_ACTIVE")) {
+  std::string cmd = argc > 1 ? argv[1] : "";
+  // Prefill waits long on the NPU, so its host threads sleep; decode runs many tiny parallel regions per token and
+  // needs the default short spin (passive waits cost about 6 ms per token).
+  if (cmd == "capture" && !std::getenv("OMP_WAIT_POLICY") && !std::getenv("GUFO_OMP_ACTIVE")) {
     setenv("OMP_WAIT_POLICY", "passive", 1);
     execv("/proc/self/exe", argv);
   }
-  std::string cmd = argc > 1 ? argv[1] : "";
   gufo::models::lfm3::npu::Options opt;
   std::string in, out;
   std::size_t maxtok = 512, maxnew = 128;
