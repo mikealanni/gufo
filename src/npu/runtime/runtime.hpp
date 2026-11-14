@@ -299,7 +299,7 @@ class NpuRuntime {
 
   /// m64 prefill FFN: gu (swiglu flush) -> byte-shuffle into down's A -> plain down gemm.
   void Ffn64(WeightBuffer& wb_gu, Program& p_gu, WeightBuffer& wb_dn, Program& p_dn,
-             const float* x, std::uint32_t n, float* y, Timings* t = nullptr);
+             const float* x, std::uint32_t n, float* y, Timings* t = nullptr, std::uint32_t taps = 120);
 
   /// Argmax GEMM over an int5 head: returns the greedy token id per row.
   /// C must have been produced by an argmax-mode program (per-strip reduced).

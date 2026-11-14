@@ -185,7 +185,7 @@ WeightBuffer& NpuRuntime::WeightSlot(WeightBuffer& wb, Program& prog) {
 // then the plain 7680x2048 down gemm. No float round-trip, no requantization.
 void NpuRuntime::Ffn64(WeightBuffer& wb_gu, Program& p_gu,
                        WeightBuffer& wb_dn, Program& p_dn,
-                       const float* x, std::uint32_t n, float* y, Timings* t) {
+                       const float* x, std::uint32_t n, float* y, Timings* t, std::uint32_t taps) {
   const std::uint32_t tk = p_gu.K / kTileK;  // 32 k-tiles; gu C strips = K2/k = 120
   auto t0 = Clock::now();
   WeightBuffer& w_gu = WeightSlot(wb_gu, p_gu);
@@ -217,7 +217,7 @@ void NpuRuntime::Ffn64(WeightBuffer& wb_gu, Program& p_gu,
   // gu C wire per (tap s, aie-row r) element: 4 swiglu row-blocks of 288 B at mb*288
   // (matches the fused m16 down-A DMA pattern [1,ktile,mrows,rows,288] x [0,SB,288,CB,1]).
   const std::uint8_t* cgu = p_gu.ch;
-  for (std::uint32_t s = 0; s < 120; ++s)
+  for (std::uint32_t s = 0; s < taps; ++s)
     for (int r = 0; r < 4; ++r)
       for (std::uint32_t mb = 0; mb < p_dn.mrows; ++mb)
         std::memcpy(p_dn.ah + (std::size_t(s) * 4 + mb) * 1152 + std::size_t(r) * 288,

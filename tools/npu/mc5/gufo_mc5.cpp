@@ -25,6 +25,8 @@ using Clock = std::chrono::steady_clock;
 using namespace gufo::npu::runtime;
 
 constexpr std::uint32_t kRows = 16;
+constexpr std::uint32_t kRows64 = 64;
+constexpr std::uint32_t kPrefillRows = kRows64;
 constexpr std::uint32_t kStripRows = 128;
 constexpr std::uint32_t kPassCols = 1024;
 constexpr std::uint32_t PadN(std::uint32_t n) { return (n + kPassCols - 1) / kPassCols * kPassCols; }
@@ -103,8 +105,8 @@ void RmsNorm(const float* x, const float* w, float* out, std::uint32_t d, float 
 
 struct Layer {
   std::vector<float> attn_norm, ffn_norm;
-  WeightBuffer qkv, out, ffn;
-  Program p_qkv, p_out, p_ffn;
+  WeightBuffer qkv, out, ffn, ffn_dn;
+  Program p_qkv, p_out, p_ffn, p_qkv64, p_out64, p_gu64, p_dn64;
   std::vector<float> k, v;
   std::vector<float> wqkv, wo, wgate, wup, wdown;
 };
@@ -131,6 +133,7 @@ struct Engine {
   std::vector<std::uint16_t> embed, head;
   std::uint32_t pos{0}, ctx{0};
   std::uint32_t gu_strips{0};
+  bool m64{std::getenv("MC5_NO_M64") == nullptr};
   double t_npu{0}, t_cpu{0};
   bool cpu_ref{std::getenv("MC5_CPU") != nullptr || std::getenv("MC5_CPU_OP") != nullptr};
   std::string cpu_ops{std::getenv("MC5_CPU") ? "qkv,out,ffn" : (std::getenv("MC5_CPU_OP") ? std::getenv("MC5_CPU_OP") : "")};
@@ -170,6 +173,12 @@ struct Engine {
       st.Load(pre + "post_attention_layernorm.weight", L.ffn_norm.data(), H);
       L.p_qkv = rt.MakeProgram(H, qkv_p, programs + "/insts_plain_1536x3072.txt", 0, &err);
       L.p_out = rt.MakeProgram(qd, h_p, programs + "/insts_plain_2048x2048.txt", 0, &err);
+      if (m64) {
+        L.p_qkv64 = rt.MakeProgram(H, qkv_p, programs + "/insts_plain_1536x3072_m64.txt", 0, &err, 0, 4);
+        L.p_out64 = rt.MakeProgram(qd, h_p, programs + "/insts_plain_2048x2048_m64.txt", 0, &err, 0, 4);
+        L.p_gu64 = rt.MakeProgram(H, 2 * I, programs + "/insts_ffngu64_1536.txt", 0, &err, 0, 4);
+        L.p_dn64 = rt.MakeProgram(I, h_p, programs + "/insts_plain_4608x2048_m64.txt", 0, &err, 0, 4);
+      }
       L.p_ffn = rt.MakeProgram(H, H, programs + "/insts_ffn_1536.txt",
                                std::size_t{gu_strips + h_p / kStripRows} * kStripBytes, &err);
       buf.assign(std::size_t{qkv_p} * H, 0.f);
@@ -204,6 +213,7 @@ struct Engine {
       st.Load(pre + "mlp.down_proj.weight", buf.data(), std::size_t{H} * I);
       if (cpu_ref) L.wdown.assign(buf.begin(), buf.begin() + std::size_t{H} * I);
       PackMatInt5(buf.data(), h_p, I, m.host + gu_bytes);
+      if (m64) L.ffn_dn = rt.PackWeight(buf.data(), h_p, I);
       m.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
       L.ffn = std::move(m);
       L.k.assign(std::size_t{ctx} * kvd, 0.f);
@@ -272,8 +282,9 @@ struct Engine {
       Layer& L = layers[l];
       for (std::uint32_t r = 0; r < n; ++r) RmsNorm(&x[std::size_t{r} * H], L.attn_norm.data(), &z[std::size_t{r} * H], H, c.eps);
       auto t0 = Clock::now();
+      const bool u64 = m64 && n > kRows;
       if (Cpu("qkv")) MatVec(L.wqkv.data(), qkv_n, H, z.data(), n, qkv.data());
-      else rt.Gemm(L.p_qkv, L.qkv, z.data(), n, qkv.data(), &tim);
+      else rt.Gemm(u64 ? L.p_qkv64 : L.p_qkv, L.qkv, z.data(), n, qkv.data(), &tim);
       t_npu += Ms(t0);
       t0 = Clock::now();
       for (std::uint32_t r = 0; r < n; ++r) {
@@ -288,7 +299,7 @@ struct Engine {
       t0 = Clock::now();
       if (Cpu("out")) MatVec(L.wo.data(), H, qd, att.data(), n, brh.data());
       else {
-        rt.Gemm(L.p_out, L.out, att.data(), n, br.data(), &tim);
+        rt.Gemm(u64 ? L.p_out64 : L.p_out, L.out, att.data(), n, br.data(), &tim);
         for (std::uint32_t r = 0; r < n; ++r) std::memcpy(&brh[std::size_t{r} * H], &br[std::size_t{r} * h_p], H * 4);
       }
       t_npu += Ms(t0);
@@ -301,6 +312,10 @@ struct Engine {
         MatVec(L.wup.data(), c.inter, H, z.data(), n, u.data());
         for (std::size_t i = 0; i < g.size(); ++i) g[i] = g[i] / (1.0f + std::exp(-g[i])) * u[i];
         MatVec(L.wdown.data(), H, c.inter, g.data(), n, brh.data());
+      } else if (u64) {
+        std::vector<float> yo(std::size_t{n} * h_p);
+        rt.Ffn64(L.ffn, L.p_gu64, L.ffn_dn, L.p_dn64, z.data(), n, yo.data(), &tim, c.inter / kTileK);
+        for (std::uint32_t r = 0; r < n; ++r) std::memcpy(&brh[std::size_t{r} * H], &yo[std::size_t{r} * h_p], H * 4);
       } else {
         rt.Ffn(L.p_ffn, L.ffn, z.data(), n, brh.data(), &tim, gu_strips, H);
       }
@@ -370,7 +385,7 @@ int main(int argc, char** argv) {
   const auto toks = ReadTokens(argv[4]);
   if (cmd == "judge") {
     Engine je;
-    if (!je.Init(argv[2], argv[3], 512)) return 1;
+    if (!je.Init(argv[2], argv[3], 512 + kRows64)) return 1;
     std::size_t at = 3;
     const std::uint32_t yes = static_cast<std::uint32_t>(toks[0]), no = static_cast<std::uint32_t>(toks[1]), cases = static_cast<std::uint32_t>(toks[2]);
     std::vector<float> lg(je.c.vocab), hd;
@@ -379,8 +394,8 @@ int main(int argc, char** argv) {
     for (std::uint32_t k = 0; k < cases; ++k) {
       const std::uint32_t len = static_cast<std::uint32_t>(toks[at++]);
       je.Reset();
-      for (std::uint32_t o = 0; o < len; o += kRows) {
-        const std::uint32_t m = std::min(kRows, len - o);
+      for (std::uint32_t o = 0; o < len; o += kPrefillRows) {
+        const std::uint32_t m = std::min(kPrefillRows, len - o);
         std::vector<std::uint32_t> in(m);
         for (std::uint32_t i = 0; i < m; ++i) in[i] = static_cast<std::uint32_t>(toks[at + o + i]);
         je.Step(in.data(), m, &hd);
@@ -396,14 +411,14 @@ int main(int argc, char** argv) {
   std::uint32_t n_tok = static_cast<std::uint32_t>(toks.size());
   if (argc > 5) n_tok = std::min<std::uint32_t>(n_tok, static_cast<std::uint32_t>(std::atoi(argv[5])));
   Engine e;
-  if (!e.Init(argv[2], argv[3], n_tok + kRows)) return 1;
+  if (!e.Init(argv[2], argv[3], n_tok + kRows64)) return 1;
   std::vector<float> logits(e.c.vocab), hid;
   if (cmd == "nll") {
     double total = 0;
     std::uint32_t count = 0;
     const auto t0 = Clock::now();
-    for (std::uint32_t o = 0; o < n_tok; o += kRows) {
-      const std::uint32_t m = std::min(kRows, n_tok - o);
+    for (std::uint32_t o = 0; o < n_tok; o += kPrefillRows) {
+      const std::uint32_t m = std::min(kPrefillRows, n_tok - o);
       std::vector<std::uint32_t> in(m);
       for (std::uint32_t i = 0; i < m; ++i) in[i] = static_cast<std::uint32_t>(toks[o + i]);
       e.Step(in.data(), m, &hid);
@@ -421,8 +436,8 @@ int main(int argc, char** argv) {
     return 0;
   }
   if (cmd == "top") {
-    for (std::uint32_t o = 0; o < n_tok; o += kRows) {
-      const std::uint32_t m = std::min(kRows, n_tok - o);
+    for (std::uint32_t o = 0; o < n_tok; o += kPrefillRows) {
+      const std::uint32_t m = std::min(kPrefillRows, n_tok - o);
       std::vector<std::uint32_t> in(m);
       for (std::uint32_t i = 0; i < m; ++i) in[i] = static_cast<std::uint32_t>(toks[o + i]);
       e.Step(in.data(), m, &hid);
