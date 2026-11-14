@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unistd.h>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -25,6 +26,10 @@ static std::vector<std::uint8_t> Slurp(const std::string& p) {
 }
 
 int main(int argc, char** argv) {
+  if (!std::getenv("OMP_WAIT_POLICY") && !std::getenv("GUFO_OMP_ACTIVE")) {
+    setenv("OMP_WAIT_POLICY", "passive", 1);
+    execv("/proc/self/exe", argv);
+  }
   std::string cmd = argc > 1 ? argv[1] : "";
   gufo::models::lfm3::npu::Options opt;
   std::string in, out;
