@@ -14,6 +14,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -30,6 +31,7 @@ constexpr std::uint32_t kPrefillRows = kRows64;
 constexpr std::uint32_t kStripRows = 128;
 constexpr std::uint32_t kPassCols = 1024;
 constexpr std::uint32_t kAttnKv = 4 * 128;
+constexpr std::uint32_t kExactCtx = 4096;
 constexpr std::uint32_t PadN(std::uint32_t n) { return (n + kPassCols - 1) / kPassCols * kPassCols; }
 
 double Ms(Clock::time_point a) {
@@ -187,6 +189,7 @@ struct Engine {
   bool m64{std::getenv("MC5_NO_M64") == nullptr};
   bool npu_attn{std::getenv("MC5_HOST_ATTN") == nullptr};
   std::string programs_dir;
+  std::unique_ptr<AttnPrefill> apre;
   const char* qdir{std::getenv("MC5_QDIR")};
   double t_npu{0}, t_cpu{0};
   bool cpu_ref{std::getenv("MC5_CPU") != nullptr || std::getenv("MC5_CPU_OP") != nullptr};
@@ -196,6 +199,12 @@ struct Engine {
   bool Init(const std::string& model_dir, const std::string& programs, std::uint32_t context) {
     ctx = context;
     programs_dir = programs;
+    if (npu_attn && !std::getenv("MC5_NO_ATTNP")) {
+      auto ap = std::make_unique<AttnPrefill>();
+      std::string aerr;
+      if (ap->Init(programs, &aerr)) apre = std::move(ap);
+      else std::fprintf(stderr, "prefill attention unavailable: %s\n", aerr.c_str());
+    }
     Safetensors st;
     if (!st.Open(model_dir + "/model-00000-of-00001.safetensors")) {
       std::fprintf(stderr, "cannot open safetensors\n");
@@ -418,6 +427,18 @@ struct Engine {
             }
           }
         }
+        if (apre && n > kRows) {
+          apre->SetExact(pos + n <= kExactCtx);
+          for (std::uint32_t o = 0; o < n; o += 16)
+            rt.AttnAppend(L.al, pos + o, std::min(16u, n - o), &kd[std::size_t{o} * kAttnKv], L.vh.data(), &tim);
+          for (std::uint32_t o = 0; o < n; o += 128) {
+            const std::uint32_t n2 = std::min(128u, n - o);
+            if (!apre->Run(L.al, pos + o, n2, &qa[std::size_t{o} * qd], L.kh.data(), L.vh.data(), &att[std::size_t{o} * qd], &tim)) {
+              std::fprintf(stderr, "prefill attention failed (layer %u pos %u)\n", l, pos + o);
+              std::exit(3);
+            }
+          }
+        } else
         for (std::uint32_t o = 0, m = 0; o < n; o += m) {
           m = std::min({16u, n - o, 16u - (pos + o) % 16u});
           rt.AttnAppend(L.al, pos + o, m, &kd[std::size_t{o} * kAttnKv], L.vh.data(), &tim);
@@ -426,6 +447,24 @@ struct Engine {
             std::exit(3);
           }
         }
+        if (std::getenv("MC5_ATTN_CHECK")) {
+          std::vector<float> ref(std::size_t{n} * qd);
+          for (std::uint32_t r = 0; r < n; ++r) {
+            const float* row = &qkv[std::size_t{r} * (Cpu("qkv") ? qkv_n : qkv_p)];
+            std::memcpy(&L.k[std::size_t{pos + r} * kvd], row + qd, kvd * 4);
+            std::memcpy(&L.v[std::size_t{pos + r} * kvd], row + qd + kvd, kvd * 4);
+            Attend(L, qa.data() + std::size_t{r} * qd, pos + r, &ref[std::size_t{r} * qd]);
+          }
+          double num = 0, den = 0, sg = 0, dot = 0;
+          for (std::size_t i = 0; i < ref.size(); ++i) {
+            const double d = att[i] - ref[i];
+            num += d * d;
+            den += static_cast<double>(ref[i]) * ref[i];
+            sg += d;
+            dot += static_cast<double>(att[i]) * ref[i];
+          }
+          std::fprintf(stderr, "attn check layer %u pos %u n %u rel_err %.4f mean_err %.2e gain %.4f\n", l, pos, n, std::sqrt(num / den), sg / ref.size(), dot / den);
+        }
       } else {
       for (std::uint32_t r = 0; r < n; ++r) {
         float* row = &qkv[std::size_t{r} * (Cpu("qkv") ? qkv_n : qkv_p)];
@@ -433,6 +472,11 @@ struct Engine {
         Rope(row + qd, c.kv_heads, pos + r);
         std::memcpy(&L.k[std::size_t{pos + r} * kvd], row + qd, kvd * 4);
         std::memcpy(&L.v[std::size_t{pos + r} * kvd], row + qd + kvd, kvd * 4);
+        if (std::getenv("MC5_HOST_BF16KV"))
+          for (std::uint32_t i = 0; i < kvd; ++i) {
+            L.k[std::size_t{pos + r} * kvd + i] = Bf(Bf16Bits(L.k[std::size_t{pos + r} * kvd + i]));
+            L.v[std::size_t{pos + r} * kvd + i] = Bf(Bf16Bits(L.v[std::size_t{pos + r} * kvd + i]));
+          }
         Attend(L, row, pos + r, &att[std::size_t{r} * qd]);
       }
       }
