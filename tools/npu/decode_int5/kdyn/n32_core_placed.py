@@ -46,6 +46,10 @@ import os
 RESH_R = int(os.environ.get("RESH_R", "15"))
 
 
+INTER = int(os.environ.get("INTER", "7680"))
+TAPS = INTER // 64
+
+
 def my_matmul(M, K, N, m, k, n, mode="gemm", noff=0, a2=0):
 
     DIV = 4
@@ -496,7 +500,7 @@ def my_matmul(M, K, N, m, k, n, mode="gemm", noff=0, a2=0):
                 np.ndarray[
                     (K * N // 8,), np.dtype[v8bfp16ebs8]
                 ],  # B0 for core1 (odd columns)
-                np.ndarray[((2 * M * 7680 // 8) if mode == "swigu" else (M * N // 8),), np.dtype[dtype_out]],
+                np.ndarray[((2 * M * INTER // 8) if mode == "swigu" else (M * N // 8),), np.dtype[dtype_out]],
             )
             def sequence(A, B, C):
                 for row in range(n_aie_rows):
@@ -570,10 +574,10 @@ def my_matmul(M, K, N, m, k, n, mode="gemm", noff=0, a2=0):
                         if mode == "swigu":
                             gm, gn = group_idx // num_col_tile, group_idx % num_col_tile
                             c_tap = TensorAccessPattern(
-                                (1, 2 * M * 7680 // 8),
-                                (((4 * gm) * 120 + noff + gn * 8 + col) * 2) * 1024,
+                                (1, 2 * M * INTER // 8),
+                                (((4 * gm) * TAPS + noff + gn * 8 + col) * 2) * 1024,
                                 [1, 4, 8, 256],
-                                [0, 240 * 1024, 256, 1],
+                                [0, 2 * TAPS * 1024, 256, 1],
                             )
                         else:
                             c_tap = C_taps[c_base_idx + col]

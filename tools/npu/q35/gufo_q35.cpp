@@ -186,17 +186,24 @@ struct Layer {
   std::vector<float> qn, kn;
   WeightBuffer w_in, w_out, w_gu, w_dn;
   Program p_in, p_out, p_gu, p_dn;
+  WeightBuffer kw_in, kw_out, kw_g, kw_u, kw_d;
+  Program kp_in, kp_out, kp_g, kp_u, kp_d;
+  WeightBuffer kw_a, kw_b;
+  Program kq_a, kq_b, kq_d;
+  xrt::bo swc;
+  bool fused{false};
 };
 
 struct Engine {
-  NpuRuntime rt;
+  NpuRuntime rt, rk;
   NpuRuntime::Timings tim{};
+  bool kd{std::getenv("Q35_KD") != nullptr};
   std::vector<Layer> layers;
   std::vector<float> norm_w, readout;
   std::vector<std::uint16_t> embed_raw;
   const std::uint16_t* embed{nullptr};
   Weights w;
-  double t_npu{0}, t_host{0};
+  double t_npu{0}, t_host{0}, ph[4]{0, 0, 0, 0};
   const char* qdir{std::getenv("Q35_QDIR")};
 
   bool Init(const std::string& model_dir, const std::string& programs) {
@@ -211,7 +218,7 @@ struct Engine {
     readout.resize(cnt);
     for (std::size_t i = 0; i < cnt; ++i) readout[i] = Bf(rp[i]);
     std::string err;
-    if (!rt.Init(programs + "/final_16x64x128_ffn.xclbin", &err)) {
+    if (!(kd ? rk.Init(programs + "/final_kd.xclbin", &err) : rt.Init(programs + "/final_16x64x128_ffn.xclbin", &err))) {
       std::fprintf(stderr, "npu init: %s\n", err.c_str());
       return false;
     }
@@ -234,6 +241,10 @@ struct Engine {
         L.gnorm = w.Vec(a + "norm.weight", kVD);
         L.w_a = w.Vec(a + "in_proj_a.weight", std::size_t{kVH} * kH);
         L.w_b = w.Vec(a + "in_proj_b.weight", std::size_t{kVH} * kH);
+        if (kd) {
+          PackKdIn(L, a, programs, true, buf, &err);
+          PackKdOut(L, a + "out_proj.weight", kValDim, programs, buf, &err);
+        } else {
         L.p_in = rt.MakeProgram(kH, kGdnInN, programs + "/insts_plain_2560x12288_m64.txt", 0, &err, 0, 4);
         buf.resize(std::size_t{kGdnInN} * kH);
         w.Load(a + "in_proj_qkv.weight", buf.data(), std::size_t{kConvDim} * kH);
@@ -258,10 +269,15 @@ struct Engine {
         } else {
           L.w_out = rt.PackWeight(buf.data(), kOutN, kValDim);
         }
+        }
       } else {
         const std::string a = pre + "self_attn.";
         L.qn = w.Vec(a + "q_norm.weight", kHeadDim, 1.0f);
         L.kn = w.Vec(a + "k_norm.weight", kHeadDim, 1.0f);
+        if (kd) {
+          PackKdIn(L, a, programs, false, buf, &err);
+          PackKdOut(L, a + "o_proj.weight", kQDim, programs, buf, &err);
+        } else {
         L.p_in = rt.MakeProgram(kH, kAttnInN, programs + "/insts_plain_2560x10240_m64.txt", 0, &err, 0, 4);
         buf.resize(std::size_t{kAttnInN} * kH);
         w.Load(a + "q_proj.weight", buf.data(), std::size_t{2 * kQDim} * kH);
@@ -288,7 +304,11 @@ struct Engine {
         } else {
           L.w_out = rt.PackWeight(buf.data(), kOutN, kQDim);
         }
+        }
       }
+      if (kd) {
+        PackKdMlp(L, pre, programs, buf, &err);
+      } else {
       L.p_gu = rt.MakeProgram(kH, 2 * kI, programs + "/insts_ffngu64_2560.txt", 0, &err, 0, 4);
       L.p_dn = rt.MakeProgram(kI, kOutN, programs + "/insts_plain_9216x3072_m64.txt", 0, &err, 0, 4);
       std::vector<float> gate(std::size_t{kI} * kH), up(std::size_t{kI} * kH);
@@ -325,10 +345,103 @@ struct Engine {
       } else {
         L.w_dn = rt.PackWeight(buf.data(), kOutN, kI);
       }
+      }
       if (l % 8 == 0) std::fprintf(stderr, "q35: packed layer %u (%.1f s)\n", l, Ms(t0) / 1000.0);
     }
     std::fprintf(stderr, "q35: packed %u layers in %.1f s\n", kLayers, Ms(t0) / 1000.0);
     return true;
+  }
+
+  void PackKdIn(Layer& L, const std::string& a, const std::string& programs, bool gdn, std::vector<float>& buf, std::string* err) {
+    if (gdn) {
+      L.kp_in = rk.MakeProgram(kH, kGdnInN, programs + "/insts_kd_1024x2560x12288.txt", std::size_t{1024} * kGdnInN / 8 * 9, err, 0, 64, 3, 5);
+      buf.resize(std::size_t{kGdnInN} * kH);
+      w.Load(a + "in_proj_qkv.weight", buf.data(), std::size_t{kConvDim} * kH);
+      w.Load(a + "in_proj_z.weight", buf.data() + std::size_t{kConvDim} * kH, std::size_t{kValDim} * kH);
+      L.kw_in = rk.PackWeightAtb(buf.data(), kGdnInN, kH, 4);
+    } else {
+      L.kp_in = rk.MakeProgram(kH, kAttnInN, programs + "/insts_kd_1024x2560x10240.txt", std::size_t{1024} * kAttnInN / 8 * 9, err, 0, 64, 3, 5);
+      buf.resize(std::size_t{kAttnInN} * kH);
+      w.Load(a + "q_proj.weight", buf.data(), std::size_t{2 * kQDim} * kH);
+      w.Load(a + "k_proj.weight", buf.data() + std::size_t{2 * kQDim} * kH, std::size_t{kKvDim} * kH);
+      w.Load(a + "v_proj.weight", buf.data() + std::size_t{2 * kQDim + kKvDim} * kH, std::size_t{kKvDim} * kH);
+      L.kw_in = rk.PackWeightAtb(buf.data(), kAttnInN, kH, 4);
+    }
+  }
+
+  void PackKdOut(Layer& L, const std::string& name, std::uint32_t K, const std::string& programs, std::vector<float>& buf, std::string* err) {
+    L.kp_out = rk.MakeProgram(K, kOutN, programs + "/insts_kd_1024x4096x3072.txt", std::size_t{1024} * kOutN / 8 * 9, err, 0, 64, 3, 5);
+    buf.assign(std::size_t{kOutN} * K, 0.f);
+    w.Load(name, buf.data(), std::size_t{kH} * K);
+    L.kw_out = rk.PackWeightAtb(buf.data(), kOutN, K, 4);
+  }
+
+  void PackKdMlp(Layer& L, const std::string& pre, const std::string& programs, std::vector<float>& buf, std::string* err) {
+    if (!std::getenv("Q35_NOFUSE")) {
+      constexpr std::uint32_t kHalf = kI / 2;
+      std::vector<float> gate(std::size_t{kI} * kH), up(std::size_t{kI} * kH), ws(std::size_t{2} * kHalf * kH);
+      w.Load(pre + "mlp.gate_proj.weight", gate.data(), gate.size());
+      w.Load(pre + "mlp.up_proj.weight", up.data(), up.size());
+      auto pack = [&](std::uint32_t c0) {
+        for (std::uint32_t r = 0; r < 2 * kHalf; ++r) {
+          const std::uint32_t q = r >> 4, rr = r & 15;
+          const float* src = (rr < 8 ? gate.data() : up.data()) + std::size_t{c0 + q * 8 + (rr & 7)} * kH;
+          std::memcpy(ws.data() + std::size_t{r} * kH, src, kH * 4);
+        }
+        return rk.PackWeightAtb(ws.data(), 2 * kHalf, kH, 4);
+      };
+      L.kw_a = pack(0);
+      L.kw_b = pack(kHalf);
+      const std::size_t abytes = std::size_t{1024} * kI / 8 * 9;
+      L.swc = rk.MakeBo(2 * abytes, 3);
+      std::memset(L.swc.map<void*>(), 0, 2 * abytes);
+      L.swc.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      L.kq_a = rk.MakeProgram(kH, 2 * kHalf, programs + "/insts_kd_swi_a_1024x2560x9216.txt", 64, err, 0, 64, 3, 5);
+      L.kq_b = rk.MakeProgram(kH, 2 * kHalf, programs + "/insts_kd_swi_b_1024x2560x9216.txt", 64, err, 0, 64, 3, 5);
+      L.kq_a.c = L.swc;
+      L.kq_a.ch = L.swc.map<std::uint8_t*>();
+      L.kq_b.c = L.swc;
+      L.kq_b.ch = L.kq_a.ch;
+      L.kq_d = rk.MakeProgram(kI, kOutN, programs + "/insts_kd_dn2_1024x9216x3072.txt", std::size_t{1024} * kOutN / 8 * 9, err, 0, 64, 3, 5);
+      rk.RebindA(L.kq_d, L.swc);
+      buf.assign(std::size_t{kOutN} * kI, 0.f);
+      w.Load(pre + "mlp.down_proj.weight", buf.data(), std::size_t{kH} * kI);
+      L.kw_d = rk.PackWeightAtb(buf.data(), kOutN, kI, 4);
+      rk.WeightSlot(L.kw_d, L.kq_d);
+      L.fused = true;
+      return;
+    }
+    L.kp_g = rk.MakeProgram(kH, kI, programs + "/insts_kd_1024x2560x9216.txt", std::size_t{1024} * kI / 8 * 9, err, 0, 64, 3, 5);
+    L.kp_u = rk.MakeProgram(kH, kI, programs + "/insts_kd_1024x2560x9216.txt", std::size_t{1024} * kI / 8 * 9, err, 0, 64, 3, 5);
+    L.kp_d = rk.MakeProgram(kI, kOutN, programs + "/insts_kd_1024x9216x3072.txt", std::size_t{1024} * kOutN / 8 * 9, err, 0, 64, 3, 5);
+    buf.resize(std::size_t{kI} * kH);
+    w.Load(pre + "mlp.gate_proj.weight", buf.data(), buf.size());
+    L.kw_g = rk.PackWeightAtb(buf.data(), kI, kH, 4);
+    w.Load(pre + "mlp.up_proj.weight", buf.data(), buf.size());
+    L.kw_u = rk.PackWeightAtb(buf.data(), kI, kH, 4);
+    buf.assign(std::size_t{kOutN} * kI, 0.f);
+    w.Load(pre + "mlp.down_proj.weight", buf.data(), std::size_t{kH} * kI);
+    L.kw_d = rk.PackWeightAtb(buf.data(), kOutN, kI, 4);
+  }
+
+  std::vector<float> kx, ky;
+
+  void KGemm(Program& p, WeightBuffer& wb, const float* z, std::uint32_t T, std::uint32_t K, float* out) {
+    const auto t0 = Clock::now();
+    if (kx.size() < std::size_t{1024} * 9216) kx.assign(std::size_t{1024} * 9216, 0.f);
+    if (ky.size() < std::size_t{1024} * kGdnInN) ky.assign(std::size_t{1024} * kGdnInN, 0.f);
+    for (std::uint32_t o = 0; o < T; o += 1024) {
+      const std::uint32_t n = std::min(1024u, T - o);
+      if (n == 1024) {
+        rk.GemmAtb(p, wb, z + std::size_t{o} * K, 1024, out + std::size_t{o} * p.N, &tim);
+        continue;
+      }
+      std::memcpy(kx.data(), z + std::size_t{o} * K, std::size_t{n} * K * 4);
+      std::memset(kx.data() + std::size_t{n} * K, 0, std::size_t{1024 - n} * K * 4);
+      rk.GemmAtb(p, wb, kx.data(), 1024, ky.data(), &tim);
+      std::memcpy(out + std::size_t{o} * p.N, ky.data(), std::size_t{n} * p.N * 4);
+    }
+    t_npu += Ms(t0);
   }
 
   void Gemm(Program& p, WeightBuffer& wb, const float* z, std::uint32_t T, std::uint32_t K, float* out) {
@@ -342,12 +455,14 @@ struct Engine {
 
   void Gdn(Layer& L, const float* z, std::uint32_t Tt, const std::vector<std::pair<std::uint32_t, std::uint32_t>>& segs, float* out_h) {
     std::vector<float> proj(std::size_t{Tt} * kGdnInN), gated(std::size_t{Tt} * kValDim);
-    Gemm(L.p_in, L.w_in, z, Tt, kH, proj.data());
+    if (kd) KGemm(L.kp_in, L.kw_in, z, Tt, kH, proj.data());
+    else Gemm(L.p_in, L.w_in, z, Tt, kH, proj.data());
     const auto t0 = Clock::now();
     for (const auto& sg : segs) GdnHost(L, proj.data() + std::size_t{sg.first} * kGdnInN, z + std::size_t{sg.first} * kH, sg.second, gated.data() + std::size_t{sg.first} * kValDim);
     t_host += Ms(t0);
     std::vector<float> outp(std::size_t{Tt} * kOutN);
-    Gemm(L.p_out, L.w_out, gated.data(), Tt, kValDim, outp.data());
+    if (kd) KGemm(L.kp_out, L.kw_out, gated.data(), Tt, kValDim, outp.data());
+    else Gemm(L.p_out, L.w_out, gated.data(), Tt, kValDim, outp.data());
     for (std::uint32_t t = 0; t < Tt; ++t) std::memcpy(out_h + std::size_t{t} * kH, &outp[std::size_t{t} * kOutN], kH * 4);
   }
 
@@ -429,12 +544,14 @@ struct Engine {
 
   void Attn(Layer& L, const float* z, std::uint32_t Tt, const std::vector<std::pair<std::uint32_t, std::uint32_t>>& segs, float* out_h) {
     std::vector<float> proj(std::size_t{Tt} * kAttnInN), att(std::size_t{Tt} * kQDim);
-    Gemm(L.p_in, L.w_in, z, Tt, kH, proj.data());
+    if (kd) KGemm(L.kp_in, L.kw_in, z, Tt, kH, proj.data());
+    else Gemm(L.p_in, L.w_in, z, Tt, kH, proj.data());
     const auto t0 = Clock::now();
     for (const auto& sg : segs) AttnHost(L, proj.data() + std::size_t{sg.first} * kAttnInN, sg.second, att.data() + std::size_t{sg.first} * kQDim);
     t_host += Ms(t0);
     std::vector<float> outp(std::size_t{Tt} * kOutN);
-    Gemm(L.p_out, L.w_out, att.data(), Tt, kQDim, outp.data());
+    if (kd) KGemm(L.kp_out, L.kw_out, att.data(), Tt, kQDim, outp.data());
+    else Gemm(L.p_out, L.w_out, att.data(), Tt, kQDim, outp.data());
     for (std::uint32_t t = 0; t < Tt; ++t) std::memcpy(out_h + std::size_t{t} * kH, &outp[std::size_t{t} * kOutN], kH * 4);
   }
 
@@ -512,7 +629,66 @@ struct Engine {
     }
   }
 
+  void Dispatch(WeightBuffer& wb, Program& p) {
+    WeightBuffer& ww = rk.WeightSlot(wb, p);
+    ww.run.start();
+    ww.run.wait();
+    if (!p.warmed) {
+      p.warmed = true;
+      ww.run.start();
+      ww.run.wait();
+    }
+  }
+
+  void MlpFused(Layer& L, const float* z, std::uint32_t T, float* out_h) {
+    if (kx.size() < std::size_t{1024} * 9216) kx.assign(std::size_t{1024} * 9216, 0.f);
+    if (ky.size() < std::size_t{1024} * kGdnInN) ky.assign(std::size_t{1024} * kGdnInN, 0.f);
+    const auto t0 = Clock::now();
+    for (std::uint32_t o = 0; o < T; o += 1024) {
+      const std::uint32_t n = std::min(1024u, T - o);
+      const float* src = z + std::size_t{o} * kH;
+      if (n < 1024) {
+        std::memcpy(kx.data(), src, std::size_t{n} * kH * 4);
+        std::memset(kx.data() + std::size_t{n} * kH, 0, std::size_t{1024 - n} * kH * 4);
+        src = kx.data();
+      }
+      auto t1 = Clock::now();
+      rk.EncodeAAtbRaw(src, 1024, kH, L.kq_a.ah);
+      std::memcpy(L.kq_b.ah, L.kq_a.ah, std::size_t{1024} * kH / 8 * 9);
+      L.kq_a.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      L.kq_b.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      tim.enc += Ms(t1);
+      t1 = Clock::now();
+      Dispatch(L.kw_a, L.kq_a);
+      Dispatch(L.kw_b, L.kq_b);
+      Dispatch(L.kw_d, L.kq_d);
+      L.kq_d.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+      tim.wait += Ms(t1);
+      t1 = Clock::now();
+      rk.DecodeCAtbRaw(L.kq_d.ch, ky.data(), 1024, kOutN);
+      tim.dec += Ms(t1);
+      for (std::uint32_t r = 0; r < n; ++r) std::memcpy(out_h + std::size_t{o + r} * kH, &ky[std::size_t{r} * kOutN], kH * 4);
+    }
+    t_npu += Ms(t0);
+  }
+
   void Mlp(Layer& L, const float* z, std::uint32_t T, float* out_h) {
+    if (kd && L.fused) {
+      MlpFused(L, z, T, out_h);
+      return;
+    }
+    if (kd) {
+      std::vector<float> g(std::size_t{T} * kI), u(std::size_t{T} * kI), o(std::size_t{T} * kOutN);
+      KGemm(L.kp_g, L.kw_g, z, T, kH, g.data());
+      KGemm(L.kp_u, L.kw_u, z, T, kH, u.data());
+      const auto t1 = Clock::now();
+#pragma omp parallel for
+      for (std::int64_t i = 0; i < static_cast<std::int64_t>(g.size()); ++i) g[i] = Silu(g[i]) * u[i];
+      t_host += Ms(t1);
+      KGemm(L.kp_d, L.kw_d, g.data(), T, kI, o.data());
+      for (std::uint32_t t = 0; t < T; ++t) std::memcpy(out_h + std::size_t{t} * kH, &o[std::size_t{t} * kOutN], kH * 4);
+      return;
+    }
     std::vector<float> yo(std::size_t{kRows} * kOutN);
     const auto t0 = Clock::now();
     for (std::uint32_t o = 0; o < T; o += kRows) {
@@ -542,13 +718,21 @@ struct Engine {
         for (std::uint32_t c = 0; c < kH; ++c) x[std::size_t(segs[i].first + t) * kH + c] = Bf(embed[std::size_t(seqs[i].tok[t]) * kH + c]);
     for (std::uint32_t l = 0; l < kLayers; ++l) {
       Layer& L = layers[l];
+      auto tp = Clock::now();
       RmsNormRows(x.data(), L.ln1.data(), z.data(), T, kH);
+      ph[0] += Ms(tp); tp = Clock::now();
       if (L.linear) Gdn(L, z.data(), T, segs, br.data());
       else Attn(L, z.data(), T, segs, br.data());
-      for (std::size_t i = 0; i < x.size(); ++i) x[i] += br[i];
+      ph[1] += Ms(tp); tp = Clock::now();
+#pragma omp parallel for
+      for (std::int64_t i = 0; i < static_cast<std::int64_t>(x.size()); ++i) x[i] += br[i];
       RmsNormRows(x.data(), L.ln2.data(), z.data(), T, kH);
+      ph[2] += Ms(tp); tp = Clock::now();
       Mlp(L, z.data(), T, br.data());
-      for (std::size_t i = 0; i < x.size(); ++i) x[i] += br[i];
+      ph[3] += Ms(tp); tp = Clock::now();
+#pragma omp parallel for
+      for (std::int64_t i = 0; i < static_cast<std::int64_t>(x.size()); ++i) x[i] += br[i];
+      ph[2] += Ms(tp);
     }
     hidden->resize(seqs.size() * kH);
     for (std::size_t i = 0; i < seqs.size(); ++i)
@@ -566,6 +750,43 @@ struct Engine {
 };
 
 }  // namespace
+
+int KdTest(const char* programs, std::uint32_t K, std::uint32_t N) {
+  NpuRuntime rt;
+  std::string err;
+  if (!rt.Init(std::string(programs) + "/final_kd.xclbin", &err)) {
+    std::fprintf(stderr, "init %s\n", err.c_str());
+    return 1;
+  }
+  const std::uint32_t M = 1024;
+  std::vector<float> W(std::size_t{N} * K), x(std::size_t{M} * K), y(std::size_t{M} * N), ref(y.size());
+  std::srand(3);
+  for (auto& v : W) v = (std::rand() / static_cast<float>(RAND_MAX) - 0.5f) * 0.1f;
+  for (auto& v : x) v = std::rand() / static_cast<float>(RAND_MAX) - 0.5f;
+  Program p = rt.MakeProgram(K, N, std::string(programs) + "/insts_kd_1024x" + std::to_string(K) + "x" + std::to_string(N) + ".txt", std::size_t{M} * N / 8 * 9, &err, 0, M / 16, 3, 5);
+  WeightBuffer wb = rt.PackWeightAtb(W.data(), N, K, 4);
+  NpuRuntime::Timings tm{};
+  for (int it = 0; it < 3; ++it) {
+    const auto t0 = Clock::now();
+    rt.GemmAtb(p, wb, x.data(), M, y.data(), &tm);
+    std::fprintf(stderr, "run %d: %.1f ms (enc %.1f syncA %.1f wait %.1f dec %.1f)\n", it, Ms(t0), tm.enc, tm.syncA, tm.wait, tm.dec);
+    tm = {};
+  }
+#pragma omp parallel for
+  for (std::int64_t r = 0; r < M; ++r)
+    for (std::uint32_t n = 0; n < N; ++n) {
+      float s = 0;
+      for (std::uint32_t k = 0; k < K; ++k) s += x[std::size_t(r) * K + k] * W[std::size_t{n} * K + k];
+      ref[std::size_t(r) * N + n] = s;
+    }
+  double num = 0, den = 0;
+  for (std::size_t i = 0; i < y.size(); ++i) {
+    num += (y[i] - ref[i]) * (y[i] - ref[i]);
+    den += ref[i] * ref[i];
+  }
+  std::printf("kd %ux%u rel_err %.5f\n", K, N, std::sqrt(num / den));
+  return 0;
+}
 
 int EvalBatch(const char* model, const char* programs, const char* path) {
   std::ifstream f(path, std::ios::binary);
@@ -586,8 +807,17 @@ int EvalBatch(const char* model, const char* programs, const char* path) {
     at += it.len;
     items.push_back(it);
   }
-  const auto t0 = Clock::now();
+  const int reps = std::getenv("Q35_REPEAT") ? std::atoi(std::getenv("Q35_REPEAT")) : 1;
+  auto t0 = Clock::now();
   std::uint64_t total = 0;
+  for (int rep = 0; rep < reps; ++rep) {
+  if (rep == reps - 1) {
+    t0 = Clock::now();
+    total = 0;
+    e.tim = {};
+    e.t_npu = e.t_host = 0;
+    for (auto& v : e.ph) v = 0;
+  }
   for (std::size_t g = 0; g < items.size(); g += group) {
     std::vector<Engine::Seq> sq;
     for (std::size_t i = g; i < std::min(items.size(), g + group); ++i) {
@@ -605,11 +835,15 @@ int EvalBatch(const char* model, const char* programs, const char* path) {
       std::printf("\n");
     }
   }
+  }
+  std::fprintf(stderr, "npu: enc %.0f syncA %.0f submit %.0f wait %.0f syncC %.0f dec %.0f ms\n", e.tim.enc, e.tim.syncA, e.tim.submit, e.tim.wait, e.tim.syncC, e.tim.dec);
+  std::fprintf(stderr, "phases: norm1 %.0f mixer %.0f resid+norm2 %.0f mlp %.0f ms\n", e.ph[0], e.ph[1], e.ph[2], e.ph[3]);
   std::fprintf(stderr, "eval: %d cases %llu tokens %.1f ms (%.1f ms/case, npu %.0f host %.0f) group %u\n", cases, static_cast<unsigned long long>(total), Ms(t0), Ms(t0) / cases, e.t_npu, e.t_host, group);
   return 0;
 }
 
 int main(int argc, char** argv) {
+  if (argc == 5 && std::string(argv[1]) == "kdtest") return KdTest(argv[2], std::atoi(argv[3]), std::atoi(argv[4]));
   if (argc == 5 && std::string(argv[1]) == "eval") return EvalBatch(argv[2], argv[3], argv[4]);
   if (argc < 6) {
     std::fprintf(stderr, "usage: gufo-q35 logits MODEL_DIR PROGRAMS TOKENS.i32 MARKER[,MARKER...] [COUNT]\n");
