@@ -118,7 +118,7 @@ def design(m, k, n, mc):
         c_per_col = OUT_ELEMS * ROWS * CB
         c_total = COLS * c_per_col
         n_bd = (mc + MAX_BD - 1) // MAX_BD
-        assert n_bd <= 3, "context beyond 3 BDs of 1023 chunks unsupported"
+        assert mc <= 3 * MAX_BD or mc % 2 == 0
         per_bd = (mc + n_bd - 1) // n_bd
 
         @runtime_sequence(
@@ -138,11 +138,20 @@ def design(m, k, n, mc):
                 )
                 in_tasks.append(shim_dma_single_bd_task(B_l3l2[col], A, tap=p_tap, issue_token=False))
                 dma_start_task(in_tasks[-1])
-            for r in range(ROWS):
+            for r in range(ROWS if mc <= 3 * MAX_BD else 0):
                 for bi in range(n_bd):
                     inner = min(per_bd, mc - bi * per_bd)
                     b_tap = TensorAccessPattern(
                         (1, b_total), bi * per_bd * CHUNK + r * BQ, [1, inner, 3, BQ], [0, CHUNK, ROWS * BQ, 1]
+                    )
+                    in_tasks.append(shim_dma_single_bd_task(BC[r], B, tap=b_tap, issue_token=False))
+                    dma_start_task(in_tasks[-1])
+            if mc > 3 * MAX_BD:
+                g = next(g for g in range(2, 1024) if mc % g == 0 and mc // g <= 224)
+                inn = mc // g
+                for r in range(ROWS):
+                    b_tap = TensorAccessPattern(
+                        (1, b_total), r * BQ, [g, inn, 3, BQ], [inn * CHUNK, CHUNK, ROWS * BQ, 1]
                     )
                     in_tasks.append(shim_dma_single_bd_task(BC[r], B, tap=b_tap, issue_token=False))
                     dma_start_task(in_tasks[-1])
