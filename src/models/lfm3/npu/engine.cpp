@@ -481,7 +481,7 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
     if (s.atb) s.atb->Warm();
     // WP4: pack tied embedding as int5 head for NPU argmax, if program exists.
     s.npu_argmax = false;
-    if (std::getenv("GUFO_NPU_ARGMAX") != nullptr) {
+    if (std::getenv("GUFO_CPU_ARGMAX") == nullptr) {
       const std::string ainst = options.programs + "/insts_argmax_2048x128000.txt";
       std::ifstream af(ainst, std::ios::binary);
       if (af.good()) {
@@ -499,7 +499,7 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
             float* out = emb.data() + std::size_t(v) * s.H;
             for (std::uint32_t b = 0; b < nb; ++b) {
               std::uint16_t hd; std::memcpy(&hd, row + std::size_t{b} * 34, 2);
-              const float d = Bf16Float(hd);
+              const float d = _cvtsh_ss(hd);
               for (int i = 0; i < 32; ++i)
                 out[b * 32 + i] = static_cast<float>(static_cast<int8_t>(row[b * 34 + 2 + i])) * d;
             }
@@ -507,6 +507,20 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
           s.m_argmax = s.rt.PackWeight(emb.data(), V, s.H);
           ;
           s.npu_argmax = true;
+          if (std::getenv("GUFO_ARGMAX_SELFTEST")) {
+            for (std::uint32_t j : {0u, 1u, 7u, 100u, 1024u, 2047u}) {
+              std::vector<float> x(s.H, 0.f);
+              x[j] = 4.0f;
+              std::uint32_t got = 0;
+              s.rt.Argmax(s.p_argmax, s.m_argmax, x.data(), 1, &got, &s.tim);
+              std::uint32_t want = 0; float wv = -1e30f;
+              for (std::uint32_t v = 0; v < V; ++v) { const float e = emb[std::size_t{v} * s.H + j]; if (e > wv) { wv = e; want = v; } }
+              std::fprintf(stderr, "[argmax selftest] onehot dim %u: npu id %u (emb %.4f)  expected id %u (emb %.4f)\n", j, got, got < V ? emb[std::size_t{got} * s.H + j] : 0.f, want, wv);
+              const std::uint8_t* base = s.p_argmax.ch;
+              float v0; std::uint32_t lc0; std::memcpy(&v0, base, 4); std::memcpy(&lc0, base + 4, 4);
+              std::fprintf(stderr, "[argmax selftest]   strip0 cr0 row0 raw (%g, %u); expected logit scale 4*emb\n", v0, lc0);
+            }
+          }
           std::fprintf(stderr, "npu engine: packed int5 argmax head (%u x %u)\n", V, s.H);
         } catch (...) {
           s.npu_argmax = false;
@@ -1529,6 +1543,12 @@ std::uint32_t Engine::Argmax(const float* hidden_row) {
       std::uint32_t best = 0;
       for (std::uint32_t v = 1; v < lg.size(); ++v) if (lg[v] > lg[best]) best = v;
       std::fprintf(stderr, "[argmax] npu %u (cpu logit %.3f) cpu %u (logit %.3f)\n", out, lg[out], best, lg[best]);
+      {
+        const auto& wb = s.m_argmax;
+        std::size_t wnz = 0, wtot = wb.bytes;
+        for (std::size_t i = 0; i < wtot; i += 97) wnz += wb.host[i] != 0;
+        std::fprintf(stderr, "[argmax] weight BO bytes %zu, sampled nonzero %zu of %zu; first %02x %02x %02x %02x %02x %02x %02x %02x\n", wtot, wnz, wtot / 97, wb.host[0], wb.host[1], wb.host[2], wb.host[3], wb.host[4], wb.host[5], wb.host[6], wb.host[7]);
+      }
       {
         std::size_t nz = 0, total = std::size_t{1000} * gufo::npu::runtime::kStripBytes;
         for (std::size_t i = 0; i < total; ++i) nz += s.p_argmax.ch[i] != 0;
