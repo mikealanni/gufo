@@ -29,6 +29,7 @@ constexpr std::uint32_t kRows64 = 64;
 constexpr std::uint32_t kPrefillRows = kRows64;
 constexpr std::uint32_t kStripRows = 128;
 constexpr std::uint32_t kPassCols = 1024;
+constexpr std::uint32_t kAttnKv = 4 * 128;
 constexpr std::uint32_t PadN(std::uint32_t n) { return (n + kPassCols - 1) / kPassCols * kPassCols; }
 
 double Ms(Clock::time_point a) {
@@ -103,12 +104,59 @@ void RmsNorm(const float* x, const float* w, float* out, std::uint32_t d, float 
   for (std::uint32_t i = 0; i < d; ++i) out[i] = x[i] * scale * w[i];
 }
 
+std::vector<char> ReadNpy(const std::string& path, std::size_t* bytes) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) {
+    std::fprintf(stderr, "cannot open %s\n", path.c_str());
+    std::exit(1);
+  }
+  std::vector<char> b((std::istreambuf_iterator<char>(f)), {});
+  std::uint16_t hl;
+  std::memcpy(&hl, b.data() + 8, 2);
+  const std::size_t off = 10 + hl;
+  *bytes = b.size() - off;
+  return std::vector<char>(b.begin() + off, b.end());
+}
+
+struct QMat {
+  std::vector<std::int8_t> q;
+  std::vector<std::uint16_t> s;
+  std::uint32_t N{0}, K{0};
+  void Resize(std::uint32_t n, std::uint32_t k) {
+    N = n;
+    K = k;
+    q.assign(std::size_t{n} * k, 0);
+    s.assign(std::size_t{n} * (k / 32), 0x3F80);
+  }
+  void Load(const std::string& dir, const std::string& name, std::uint32_t row0, std::uint32_t rows) {
+    std::size_t nb = 0;
+    auto qb = ReadNpy(dir + "/" + name + ".q.npy", &nb);
+    if (nb != std::size_t{rows} * K) {
+      std::fprintf(stderr, "%s q size mismatch\n", name.c_str());
+      std::exit(1);
+    }
+    std::memcpy(&q[std::size_t{row0} * K], qb.data(), nb);
+    auto sb = ReadNpy(dir + "/" + name + ".s.npy", &nb);
+    if (nb != std::size_t{rows} * (K / 32) * 2) {
+      std::fprintf(stderr, "%s s size mismatch\n", name.c_str());
+      std::exit(1);
+    }
+    std::memcpy(&s[std::size_t{row0} * (K / 32)], sb.data(), nb);
+  }
+  void CopyRows(const QMat& src, std::uint32_t srow, std::uint32_t drow, std::uint32_t rows) {
+    std::memcpy(&q[std::size_t{drow} * K], &src.q[std::size_t{srow} * K], std::size_t{rows} * K);
+    std::memcpy(&s[std::size_t{drow} * (K / 32)], &src.s[std::size_t{srow} * (K / 32)], std::size_t{rows} * (K / 32) * 2);
+  }
+};
+
 struct Layer {
   std::vector<float> attn_norm, ffn_norm;
   WeightBuffer qkv, out, ffn, ffn_dn;
   Program p_qkv, p_out, p_ffn, p_qkv64, p_out64, p_gu64, p_dn64;
   std::vector<float> k, v;
   std::vector<float> wqkv, wo, wgate, wup, wdown;
+  AttnLayer al;
+  std::vector<std::uint16_t> kh, vh;
 };
 
 void MatVec(const float* W, std::uint32_t N, std::uint32_t K, const float* x, std::uint32_t n, float* y) {
@@ -137,6 +185,9 @@ struct Engine {
   std::uint32_t pos{0}, ctx{0};
   std::uint32_t gu_strips{0};
   bool m64{std::getenv("MC5_NO_M64") == nullptr};
+  bool npu_attn{std::getenv("MC5_HOST_ATTN") == nullptr};
+  std::string programs_dir;
+  const char* qdir{std::getenv("MC5_QDIR")};
   double t_npu{0}, t_cpu{0};
   bool cpu_ref{std::getenv("MC5_CPU") != nullptr || std::getenv("MC5_CPU_OP") != nullptr};
   std::string cpu_ops{std::getenv("MC5_CPU") ? "qkv,out,ffn" : (std::getenv("MC5_CPU_OP") ? std::getenv("MC5_CPU_OP") : "")};
@@ -144,6 +195,7 @@ struct Engine {
 
   bool Init(const std::string& model_dir, const std::string& programs, std::uint32_t context) {
     ctx = context;
+    programs_dir = programs;
     Safetensors st;
     if (!st.Open(model_dir + "/model-00000-of-00001.safetensors")) {
       std::fprintf(stderr, "cannot open safetensors\n");
@@ -189,11 +241,27 @@ struct Engine {
       st.Load(pre + "self_attn.k_proj.weight", buf.data() + std::size_t{qd} * H, std::size_t{kvd} * H);
       st.Load(pre + "self_attn.v_proj.weight", buf.data() + std::size_t{qd + kvd} * H, std::size_t{kvd} * H);
       if (cpu_ref) L.wqkv = buf;
-      L.qkv = rt.PackWeight(buf.data(), qkv_p, H);
+      if (qdir) {
+        QMat m;
+        m.Resize(qkv_p, H);
+        m.Load(qdir, std::to_string(l) + ".q", 0, qd);
+        m.Load(qdir, std::to_string(l) + ".k", qd, kvd);
+        m.Load(qdir, std::to_string(l) + ".v", qd + kvd, kvd);
+        L.qkv = rt.PackWeightQ(m.q.data(), m.s.data(), qkv_p, H);
+      } else {
+        L.qkv = rt.PackWeight(buf.data(), qkv_p, H);
+      }
       buf.assign(std::size_t{h_p} * qd, 0.f);
       st.Load(pre + "self_attn.o_proj.weight", buf.data(), std::size_t{H} * qd);
       if (cpu_ref) L.wo.assign(buf.begin(), buf.begin() + std::size_t{H} * qd);
-      L.out = rt.PackWeight(buf.data(), h_p, qd);
+      if (qdir) {
+        QMat m;
+        m.Resize(h_p, qd);
+        m.Load(qdir, std::to_string(l) + ".o", 0, H);
+        L.out = rt.PackWeightQ(m.q.data(), m.s.data(), h_p, qd);
+      } else {
+        L.out = rt.PackWeight(buf.data(), h_p, qd);
+      }
       std::vector<float> gate(std::size_t{I} * H), up(std::size_t{I} * H);
       st.Load(pre + "mlp.gate_proj.weight", gate.data(), gate.size());
       st.Load(pre + "mlp.up_proj.weight", up.data(), up.size());
@@ -211,14 +279,40 @@ struct Engine {
       m.bo = xrt::bo(rt.device(), m.bytes, XRT_BO_FLAGS_HOST_ONLY, rt.kernel().group_id(3));
       m.host = m.bo.map<std::uint8_t*>();
       std::memset(m.host, 0, m.bytes);
-      PackMatInt5(buf.data(), 2 * I, H, m.host);
+      if (qdir) {
+        QMat g, u, gu;
+        g.Resize(I, H);
+        u.Resize(I, H);
+        gu.Resize(2 * I, H);
+        g.Load(qdir, std::to_string(l) + ".gate", 0, I);
+        u.Load(qdir, std::to_string(l) + ".up", 0, I);
+        for (std::size_t f = 0; f < I / 8; ++f) {
+          gu.CopyRows(g, f * 8, f * 16, 8);
+          gu.CopyRows(u, f * 8, f * 16 + 8, 8);
+        }
+        PackMatInt5Q(gu.q.data(), gu.s.data(), 2 * I, H, m.host);
+      } else {
+        PackMatInt5(buf.data(), 2 * I, H, m.host);
+      }
       buf.assign(std::size_t{h_p} * I, 0.f);
       st.Load(pre + "mlp.down_proj.weight", buf.data(), std::size_t{H} * I);
       if (cpu_ref) L.wdown.assign(buf.begin(), buf.begin() + std::size_t{H} * I);
-      PackMatInt5(buf.data(), h_p, I, m.host + gu_bytes);
-      if (m64) L.ffn_dn = rt.PackWeight(buf.data(), h_p, I);
+      QMat dn;
+      if (qdir) {
+        dn.Resize(h_p, I);
+        dn.Load(qdir, std::to_string(l) + ".down", 0, H);
+        PackMatInt5Q(dn.q.data(), dn.s.data(), h_p, I, m.host + gu_bytes);
+      } else {
+        PackMatInt5(buf.data(), h_p, I, m.host + gu_bytes);
+      }
+      if (m64) L.ffn_dn = qdir ? rt.PackWeightQ(dn.q.data(), dn.s.data(), h_p, I) : rt.PackWeight(buf.data(), h_p, I);
       m.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
       L.ffn = std::move(m);
+      if (npu_attn) {
+        L.al = rt.MakeAttnLayer(ctx);
+        L.kh.assign(std::size_t{ctx} * kAttnKv, 0);
+        L.vh.assign(std::size_t{ctx} * kAttnKv, 0);
+      }
       L.k.assign(std::size_t{ctx} * kvd, 0.f);
       L.v.assign(std::size_t{ctx} * kvd, 0.f);
     }
@@ -235,7 +329,15 @@ struct Engine {
     return true;
   }
 
-  void Reset() { pos = 0; }
+  void Reset() {
+    pos = 0;
+    if (npu_attn)
+      for (auto& L : layers) {
+        rt.AttnReset(L.al);
+        std::fill(L.kh.begin(), L.kh.end(), std::uint16_t{0});
+        std::fill(L.vh.begin(), L.vh.end(), std::uint16_t{0});
+      }
+  }
 
   void Rope(float* x, std::uint32_t nh, std::uint32_t p) const {
     const std::uint32_t hd = c.head_dim, half = hd / 2;
@@ -299,6 +401,32 @@ struct Engine {
       else rt.Gemm(u64 ? L.p_qkv64 : L.p_qkv, L.qkv, z.data(), n, qkv.data(), &tim);
       t_npu += Ms(t0);
       t0 = Clock::now();
+      if (npu_attn) {
+        std::vector<float> qa(std::size_t{n} * qd), kd(std::size_t{n} * kAttnKv);
+        const std::uint32_t hd = c.head_dim, rep = kAttnKv / kvd;
+        for (std::uint32_t r = 0; r < n; ++r) {
+          float* row = &qkv[std::size_t{r} * (Cpu("qkv") ? qkv_n : qkv_p)];
+          Rope(row, c.heads, pos + r);
+          Rope(row + qd, c.kv_heads, pos + r);
+          std::memcpy(&qa[std::size_t{r} * qd], row, qd * 4);
+          for (std::uint32_t h = 0; h < 4; ++h) {
+            const std::uint32_t src = h / rep;
+            std::memcpy(&kd[std::size_t{r} * kAttnKv + h * hd], row + qd + src * hd, hd * 4);
+            for (std::uint32_t i = 0; i < hd; ++i) {
+              L.kh[std::size_t{pos + r} * kAttnKv + h * hd + i] = Bf16Bits(row[qd + src * hd + i]);
+              L.vh[std::size_t{pos + r} * kAttnKv + h * hd + i] = Bf16Bits(row[qd + kvd + src * hd + i]);
+            }
+          }
+        }
+        for (std::uint32_t o = 0, m = 0; o < n; o += m) {
+          m = std::min({16u, n - o, 16u - (pos + o) % 16u});
+          rt.AttnAppend(L.al, pos + o, m, &kd[std::size_t{o} * kAttnKv], L.vh.data(), &tim);
+          if (!rt.AttnRun(L.al, pos + o, m, &qa[std::size_t{o} * qd], L.kh.data(), L.vh.data(), programs_dir, &att[std::size_t{o} * qd], &tim)) {
+            std::fprintf(stderr, "npu attention declined (layer %u pos %u)\n", l, pos + o);
+            std::exit(3);
+          }
+        }
+      } else {
       for (std::uint32_t r = 0; r < n; ++r) {
         float* row = &qkv[std::size_t{r} * (Cpu("qkv") ? qkv_n : qkv_p)];
         Rope(row, c.heads, pos + r);
@@ -306,6 +434,7 @@ struct Engine {
         std::memcpy(&L.k[std::size_t{pos + r} * kvd], row + qd, kvd * 4);
         std::memcpy(&L.v[std::size_t{pos + r} * kvd], row + qd + kvd, kvd * 4);
         Attend(L, row, pos + r, &att[std::size_t{r} * qd]);
+      }
       }
       t_cpu += Ms(t0);
       t0 = Clock::now();

@@ -46,6 +46,12 @@ void PackMatInt5(const float* W, std::uint32_t N, std::uint32_t K,
         q[std::size_t(n) * K + kg * 32 + i] = static_cast<std::int8_t>(
             std::fmin(15.f, std::fmax(-15.f, std::nearbyint(row[i] / s))));
     }
+  PackMatInt5Q(q.data(), sc.data(), N, K, dst, extra_tiles, tile_perm);
+}
+
+void PackMatInt5Q(const std::int8_t* q, const std::uint16_t* sc, std::uint32_t N, std::uint32_t K,
+                  std::uint8_t* dst, std::uint32_t extra_tiles, const std::uint32_t* tile_perm) {
+  const std::uint32_t strips = N / kStrip, tk = K / kTileK;
 #pragma omp parallel for collapse(2)
   for (std::int64_t s2 = 0; s2 < strips; ++s2)
     for (std::int64_t t = 0; t < tk; ++t)
@@ -125,6 +131,18 @@ Program NpuRuntime::MakeProgram(std::uint32_t K, std::uint32_t N,
   p.c.sync(XCL_BO_SYNC_BO_TO_DEVICE);
   (void)error;
   return p;
+}
+
+WeightBuffer NpuRuntime::PackWeightQ(const std::int8_t* q, const std::uint16_t* sc, std::uint32_t N,
+                                     std::uint32_t K) {
+  WeightBuffer wb;
+  wb.bytes = std::size_t{N / kStrip} * (K / kTileK) * 4 * kQuarterBytes;
+  wb.bo = xrt::bo(dev_, wb.bytes, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(3));
+  wb.host = wb.bo.map<std::uint8_t*>();
+  std::memset(wb.host, 0, wb.bytes);
+  PackMatInt5Q(q, sc, N, K, wb.host);
+  wb.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  return wb;
 }
 
 WeightBuffer NpuRuntime::PackWeight(const float* W, std::uint32_t N,

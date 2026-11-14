@@ -84,6 +84,8 @@ inline float Bf16Float(std::uint16_t b) {
 void PackMatInt5(const float* W, std::uint32_t N, std::uint32_t K,
                  std::uint8_t* dst, std::uint32_t extra_tiles = 0,
                  const std::uint32_t* tile_perm = nullptr);
+void PackMatInt5Q(const std::int8_t* q, const std::uint16_t* sc, std::uint32_t N, std::uint32_t K,
+                  std::uint8_t* dst, std::uint32_t extra_tiles = 0, const std::uint32_t* tile_perm = nullptr);
 
 // Instruction-stream program (one runtime sequence) with its A/C staging BOs.
 struct WeightBuffer;  // fwd: Program pins one via wpin (see NpuRuntime::WeightSlot)
@@ -204,6 +206,7 @@ class NpuRuntime {
 
   /// Allocate and pack a weight matrix (N rows x K cols, row-major float).
   WeightBuffer PackWeight(const float* W, std::uint32_t N, std::uint32_t K);
+  WeightBuffer PackWeightQ(const std::int8_t* q, const std::uint16_t* sc, std::uint32_t N, std::uint32_t K);
   /// Bind a weight buffer to a program (sets kernel args 0-5).
   void Attach(WeightBuffer& wb, Program& prog);
   /// WP10: this XRT/xdna stack keeps a program's FIRST weight buffer bound: later
