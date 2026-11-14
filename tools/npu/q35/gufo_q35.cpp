@@ -248,10 +248,18 @@ struct Engine {
     t_npu += Ms(t0);
   }
 
-  void Gdn(Layer& L, const float* z, std::uint32_t T, float* out_h) {
-    std::vector<float> proj(std::size_t{T} * kGdnInN);
-    Gemm(L.p_in, L.w_in, z, T, kH, proj.data());
+  void Gdn(Layer& L, const float* z, std::uint32_t Tt, const std::vector<std::pair<std::uint32_t, std::uint32_t>>& segs, float* out_h) {
+    std::vector<float> proj(std::size_t{Tt} * kGdnInN), gated(std::size_t{Tt} * kValDim);
+    Gemm(L.p_in, L.w_in, z, Tt, kH, proj.data());
     const auto t0 = Clock::now();
+    for (const auto& sg : segs) GdnHost(L, proj.data() + std::size_t{sg.first} * kGdnInN, z + std::size_t{sg.first} * kH, sg.second, gated.data() + std::size_t{sg.first} * kValDim);
+    t_host += Ms(t0);
+    std::vector<float> outp(std::size_t{Tt} * kOutN);
+    Gemm(L.p_out, L.w_out, gated.data(), Tt, kValDim, outp.data());
+    for (std::uint32_t t = 0; t < Tt; ++t) std::memcpy(out_h + std::size_t{t} * kH, &outp[std::size_t{t} * kOutN], kH * 4);
+  }
+
+  void GdnHost(Layer& L, const float* proj, const float* z, std::uint32_t T, float* gated) {
     std::vector<float> ab(std::size_t{T} * 2 * kVH);
 #pragma omp parallel for collapse(2)
     for (std::int64_t t = 0; t < T; ++t)
@@ -275,7 +283,6 @@ struct Engine {
         qkv[std::size_t{t} * kConvDim + c] = Silu(s);
       }
     }
-    std::vector<float> gated(std::size_t{T} * kValDim);
 #pragma omp parallel for
     for (std::int64_t h = 0; h < kVH; ++h) {
       const std::uint32_t kh = static_cast<std::uint32_t>(h) / (kVH / kKH);
@@ -326,16 +333,20 @@ struct Engine {
         for (std::uint32_t j = 0; j < kVD; ++j) g[j] = L.gnorm[j] * (o[j] * rs) * Silu(zz[j]);
       }
     }
-    t_host += Ms(t0);
-    std::vector<float> outp(std::size_t{T} * kOutN);
-    Gemm(L.p_out, L.w_out, gated.data(), T, kValDim, outp.data());
-    for (std::uint32_t t = 0; t < T; ++t) std::memcpy(out_h + std::size_t{t} * kH, &outp[std::size_t{t} * kOutN], kH * 4);
   }
 
-  void Attn(Layer& L, const float* z, std::uint32_t T, float* out_h) {
-    std::vector<float> proj(std::size_t{T} * kAttnInN);
-    Gemm(L.p_in, L.w_in, z, T, kH, proj.data());
+  void Attn(Layer& L, const float* z, std::uint32_t Tt, const std::vector<std::pair<std::uint32_t, std::uint32_t>>& segs, float* out_h) {
+    std::vector<float> proj(std::size_t{Tt} * kAttnInN), att(std::size_t{Tt} * kQDim);
+    Gemm(L.p_in, L.w_in, z, Tt, kH, proj.data());
     const auto t0 = Clock::now();
+    for (const auto& sg : segs) AttnHost(L, proj.data() + std::size_t{sg.first} * kAttnInN, sg.second, att.data() + std::size_t{sg.first} * kQDim);
+    t_host += Ms(t0);
+    std::vector<float> outp(std::size_t{Tt} * kOutN);
+    Gemm(L.p_out, L.w_out, att.data(), Tt, kQDim, outp.data());
+    for (std::uint32_t t = 0; t < Tt; ++t) std::memcpy(out_h + std::size_t{t} * kH, &outp[std::size_t{t} * kOutN], kH * 4);
+  }
+
+  void AttnHost(Layer& L, const float* proj, std::uint32_t T, float* att) {
     std::vector<float> q(std::size_t{T} * kQDim), gate(std::size_t{T} * kQDim), k(std::size_t{T} * kKvDim), v(std::size_t{T} * kKvDim);
     std::vector<float> cs(std::size_t{T} * kRot / 2), sn(std::size_t{T} * kRot / 2);
     for (std::uint32_t t = 0; t < T; ++t)
@@ -372,7 +383,6 @@ struct Engine {
         std::memcpy(&v[std::size_t(t) * kKvDim + h * kHeadDim], row + 2 * kQDim + kKvDim + h * kHeadDim, kHeadDim * 4);
       }
     }
-    std::vector<float> att(std::size_t{T} * kQDim);
     const float scale = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
     const std::uint32_t grp = kHeads / kKvHeads;
 #pragma omp parallel
@@ -408,10 +418,6 @@ struct Engine {
           for (std::uint32_t i = 0; i < kHeadDim; ++i) o[i] *= 1.0f / (1.0f + std::exp(-g[i]));
         }
     }
-    t_host += Ms(t0);
-    std::vector<float> outp(std::size_t{T} * kOutN);
-    Gemm(L.p_out, L.w_out, att.data(), T, kQDim, outp.data());
-    for (std::uint32_t t = 0; t < T; ++t) std::memcpy(out_h + std::size_t{t} * kH, &outp[std::size_t{t} * kOutN], kH * 4);
   }
 
   void Mlp(Layer& L, const float* z, std::uint32_t T, float* out_h) {
@@ -425,28 +431,45 @@ struct Engine {
     t_npu += Ms(t0);
   }
 
-  void Forward(const std::int32_t* tok, std::uint32_t T, const std::vector<std::uint32_t>& markers, std::vector<float>* hidden) {
+  struct Seq {
+    const std::int32_t* tok;
+    std::uint32_t len, marker;
+  };
+
+  void ForwardBatch(const std::vector<Seq>& seqs, std::vector<float>* hidden) {
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> segs;
+    std::uint32_t T = 0;
+    for (const auto& q : seqs) {
+      segs.push_back({T, q.len});
+      T += q.len;
+    }
     std::vector<float> x(std::size_t{T} * kH), z(std::size_t{T} * kH), br(std::size_t{T} * kH);
+    for (std::size_t i = 0; i < seqs.size(); ++i)
 #pragma omp parallel for
-    for (std::int64_t t = 0; t < T; ++t)
-      for (std::uint32_t i = 0; i < kH; ++i) x[std::size_t(t) * kH + i] = Bf(embed[std::size_t(tok[t]) * kH + i]);
+      for (std::int64_t t = 0; t < seqs[i].len; ++t)
+        for (std::uint32_t c = 0; c < kH; ++c) x[std::size_t(segs[i].first + t) * kH + c] = Bf(embed[std::size_t(seqs[i].tok[t]) * kH + c]);
     for (std::uint32_t l = 0; l < kLayers; ++l) {
       Layer& L = layers[l];
       RmsNormRows(x.data(), L.ln1.data(), z.data(), T, kH);
-      if (L.linear) Gdn(L, z.data(), T, br.data());
-      else Attn(L, z.data(), T, br.data());
+      if (L.linear) Gdn(L, z.data(), T, segs, br.data());
+      else Attn(L, z.data(), T, segs, br.data());
       for (std::size_t i = 0; i < x.size(); ++i) x[i] += br[i];
       RmsNormRows(x.data(), L.ln2.data(), z.data(), T, kH);
       Mlp(L, z.data(), T, br.data());
       for (std::size_t i = 0; i < x.size(); ++i) x[i] += br[i];
-      if (std::getenv("Q35_TRACE")) {
-        double s = 0;
-        for (std::uint32_t i = 0; i < kH; ++i) s += std::fabs(x[std::size_t{markers.back()} * kH + i]);
-        std::fprintf(stderr, "layer %u marker |x| mean %.6f\n", l, s / kH);
-      }
     }
-    hidden->resize(markers.size() * kH);
-    for (std::size_t m = 0; m < markers.size(); ++m) RmsNormRows(&x[std::size_t{markers[m]} * kH], norm_w.data(), &(*hidden)[m * kH], 1, kH);
+    hidden->resize(seqs.size() * kH);
+    for (std::size_t i = 0; i < seqs.size(); ++i)
+      RmsNormRows(&x[std::size_t{segs[i].first + seqs[i].marker} * kH], norm_w.data(), &(*hidden)[i * kH], 1, kH);
+  }
+
+  void Forward(const std::int32_t* tok, std::uint32_t T, const std::vector<std::uint32_t>& markers, std::vector<float>* hidden) {
+    hidden->clear();
+    for (auto m : markers) {
+      std::vector<float> h;
+      ForwardBatch({{tok, T, m}}, &h);
+      hidden->insert(hidden->end(), h.begin(), h.end());
+    }
   }
 };
 
@@ -461,22 +484,36 @@ int EvalBatch(const char* model, const char* programs, const char* path) {
   if (!e.Init(model, programs)) return 1;
   std::size_t at = 0;
   const std::int32_t cases = d[at++];
+  const std::uint32_t group = std::getenv("Q35_GROUP") ? static_cast<std::uint32_t>(std::atoi(std::getenv("Q35_GROUP"))) : 1;
+  struct Item { const std::int32_t* tok; std::uint32_t len, marker, cnt; };
+  std::vector<Item> items;
+  for (std::int32_t c = 0; c < cases; ++c) {
+    Item it{nullptr, static_cast<std::uint32_t>(d[at]), static_cast<std::uint32_t>(d[at + 1]), static_cast<std::uint32_t>(d[at + 2])};
+    at += 3;
+    it.tok = &d[at];
+    at += it.len;
+    items.push_back(it);
+  }
   const auto t0 = Clock::now();
   std::uint64_t total = 0;
-  for (std::int32_t c = 0; c < cases; ++c) {
-    const std::uint32_t len = static_cast<std::uint32_t>(d[at++]), marker = static_cast<std::uint32_t>(d[at++]), cnt = static_cast<std::uint32_t>(d[at++]);
-    std::vector<float> hid;
-    e.Forward(&d[at], len, {marker}, &hid);
-    at += len;
-    total += len;
-    for (std::uint32_t k = 0; k < cnt; ++k) {
-      float s = 0;
-      for (std::uint32_t i = 0; i < kH; ++i) s += e.readout[std::size_t{k} * kH + i] * hid[i];
-      std::printf("%.5f ", s);
+  for (std::size_t g = 0; g < items.size(); g += group) {
+    std::vector<Engine::Seq> sq;
+    for (std::size_t i = g; i < std::min(items.size(), g + group); ++i) {
+      sq.push_back({items[i].tok, items[i].len, items[i].marker});
+      total += items[i].len;
     }
-    std::printf("\n");
+    std::vector<float> hid;
+    e.ForwardBatch(sq, &hid);
+    for (std::size_t i = 0; i < sq.size(); ++i) {
+      for (std::uint32_t k = 0; k < items[g + i].cnt; ++k) {
+        float s = 0;
+        for (std::uint32_t c = 0; c < kH; ++c) s += e.readout[std::size_t{k} * kH + c] * hid[i * kH + c];
+        std::printf("%.5f ", s);
+      }
+      std::printf("\n");
+    }
   }
-  std::fprintf(stderr, "eval: %d cases %llu tokens %.1f ms (%.1f ms/case, npu %.0f host %.0f)\n", cases, static_cast<unsigned long long>(total), Ms(t0), Ms(t0) / cases, e.t_npu, e.t_host);
+  std::fprintf(stderr, "eval: %d cases %llu tokens %.1f ms (%.1f ms/case, npu %.0f host %.0f) group %u\n", cases, static_cast<unsigned long long>(total), Ms(t0), Ms(t0) / cases, e.t_npu, e.t_host, group);
   return 0;
 }
 
