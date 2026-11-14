@@ -142,7 +142,7 @@ int main(int argc, char** argv) {
       ids = tokenizer->Encode(text);
     } else {
       const std::vector<std::pair<std::string, std::string>> messages = {{"user", text}};
-      ids = tokenizer->Encode(gufo::models::lfm3::Tokenizer::Render(messages, false));
+      ids = tokenizer->Encode(gufo::models::lfm3::Tokenizer::Render(messages, std::getenv("GUFO_NOTHINK") == nullptr));
     }
     std::uint32_t eos = 7;
     if (auto e = reader->GetMetadataUint32("tokenizer.ggml.eos_token_id"))
@@ -333,7 +333,7 @@ int main(int argc, char** argv) {
       if (!std::getline(std::cin, line) || line.empty())
         break;
       msgs.push_back({"user", line});
-      std::vector<std::uint32_t> ids = tokenizer->Encode(gufo::models::lfm3::Tokenizer::Render(msgs, false));
+      std::vector<std::uint32_t> ids = tokenizer->Encode(gufo::models::lfm3::Tokenizer::Render(msgs, std::getenv("GUFO_NOTHINK") == nullptr));
       if (ids.size() + maxnew + 1 > opt.context) {
         std::fprintf(stderr, "[context full: %zu tokens]\n", ids.size());
         break;
