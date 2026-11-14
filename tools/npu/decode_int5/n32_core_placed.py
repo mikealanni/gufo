@@ -15,6 +15,30 @@ from aie.dialects import arith, memref
 from aie.extras import types as T
 import aie.utils.trace as trace_utils
 from aie.helpers.taplib import TensorTiler2D, TensorAccessPattern
+from aie.ir import DenseElementsAttr
+import os
+
+RTP_BLOCK = os.environ.get("RTP_BLOCK", "1") == "1"
+_rtp_globals = {}
+
+
+def rtp_global(vals):
+    """Constant block holding one core's runtime parameters (shared by every core with the same values)."""
+    key = tuple(vals)
+    if key not in _rtp_globals:
+        name = f"rtp_vals_{len(_rtp_globals)}"
+        memref.global_(name, T.memref(len(vals), T.i32()), initial_value=DenseElementsAttr.get(np.array(vals, dtype=np.int32), type=T.i32()), constant=True, sym_visibility="private")
+        _rtp_globals[key] = name
+    return _rtp_globals[key]
+
+
+def write_rtps(row, col, vals):
+    if RTP_BLOCK:
+        npu_blockwrite(0, memref.get_global(T.memref(len(vals), T.i32()), _rtp_globals[tuple(vals)]), buffer=f"rtp_{row}_{col}")
+    else:
+        for wi, wv in enumerate(vals):
+            npu_rtp_write(f"rtp_{row}_{col}", wi, wv)
+
 from aie.helpers.dialects.scf import _for as range_
 
 
@@ -223,6 +247,9 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None, 
             c_per_col = ATTN_OUT_ELEMS * n_aie_rows * CB
             c_total = n_aie_cols * c_per_col
 
+            if RTP_BLOCK:
+                rtp_global((0, 0, 0, 0, 0, 1, 3 * mchunks, 0, 1))
+
             @runtime_sequence(
                 np.ndarray[(a_groups,), np.dtype[dtype]],
                 np.ndarray[(b_total,), np.dtype[np.uint8]],
@@ -231,8 +258,7 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None, 
             def attn_sequence(A, B, C):
                 for row in range(n_aie_rows):
                     for col in range(n_aie_cols):
-                        for wi, wv in enumerate((0, 0, 0, 0, 0, 1, 3 * mchunks, 0, 1)):
-                            npu_rtp_write(f"rtp_{row}_{col}", wi, wv)
+                        write_rtps(row, col, (0, 0, 0, 0, 0, 1, 3 * mchunks, 0, 1))
                         set_lock_value(rtp_locks[row][col], 1)
                 a_tap = TensorAccessPattern((1, a_groups), 0, [1, 1, 1, a_groups], [0, 0, 0, 1])
                 a_task = shim_dma_single_bd_task(A_l3l2, A, tap=a_tap, issue_token=False)
@@ -293,6 +319,9 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None, 
         c_total = (N1 // n + N2 // n) * SB
         a_groups = Mfull * KA // 8
 
+        if RTP_BLOCK:
+            rtp_global((k1t, N1 // n // n_aie_cols if N1 else 0, K2 // k, N2 // n // n_aie_cols, rtp_mode, 0, 0, 2 if mode == "argmax" else 0, mrows))
+
         @runtime_sequence(
             np.ndarray[(a_groups,), np.dtype[dtype]],
             np.ndarray[(gu_bytes + dn_bytes,), np.dtype[np.uint8]],
@@ -301,15 +330,7 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None, 
         def sequence(A, B, C):
             for row in range(n_aie_rows):
                 for col in range(n_aie_cols):
-                    npu_rtp_write(f"rtp_{row}_{col}", 0, k1t)
-                    npu_rtp_write(f"rtp_{row}_{col}", 1, N1 // n // n_aie_cols if N1 else 0)
-                    npu_rtp_write(f"rtp_{row}_{col}", 2, K2 // k)
-                    npu_rtp_write(f"rtp_{row}_{col}", 3, N2 // n // n_aie_cols)
-                    npu_rtp_write(f"rtp_{row}_{col}", 4, rtp_mode)
-                    npu_rtp_write(f"rtp_{row}_{col}", 5, 0)
-                    npu_rtp_write(f"rtp_{row}_{col}", 6, 0)
-                    npu_rtp_write(f"rtp_{row}_{col}", 7, 2 if mode == "argmax" else 0)
-                    npu_rtp_write(f"rtp_{row}_{col}", 8, mrows)
+                    write_rtps(row, col, (k1t, N1 // n // n_aie_cols if N1 else 0, K2 // k, N2 // n // n_aie_cols, rtp_mode, 0, 0, 2 if mode == "argmax" else 0, mrows))
                     set_lock_value(rtp_locks[row][col], 1)
             A_tap = TensorAccessPattern((1, a_groups), 0, [1, 1, 1, a_groups], [0, 0, 0, 1])
             tb_max = 4
