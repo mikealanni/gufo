@@ -593,7 +593,7 @@ void NpuRuntime::GemmAtb(Program& p, WeightBuffer& wb, const float* x,
 }
 
 void NpuRuntime::Ffn(Program& p, WeightBuffer& wb, const float* x,
-                     std::uint32_t n, float* y, Timings* t) {
+                     std::uint32_t n, float* y, Timings* t, std::uint32_t gu_strips, std::uint32_t out_n) {
   WeightBuffer& w = WeightSlot(wb, p);
   auto t0 = Clock::now();
   EncodeA(x, n, p.K, p);
@@ -624,7 +624,7 @@ void NpuRuntime::Ffn(Program& p, WeightBuffer& wb, const float* x,
   p.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
   if (t) t->syncC += Ms(t0);
   t0 = Clock::now();
-  DecodeC(y, n, p, p.ch + std::size_t{120} * kStripBytes, 2048);
+  DecodeC(y, n, p, p.ch + std::size_t{gu_strips} * kStripBytes, out_n);
   if (t) t->dec += Ms(t0);
   if (t) ++t->calls;
 }

@@ -295,7 +295,7 @@ class NpuRuntime {
             float* y, Timings* t = nullptr);
   // Fused FFN: decode down-output from combined C buffer (offset after 120 strips).
   void Ffn(Program& p, WeightBuffer& wb, const float* x, std::uint32_t n,
-           float* y, Timings* t = nullptr);
+           float* y, Timings* t = nullptr, std::uint32_t gu_strips = 120, std::uint32_t out_n = 2048);
 
   /// m64 prefill FFN: gu (swiglu flush) -> byte-shuffle into down's A -> plain down gemm.
   void Ffn64(WeightBuffer& wb_gu, Program& p_gu, WeightBuffer& wb_dn, Program& p_dn,
