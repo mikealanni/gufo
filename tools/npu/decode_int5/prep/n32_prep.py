@@ -20,6 +20,8 @@ PASS = int(os.environ.get("PREP_PASS", str(8 * 98304)))  # byte stride between 1
 PCOL = 98304
 QKV_BYTES = 8 * 3 * 32 * TILE  # 1024 rows x 3072 cols, kM = 1024
 WIN = 4
+MODE = os.environ.get("PREP_MODE", "kv")
+KV_WIN_PAD = 2
 
 
 def main():
@@ -44,6 +46,9 @@ def design(m, k, n):
         prep_q2 = external_func("prep_q2", inputs=[S_l1_ty, T_ty, np.int32], link_with=lw)
         prep_kv2 = external_func("prep_kv2", inputs=[S_l1_ty, T_ty], link_with=lw)
         prep_emit = external_func("prep_emit", inputs=[C_l1_ty, np.int32, np.int32], link_with=lw)
+        prep_mbegin = external_func("prep_mbegin", inputs=[], link_with=lw)
+        prep_kh = external_func("prep_kh", inputs=[S_l1_ty, T_ty, np.int32], link_with=lw)
+        prep_mfin = external_func("prep_mfin", inputs=[T_ty, np.int32], link_with=lw)
 
         tiles = [[tile(col, row) for col in range(COLS)] for row in range(ROWS + 2)]
         shim_tiles, mem_tiles, core_tiles = tiles[0], tiles[1], tiles[2:]
@@ -64,7 +69,7 @@ def design(m, k, n):
             C_l2l3[col] = object_fifo(f"C_L2L3_{col}", mem_tiles[col], shim_tiles[col], 2, C_l2_ty)
             object_fifo_link([C_l1l2[row][col] for row in range(ROWS)], C_l2l3[col], [PIECE * row for row in range(ROWS)], [])
 
-        rtp_ty = np.ndarray[(1,), np.dtype[np.int32]]
+        rtp_ty = np.ndarray[(2,), np.dtype[np.int32]]
         rtps = [[None] * COLS for _ in range(ROWS)]
         rtp_locks = [[None] * COLS for _ in range(ROWS)]
         for row in range(ROWS):
@@ -80,8 +85,10 @@ def design(m, k, n):
                     for _ in range_(0xFFFFFFFF):
                         use_lock(rtp_locks[row][col], LockAction.Acquire, value=1)
                         nt_i32 = memref.load(rtps[row][col], [arith.constant(T.index(), 0)])
+                        nq_i32 = memref.load(rtps[row][col], [arith.constant(T.index(), 1)])
                         use_lock(rtp_locks[row][col], LockAction.Release, value=1)
                         nt = arith.index_cast(T.index(), nt_i32)
+                        nq = arith.index_cast(T.index(), nq_i32)
                         for _ in range_(nt):
                             t = T_f[col].acquire(ObjectFifoPort.Consume, 1)
                             s = S_l2l1[row][col].acquire(ObjectFifoPort.Consume, 1)
@@ -97,46 +104,79 @@ def design(m, k, n):
                                     o = C_l1l2[row][col].acquire(ObjectFifoPort.Produce, 1)
                                     prep_emit(o, arith.constant(T.i32(), kind), arith.index_cast(T.i32(), u))
                                     C_l1l2[row][col].release(ObjectFifoPort.Produce, 1)
+                        for _ in range_(nq):
+                            t = T_f[col].acquire(ObjectFifoPort.Consume, 1)
+                            prep_mbegin()
+                            for pr in range_(2):
+                                s = S_l2l1[row][col].acquire(ObjectFifoPort.Consume, 1)
+                                prep_q2(s, t, arith.index_cast(T.i32(), pr))
+                                S_l2l1[row][col].release(ObjectFifoPort.Consume, 1)
+                            for hi in range_(4):
+                                s = S_l2l1[row][col].acquire(ObjectFifoPort.Consume, 1)
+                                prep_kh(s, t, arith.index_cast(T.i32(), hi))
+                                S_l2l1[row][col].release(ObjectFifoPort.Consume, 1)
+                            prep_mfin(t, arith.constant(T.i32(), row))
+                            T_f[col].release(ObjectFifoPort.Consume, 1)
+                            for kind, cnt in ((4, 1), (1, 6)):
+                                for u in range_(cnt):
+                                    o = C_l1l2[row][col].acquire(ObjectFifoPort.Produce, 1)
+                                    prep_emit(o, arith.constant(T.i32(), kind), arith.index_cast(T.i32(), u))
+                                    C_l1l2[row][col].release(ObjectFifoPort.Produce, 1)
 
         TAB_BYTES = NT * 8 * TE
-        Q_BYTES = (NT - 1) * PASS + 8 * PCOL
-        KV_BYTES = NT * 8 * 18432
+        PASS_BYTES = (NT - 1) * PASS + 8 * PCOL
+        KVW = (NT * 8 + KV_WIN_PAD) * 18432
         KN_BYTES = NT * 8 * 6144
-        OUT_BYTES = Q_BYTES + KV_BYTES + KN_BYTES
+        KV0 = 18432
 
         @runtime_sequence(
             np.ndarray[(QKV_BYTES,), np.dtype[np.uint8]],
             np.ndarray[(TAB_BYTES,), np.dtype[np.uint8]],
-            np.ndarray[(OUT_BYTES,), np.dtype[np.uint8]],
+            np.ndarray[(PASS_BYTES,), np.dtype[np.uint8]],
+            np.ndarray[(KVW,), np.dtype[np.uint8]],
+            np.ndarray[(max(KN_BYTES, KV0),), np.dtype[np.uint8]],
         )
-        def sequence(QKV, TAB, OUT):
+        def sequence(QKV, TAB, PASSB, KVB, AUX):
             def lin(full, offset, sizes, strides):
                 return TensorAccessPattern((1, full), offset, sizes, strides)
 
+            kvmode = MODE == "kv"
             for row in range(ROWS):
                 for col in range(COLS):
-                    npu_rtp_write(f"rtp_{row}_{col}", 0, NT)
+                    npu_rtp_write(f"rtp_{row}_{col}", 0, NT if kvmode else 0)
+                    npu_rtp_write(f"rtp_{row}_{col}", 1, 0 if kvmode else NT)
                     set_lock_value(rtp_locks[row][col], 1)
+            bufs = {"qkv": QKV, "tab": TAB, "pass": PASSB, "kv": KVB, "aux": AUX}
+            full = {"qkv": QKV_BYTES, "tab": TAB_BYTES, "pass": PASS_BYTES, "kv": KVW, "aux": max(KN_BYTES, KV0)}
             for c in range(COLS):
                 sin, tin, outs = [], [], []
                 for mt in range(NT):
+                    w = mt * 8 + c
                     base = ((mt // 4) * 96 + mt % 4) * TILE + c * 2304
-                    # K (nt 16+r) and V (nt 20+r): tile (mt/4)*96 + 64 + 4r + mt%4, V = K + 16 tiles
-                    sin.append((S_l3l2[c], lin(QKV_BYTES, base + 64 * TILE, [4, 2, 9, 256], [4 * TILE, 16 * TILE, 256, 1])))
-                    # Q heads hq 0,1 and 2,3 of every kv head r: tile (mt/4)*96 + 16r + 4hq + mt%4
-                    sin.append((S_l3l2[c], lin(QKV_BYTES, base, [4, 2, 9, 256], [16 * TILE, 4 * TILE, 256, 1])))
-                    sin.append((S_l3l2[c], lin(QKV_BYTES, base + 8 * TILE, [4, 2, 9, 256], [16 * TILE, 4 * TILE, 256, 1])))
-                    tin.append((T_f[c], lin(TAB_BYTES, (mt * 8 + c) * TE, [1, 1, 5, 1024], [0, 0, 1024, 1])))
-                    outs.append((C_l2l3[c], lin(OUT_BYTES, Q_BYTES + (mt * 8 + c) * 18432, [1, 1, 18, 1024], [0, 0, 1024, 1])))
-                    outs.append((C_l2l3[c], lin(OUT_BYTES, mt * PASS + c * PCOL + 6144, [1, 1, 72, 1024], [0, 0, 1024, 1])))
-                    outs.append((C_l2l3[c], lin(OUT_BYTES, Q_BYTES + KV_BYTES + (mt * 8 + c) * 6144, [1, 1, 6, 1024], [0, 0, 1024, 1])))
+                    kvq = ("qkv", base + 64 * TILE, [4, 2, 9, 256], [4 * TILE, 16 * TILE, 256, 1])
+                    qa = ("qkv", base, [4, 2, 9, 256], [16 * TILE, 4 * TILE, 256, 1])
+                    qb = ("qkv", base + 8 * TILE, [4, 2, 9, 256], [16 * TILE, 4 * TILE, 256, 1])
+                    if kvmode:
+                        sin += [kvq, qa, qb]
+                        outs.append(("kv", w * 18432, [1, 1, 18, 1024], [0, 0, 1024, 1]))
+                        outs.append(("pass", mt * PASS + c * PCOL + 6144, [1, 1, 72, 1024], [0, 0, 1024, 1]))
+                        outs.append(("aux", w * 6144, [1, 1, 6, 1024], [0, 0, 1024, 1]))
+                    else:
+                        sin += [qa, qb]
+                        for hi in range(3):
+                            sin.append(("kv", (w + hi) * 18432, [4, 3, 6, 256], [1536, 6144, 256, 1]))
+                        sin.append(("aux", 0, [4, 3, 6, 256], [1536, 6144, 256, 1]))
+                        outs.append(("pass", mt * PASS + c * PCOL, [1, 1, 42, 1024], [0, 0, 1024, 1]))
+                    tin.append(("tab", w * TE, [1, 1, 5, 1024], [0, 0, 1024, 1]))
+                nS = len(sin) // NT
+                nO = len(outs) // NT
                 chans = [sin, tin, outs]
+                fifos = [S_l3l2[c], T_f[c], C_l2l3[c]]
                 tasks = [dict() for _ in chans]
 
                 def start(ci, k):
-                    f_, t_ = chans[ci][k]
-                    buf = (QKV, TAB, OUT)[ci] if ci < 2 else OUT
-                    tasks[ci][k] = shim_dma_single_bd_task(f_, buf, tap=t_, issue_token=True)
+                    name, off, sz, st = chans[ci][k]
+                    tasks[ci][k] = shim_dma_single_bd_task(fifos[ci], bufs[name], tap=lin(full[name], off, sz, st), issue_token=True)
                     dma_start_task(tasks[ci][k])
 
                 nxt = [0, 0, 0]
@@ -144,11 +184,10 @@ def design(m, k, n):
                     for k in range(min(WIN, len(chans[ci]))):
                         start(ci, k)
                         nxt[ci] = k + 1
-                # keep windows full in dependency order: per mt the core needs 1 table, 3 stripe objects, 2 outputs
                 for mt in range(NT):
-                    need = [(mt + 1) * 3, (mt + 1), (mt + 1) * 3]
+                    need = [(mt + 1) * nS, (mt + 1), (mt + 1) * nO]
                     for ci in range(3):
-                        while nxt[ci] < len(chans[ci]) and nxt[ci] - WIN < need[ci] and nxt[ci] - WIN < len(chans[ci]):
+                        while nxt[ci] < len(chans[ci]) and nxt[ci] - WIN < need[ci]:
                             kk = nxt[ci]
                             dma_await_task(tasks[ci][kk - WIN])
                             dma_free_task(tasks[ci][kk - WIN])
