@@ -326,6 +326,19 @@ class FfnAtbChain {
     j.c.assign(p.ch, p.ch + std::size_t{kM} * 3072 / 8 * 9);
   }
   xrt::bo& QkvBo(std::size_t l) { return attn_[l]->pq.c; }
+  xrt::bo NewQkvC() { return gu_.MakeBo(std::size_t{kM} * 3072 / 8 * 9, 3); }
+  /// QKV GEMM whose result stays on the device in `c` (caller keeps the staged A / port as for ExecQkv).
+  void ExecQkvTo(std::size_t l, Job& j, xrt::bo& c) {
+    Program& p = attn_[l]->pq;
+    xrt::bo saved = p.c;
+    p.c = c;
+    if (!j.staged) {
+      std::memcpy(p.ah, j.a.data(), j.a.size());
+      p.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    }
+    Dispatch(gu_, attn_[l]->wq, p);
+    p.c = saved;
+  }
   void ReleaseQkv(std::size_t l, Job& j) {
     j.staged = false;
     attn_[l]->port_q->m.unlock();

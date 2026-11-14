@@ -194,6 +194,7 @@ struct Engine::Impl {
   bool devres_ok{false};
   std::unique_ptr<gufo::npu::runtime::AttnDevPrep> dprep;
   std::vector<bool> dprep_layer;
+  std::vector<std::vector<xrt::bo>> dp_qkv;  // [layer][chunk]: QKV GEMM results kept for the batched prep
   gufo::npu::runtime::NpuRuntime rt;
   gufo::npu::runtime::Program p_conv;
   gufo::npu::runtime::Program p_conv64;
@@ -460,6 +461,7 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
       std::string perr;
       if (dp->Init(options.programs, s.apre->device(), &perr)) {
         s.dprep_layer.assign(L, false);
+        s.dp_qkv.resize(L);
         const auto* fac = static_cast<const float*>(s.w->rope_freqs.data);
         bool all = true;
         for (std::size_t l = 0; l < L; ++l) {
@@ -586,6 +588,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     std::uint32_t n{0}, pos0{0}, row0{0};
     bool attn_done{false};
     bool dev_prep{false};
+    bool dev_prepped{false};
   };
   std::vector<ChunkState> css(nChunks);
   std::mutex npu_mu, tick_mu;
@@ -602,6 +605,20 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       DecodeRow(s.w->embedding, tokens[cs.row0 + i], std::span<float>(&cs.X[std::size_t{i} * H], H));
   }
   const bool dp_ok = s.dprep && css.back().n > 64;
+  const auto dev_prep_chunks = [&](std::size_t l, std::vector<ChunkState*> chunks) -> bool {
+    std::lock_guard<std::mutex> g_(npu_mu);
+    for (ChunkState* cs : chunks) {
+      if (cs->dev_prepped) continue;
+      std::string derr;
+      const std::uint32_t ci = cs->row0 / kChunk;
+      if (!s.dprep->Run(s.m_attn[l], l, s.dp_qkv[l][ci], cs->pos0, cs->n, ci * 8, &derr)) {
+        std::fprintf(stderr, "devprep L%zu chunk %u: %s\n", l, ci, derr.c_str());
+        return false;
+      }
+      cs->dev_prepped = true;
+    }
+    return true;
+  };
   auto cpu0 = Clock::now();
   const auto layer_run = [&](ChunkState& cs, int seg, std::size_t l) {
     const std::uint32_t nTot = cs.n;
@@ -642,151 +659,16 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
         gufo::npu::runtime::FfnAtbChain::Job jq;
         { TlScope tl_("q.enc", l); s.atb->EncodeJob(Z.data(), nTot, 2048, jq); s.atb->StageQkv(l, jq); }
         cs.dev_prep = false;
-        { TlScope tl_("q.exec", l); std::lock_guard<std::mutex> g_(npu_mu); const auto tl0 = Clock::now(); s.atb->ExecQkv(l, jq);
+        cs.dev_prepped = false;
+        { TlScope tl_("q.exec", l); std::lock_guard<std::mutex> g_(npu_mu); const auto tl0 = Clock::now();
           if (dp_ok && defer && s.dprep_layer[l] && pos0 % 16 == 0) {
-            std::string derr;
-            const std::uint32_t pass0 = ci_ * 8;
-            if (s.dprep->Run(s.m_attn[l], l, s.atb->QkvBo(l), pos0, nTot, pass0, &derr)) cs.dev_prep = true;
-            else std::fprintf(stderr, "devprep L%zu: %s\n", l, derr.c_str());
-            if (cs.dev_prep && std::getenv("GUFO_DEVPREP_CHECK") && l <= 4) {
-              gufo::npu::runtime::FfnAtbChain::Job jc;
-              s.atb->QkvOut(l, jc);
-              std::vector<float> qk(std::size_t{nTot} * 3072);
-              s.atb->DecodeJob(jc, nTot, 3072, qk.data());
-              const auto* fac = static_cast<const float*>(s.w->rope_freqs.data);
-              const auto* kn = static_cast<const float*>(lw.k_norm.data);
-              std::vector<std::uint16_t> kd(std::size_t{s.capacity[l]} * kvd), vd(std::size_t{s.capacity[l]} * kvd);
-              gufo::npu::runtime::AttnDevPrep::ReadHist(s.m_attn[l], pos0, std::min(64u, nTot), kd.data(), vd.data(), kvd, s.capacity[l]);
-              double nk = 0, dk = 0, nv = 0, dv = 0;
-              for (std::uint32_t t = 0; t < std::min(64u, nTot); ++t)
-                for (std::uint32_t r = 0; r < kvh; ++r) {
-                  float* kb = &qk[std::size_t{t} * 3072 + qd + r * hd];
-                  float ss = 0; for (std::uint32_t i = 0; i < hd; ++i) ss += kb[i] * kb[i];
-                  const float sc = 1.0f / std::sqrt(ss / hd + c.eps);
-                  float y[128]; for (std::uint32_t i = 0; i < hd; ++i) y[i] = kb[i] * sc * kn[i];
-                  for (std::uint32_t i = 0; i < hd / 2; ++i) {
-                    float ang = static_cast<float>(pos0 + t) * std::pow(c.theta, -2.0f * static_cast<float>(i) / hd) / fac[i];
-                    const float a = y[i], b = y[i + hd / 2];
-                    const float k0 = a * std::cos(ang) - b * std::sin(ang), k1 = b * std::cos(ang) + a * std::sin(ang);
-                    const float g0 = Bf16Float(kd[std::size_t{(pos0 + t) % s.capacity[l]} * kvd + r * hd + i]);
-                    const float g1 = Bf16Float(kd[std::size_t{(pos0 + t) % s.capacity[l]} * kvd + r * hd + i + hd / 2]);
-                    nk += (g0 - k0) * (g0 - k0) + (g1 - k1) * (g1 - k1); dk += k0 * k0 + k1 * k1;
-                  }
-                  for (std::uint32_t i = 0; i < hd; ++i) {
-                    const float v0 = qk[std::size_t{t} * 3072 + qd + kvd + r * hd + i];
-                    const float g = Bf16Float(vd[std::size_t{(pos0 + t) % s.capacity[l]} * kvd + r * hd + i]);
-                    nv += (g - v0) * (g - v0); dv += v0 * v0;
-                  }
-                }
-              std::fprintf(stderr, "[devprep-check] L%zu pos0 %u: K rel err %.4f V rel err %.4f\n", l, pos0, std::sqrt(nk / std::max(dk, 1e-30)), std::sqrt(nv / std::max(dv, 1e-30)));
-              // Q block, header and bound of pass 0, column 0
-              const std::uint8_t* pb = s.dprep->PassHost(pass0);
-              const auto* qn = static_cast<const float*>(lw.q_norm.data);
-              double nq = 0, dq = 0;
-              const float qscale = 1.4426950408889634f / std::sqrt(static_cast<float>(hd));
-              for (std::uint32_t r = 0; r < kvh; ++r) {
-                std::uint8_t qb[9216];
-                for (std::uint32_t u = 0; u < 6; ++u) std::memcpy(qb + u * 1536, pb + (1 + u) * 6144 + r * 1536, 1536);
-                for (std::uint32_t hq = 0; hq < 4; ++hq)
-                  for (std::uint32_t t = 0; t < 16; ++t) {
-                    float* qr = &qk[std::size_t{t} * 3072 + (r * 4 + hq) * hd];
-                    float ss = 0; for (std::uint32_t i = 0; i < hd; ++i) ss += qr[i] * qr[i];
-                    const float sc = 1.0f / std::sqrt(ss / hd + c.eps);
-                    float y[128]; for (std::uint32_t i = 0; i < hd; ++i) y[i] = qr[i] * sc * qn[i];
-                    float ref[128];
-                    for (std::uint32_t i = 0; i < hd / 2; ++i) {
-                      float ang = static_cast<float>(pos0 + t) * std::pow(c.theta, -2.0f * static_cast<float>(i) / hd) / fac[i];
-                      ref[i] = (y[i] * std::cos(ang) - y[i + hd / 2] * std::sin(ang)) * qscale;
-                      ref[i + hd / 2] = (y[i + hd / 2] * std::cos(ang) + y[i] * std::sin(ang)) * qscale;
-                    }
-                    const std::uint32_t rb = hq * 2 + t / 8, rib = t % 8;
-                    for (std::uint32_t ks = 0; ks < 16; ++ks) {
-                      const std::uint8_t* g = qb + (std::size_t{rb} * 16 + ks) * 72 + rib * 9;
-                      const float mult = std::ldexp(1.0f, static_cast<int>(g[0]) - 127) / 64.0f;
-                      for (int i = 0; i < 8; ++i) {
-                        const float got = static_cast<float>(static_cast<std::int8_t>(g[1 + i])) * mult;
-                        nq += (got - ref[ks * 8 + i]) * (got - ref[ks * 8 + i]); dq += ref[ks * 8 + i] * ref[ks * 8 + i];
-                      }
-                    }
-                  }
-              }
-              {
-                // byte-level comparison with the host Prep of pass 0
-                std::vector<std::uint16_t> kh(std::size_t{s.capacity[l]} * kvd), vh(std::size_t{s.capacity[l]} * kvd);
-                gufo::npu::runtime::AttnDevPrep::ReadHist(s.m_attn[l], 0, 128, kh.data(), vh.data(), kvd, s.capacity[l]);
-                std::vector<float> qh(std::size_t{128} * qd);
-                for (std::uint32_t t = 0; t < 128; ++t)
-                  for (std::uint32_t h = 0; h < heads; ++h) {
-                    float* qr = &qk[std::size_t{t} * 3072 + h * hd];
-                    float ss = 0; for (std::uint32_t i = 0; i < hd; ++i) ss += qr[i] * qr[i];
-                    const float sc = 1.0f / std::sqrt(ss / hd + c.eps);
-                    float y[128]; for (std::uint32_t i = 0; i < hd; ++i) y[i] = qr[i] * sc * qn[i];
-                    for (std::uint32_t i = 0; i < hd / 2; ++i) {
-                      float ang = static_cast<float>(pos0 + t) * std::pow(c.theta, -2.0f * static_cast<float>(i) / hd) / fac[i];
-                      qh[std::size_t{t} * qd + h * hd + i] = y[i] * std::cos(ang) - y[i + hd / 2] * std::sin(ang);
-                      qh[std::size_t{t} * qd + h * hd + i + hd / 2] = y[i + hd / 2] * std::cos(ang) + y[i] * std::sin(ang);
-                    }
-                  }
-                std::vector<std::uint8_t> ref;
-                if (s.apre->DebugPrep(s.m_attn[l], pos0, 128, qh.data(), kh.data(), vh.data(), &ref)) {
-                  {
-                    const float* mh = reinterpret_cast<const float*>(ref.data() + 128);
-                    const float* md = reinterpret_cast<const float*>(pb + 128);
-                    std::fprintf(stderr, "[devprep-M] host:");
-                    for (int i = 0; i < 20; ++i) std::fprintf(stderr, " %.2f", mh[i]);
-                    std::fprintf(stderr, "\n[devprep-M] dev :");
-                    for (int i = 0; i < 20; ++i) std::fprintf(stderr, " %.2f", md[i]);
-                    std::fprintf(stderr, "\n");
-                  }
-                  {
-                    // host K/V chunk 0 from the same inputs, compared with the device chunk
-                    auto tmp = s.rt.MakeAttnLayer(256);
-                    std::vector<float> kf(std::size_t{16} * kvd);
-                    std::vector<std::uint16_t> vref(std::size_t{256} * kvd, 0);
-                    for (std::uint32_t t = 0; t < 16; ++t)
-                      for (std::uint32_t r = 0; r < kvh; ++r) {
-                        float* kb = &qk[std::size_t{t} * 3072 + qd + r * hd];
-                        float ss = 0; for (std::uint32_t i = 0; i < hd; ++i) ss += kb[i] * kb[i];
-                        const float sc = 1.0f / std::sqrt(ss / hd + c.eps);
-                        float y[128]; for (std::uint32_t i = 0; i < hd; ++i) y[i] = kb[i] * sc * kn[i];
-                        for (std::uint32_t i = 0; i < hd / 2; ++i) {
-                          float ang = static_cast<float>(t) * std::pow(c.theta, -2.0f * static_cast<float>(i) / hd) / fac[i];
-                          kf[std::size_t{t} * kvd + r * hd + i] = y[i] * std::cos(ang) - y[i + hd / 2] * std::sin(ang);
-                          kf[std::size_t{t} * kvd + r * hd + i + hd / 2] = y[i + hd / 2] * std::cos(ang) + y[i] * std::sin(ang);
-                        }
-                        for (std::uint32_t i = 0; i < hd; ++i) vref[std::size_t{t} * kvd + r * hd + i] = Bf16Bits(qk[std::size_t{t} * 3072 + qd + kvd + r * hd + i]);
-                      }
-                    s.rt.AttnAppend(tmp, 0, 16, kf.data(), vref.data(), nullptr);
-                    s.m_attn[l].kv.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-                    for (std::uint32_t r = 0; r < kvh; ++r) {
-                      std::size_t kk_same = 0, vv_same = 0;
-                      std::size_t kfirst = ~std::size_t{0}, vfirst = ~std::size_t{0};
-                      for (std::uint32_t b = 0; b < 4608; ++b) {
-                        const std::size_t off = (b / 1536) * 6144 + r * 1536 + b % 1536;
-                        const bool same = tmp.host[off] == s.m_attn[l].host[off];
-                        if (b < 2304) { kk_same += same; if (!same && kfirst == ~std::size_t{0}) kfirst = b; }
-                        else { vv_same += same; if (!same && vfirst == ~std::size_t{0}) vfirst = b - 2304; }
-                      }
-                      std::fprintf(stderr, "[devprep-chunk0] r%u: K %zu/2304 equal (first diff %zd), V^T %zu/2304 equal (first diff %zd)\n", r, kk_same, static_cast<std::ptrdiff_t>(kfirst), vv_same, static_cast<std::ptrdiff_t>(vfirst));
-                    }
-                  }
-                  const std::size_t U = 6144;
-                  for (std::uint32_t cc = 0; cc < 2; ++cc)
-                    for (std::uint32_t u = 0; u < 16; ++u) {
-                      std::size_t same = 0, tot = 0, firstdiff = ~std::size_t{0};
-                      for (std::uint32_t r = 0; r < 4; ++r)
-                        for (std::size_t b = 0; b < 1536; ++b) {
-                          const std::size_t off = std::size_t{cc} * 98304 + u * U + r * 1536 + b;
-                          ++tot; if (ref[off] == pb[off]) ++same; else if (firstdiff == ~std::size_t{0}) firstdiff = r * 1536 + b;
-                        }
-                      std::fprintf(stderr, "[devprep-bytes] col %u unit %2u: %zu/%zu bytes equal, first diff at %zd\n", cc, u, same, tot, static_cast<std::ptrdiff_t>(firstdiff));
-                    }
-                }
-              }
-              std::int32_t hh[4]; std::memcpy(hh, pb, 16);
-              const float* mm = reinterpret_cast<const float*>(pb + 128);
-              std::fprintf(stderr, "[devprep-check] L%zu Q rel err %.4f; hdr %d %d %d %d; M[0..3] %.3f %.3f %.3f %.3f\n", l, std::sqrt(nq / std::max(dq, 1e-30)), hh[0], hh[1], hh[2], hh[3], mm[0], mm[1], mm[2], mm[3]);
-            }
+            auto& cv = s.dp_qkv[l];
+            if (cv.size() <= ci_) cv.resize(ci_ + 1);
+            if (!cv[ci_]) cv[ci_] = s.atb->NewQkvC();
+            s.atb->ExecQkvTo(l, jq, cv[ci_]);
+            cs.dev_prep = true;
+          } else {
+            s.atb->ExecQkv(l, jq);
           }
           g_lock_ms += Ms(tl0); }
         if (cs.dev_prep) s.atb->ReleaseQkv(l, jq);
@@ -1297,6 +1179,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       const auto ta1 = Clock::now();
       bool many_ok = cs.attn_done;
       cs.attn_done = false;
+      if (!many_ok && cs.dev_prep && s.dprep && !dev_prep_chunks(l, {&cs})) cs.dev_prep = false;
       if (!many_ok && cs.dev_prep && s.dprep) {
         std::vector<gufo::npu::runtime::AttnPrefill::DevPass> dps;
         for (std::uint32_t o = 0; o < nTot; o += 128)
@@ -1506,6 +1389,11 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       if (eligible && dp_ok && s.dprep_layer[l]) {
         bool alld = true;
         for (auto& cs : css) alld = alld && cs.dev_prep;
+        if (alld) {
+          std::vector<ChunkState*> cp;
+          for (auto& cs : css) cp.push_back(&cs);
+          alld = dev_prep_chunks(l, cp);
+        }
         if (alld) {
           std::vector<gufo::npu::runtime::AttnPrefill::DevPass> dps;
           for (std::uint32_t ci = 0; ci < css.size(); ++ci)
