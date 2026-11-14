@@ -116,10 +116,14 @@ def design(m, k, n):
                 )
                 in_tasks.append(shim_dma_single_bd_task(Q_l3l2[col], QI, tap=q_tap, issue_token=False))
                 dma_start_task(in_tasks[-1])
+            tot_k = (q_col_out + k_col_out) // 1024
+            o_in = next(d for d in range(min(tot_k, 1023), 0, -1) if tot_k % d == 0)
+            o_out = tot_k // o_in
+            assert o_out <= 1023
             for col in range(COLS):
                 o_tap = TensorAccessPattern(
                     (1, COLS * (q_col_out + k_col_out)), col * (q_col_out + k_col_out),
-                    [1, 1, (q_col_out + k_col_out) // 1024, 1024], [0, 0, 1024, 1]
+                    [1, o_out, o_in, 1024], [0, o_in * 1024, 1024, 1]
                 )
                 c_tasks.append(shim_dma_single_bd_task(C_l2l3[col], OUT, tap=o_tap, issue_token=True))
                 dma_start_task(c_tasks[-1])
