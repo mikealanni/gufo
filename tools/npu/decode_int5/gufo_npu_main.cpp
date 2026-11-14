@@ -1,4 +1,5 @@
 #include <immintrin.h>
+#include <iostream>
 #include <iterator>
 #include <omp.h>
 #include <chrono>
@@ -239,6 +240,67 @@ int main(int argc, char** argv) {
     std::printf("\n");
     return 0;
   }
-  std::fprintf(stderr, "usage: gufo-npu capture|generate ...\n");
+  if (cmd == "chat") {
+    auto reader = gufo::core::GgufReader::OpenFile(opt.gguf, &err);
+    auto tokenizer = gufo::models::lfm3::Tokenizer::Load(*reader, &err);
+    if (!tokenizer) {
+      std::fprintf(stderr, "tokenizer: %s\n", err.c_str());
+      return 1;
+    }
+    std::uint32_t eos = 7;
+    if (auto e = reader->GetMetadataUint32("tokenizer.ggml.eos_token_id"))
+      eos = *e;
+    std::vector<std::pair<std::string, std::string>> msgs;
+    std::string line;
+    std::fprintf(stderr, "gufo-npu chat (context %zu). Empty line or Ctrl-D quits.\n", static_cast<std::size_t>(opt.context));
+    for (;;) {
+      std::fprintf(stderr, "\nyou> ");
+      if (!std::getline(std::cin, line) || line.empty())
+        break;
+      msgs.push_back({"user", line});
+      std::vector<std::uint32_t> ids = tokenizer->Encode(gufo::models::lfm3::Tokenizer::Render(msgs, false));
+      if (ids.size() + maxnew + 1 > opt.context) {
+        std::fprintf(stderr, "[context full: %zu tokens]\n", ids.size());
+        break;
+      }
+      engine->Reset();
+      std::vector<float> h;
+      const auto t0 = std::chrono::steady_clock::now();
+      for (std::size_t at = 0; at < ids.size();) {
+        const std::size_t chunk = engine->PrefillRows();
+        const std::size_t n = std::min<std::size_t>(chunk, ids.size() - at);
+        if (!engine->Step(std::span<const std::uint32_t>(ids.data() + at, n), &h))
+          return 1;
+        engine->Commit(n);
+        at += n;
+      }
+      const auto t1 = std::chrono::steady_clock::now();
+      std::uint32_t next = engine->Argmax(h.data() + (h.size() - 2048));
+      std::vector<std::uint32_t> out;
+      std::printf("npu> ");
+      std::fflush(stdout);
+      while (out.size() < maxnew) {
+        if (next == eos || tokenizer->IsStop(next))
+          break;
+        out.push_back(next);
+        const std::uint32_t one[1] = {next};
+        std::printf("%s", tokenizer->Decode(std::span<const std::uint32_t>(one, 1)).c_str());
+        std::fflush(stdout);
+        if (!engine->Step(std::span<const std::uint32_t>(one, 1), &h))
+          return 1;
+        engine->Commit(1);
+        next = engine->Argmax(h.data());
+      }
+      const auto t2 = std::chrono::steady_clock::now();
+      std::printf("\n");
+      msgs.push_back({"assistant", tokenizer->Decode(out)});
+      const double pre = std::chrono::duration<double>(t1 - t0).count();
+      const double dec = std::chrono::duration<double>(t2 - t1).count();
+      std::fprintf(stderr, "[prompt %zu tok in %.2f s = %.0f tok/s; %zu new tok in %.2f s = %.1f tok/s]\n", ids.size(), pre,
+                   ids.size() / pre, out.size(), dec, out.size() / std::max(dec, 1e-9));
+    }
+    return 0;
+  }
+  std::fprintf(stderr, "usage: gufo-npu capture|generate|chat ...\n");
   return 2;
 }

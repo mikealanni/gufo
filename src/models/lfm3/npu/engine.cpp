@@ -481,7 +481,7 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
     if (s.atb) s.atb->Warm();
     // WP4: pack tied embedding as int5 head for NPU argmax, if program exists.
     s.npu_argmax = false;
-    if (!std::getenv("GUFO_CPU_ARGMAX")) {
+    if (std::getenv("GUFO_NPU_ARGMAX") != nullptr) {
       const std::string ainst = options.programs + "/insts_argmax_2048x128000.txt";
       std::ifstream af(ainst, std::ios::binary);
       if (af.good()) {
@@ -1522,6 +1522,31 @@ std::uint32_t Engine::Argmax(const float* hidden_row) {
   if (s.npu_argmax) {
     std::uint32_t out = 0;
     s.rt.Argmax(s.p_argmax, s.m_argmax, hidden_row, 1, &out, &s.tim);
+    if (std::getenv("GUFO_ARGMAX_CHECK")) {
+      std::vector<float> lg;
+      Logits(hidden_row, &lg);
+      std::uint32_t best = 0;
+      for (std::uint32_t v = 1; v < lg.size(); ++v) if (lg[v] > lg[best]) best = v;
+      std::fprintf(stderr, "[argmax] npu %u (cpu logit %.3f) cpu %u (logit %.3f)\n", out, lg[out], best, lg[best]);
+      {
+        std::size_t nz = 0, total = std::size_t{1000} * gufo::npu::runtime::kStripBytes;
+        for (std::size_t i = 0; i < total; ++i) nz += s.p_argmax.ch[i] != 0;
+        std::uint32_t w4[8]; std::memcpy(w4, s.p_argmax.ch, 32);
+        std::fprintf(stderr, "[argmax] C nonzero bytes %zu of %zu; first words %08x %08x %08x %08x %08x %08x %08x %08x\n", nz, total, w4[0], w4[1], w4[2], w4[3], w4[4], w4[5], w4[6], w4[7]);
+        std::size_t anz = 0; for (std::size_t i = 0; i < s.p_argmax.a.size(); ++i) anz += s.p_argmax.ah[i] != 0;
+        std::fprintf(stderr, "[argmax] A nonzero bytes %zu of %zu\n", anz, static_cast<std::size_t>(s.p_argmax.a.size()));
+      }
+      for (std::uint32_t si : {0u, 4u, 4u + 1u, 500u}) {
+        for (std::uint32_t cr = 0; cr < 4; ++cr) {
+          const std::uint8_t* base = s.p_argmax.ch + std::size_t{si} * gufo::npu::runtime::kStripBytes + std::size_t{cr} * gufo::npu::runtime::kRowBytes;
+          float v; std::uint32_t lc;
+          std::memcpy(&v, base, 4); std::memcpy(&lc, base + 4, 4);
+          float cm = -1e30f; std::uint32_t ci = 0;
+          for (std::uint32_t k = 0; k < 32; ++k) { const std::uint32_t id = si * 128 + cr * 32 + k; if (lg[id] > cm) { cm = lg[id]; ci = k; } }
+          std::fprintf(stderr, "[argmax] strip %u cr %u: npu (%.3f, %u)  cpu (%.3f, %u)\n", si, cr, v, lc, cm, ci);
+        }
+      }
+    }
     return out;
   }
   const auto& e = s.w->embedding;
