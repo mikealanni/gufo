@@ -537,6 +537,7 @@ struct TlScope {
   }
 };
 static double g_busy[4];
+static double g_dr_norm, g_dr_zdec, g_dr_init, g_dr_fin, g_dr_qkvdec, g_dr_devtot;
 static double g_w_conv, g_w_a, g_w_b, g_w_c, g_f_enc, g_f_exe, g_f_dec;
 static double g_t_post, g_t_fin, g_t_cin, g_t_cmid, g_t_cout, g_t_norm, g_t_prep, g_t_attn_npu, g_t_attn_cpu, g_t_resid, g_t_conv, g_t_qkv, g_t_oproj;
 bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hidden) {
@@ -602,10 +603,9 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
       ATT.resize(std::size_t{nTot} * qd);
       gufo::npu::runtime::FfnAtbChain::Job jq;
       jq.staged = true;
-      { std::lock_guard<std::mutex> g_(npu_mu); const auto tl0 = Clock::now(); s.atb->ExecNorm(l, 0); s.atb->ExecQkv(l, jq); g_lock_ms += Ms(tl0); }
-      s.atb->QkvOut(l, jq);
-      s.atb->DecodeJob(jq, nTot, 3072, QKV.data());
-      s.atb->DevResFinal(nTot, Z.data());
+      { std::lock_guard<std::mutex> g_(npu_mu); const auto tl0 = Clock::now(); { const auto tn = Clock::now(); s.atb->ExecNorm(l, 0); g_dr_norm += Ms(tn); } s.atb->ExecQkv(l, jq); g_lock_ms += Ms(tl0); }
+      { const auto tq = Clock::now(); s.atb->QkvOut(l, jq); s.atb->DecodeJob(jq, nTot, 3072, QKV.data()); g_dr_qkvdec += Ms(tq); }
+      { const auto tz = Clock::now(); s.atb->DevResFinal(nTot, Z.data()); g_dr_zdec += Ms(tz); }
     } else if (big_attn) {
       { TlScope tl_("norm", l); RmsNorm(X.data(), static_cast<const float*>(lw.norm.data), Z.data(), nTot, H, c.eps); }
       QKV.resize(std::size_t{nTot} * 3072);
@@ -1279,10 +1279,10 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
   if (devres) {
     if (hidden) hidden->resize(std::size_t{nTot} * H);
     for (auto& cs : css) {
-      s.atb->DevResInit(cs.X.data(), cs.n);
+      { const auto ti = Clock::now(); s.atb->DevResInit(cs.X.data(), cs.n); g_dr_init += Ms(ti); }
       for (std::size_t l = 0; l < NL; ++l) layer_run(cs, 0, l);
       { std::lock_guard<std::mutex> g_(npu_mu); s.atb->ExecNorm(NL, 0); }
-      if (hidden) s.atb->DevResFinal(cs.n, hidden->data() + std::size_t{cs.row0} * H);
+      { const auto tf = Clock::now(); if (hidden) s.atb->DevResFinal(cs.n, hidden->data() + std::size_t{cs.row0} * H); g_dr_fin += Ms(tf); }
     }
   }
   for (std::size_t si = 0; !devres && si < stages.size();) {
@@ -1343,6 +1343,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
     for (auto& cs : css)
       RmsNorm(cs.X.data(), static_cast<const float*>(s.w->output_norm.data), hidden->data() + std::size_t{cs.row0} * H, cs.n, H, c.eps);
   }
+  if (devres && std::getenv("GUFO_ATB_STATS")) std::fprintf(stderr, "[devres] norm-under-qkv %.0f zdec %.0f qkvdec %.0f init %.0f final %.0f lock %.0f ms\n", g_dr_norm, g_dr_zdec, g_dr_qkvdec, g_dr_init, g_dr_fin, g_lock_ms);
   s.pending = nTot;
   s.t_cpu += Ms(cpu0);
   if (g_tl_on) {
