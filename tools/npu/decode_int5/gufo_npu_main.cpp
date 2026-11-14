@@ -254,7 +254,13 @@ int main(int argc, char** argv) {
       eos = *e;
     std::vector<std::pair<std::string, std::string>> msgs;
     std::string line;
-    std::fprintf(stderr, "gufo-npu chat (context %zu). Empty line or Ctrl-D quits.\n", static_cast<std::size_t>(opt.context));
+    if (!heads_path.empty() && !engine->LoadHeads(heads_path, &err)) {
+      std::fprintf(stderr, "%s\n", err.c_str());
+      return 1;
+    }
+    engine->LimitHeads(static_cast<std::uint32_t>(head_k));
+    std::fprintf(stderr, "gufo-npu chat (context %zu, draft heads %u, prompt lookup %s). Empty line or Ctrl-D quits.\n",
+                 static_cast<std::size_t>(opt.context), engine->HeadCount(), spec ? "on" : "off");
     for (;;) {
       std::fprintf(stderr, "\nyou> ");
       if (!std::getline(std::cin, line) || line.empty())
@@ -278,20 +284,74 @@ int main(int argc, char** argv) {
       }
       const auto t1 = std::chrono::steady_clock::now();
       std::uint32_t next = engine->Argmax(h.data() + (h.size() - 2048));
-      std::vector<std::uint32_t> out;
+      std::vector<std::uint32_t> out, hist = ids, head_draft;
       std::printf("npu> ");
       std::fflush(stdout);
-      while (out.size() < maxnew) {
+      const auto emit = [&](std::uint32_t t) {
+        out.push_back(t);
+        hist.push_back(t);
+        std::printf("%s", tokenizer->Decode(std::span<const std::uint32_t>(&t, 1)).c_str());
+        std::fflush(stdout);
+      };
+      bool done = false;
+      std::size_t passes = 0;
+      while (!done && out.size() < maxnew) {
         if (next == eos || tokenizer->IsStop(next))
           break;
-        out.push_back(next);
-        const std::uint32_t one[1] = {next};
-        std::printf("%s", tokenizer->Decode(std::span<const std::uint32_t>(one, 1)).c_str());
-        std::fflush(stdout);
-        if (!engine->Step(std::span<const std::uint32_t>(one, 1), &h))
+        emit(next);
+        std::vector<std::uint32_t> fed = {next};
+        if (spec) {
+          const std::size_t hn = hist.size();
+          for (std::size_t m = std::min<std::size_t>(5, hn - 1); m >= 2 && fed.size() == 1; --m) {
+            for (std::size_t p = hn - 1; p-- > m;) {
+              bool same = true;
+              for (std::size_t q = 0; q < m && same; ++q)
+                same = hist[p - q] == hist[hn - 1 - q];
+              if (same) {
+                for (std::size_t q = p + 1; q < hn && fed.size() < Engine::kMaxRows; ++q)
+                  fed.push_back(hist[q]);
+                break;
+              }
+            }
+          }
+        }
+        if (spec && fed.size() == 1)
+          for (auto t : head_draft)
+            if (fed.size() < Engine::kMaxRows)
+              fed.push_back(t);
+        if (!engine->Step(std::span<const std::uint32_t>(fed.data(), fed.size()), &h))
           return 1;
-        engine->Commit(1);
-        next = engine->Argmax(h.data());
+        ++passes;
+        std::vector<std::uint32_t> pred(fed.size());
+        std::size_t have = 0, j = 0;
+        for (;;) {
+          const std::size_t want = std::min<std::size_t>(fed.size(), have == 0 ? 4 : fed.size());
+          if (want > have) {
+            engine->ArgmaxRows(h.data() + have * 2048, want - have, pred.data() + have);
+            have = want;
+          }
+          while (j + 1 < fed.size() && j < have && pred[j] == fed[j + 1])
+            ++j;
+          if (j >= have && have < fed.size())
+            continue;
+          break;
+        }
+        for (std::size_t q = 1; q <= j && !done; ++q) {
+          if (fed[q] == eos || tokenizer->IsStop(fed[q])) {
+            done = true;
+            break;
+          }
+          emit(fed[q]);
+        }
+        engine->Commit(static_cast<std::uint32_t>(j + 1));
+        if (j >= have)
+          pred[j] = 0;
+        next = pred[j];
+        head_draft.clear();
+        if (spec && engine->HeadCount() && !done) {
+          head_draft.resize(engine->HeadCount());
+          engine->Draft(h.data() + j * 2048, head_draft.data());
+        }
       }
       const auto t2 = std::chrono::steady_clock::now();
       std::printf("\n");
