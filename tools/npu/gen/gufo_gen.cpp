@@ -290,14 +290,14 @@ struct Layer {
   std::vector<float> k, v;
   std::vector<float> qn, kn;
   std::vector<float> wqkv, wo, wgate, wup, wdown;
-  AttnLayer al;
-  std::uint32_t napp{0};
+  std::vector<AttnLayer> als;
+  std::vector<std::uint32_t> napps;
   WeightBuffer kw_qkv, kw_o, kw_a, kw_b, kw_d;
   Program kp_qkv, kp_o, kq_a, kq_b, kq_d;
   Program kp_qkv2, kp_o2, kq_a2, kq_b2, kq_d2;
   xrt::bo swc2;
   xrt::bo swc;
-  std::vector<std::uint16_t> kh, vh;
+  std::vector<std::vector<std::uint16_t>> khs, vhs;
 };
 
 void MatVec(const float* W, std::uint32_t N, std::uint32_t K, const float* x, std::uint32_t n, float* y) {
@@ -329,7 +329,9 @@ struct Engine {
   NpuRuntime rk;
   bool kd{false};
   std::uint32_t kd_min{std::getenv("GEN_KD_MIN") ? static_cast<std::uint32_t>(std::atoi(std::getenv("GEN_KD_MIN"))) : 256u};
-  std::vector<float> kx, ky, rcos, rsin, s_qa, s_kd;
+  std::vector<float> kx, ky, rcos, rsin, s_qa, s_kd, s_ap;
+  std::uint32_t kvp{1};
+  std::uint64_t bad_head_rows{0};
   std::vector<float> kxs[2], ymlp[2];
   std::size_t kxn{0}, kyn{0};
   std::uint32_t super_rows{std::getenv("GEN_SUPER") ? static_cast<std::uint32_t>(std::atoi(std::getenv("GEN_SUPER"))) : 4096u};
@@ -390,7 +392,7 @@ struct Engine {
   bool Init(const std::string& model_dir, const std::string& programs, std::uint32_t context) {
     ctx = context;
     programs_dir = programs;
-    ctx = context;
+    g_attn_tight_m = std::getenv("GEN_LOOSE_M") == nullptr;
     if (const char* gp = std::getenv("GEN_OGAIN")) {
       std::ifstream gf(gp);
       float gv;
@@ -440,10 +442,15 @@ struct Engine {
         std::fprintf(stderr, "shapes must satisfy hidden%%64, q_dim%%64, ffn%%512 (hidden %u q %u ffn %u)\n", c.hidden, c.heads * c.head_dim, c.inter);
         return false;
       }
-      if (npu_attn && !(c.head_dim == 128 && c.heads == 16 && (c.kv_heads == 1 || c.kv_heads == 2 || c.kv_heads == 4))) {
-        std::fprintf(stderr, "gen: attention shape %ux%u/%u runs on the host (NPU kernel is 16 heads, 128 dims, 1/2/4 kv heads)\n", c.heads, c.head_dim, c.kv_heads);
-        npu_attn = false;
-        apre.reset();
+      {
+        const bool dup_ok = c.heads == 16 && (c.kv_heads == 1 || c.kv_heads == 2);
+        const bool multi_ok = c.kv_heads >= 4 && c.kv_heads % 4 == 0 && c.heads % c.kv_heads == 0 && c.heads / c.kv_heads <= 4;
+        if (npu_attn && !(c.head_dim == 128 && (dup_ok || multi_ok))) {
+          std::fprintf(stderr, "gen: attention shape %ux%u/%u runs on the host (NPU kernel needs 128 dims and at most 4 query heads per kv head with 1, 2 or a multiple of 4 kv heads)\n", c.heads, c.head_dim, c.kv_heads);
+          npu_attn = false;
+          apre.reset();
+        }
+        kvp = c.kv_heads >= 4 ? c.kv_heads / 4 : 1;
       }
       std::fprintf(stderr, "gen: %s layers %u hidden %u ffn %u heads %u/%u hd %u vocab %u rope %s qknorm %d tied %d\n", st.arch.c_str(), c.layers, c.hidden, c.inter, c.heads, c.kv_heads, c.head_dim, c.vocab, c.rope_neox ? "neox" : "interleaved", c.qk_norm, c.tied);
     }
@@ -589,9 +596,12 @@ struct Engine {
       m.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
       L.ffn = std::move(m);
       if (npu_attn) {
-        L.al = rt.MakeAttnLayer(ctx);
-        L.kh.assign(std::size_t{ctx} * kAttnKv, 0);
-        L.vh.assign(std::size_t{ctx} * kAttnKv, 0);
+        for (std::uint32_t p = 0; p < kvp; ++p) {
+          L.als.push_back(rt.MakeAttnLayer(ctx));
+          L.khs.emplace_back(std::size_t{ctx} * kAttnKv, 0);
+          L.vhs.emplace_back(std::size_t{ctx} * kAttnKv, 0);
+        }
+        L.napps.assign(kvp, 0);
       }
       if (kd) PackKd(L, st, pre, programs, &err);
       L.k.assign(std::size_t{ctx} * kvd, 0.f);
@@ -618,24 +628,35 @@ struct Engine {
   void Reset() {
     pos = 0;
     if (npu_attn)
-      for (auto& L : layers) {
-        rt.AttnReset(L.al);
-        L.napp = 0;
-        std::fill(L.kh.begin(), L.kh.end(), std::uint16_t{0});
-        std::fill(L.vh.begin(), L.vh.end(), std::uint16_t{0});
-      }
+      for (auto& L : layers)
+        for (std::uint32_t p = 0; p < kvp; ++p) {
+          rt.AttnReset(L.als[p]);
+          L.napps[p] = 0;
+          std::fill(L.khs[p].begin(), L.khs[p].end(), std::uint16_t{0});
+          std::fill(L.vhs[p].begin(), L.vhs[p].end(), std::uint16_t{0});
+        }
+  }
+
+  // kv head feeding kernel slot r of attention pass p (kernels hold 4 kv heads; fewer are duplicated)
+  std::uint32_t KvSrc(std::uint32_t p, std::uint32_t r) const { return c.kv_heads >= 4 ? p * 4 + r : r / (4 / c.kv_heads); }
+  // query head for kernel row group (r, hq) of pass p, or -1 for padding
+  int QHead(std::uint32_t p, std::uint32_t r, std::uint32_t hq) const {
+    if (c.kv_heads < 4) return static_cast<int>(r * 4 + hq);
+    const std::uint32_t g = c.heads / c.kv_heads;
+    return hq < g ? static_cast<int>((p * 4 + r) * g + hq) : -1;
   }
 
   void EnsureAppended(Layer& L, std::uint32_t upto) {
-    const std::uint32_t hd = c.head_dim, kvd = c.kv_heads * hd, rep = kAttnKv / kvd;
+    const std::uint32_t hd = c.head_dim, kvd = c.kv_heads * hd;
     std::vector<float> kd(std::size_t{16} * kAttnKv);
-    while (L.napp < upto) {
-      const std::uint32_t m = std::min(16u, upto - L.napp);
-      for (std::uint32_t r = 0; r < m; ++r)
-        for (std::uint32_t h = 0; h < 4; ++h) std::memcpy(&kd[std::size_t{r} * kAttnKv + h * hd], &L.k[std::size_t{L.napp + r} * kvd + (h / rep) * hd], hd * 4);
-      rt.AttnAppend(L.al, L.napp, m, kd.data(), L.vh.data(), &tim);
-      L.napp += m;
-    }
+    for (std::uint32_t p = 0; p < kvp; ++p)
+      while (L.napps[p] < upto) {
+        const std::uint32_t m = std::min(16u, upto - L.napps[p]);
+        for (std::uint32_t r = 0; r < m; ++r)
+          for (std::uint32_t h = 0; h < 4; ++h) std::memcpy(&kd[std::size_t{r} * kAttnKv + h * hd], &L.k[std::size_t{L.napps[p] + r} * kvd + KvSrc(p, h) * hd], hd * 4);
+        rt.AttnAppend(L.als[p], L.napps[p], m, kd.data(), L.vhs[p].data(), &tim);
+        L.napps[p] += m;
+      }
   }
 
   void BuildRope() {
@@ -670,6 +691,34 @@ struct Engine {
     const std::uint32_t hd = c.head_dim;
     for (std::uint32_t h = 0; h < c.heads; ++h) RmsNorm(row + h * hd, L.qn.data(), row + h * hd, hd, c.eps);
     for (std::uint32_t h = 0; h < c.kv_heads; ++h) RmsNorm(row + qd + h * hd, L.kn.data(), row + qd + h * hd, hd, c.eps);
+  }
+
+  void AttendHead(const Layer& L, const float* q, std::uint32_t h, std::uint32_t p, float* o) const {
+    const std::uint32_t hd = c.head_dim, kvd = c.kv_heads * hd, grp = c.heads / c.kv_heads;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+    std::vector<float> sc(p + 1);
+    const float* qh = q + std::size_t{h} * hd;
+    const std::uint32_t kh = h / grp;
+    float mx = -INFINITY;
+    for (std::uint32_t t = 0; t <= p; ++t) {
+      const float* kk = &L.k[std::size_t{t} * kvd + kh * hd];
+      float s = 0;
+      for (std::uint32_t i = 0; i < hd; ++i) s += qh[i] * kk[i];
+      s *= scale;
+      sc[t] = s;
+      mx = std::max(mx, s);
+    }
+    float den = 0;
+    for (std::uint32_t t = 0; t <= p; ++t) {
+      sc[t] = std::exp(sc[t] - mx);
+      den += sc[t];
+    }
+    std::fill(o, o + hd, 0.f);
+    for (std::uint32_t t = 0; t <= p; ++t) {
+      const float w = sc[t] / den;
+      const float* vv = &L.v[std::size_t{t} * kvd + kh * hd];
+      for (std::uint32_t i = 0; i < hd; ++i) o[i] += w * vv[i];
+    }
   }
 
   void Attend(Layer& L, const float* q, std::uint32_t p, float* out) const {
@@ -904,69 +953,118 @@ struct Engine {
       t_npu += Ms(t0);
       t0 = Clock::now();
       if (npu_attn) {
-        s_qa.resize(std::size_t{n} * qd);
-        s_kd.resize(std::size_t{n} * kAttnKv);
-        std::vector<float>& qa = s_qa;
-        std::vector<float>& kd = s_kd;
-        const std::uint32_t hd = c.head_dim, rep = kAttnKv / kvd;
+        const std::uint32_t hd = c.head_dim, stride = Cpu("qkv") ? qkv_n : qkv_p;
+        s_qa.resize(std::size_t{kvp} * n * 2048);
+        s_kd.resize(std::size_t{kvp} * n * kAttnKv);
+        s_ap.resize(std::size_t{n} * 2048);
         auto tprep = Clock::now();
 #pragma omp parallel for
         for (std::int64_t r = 0; r < n; ++r) {
-          float* row = &qkv[std::size_t(r) * (Cpu("qkv") ? qkv_n : qkv_p)];
+          float* row = &qkv[std::size_t(r) * stride];
           QkNorm(L, row, qd);
           Rope(row, c.heads, pos + static_cast<std::uint32_t>(r));
           Rope(row + qd, c.kv_heads, pos + static_cast<std::uint32_t>(r));
-          std::memcpy(&qa[std::size_t(r) * qd], row, qd * 4);
-          for (std::uint32_t h = 0; h < 4; ++h) {
-            const std::uint32_t src = h / rep;
-            std::memcpy(&kd[std::size_t(r) * kAttnKv + h * hd], row + qd + src * hd, hd * 4);
-            for (std::uint32_t i = 0; i < hd; ++i) {
-              L.kh[std::size_t(pos + r) * kAttnKv + h * hd + i] = Bf16Bits(row[qd + src * hd + i]);
-              L.vh[std::size_t(pos + r) * kAttnKv + h * hd + i] = Bf16Bits(row[qd + kvd + src * hd + i]);
+          std::memcpy(&L.k[std::size_t(pos + r) * kvd], row + qd, std::size_t{kvd} * 4);
+          std::memcpy(&L.v[std::size_t(pos + r) * kvd], row + qd + kvd, std::size_t{kvd} * 4);
+          for (std::uint32_t p = 0; p < kvp; ++p) {
+            float* qa = &s_qa[(std::size_t{p} * n + r) * 2048];
+            for (std::uint32_t r4 = 0; r4 < 4; ++r4)
+              for (std::uint32_t hq = 0; hq < 4; ++hq) {
+                const int hh = QHead(p, r4, hq);
+                // padding rows repeat the first real head so the kernel's row bounds stay in range; their output is dropped
+                const int src_h = hh >= 0 ? hh : QHead(p, r4, 0);
+                std::memcpy(qa + (r4 * 4 + hq) * hd, row + src_h * hd, hd * 4);
+              }
+            for (std::uint32_t h = 0; h < 4; ++h) {
+              const std::uint32_t src = KvSrc(p, h);
+              std::memcpy(&s_kd[(std::size_t{p} * n + r) * kAttnKv + h * hd], row + qd + src * hd, hd * 4);
+              for (std::uint32_t i = 0; i < hd; ++i) {
+                L.khs[p][std::size_t(pos + r) * kAttnKv + h * hd + i] = Bf16Bits(row[qd + src * hd + i]);
+                L.vhs[p][std::size_t(pos + r) * kAttnKv + h * hd + i] = Bf16Bits(row[qd + kvd + src * hd + i]);
+              }
             }
           }
         }
         ph[3] += Ms(tprep);
         if (pos + n <= host_ctx) {
           for (std::uint32_t r = 0; r < n; ++r) {
-            const float* row = &qkv[std::size_t{r} * (Cpu("qkv") ? qkv_n : qkv_p)];
+            const float* row = &qkv[std::size_t{r} * stride];
             std::memcpy(&L.k[std::size_t{pos + r} * kvd], row + qd, kvd * 4);
             std::memcpy(&L.v[std::size_t{pos + r} * kvd], row + qd + kvd, kvd * 4);
           }
 #pragma omp parallel for
-          for (std::int64_t r = 0; r < n; ++r) Attend(L, &qa[std::size_t(r) * qd], pos + static_cast<std::uint32_t>(r), &att[std::size_t(r) * qd]);
-        } else if (apre && n > kRows) {
-          EnsureAppended(L, pos);
-          L.napp = pos + n;
-          apre->SetExact(pos + n <= kExactCtx);
-          const auto tap = Clock::now();
-          if (pos % 16 == 0 && n % 16 == 0) {
-            rt.AttnAppendBulk(L.al, pos, n, kd.data(), L.vh.data(), &tim);
-          } else {
-            for (std::uint32_t o = 0; o < n; o += 16)
-              rt.AttnAppend(L.al, pos + o, std::min(16u, n - o), &kd[std::size_t{o} * kAttnKv], L.vh.data(), &tim);
-          }
-          ph[5] += Ms(tap);
-          std::vector<AttnPrefill::Pass> passes;
-          for (std::uint32_t o = 0; o < n; o += 128)
-            passes.push_back({pos + o, std::min(128u, n - o), &qa[std::size_t{o} * qd], &att[std::size_t{o} * qd]});
-          const auto tr = Clock::now();
-          if (!apre->RunMany(L.al, passes.data(), passes.size(), L.kh.data(), L.vh.data(), &tim)) {
-            std::fprintf(stderr, "prefill attention failed (layer %u pos %u)\n", l, pos);
-            std::exit(3);
-          }
-          ph[4] += Ms(tr);
+          for (std::int64_t r = 0; r < n; ++r) Attend(L, &qkv[std::size_t(r) * stride], pos + static_cast<std::uint32_t>(r), &att[std::size_t(r) * qd]);
         } else {
-        EnsureAppended(L, pos);
-        L.napp = pos + n;
-        for (std::uint32_t o = 0, m = 0; o < n; o += m) {
-          m = std::min({16u, n - o, 16u - (pos + o) % 16u});
-          rt.AttnAppend(L.al, pos + o, m, &kd[std::size_t{o} * kAttnKv], L.vh.data(), &tim);
-          if (!rt.AttnRun(L.al, pos + o, m, &qa[std::size_t{o} * qd], L.kh.data(), L.vh.data(), programs_dir, &att[std::size_t{o} * qd], &tim)) {
-            std::fprintf(stderr, "npu attention declined (layer %u pos %u)\n", l, pos + o);
-            std::exit(3);
+          std::vector<std::uint32_t> host_rows;
+          for (std::uint32_t p = 0; p < kvp; ++p) {
+            float* qa = &s_qa[std::size_t{p} * n * 2048];
+            float* kdp = &s_kd[std::size_t{p} * n * kAttnKv];
+            AttnLayer& al = L.als[p];
+            auto& kh = L.khs[p];
+            auto& vh = L.vhs[p];
+            if (L.napps[p] < pos) {
+              // host-attention steps filled L.k/L.v only: replay them into this pass first
+              const std::uint32_t save = pos;
+              (void)save;
+              EnsureAppended(L, pos);
+            }
+            L.napps[p] = pos + n;
+            if (apre && n > kRows) {
+              apre->SetExact(pos + n <= kExactCtx);
+              const auto tap = Clock::now();
+              if (pos % 16 == 0 && n % 16 == 0) {
+                rt.AttnAppendBulk(al, pos, n, kdp, vh.data(), &tim);
+              } else {
+                for (std::uint32_t o = 0; o < n; o += 16)
+                  rt.AttnAppend(al, pos + o, std::min(16u, n - o), &kdp[std::size_t{o} * kAttnKv], vh.data(), &tim);
+              }
+              ph[5] += Ms(tap);
+              std::vector<AttnPrefill::Pass> passes;
+              for (std::uint32_t o = 0; o < n; o += 128)
+                passes.push_back({pos + o, std::min(128u, n - o), &qa[std::size_t{o} * 2048], &s_ap[std::size_t{o} * 2048]});
+              const auto tr = Clock::now();
+              apre->collect_bad = true;
+              apre->bad_rows.clear();
+              if (!apre->RunMany(al, passes.data(), passes.size(), kh.data(), vh.data(), &tim)) {
+                std::fprintf(stderr, "prefill attention failed (layer %u pos %u)\n", l, pos);
+                std::exit(3);
+              }
+              ph[4] += Ms(tr);
+              if (!apre->bad_rows.empty()) {
+                bad_head_rows += apre->bad_rows.size();
+                for (const auto& br : apre->bad_rows) {
+                  const std::uint32_t tok = br.first - pos, slot = br.second;
+                  const int hh = QHead(p, slot / 4, slot % 4);
+                  if (hh >= 0 && br.first >= pos && tok < n)
+                    AttendHead(L, &qkv[std::size_t(tok) * stride], static_cast<std::uint32_t>(hh), br.first, &s_ap[std::size_t(tok) * 2048 + slot * hd]);
+                }
+              }
+            } else {
+              for (std::uint32_t o = 0, m = 0; o < n; o += m) {
+                m = std::min({16u, n - o, 16u - (pos + o) % 16u});
+                rt.AttnAppend(al, pos + o, m, &kdp[std::size_t{o} * kAttnKv], vh.data(), &tim);
+                if (!rt.AttnRun(al, pos + o, m, &qa[std::size_t{o} * 2048], kh.data(), vh.data(), programs_dir, &s_ap[std::size_t{o} * 2048], &tim)) {
+                  // unusable softmax mass for some row: recompute these rows on the host (all heads) and skip the scatter below
+                  bad_head_rows += m * c.heads;
+                  for (std::uint32_t r2 = o; r2 < o + m; ++r2) Attend(L, &qkv[std::size_t{r2} * stride], pos + r2, &att[std::size_t{r2} * qd]);
+                  std::memset(&s_ap[std::size_t{o} * 2048], 0, std::size_t{m} * 2048 * 4);
+                  host_rows.insert(host_rows.end(), {o, m});
+                }
+              }
+            }
+            // scatter this pass's rows back to the natural head order
+#pragma omp parallel for
+            for (std::int64_t r = 0; r < n; ++r) {
+              bool on_host = false;
+              for (std::size_t hr = 0; hr + 1 < host_rows.size(); hr += 2) on_host = on_host || (r >= host_rows[hr] && r < host_rows[hr] + host_rows[hr + 1]);
+              if (on_host) continue;
+              for (std::uint32_t r4 = 0; r4 < 4; ++r4)
+                for (std::uint32_t hq = 0; hq < 4; ++hq) {
+                  const int hh = QHead(p, r4, hq);
+                  if (hh >= 0) std::memcpy(&att[std::size_t(r) * qd + hh * hd], &s_ap[std::size_t(r) * 2048 + (r4 * 4 + hq) * hd], hd * 4);
+                }
+            }
           }
-        }
         }
         if (std::getenv("GEN_ATTN_CHECK")) {
           std::vector<float> ref(std::size_t{n} * qd);
@@ -974,7 +1072,7 @@ struct Engine {
             const float* row = &qkv[std::size_t{r} * (Cpu("qkv") ? qkv_n : qkv_p)];
             std::memcpy(&L.k[std::size_t{pos + r} * kvd], row + qd, kvd * 4);
             std::memcpy(&L.v[std::size_t{pos + r} * kvd], row + qd + kvd, kvd * 4);
-            Attend(L, qa.data() + std::size_t{r} * qd, pos + r, &ref[std::size_t{r} * qd]);
+            Attend(L, &qkv[std::size_t{r} * (Cpu("qkv") ? qkv_n : qkv_p)], pos + r, &ref[std::size_t{r} * qd]);
           }
           double num = 0, den = 0, sg = 0, dot = 0;
           for (std::size_t i = 0; i < ref.size(); ++i) {
@@ -1878,6 +1976,7 @@ int Chat(const char* model, const char* programs, const std::string& prompt, std
   std::fprintf(stderr, "\nmlp host enc+dec %.0f ms | mlp device %.0f ms\n", g.ph[6], g.ph[7]);
   std::fprintf(stderr, "\nattention parts: rope+dup+convert %.0f ms | AttnAppend %.0f ms | prefill-attention run %.0f ms\n", g.ph[3], g.ph[5], g.ph[4]);
   std::fprintf(stderr, "\nhost norm+resid %.0f ms | ffn %.0f ms | attention+rope %.0f ms | gemm enc %.0f dec %.0f sync+wait %.0f ms\n", g.ph[0], g.ph[1], g.ph[2], g.tim.enc, g.tim.dec, g.tim.wait + g.tim.syncA + g.tim.syncC);
+  if (g.bad_head_rows) std::fprintf(stderr, "attention rows recomputed on the host: %llu\n", static_cast<unsigned long long>(g.bad_head_rows));
   std::fprintf(stderr, "\nprefill %zu tok %.1f ms (%.0f tok/s); decode %u tok %.1f ms (%.2f tok/s)\n", ids.size(), pf, ids.size() / pf * 1000, produced, dc, produced / dc * 1000);
   return 0;
 }
@@ -2027,7 +2126,8 @@ int JudgeStdio(const char* model, const char* programs) {
     auto ids = tok->Encode(body);
     if (ids.size() + p0 + 8 > ctx) ids.erase(ids.begin(), ids.end() - (ctx - p0 - 8));
     g.pos = p0;
-    for (auto& L : g.layers) L.napp = std::min(L.napp, p0);
+    for (auto& L : g.layers)
+      for (auto& np : L.napps) np = std::min(np, p0);
     feed(ids.data(), static_cast<std::uint32_t>(ids.size()));
     const float* last = &hd[hd.size() - g.c.hidden];
     const float ly = g.LogitAt(last, yes_ids[0]), ln = g.LogitAt(last, no_ids[0]);

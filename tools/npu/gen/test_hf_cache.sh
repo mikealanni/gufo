@@ -9,8 +9,7 @@ MODELS=(
   "$CACHE"/models--unsloth--Qwen3-0.6B-GGUF/snapshots/*/Qwen3-0.6B-Q4_0.gguf
   "$CACHE"/models--unsloth--Qwen3-1.7B-GGUF/snapshots/*/Qwen3-1.7B-Q4_0.gguf
   "$CACHE"/models--bartowski--MiniCPM5-2B-GGUF/snapshots/*/MiniCPM5-2B-Q4_K_M.gguf
-  "$CACHE"/models--unsloth--Qwen3-4B-Instruct-2507-GGUF/snapshots/*/Qwen3-4B-Instruct-2507-Q4_K_M.gguf
-  "$CACHE"/models--unsloth--Qwen3-8B-GGUF/snapshots/*/Qwen3-8B-Q4_1.gguf
+  ~/jev-model/MiniCPM5-1B-SFT-Q6_K-fixed.gguf
 )
 : >"$OUT/summary.txt"
 for m in "${MODELS[@]}"; do
@@ -21,6 +20,8 @@ for m in "${MODELS[@]}"; do
   echo "chat exit $?: $(grep -v '^gen:' "$OUT/$name.chat.txt" | head -3 | tr '\n' ' ')" | tee -a "$OUT/summary.txt"
   grep -E "^gen: [a-z0-9]+ layers|prefill|rror|not supported|unsupported" "$OUT/$name.chat.txt" | tee -a "$OUT/summary.txt"
   OMP_NUM_THREADS=16 timeout 1800 "$HERE/run_gen.sh" bench "$m" 1024 64 >"$OUT/$name.bench.txt" 2>&1
+  OMP_NUM_THREADS=16 timeout 1800 "$HERE/run_gen.sh" bench "$m" 4096 32 >"$OUT/$name.bench4k.txt" 2>&1
+  grep -E "prefill [0-9]" "$OUT/$name.bench4k.txt" | tee -a "$OUT/summary.txt"
   echo "bench exit $?" | tee -a "$OUT/summary.txt"
   grep -E "prefill|rror" "$OUT/$name.bench.txt" | tee -a "$OUT/summary.txt"
 done

@@ -19,6 +19,10 @@
 
 namespace gufo::npu::runtime {
 
+/// Attention row maximum = the probed maximum (no lower clamp from the key-norm bound). Rows whose true maximum exceeds the probe by
+/// more than the bf16 range overflow and are reported as unusable, then recomputed by the caller. Needed for models with outlier keys.
+extern bool g_attn_tight_m;
+
 constexpr std::uint32_t kMaxRows = 16;
 constexpr std::uint32_t kTileK = 64;
 constexpr std::uint32_t kStrip = 128;
@@ -388,6 +392,10 @@ class AttnPrefill {
   /// Passes whose Q, header, bounds, tails and K/V chunks were built on the device by AttnDevPrep.
   bool RunManyDev(AttnLayer& al, AttnDevPrep& dp, const DevPass* passes, std::size_t np, NpuRuntime::Timings* tm);
   xrt::device& device() { return dev_; }
+  /// When set, rows whose softmax mass is unusable do not fail a pass: they are listed in bad_rows (absolute token, q-head slot r*4+hq)
+  /// and left for the caller to recompute.
+  bool collect_bad{false};
+  std::vector<std::pair<std::uint32_t, std::uint32_t>> bad_rows;
   /// Host reference of the A prefix of one pass (debug): the bytes Prep would send.
   bool DebugPrep(AttnLayer& al, std::uint32_t pos0, std::uint32_t n, const float* q, const std::uint16_t* k_hist, const std::uint16_t* v_hist, std::vector<std::uint8_t>* out);
   bool RunMany(AttnLayer& al, const Pass* passes, std::size_t np, const std::uint16_t* k_hist,
@@ -399,7 +407,7 @@ class AttnPrefill {
             const std::uint16_t* k_hist, const std::uint16_t* v_hist, std::uint32_t* mc_out);
   bool Launch(int slot, AttnLayer& al, std::uint32_t mc, xrt::run** run_out);
   bool LaunchDev(int slot, AttnLayer& al, AttnDevPrep& dp, std::uint32_t pass_idx, std::uint32_t mc, xrt::run** run_out);
-  bool Merge(int slot, std::uint32_t n, float* out);
+  bool Merge(int slot, std::uint32_t n, float* out, std::uint32_t pos0 = 0);
   std::string dir_;
   xrt::device dev_;
   xrt::hw_context ctx_;

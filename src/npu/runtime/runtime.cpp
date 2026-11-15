@@ -15,6 +15,8 @@
 
 namespace gufo::npu::runtime {
 
+bool g_attn_tight_m = false;
+
 
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -1219,7 +1221,7 @@ bool NpuRuntime::AttnRun(AttnLayer& al, std::uint32_t pos, std::uint32_t n, cons
         for (std::uint32_t tok = lo; tok <= last; ++tok) m = std::max(m, score(tok));
         // extra early-token probing only applies to the absolute (full) cache
         for (std::uint32_t tok = 0; !ring && tok < std::min(8u, lo); ++tok) m = std::max(m, score(tok));
-        m = std::min(std::max(m, bound - 100.f), bound);
+        if (!g_attn_tight_m) m = std::min(std::max(m, bound - 100.f), bound);
       } else {
         m = 0.f;
       }
@@ -1426,7 +1428,7 @@ bool AttnPrefill::Prep(int slot, AttnLayer& al, std::uint32_t pos0, std::uint32_
         };
         for (std::uint32_t tok = lo; tok <= last; ++tok) m = std::max(m, score(tok));
         for (std::uint32_t tok = 0; !ring && tok < std::min(8u, lo); ++tok) m = std::max(m, score(tok));
-        m = std::min(std::max(m, bound - 100.f), bound);
+        if (!g_attn_tight_m) m = std::min(std::max(m, bound - 100.f), bound);
       }
       mrow[i] = m;
     }
@@ -1485,7 +1487,7 @@ bool AttnPrefill::Launch(int slot, AttnLayer& al, std::uint32_t mc, xrt::run** r
   return true;
 }
 
-bool AttnPrefill::Merge(int slot, std::uint32_t n, float* out) {
+bool AttnPrefill::Merge(int slot, std::uint32_t n, float* out, std::uint32_t pos0) {
   const std::uint32_t qd = 16 * kAttnHd;
   int bad = 0;
 #pragma omp parallel for collapse(2) reduction(+ : bad)
@@ -1504,7 +1506,15 @@ bool AttnPrefill::Merge(int slot, std::uint32_t n, float* out) {
         const std::uint32_t rb = i / 8, rib = i % 8;
         float l = 0;
         for (int cc = 0; cc < 8; ++cc) l += lt[rb * 64 + rib * 8 + cc];
-        if (!(l > 1e-30f) || !(l < 1e30f)) { ++bad; continue; }
+        if (!(l > 1e-30f) || !(l < 1e30f)) {
+          if (collect_bad) {
+#pragma omp critical(attn_bad)
+            bad_rows.emplace_back(pos0 + 16 * c + t, static_cast<std::uint32_t>(r) * 4 + hq);
+          } else {
+            ++bad;
+          }
+          continue;
+        }
         const float inv = 1.0f / l;
         for (std::uint32_t db = 0; db < 16; ++db)
           for (int cc = 0; cc < 8; ++cc)
@@ -1560,7 +1570,7 @@ bool AttnPrefill::RunMany(AttnLayer& al, const Pass* ps, std::size_t np, const s
       c_[slot].sync(XCL_BO_SYNC_BO_FROM_DEVICE);
       if (tm) tm->attn_wait += Ms(t);
       t = Clock::now();
-      ok = Merge(slot, ps[i].n, ps[i].out) && ok;
+      ok = Merge(slot, ps[i].n, ps[i].out, ps[i].pos0) && ok;
       if (tm) { tm->attn_merge += Ms(t); ++tm->attn_calls; }
       if (i + 2 < np) {
         t = Clock::now();
@@ -1608,7 +1618,7 @@ bool AttnPrefill::RunMany(AttnLayer& al, const Pass* ps, std::size_t np, const s
     if (!nok) return false;
     if (next) next->start();
     t = Clock::now();
-    ok = Merge(slot, ps[i].n, ps[i].out) && ok;
+    ok = Merge(slot, ps[i].n, ps[i].out, ps[i].pos0) && ok;
     if (tm) { tm->attn_merge += Ms(t); ++tm->attn_calls; }
     d_merge += Ms(t);
     run = next;
@@ -1944,7 +1954,7 @@ bool AttnPrefill::RunManyDev(AttnLayer& al, AttnDevPrep& dp, const DevPass* ps, 
     c_[slot].sync(XCL_BO_SYNC_BO_FROM_DEVICE);
     if (tm) tm->attn_wait += Ms(t);
     t = Clock::now();
-    ok = Merge(slot, ps[i].n, ps[i].out) && ok;
+    ok = Merge(slot, ps[i].n, ps[i].out, ps[i].pos0) && ok;
     if (tm) { tm->attn_merge += Ms(t); ++tm->attn_calls; }
     if (i + 2 < np && !issue(i + 2)) return false;
   }
