@@ -37,8 +37,29 @@ void PackMatInt5(const float* W, std::uint32_t N, std::uint32_t K,
       float amax = 0;
       for (int i = 0; i < 32; ++i)
         amax = std::max(amax, std::fabs(row[i]));
-      std::uint16_t sb = Bf16Bits(amax / 15.0f);
+      const float qmax = g_decode_int4 ? 7.0f : 15.0f, qmin = g_decode_int4 ? -8.0f : -15.0f;
+      std::uint16_t sb = Bf16Bits(amax / qmax);
       float s = Bf16Float(sb);
+      if (g_decode_int4 && amax > 0) {
+        // 4 bits leave little room: pick the group scale (a few clipping levels) that minimises the squared error
+        float best = INFINITY;
+        for (const float mult : {1.0f, 0.93f, 0.86f, 0.8f, 0.74f}) {
+          const std::uint16_t cb = Bf16Bits(amax / qmax * mult);
+          const float cs = Bf16Float(cb);
+          if (cs == 0) continue;
+          float err = 0;
+          for (int i = 0; i < 32; ++i) {
+            const float qv = std::fmin(qmax, std::fmax(qmin, std::nearbyint(row[i] / cs)));
+            const float d = row[i] - qv * cs;
+            err += d * d;
+          }
+          if (err < best) {
+            best = err;
+            sb = cb;
+            s = cs;
+          }
+        }
+      }
       if (s == 0) {
         sb = Bf16Bits(1.0f);
         s = 1.0f;
@@ -46,7 +67,7 @@ void PackMatInt5(const float* W, std::uint32_t N, std::uint32_t K,
       sc[std::size_t(n) * (K / 32) + kg] = sb;
       for (int i = 0; i < 32; ++i)
         q[std::size_t(n) * K + kg * 32 + i] = static_cast<std::int8_t>(
-            std::fmin(15.f, std::fmax(-15.f, std::nearbyint(row[i] / s))));
+            std::fmin(qmax, std::fmax(qmin, std::nearbyint(row[i] / s))));
     }
   PackMatInt5Q(q.data(), sc.data(), N, K, dst, extra_tiles, tile_perm);
 }
@@ -59,18 +80,21 @@ void PackMatInt5Q(const std::int8_t* q, const std::uint16_t* sc, std::uint32_t N
     for (std::int64_t t = 0; t < tk; ++t)
       for (int r = 0; r < 4; ++r) {
         std::uint8_t* base =
-            dst + ((std::size_t(s2) * (tk + extra_tiles) + t) * 4 + r) * kQuarterBytes;
+            dst + ((std::size_t(s2) * (tk + extra_tiles) + t) * 4 + r) * QuarterBytesW();
         auto* words = reinterpret_cast<std::uint16_t*>(base);
-        auto* scl = reinterpret_cast<std::uint16_t*>(base + kWordBytes);
+        auto* scl = reinterpret_cast<std::uint16_t*>(base + WordBytesW());
         for (int p = 0; p < 32; ++p) {
           const int sb = p >> 4, sr = (p >> 1) & 7, blk = p & 1;
           for (int lane = 0; lane < 64; ++lane) {
             const int cib = lane >> 3, kk = lane & 7;
             const std::size_t nidx = std::size_t(s2) * 128 + r * 32 + sb * 16 +
                                      blk * 8 + cib;
-            const int x = q[nidx * K + (tile_perm ? tile_perm[t] : std::uint32_t(t)) * 64 + sr * 8 + kk] + 16;
-            words[(p / 3) * 64 + lane] |=
-                static_cast<std::uint16_t>(x << (5 * (p % 3)));
+            const int qv = q[nidx * K + (tile_perm ? tile_perm[t] : std::uint32_t(t)) * 64 + sr * 8 + kk];
+            if (g_decode_int4) {
+              words[(p / 4) * 64 + lane] |= static_cast<std::uint16_t>((qv + 8) << (4 * (p % 4)));
+            } else {
+              words[(p / 3) * 64 + lane] |= static_cast<std::uint16_t>((qv + 16) << (5 * (p % 3)));
+            }
           }
         }
         for (int sb = 0; sb < 2; ++sb)
@@ -85,7 +109,8 @@ void PackMatInt5Q(const std::int8_t* q, const std::uint16_t* sc, std::uint32_t N
       }
 }
 
-bool NpuRuntime::Init(const std::string& xclbin_path, std::string* error) {
+bool NpuRuntime::Init(const std::string& xclbin_path, std::string* error, bool int4) {
+  g_decode_int4 = int4;
   try {
     dev_ = xrt::device(0u);
     const xrt::xclbin xb{xclbin_path};
@@ -138,7 +163,7 @@ Program NpuRuntime::MakeProgram(std::uint32_t K, std::uint32_t N,
 WeightBuffer NpuRuntime::PackWeightQ(const std::int8_t* q, const std::uint16_t* sc, std::uint32_t N,
                                      std::uint32_t K) {
   WeightBuffer wb;
-  wb.bytes = std::size_t{N / kStrip} * (K / kTileK) * 4 * kQuarterBytes;
+  wb.bytes = std::size_t{N / kStrip} * (K / kTileK) * 4 * QuarterBytesW();
   wb.bo = xrt::bo(dev_, wb.bytes, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(3));
   wb.host = wb.bo.map<std::uint8_t*>();
   std::memset(wb.host, 0, wb.bytes);
@@ -150,7 +175,7 @@ WeightBuffer NpuRuntime::PackWeightQ(const std::int8_t* q, const std::uint16_t* 
 WeightBuffer NpuRuntime::PackWeight(const float* W, std::uint32_t N,
                                     std::uint32_t K) {
   WeightBuffer wb;
-  wb.bytes = std::size_t{N / kStrip} * (K / kTileK) * 4 * kQuarterBytes;
+  wb.bytes = std::size_t{N / kStrip} * (K / kTileK) * 4 * QuarterBytesW();
   wb.bo = xrt::bo(dev_, wb.bytes, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(3));
   wb.host = wb.bo.map<std::uint8_t*>();
   std::memset(wb.host, 0, wb.bytes);
@@ -170,7 +195,7 @@ WeightBuffer NpuRuntime::AllocWeightBo(std::size_t bytes, int group) {
 
 WeightBuffer NpuRuntime::PackWeightCached(WeightCache& cache, const std::string& tag, std::uint32_t N, std::uint32_t K,
                                           const std::function<const float*()>& fill) {
-  const std::size_t bytes = std::size_t{N / kStrip} * (K / kTileK) * 4 * kQuarterBytes;
+  const std::size_t bytes = std::size_t{N / kStrip} * (K / kTileK) * 4 * QuarterBytesW();
   if (cache.enabled()) {
     WeightBuffer wb = AllocWeightBo(bytes, 3);
     if (cache.Load(tag, wb.host, bytes)) {

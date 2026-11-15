@@ -39,13 +39,23 @@ __attribute__((noinline)) static void Unpack(const uint16_t *__restrict pw,
                                              const bfloat16 *__restrict ps) {
   aie::block_vector_output_buffer_stream<bfp16ebs8, 64> out(b_scratch);
   out.seek(0);
+#ifdef INT4
+  const aie::vector<uint16, 64> mask = aie::broadcast<uint16, 64>(15);
+  const aie::vector<bfloat16, 64> m144 = aie::broadcast<bfloat16, 64>((bfloat16)-136.0f);  // 128 (exponent trick) + bias 8
+#else
   const aie::vector<uint16, 64> mask = aie::broadcast<uint16, 64>(31);
-  const aie::vector<uint16, 64> magic = aie::broadcast<uint16, 64>(0x4300);
   const aie::vector<bfloat16, 64> m144 = aie::broadcast<bfloat16, 64>((bfloat16)-144.0f);
+#endif
+  const aie::vector<uint16, 64> magic = aie::broadcast<uint16, 64>(0x4300);
   for (int p = 0; p < 32; p++) {
     const int sb = p >> 4, sr = (p >> 1) & 7, blk = p & 1;
+#ifdef INT4
+    aie::vector<uint16, 64> w = aie::load_v<64>(pw + (p / 4) * 64);  // four 4-bit values per 16-bit word
+    aie::vector<uint16, 64> x = aie::bit_or(aie::bit_and(aie::downshift(w, 4 * (p % 4)), mask), magic);
+#else
     aie::vector<uint16, 64> w = aie::load_v<64>(pw + (p / 3) * 64);
     aie::vector<uint16, 64> x = aie::bit_or(aie::bit_and(aie::downshift(w, 5 * (p % 3)), mask), magic);
+#endif
     aie::vector<bfloat16, 64> s = ExpandScales(ps + (((sb * 2 + blk) * 2 + (sr >> 2)) * 8));
     aie::accum<accfloat, 64> a = aie::mul(x.cast_to<bfloat16>(), s);
     a = aie::mac(a, m144, s);
@@ -225,14 +235,27 @@ __attribute__((noinline)) static void FlushConv(const uint8_t *__restrict ctl_b,
     }
 }
 
+#ifdef INT4
+// The 4-bit decode xclbin carries no attention programs (its weight element is 1152 B, not the 1536 B attention chunks):
+// stubs keep the unified core program linkable and free its program memory.
+#else
 #include "attn_kernel.h"
+#endif
 
 extern "C" {
+#ifdef INT4
+void attn_begin(uint8_t *, int32_t) {}
+void attn_q(uint8_t *, int32_t, int32_t) {}
+void attn_tail(uint8_t *, int32_t, int32_t, int32_t) {}
+void attn_feed(uint8_t *, int32_t) {}
+void attn_out(uint8_t *, int32_t) {}
+#else
 void attn_begin(uint8_t *hdr, int32_t row_id) { AttnBegin(hdr, row_id); }
 void attn_q(uint8_t *pA, int32_t idx, int32_t row_id) { AttnQ(pA, idx, row_id); }
 void attn_tail(uint8_t *pA, int32_t idx, int32_t row_id, int32_t col_id) { AttnTailFeed(pA, idx, row_id, col_id); }
 void attn_feed(uint8_t *pB, int32_t col) { AttnFeed(pB, col); }
 void attn_out(uint8_t *pC, int32_t idx) { AttnOut(pC, idx); }
+#endif
 
 static int kc_p1 = 0;
 static int kc_dn = 0;
@@ -241,7 +264,11 @@ static int kc_dn = 0;
 // Returns true when the C tile (all k-tiles) is complete.
 __attribute__((noinline)) static bool TileStep(bfp16ebs8 *__restrict pA, uint8_t *__restrict pBp,
                                               int32_t kcnt, int *kc) {
+#ifdef INT4
+  if (g_m == 0) Unpack((const uint16_t *)pBp, (const bfloat16 *)(pBp + 1024));
+#else
   if (g_m == 0) Unpack((const uint16_t *)pBp, (const bfloat16 *)(pBp + 1408));
+#endif
   MacTile(pA, c_stage + g_m * kRows * kCols, *kc == 0);
   if (++g_m < g_mrows) return false;
   g_m = 0;

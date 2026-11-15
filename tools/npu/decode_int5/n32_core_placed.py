@@ -83,7 +83,7 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None, 
     @device(dev_ty)
     def device_body():
         A_ty = np.ndarray[(m, k // 8), np.dtype[dtype]]
-        BQ = 1536
+        BQ = int(os.environ.get("QBYTES", "1536"))  # bytes of one packed weight element: 1536 (5-bit values) or 1152 (4-bit)
         B_l2_ty = np.ndarray[(n_aie_rows * BQ,), np.dtype[np.uint8]]
         B_l1_ty = np.ndarray[(BQ,), np.dtype[np.uint8]]
         # One 1 KB C element per core row and row-block: a 64-row program emits mrows elements per strip.

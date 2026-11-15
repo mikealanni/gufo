@@ -29,6 +29,11 @@ constexpr std::uint32_t kTileK = 64;
 constexpr std::uint32_t kStrip = 128;
 constexpr std::uint32_t kQuarterBytes = 1536;
 constexpr std::uint32_t kWordBytes = 1408;
+// Decode weight stream format: 5-bit values (three per 16-bit word, 1536 B per 2048 weights) or 4-bit values (four per word, 1152 B).
+// The choice is made by the decode xclbin that is loaded (NpuRuntime::Init), and applies to the packers and byte counts below.
+inline bool g_decode_int4 = false;
+inline std::uint32_t QuarterBytesW() { return g_decode_int4 ? 1152 : 1536; }
+inline std::uint32_t WordBytesW() { return g_decode_int4 ? 1024 : 1408; }
 // C staging: one 1024 B slot per core row and strip (576 B used by bfp16 tiles).
 // C staging: one 1 KB element per core row and row-block. A strip of an m-row-block program is
 // [row-block][core row][kRowBytes], i.e. mrows * kStripBytes bytes.
@@ -195,7 +200,8 @@ class NpuRuntime {
  public:
   NpuRuntime() = default;
   /// Load device + xclbin + kernel. `xclbin_path` selects the built program.
-  bool Init(const std::string& xclbin_path, std::string* error);
+  /// int4: the xclbin streams 4-bit weights (see g_decode_int4).
+  bool Init(const std::string& xclbin_path, std::string* error, bool int4 = false);
 
   xrt::device& device() { return dev_; }
   xrt::kernel& kernel() { return kern_; }

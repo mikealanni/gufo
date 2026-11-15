@@ -20,7 +20,7 @@ gen_plain() {
   aiecc --aietools="${AIETOOLS:?}" --alloc-scheme=basic-sequential --no-compile --no-link \
     --no-xchesscc --aie-generate-npu-insts --unified --dynamic-objFifos \
     --npu-insts-name="$work/i.txt" "$work/a.mlir" >/dev/null
-  mv "$work/i.txt" "$dir/runtime/$out"
+  mv "$work/i.txt" "${INSTS_DIR:-$dir/runtime}/$out"
   echo "generated $out (plain ${K}x${N})"
 }
 
@@ -33,7 +33,7 @@ gen_ffn() {
   aiecc --aietools="${AIETOOLS:?}" --alloc-scheme=basic-sequential --no-compile --no-link \
     --no-xchesscc --aie-generate-npu-insts --unified --dynamic-objFifos \
     --npu-insts-name="$work/i.txt" "$work/a.mlir" >/dev/null
-  mv "$work/i.txt" "$dir/runtime/$out"
+  mv "$work/i.txt" "${INSTS_DIR:-$dir/runtime}/$out"
   echo "generated $out (ffn ${K1}x${N1} -> ${K2}x${N2})"
 }
 
@@ -47,7 +47,7 @@ gen_conv() {
   aiecc --aietools="${AIETOOLS:?}" --alloc-scheme=basic-sequential --no-compile --no-link \
     --no-xchesscc --aie-generate-npu-insts --unified --dynamic-objFifos \
     --npu-insts-name="$work/i.txt" "$work/a.mlir" >/dev/null
-  mv "$work/i.txt" "$dir/runtime/$out"
+  mv "$work/i.txt" "${INSTS_DIR:-$dir/runtime}/$out"
   echo "generated $out (conv ${H}: in_proj ${N1} -> out_proj ${H}, mrows=${MR})"
 }
 
@@ -72,7 +72,7 @@ gen_argmax() {
   python3 "$dir/n32_core_placed.py" -m 16 -k 64 -n 128 -M 16 -K "$K" -N "$K" --mode argmax \
     --k2 "$K" --n2 "$N" >"$work/a.mlir"
   aiecc --aietools="${AIETOOLS:?}" --alloc-scheme=basic-sequential --no-compile --no-link     --no-xchesscc --aie-generate-npu-insts --unified --dynamic-objFifos     --npu-insts-name="$work/i.txt" "$work/a.mlir" >/dev/null
-  mv "$work/i.txt" "$dir/runtime/$out"
+  mv "$work/i.txt" "${INSTS_DIR:-$dir/runtime}/$out"
   echo "generated $out (argmax ${K}x${N})"
 }
 

@@ -665,8 +665,8 @@ struct Engine {
         L.out = rt.PackWeight(buf.data(), h_p, qd);
       }
       if (wc) {
-        const std::size_t gu_b = std::size_t{gu_strips} * (H / kTileK) * 4 * kQuarterBytes;
-        const std::size_t dn_b = std::size_t{h_p / kStripRows} * (I / kTileK) * 4 * kQuarterBytes;
+        const std::size_t gu_b = std::size_t{gu_strips} * (H / kTileK) * 4 * QuarterBytesW();
+        const std::size_t dn_b = std::size_t{h_p / kStripRows} * (I / kTileK) * 4 * QuarterBytesW();
         const auto load_down = [&]() -> const float* {
           buf.assign(std::size_t{h_p} * I, 0.f);
           st.Load(pre + "mlp.down_proj.weight", buf.data(), std::size_t{H} * I);
@@ -700,8 +700,8 @@ struct Engine {
           std::memcpy(&buf[(f * 16 + i) * H], &gate[(f * 8 + i) * H], H * 4);
           std::memcpy(&buf[(f * 16 + 8 + i) * H], &up[(f * 8 + i) * H], H * 4);
         }
-      const std::size_t gu_bytes = std::size_t{gu_strips} * (H / kTileK) * 4 * kQuarterBytes;
-      const std::size_t dn_bytes = std::size_t{h_p / kStripRows} * (I / kTileK) * 4 * kQuarterBytes;
+      const std::size_t gu_bytes = std::size_t{gu_strips} * (H / kTileK) * 4 * QuarterBytesW();
+      const std::size_t dn_bytes = std::size_t{h_p / kStripRows} * (I / kTileK) * 4 * QuarterBytesW();
       WeightBuffer m;
       m.bytes = gu_bytes + dn_bytes;
       m.bo = xrt::bo(rt.device(), m.bytes, XRT_BO_FLAGS_HOST_ONLY, rt.kernel().group_id(3));
@@ -1643,6 +1643,9 @@ struct HybridEngine : Engine {
   std::vector<LmState> row0, row1;  // delta-net state after the first / second row of a 2-3 row step (a draft may be rejected there)
   std::uint32_t n_exp{0}, n_used{0};
   bool dec_ok{false};   // int5 stream-bound decode path available (language-model mode)
+  bool dec_int4{false};  // the decode programs stream 4-bit weights (programs/q4)
+  std::string dec_pre;   // "q4/" when dec_int4: where the decode xclbin and instruction streams live below `programs`
+  std::string qtag{"q5."};  // weight cache prefix of the decode copies (format dependent)
   bool use_dec{false};  // the current Step runs on it (few rows)
   std::vector<float> s_gu, s_act, s_dn;
   int moe_threads{std::getenv("GEN_MOE_THREADS") ? std::atoi(std::getenv("GEN_MOE_THREADS")) : 8};  // per host stage of the expert pipeline
@@ -1728,7 +1731,10 @@ struct HybridEngine : Engine {
     }
     kd = true;
     dec_ok = lm_mode && !std::getenv("GEN_NO_INT5_DECODE");
-    if (dec_ok && !rt.Init(programs + "/final_16x64x128_ffn.xclbin", &err)) {
+    dec_int4 = dec_ok && !std::getenv("GEN_INT5") && std::ifstream(programs + "/q4/final_16x64x128_ffn.xclbin").good();
+    dec_pre = dec_int4 ? "q4/" : "";
+    qtag = dec_int4 ? "q4." : "q5.";
+    if (dec_ok && !rt.Init(programs + "/" + dec_pre + "final_16x64x128_ffn.xclbin", &err, dec_int4)) {
       std::fprintf(stderr, "npu init (decode): %s\n", err.c_str());
       dec_ok = false;
     }
@@ -1826,21 +1832,24 @@ struct HybridEngine : Engine {
     }
     kxn = std::max({H, qd, I, kValDim});
     kyn = std::max<std::size_t>(kGdnInN, h_p);
-    const auto plain_name = [](std::uint32_t K, std::uint32_t N) { return "insts_plain_" + std::to_string(K) + "x" + std::to_string(N) + ".txt"; };
+    const auto plain_name = [this](std::uint32_t K, std::uint32_t N) { return dec_pre + "insts_plain_" + std::to_string(K) + "x" + std::to_string(N) + ".txt"; };
+    const auto base_name = [](const std::string& f) { return f.substr(f.rfind('/') + 1); };
+    // 4-bit decode programs are generated for the 1152-byte weight element into programs/q4
+    const std::string gen_env = dec_int4 ? "QBYTES=1152 INSTS_DIR=" + programs + "/q4 " : "";
     const std::uint32_t vp_n = PadN(c.vocab);
     if (dec_ok) {
       const std::string gi = "bash " + programs + "/../gen_insts.sh ";
       const auto n = [](std::uint32_t v) { return std::to_string(v); };
       for (const auto& kn : {std::pair{H, kGdnInN}, std::pair{kValDim, h_p}, std::pair{H, attn_n}, std::pair{qd, h_p}})
-        NeedInsts(programs, plain_name(kn.first, kn.second), gi + "plain " + n(kn.first) + " " + n(kn.second));
-      nm.ffn16 = "insts_ffn_" + n(H) + "x" + n(I) + ".txt";
-      NeedInsts(programs, nm.ffn16, gi + "ffn " + n(H) + " " + n(2 * I) + " " + n(I) + " " + n(h_p) + " 1 " + nm.ffn16);
+        NeedInsts(programs, plain_name(kn.first, kn.second), gen_env + gi + "plain " + n(kn.first) + " " + n(kn.second));
+      nm.ffn16 = dec_pre + "insts_ffn_" + n(H) + "x" + n(I) + ".txt";
+      NeedInsts(programs, nm.ffn16, gen_env + gi + "ffn " + n(H) + " " + n(2 * I) + " " + n(I) + " " + n(h_p) + " 1 " + base_name(nm.ffn16));
       gu_strips = 2 * I / kStripRows;
-      nm.argmax = "insts_argmax_" + n(H) + "x" + n(vp_n) + ".txt";
-      NeedInsts(programs, nm.argmax, gi + "argmax " + n(H) + " " + n(vp_n) + " " + nm.argmax);
+      nm.argmax = dec_pre + "insts_argmax_" + n(H) + "x" + n(vp_n) + ".txt";
+      NeedInsts(programs, nm.argmax, gen_env + gi + "argmax " + n(H) + " " + n(vp_n) + " " + base_name(nm.argmax));
       p_argmax = rt.MakeProgram(H, vp_n, programs + "/" + nm.argmax, 0, &err);
       std::vector<float> argbuf;
-      w_argmax = rt.PackWeightCached(wcache, "argmax", vp_n, H, [&]() -> const float* {
+      w_argmax = rt.PackWeightCached(wcache, qtag + "argmax", vp_n, H, [&]() -> const float* {
         argbuf.assign(std::size_t{vp_n} * H, 0.f);
 #pragma omp parallel for
         for (std::int64_t i = 0; i < static_cast<std::int64_t>(std::size_t{c.vocab} * H); ++i) argbuf[i] = Bf(head_bf[i]);
@@ -2000,13 +2009,13 @@ struct HybridEngine : Engine {
           // int5 decode copy of the layer: m16 programs on the decode xclbin, streamed once per token
           std::vector<float> gu_buf, dn_buf;
           const std::uint32_t ko = h.linear ? kValDim : qd;
-          L.dq_in = rt.PackWeightCached(wcache, b + "q5.in", in_rows, H, load_in);
-          L.dq_o = rt.PackWeightCached(wcache, b + "q5.o", h_p, ko, load_o);
+          L.dq_in = rt.PackWeightCached(wcache, b + qtag + "in", in_rows, H, load_in);
+          L.dq_o = rt.PackWeightCached(wcache, b + qtag + "o", h_p, ko, load_o);
           {
-            const std::size_t gu_b = std::size_t{gu_strips} * (H / kTileK) * 4 * kQuarterBytes;
-            const std::size_t dn_b = std::size_t{h_p / kStripRows} * (I / kTileK) * 4 * kQuarterBytes;
+            const std::size_t gu_b = std::size_t{gu_strips} * (H / kTileK) * 4 * QuarterBytesW();
+            const std::size_t dn_b = std::size_t{h_p / kStripRows} * (I / kTileK) * 4 * QuarterBytesW();
             L.dq_ffn = rt.AllocWeightBo(gu_b + dn_b, 3);
-            if (!wcache.Load(b + "q5.ffn", L.dq_ffn.host, L.dq_ffn.bytes)) {
+            if (!wcache.Load(b + qtag + "ffn", L.dq_ffn.host, L.dq_ffn.bytes)) {
               ensure();
               gu_buf.resize(std::size_t{2 * I} * H);
               for (std::size_t f = 0; f < I / 8; ++f)
@@ -2018,7 +2027,7 @@ struct HybridEngine : Engine {
               std::memcpy(dn_buf.data(), down.data(), down.size() * 4);
               PackMatInt5(gu_buf.data(), 2 * I, H, L.dq_ffn.host);
               PackMatInt5(dn_buf.data(), h_p, I, L.dq_ffn.host + gu_b);
-              wcache.Store(b + "q5.ffn", L.dq_ffn.host, L.dq_ffn.bytes);
+              wcache.Store(b + qtag + "ffn", L.dq_ffn.host, L.dq_ffn.bytes);
             }
             L.dq_ffn.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
           }
@@ -2046,9 +2055,9 @@ struct HybridEngine : Engine {
       const std::string gi = "bash " + programs + "/../gen_insts.sh ";
       const std::string gk = "bash " + programs + "/../kdh/gen_kdh.sh ";
       const std::string kn = "insts_kdh_1024x" + std::to_string(2 * H) + "x" + std::to_string(h_p);
-      NeedInsts(programs, plain_name(2 * H, h_p), gi + "plain " + std::to_string(2 * H) + " " + std::to_string(h_p));
+      NeedInsts(programs, plain_name(2 * H, h_p), gen_env + gi + "plain " + std::to_string(2 * H) + " " + std::to_string(h_p));
       NeedInsts(programs, kn + ".txt", gk + kn + " " + std::to_string(c.inter) + " -M 1024 -K " + std::to_string(2 * H) + " -N " + std::to_string(h_p));
-      mtp_dq_eh = rt.PackWeightCached(wcache, "mtp.q5.eh", h_p, 2 * H, load_eh);
+      mtp_dq_eh = rt.PackWeightCached(wcache, "mtp." + qtag + "eh", h_p, 2 * H, load_eh);
       mtp_dp_eh = rt.MakeProgram(2 * H, h_p, programs + "/" + plain_name(2 * H, h_p), 0, &err);
       mtp_kq_eh = rk.PackWeightAtbCached(wcache, "mtp.kd.eh", h_p, 2 * H, 4, load_eh);
       mtp_kp_eh = rk.MakeProgram(2 * H, h_p, programs + "/" + kn + ".txt", std::size_t{1024} * h_p / 8 * 9, &err, 0, 64, 3, 5);
@@ -2440,7 +2449,7 @@ struct HybridEngine : Engine {
 
   void PackExperts(Layer& L, const Safetensors& st, const std::string& b) {
     const std::uint32_t H = c.hidden, SI = slice_i, h_p = PadN(H);
-    const std::string tag_kd = b + "kd.experts", tag_q5 = b + "q5.experts";
+    const std::string tag_kd = b + "kd.experts", tag_q5 = b + qtag + "experts";
     const std::size_t per_kd = ex_a + ex_d, per_q5 = ex_qa + ex_qd;
     L.exp_kd = std::make_shared<ExpertBlob>();
     L.exp_kd->len = per_kd * n_exp;
@@ -2505,8 +2514,8 @@ struct HybridEngine : Engine {
     const std::uint32_t H = c.hidden, SI = slice_i, h_p = PadN(H);
     ex_a = std::size_t{H} * (2 * SI) / 8 * 9;
     ex_d = std::size_t{SI} * h_p / 8 * 9;
-    ex_qa = std::size_t{(2 * SI) / kStrip} * (H / kTileK) * 4 * kQuarterBytes;
-    ex_qd = std::size_t{h_p / kStripRows} * (SI / kTileK) * 4 * kQuarterBytes;
+    ex_qa = std::size_t{(2 * SI) / kStrip} * (H / kTileK) * 4 * QuarterBytesW();
+    ex_qd = std::size_t{h_p / kStripRows} * (SI / kTileK) * 4 * QuarterBytesW();
     const std::size_t abytes = std::size_t{1024} * SI / 8 * 9;
     for (ExpertSet& e : es) {
       e.swc = rk.MakeBo(2 * abytes, 3);
@@ -2952,6 +2961,47 @@ int DecideEval(const char* model, const char* programs, const char* path, const 
 }  // namespace
 
 // Timing probe of one int5 m64 program: gemmbench64 PROGRAMS INSTS K N
+// Teacher-forced negative log-likelihood of a text on a hybrid model: `kd` runs the exact bfp16 prefill path in one pass,
+// `dec` feeds the same tokens one at a time through the decode path (int5 or int4 weights). The gap between the two is the decode quantisation cost.
+int HybridQuality(const char* model, const char* programs, const char* text_path, std::uint32_t ntok, const std::string& mode) {
+  std::string e;
+  auto reader = gufo::core::GgufReader::OpenFile(model, &e);
+  if (!reader) return 1;
+  auto tok = gufo::tokenization::QwenTokenizer::CreateFromGguf(*reader, &e);
+  if (!tok) return 1;
+  std::ifstream f(text_path);
+  const std::string text((std::istreambuf_iterator<char>(f)), {});
+  std::vector<std::uint32_t> ids = tok->Encode(text);
+  if (ids.size() > ntok) ids.resize(ntok);
+  HybridEngine g;
+  if (!g.Init(model, programs, static_cast<std::uint32_t>(ids.size()) + 64)) return 1;
+  const std::uint32_t H = g.c.hidden;
+  std::vector<float> hd, lg(g.c.vocab);
+  double nll = 0;
+  std::uint32_t counted = 0;
+  const auto score = [&](const float* h, std::uint32_t target) {
+#pragma omp parallel for
+    for (std::int64_t v = 0; v < g.c.vocab; ++v) lg[v] = g.LogitAt(h, static_cast<std::uint32_t>(v));
+    float mx = -INFINITY;
+    for (float v : lg) mx = std::max(mx, v);
+    double den = 0;
+    for (float v : lg) den += std::exp(v - mx);
+    nll += std::log(den) + mx - lg[target];
+    ++counted;
+  };
+  if (mode == "kd") {
+    g.Step(ids.data(), static_cast<std::uint32_t>(ids.size()), &hd);
+    for (std::uint32_t t = 0; t + 1 < ids.size(); ++t) score(&hd[std::size_t{t} * H], ids[t + 1]);
+  } else {
+    for (std::uint32_t t = 0; t + 1 < ids.size(); ++t) {
+      g.Step(&ids[t], 1, &hd);
+      score(hd.data(), ids[t + 1]);
+    }
+  }
+  std::printf("%s: %u tokens, NLL %.4f (ppl %.2f)\n", mode.c_str(), counted, nll / counted, std::exp(nll / counted));
+  return 0;
+}
+
 int GemmBench64(const char* prog_dir, const char* inst, std::uint32_t K, std::uint32_t N) {
   NpuRuntime rt;
   std::string err;
@@ -3502,6 +3552,7 @@ int main(int argc, char** argv) {
   if (argc >= 4 && std::string(argv[1]) == "interactive") return Interactive(argv[2], argv[3]);
   if (argc >= 5 && std::string(argv[1]) == "chat") return Chat(argv[2], argv[3], argv[4], argc > 5 ? std::atoi(argv[5]) : 256, false, 0);
   if (argc >= 5 && std::string(argv[1]) == "bench") return Chat(argv[2], argv[3], "", static_cast<std::uint32_t>(std::atoi(argv[5 < argc ? 5 : 4])), true, static_cast<std::uint32_t>(std::atoi(argv[4])));
+  if (argc == 7 && std::string(argv[1]) == "quality") return HybridQuality(argv[2], argv[3], argv[4], static_cast<std::uint32_t>(std::atoi(argv[5])), argv[6]);
   if (argc == 6 && std::string(argv[1]) == "gemmbench64") return GemmBench64(argv[2], argv[3], std::atoi(argv[4]), std::atoi(argv[5]));
   if (argc == 6 && std::string(argv[1]) == "gemmtest") return GemmTest(argv[2], argv[3], std::atoi(argv[4]), std::atoi(argv[5]));
   if (argc < 5) {
