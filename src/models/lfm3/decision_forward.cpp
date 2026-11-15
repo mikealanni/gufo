@@ -3,16 +3,16 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <thread>
-#include <cstdio>
-#include <cstdlib>
 namespace gufo::models::lfm3 {
 namespace {
 using Matrix = std::vector<float>;
 
-template <typename Fn>
+template<typename Fn>
 void ParallelFor(std::size_t count, unsigned threads, Fn fn) {
   std::atomic<std::size_t> next{0};
   auto work = [&] {
@@ -169,8 +169,7 @@ std::vector<float> DecisionForward(const Weights& w,
         for (std::size_t d = 0; d < D; ++d) {
           float sum = 0;
           for (std::size_t i = 0; i < keys.size(); ++i)
-            sum += (scores[i] / den) *
-                   v[keys[i] * kh_count * D + kh * D + d];
+            sum += (scores[i] / den) * v[keys[i] * kh_count * D + kh * D + d];
           av[d] = sum * g;
         }
       });
@@ -195,9 +194,10 @@ std::vector<float> DecisionForward(const Weights& w,
       double mean = 0;
       for (float v : x)
         mean += std::abs(v);
-      std::fprintf(stderr, "[d1 host] layer %zu mean|x| %.5f last %.4f %.4f %.4f %.4f\n",
-                   il, mean / x.size(), x[(n - 1) * H], x[(n - 1) * H + 1],
-                   x[(n - 1) * H + 2], x[(n - 1) * H + 3]);
+      std::fprintf(
+          stderr, "[d1 host] layer %zu mean|x| %.5f last %.4f %.4f %.4f %.4f\n",
+          il, mean / x.size(), x[(n - 1) * H], x[(n - 1) * H + 1],
+          x[(n - 1) * H + 2], x[(n - 1) * H + 3]);
     }
   }
   Matrix hidden(slots.size() * H);

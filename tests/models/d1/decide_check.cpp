@@ -17,7 +17,8 @@ int main(int argc, char** argv) {
   using namespace gufo;
   using namespace gufo::models;
   if (argc < 3) {
-    std::cerr << "usage: d1_decide_check MODEL.gguf REQUEST.json [pack|single]\n";
+    std::cerr
+        << "usage: d1_decide_check MODEL.gguf REQUEST.json [pack|single]\n";
     return 2;
   }
   const bool single = argc > 3 && std::string(argv[3]) == "single";
@@ -36,7 +37,8 @@ int main(int argc, char** argv) {
   std::string text;
   {
     std::FILE* f = std::fopen(argv[2], "rb");
-    if (!f) return 1;
+    if (!f)
+      return 1;
     char buf[4096];
     for (std::size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;)
       text.append(buf, n);
@@ -48,8 +50,9 @@ int main(int argc, char** argv) {
   std::vector<d1::Question> questions;
   for (const auto& [name, value] : qs->members()) {
     auto q = d1::ParseQuestion(*tokenizer, name, value);
-    q.temperature = reader->GetMetadataFloat32("lfm3.decision.temperature." + q.type)
-                        .value_or(1);
+    q.temperature =
+        reader->GetMetadataFloat32("lfm3.decision.temperature." + q.type)
+            .value_or(1);
     questions.push_back(std::move(q));
   }
   std::string prefix(tokenizer->Piece(tokenizer->Bos()));
@@ -69,7 +72,8 @@ int main(int argc, char** argv) {
     for (auto& forms : q.readout)
       for (auto& id : forms) {
         auto [at, added] = columns.emplace(id, vocabulary.size());
-        if (added) vocabulary.push_back(id);
+        if (added)
+          vocabulary.push_back(id);
         id = at->second;
       }
   auto answers = json::Value::object();
@@ -88,11 +92,13 @@ int main(int argc, char** argv) {
     tokens_run += prompt.tokens.size();
     for (std::size_t i = 0; i < count; ++i)
       answers[own[i].name] = d1::ReadAnswer(
-          own[i], std::span(logits).subspan(i * vocabulary.size(),
-                                            vocabulary.size()));
+          own[i],
+          std::span(logits).subspan(i * vocabulary.size(), vocabulary.size()));
   }
   const double ms = std::chrono::duration<double, std::milli>(
-                        std::chrono::steady_clock::now() - start).count();
-  std::cout << answers.dump() << "\ntokens " << tokens_run << " ms " << ms << '\n';
+                        std::chrono::steady_clock::now() - start)
+                        .count();
+  std::cout << answers.dump() << "\ntokens " << tokens_run << " ms " << ms
+            << '\n';
   return 0;
 }

@@ -15,11 +15,12 @@ enum class FfnKind { kSwiGLU, kGeGLU, kPlain };
 enum class BitWidth { kInt4, kInt5, kInt6, kBf16, kQ8 };
 
 struct GemmOp {
-  std::string name;           // logical name / program key
-  std::string weight;         // tensor base name (without layer prefix) or full name
+  std::string name;    // logical name / program key
+  std::string weight;  // tensor base name (without layer prefix) or full name
   std::uint32_t K{0};
   std::uint32_t N{0};
-  std::string mode{"plain"};  // "plain" or "ffn" (phase2) - used for inst selection
+  std::string mode{
+      "plain"};  // "plain" or "ffn" (phase2) - used for inst selection
   // For fused FFN: gate/up/down packed together; handled specially.
   bool fused_ffn{false};
 };
@@ -60,7 +61,7 @@ struct FfnOp {
 struct LayerSpec {
   LayerKind kind{LayerKind::kAttention};
   std::string norm{"operator_norm.weight"};
-  std::string post_norm;      // empty => residual add without post norm
+  std::string post_norm;  // empty => residual add without post norm
   std::string ffn_norm{"ffn_norm.weight"};
   std::string post_ffn_norm;  // empty => residual add without post norm
   AttentionOp attention;
@@ -81,7 +82,8 @@ struct ModelSpec {
   std::uint32_t layers{0};
   std::uint32_t context{0};
   float norm_eps{1e-5f};
-  std::vector<LayerSpec> layer_specs;  // per-layer (can be 1 pattern repeated) or explicit
+  std::vector<LayerSpec>
+      layer_specs;  // per-layer (can be 1 pattern repeated) or explicit
   std::string output_norm{"output_norm.weight"};
   EmbeddingSpec embedding;
   std::uint32_t eos_id{0};
@@ -99,8 +101,9 @@ struct ModelSpec {
   };
   std::vector<ProgramNeed> RequiredPrograms() const;
 
-  /// Validate shape constraints for the current GEMM program (K%64==0, N%1024==0, rows<=16).
-  /// Returns list of violation messages (empty => ok, possibly after padding).
+  /// Validate shape constraints for the current GEMM program (K%64==0,
+  /// N%1024==0, rows<=16). Returns list of violation messages (empty => ok,
+  /// possibly after padding).
   std::vector<std::string> ValidateConstraints() const;
 
   static std::optional<ModelSpec> LoadJsonFile(const std::string& path,

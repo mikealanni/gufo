@@ -21,13 +21,13 @@
 
 #include <cassert>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <vector>
-#include <cstdio>
 
 namespace gufo::npu::atb {
 
-inline std::vector<uint8_t> floatToBfp16(int block, int size, float *array,
+inline std::vector<uint8_t> floatToBfp16(int block, int size, float* array,
                                          int rounding = 0) {
   std::vector<uint8_t> res(size * 1.125);
 
@@ -45,26 +45,26 @@ inline std::vector<uint8_t> floatToBfp16(int block, int size, float *array,
     // Find max exp
     maxExp = 0;
     for (i = start; i < end; i++) {
-      p = (unsigned int *)(array + i);
-      exp = *p >> 23;    // Get rid of mantissa
-      exp &= 0x000000FF; // Keep the last 8 bit exponent (remove sign)
+      p = (unsigned int*)(array + i);
+      exp = *p >> 23;     // Get rid of mantissa
+      exp &= 0x000000FF;  // Keep the last 8 bit exponent (remove sign)
 
       maxExp = maxExp < exp ? exp : maxExp;
     }
 
     // Round each number
     for (i = start; i < end; i++) {
-      p = (unsigned int *)(array + i);
+      p = (unsigned int*)(array + i);
 
-      sign = *p & 0x80000000;     // Sign
-      exp = *p >> 23;             // Get rid of mantissa
-      exp &= 0x000000FF;          // Keep the last 8 bit exponent (remove sign)
-      mantissa = *p & 0x007FFFFF; // 23-bit mantissa
+      sign = *p & 0x80000000;      // Sign
+      exp = *p >> 23;              // Get rid of mantissa
+      exp &= 0x000000FF;           // Keep the last 8 bit exponent (remove sign)
+      mantissa = *p & 0x007FFFFF;  // 23-bit mantissa
       if (exp)
-        mantissa |= 0x00800000; // add the implicit for normal value
+        mantissa |= 0x00800000;  // add the implicit for normal value
 
       if (exp >= 255)
-        continue; // Infinity or NaN remains
+        continue;  // Infinity or NaN remains
 
       // The rouding mode for the mantissa in AIE2p is always truncation
       // Each scalar value is stored in two's complement representation
@@ -95,7 +95,7 @@ inline std::vector<uint8_t> floatToBfp16(int block, int size, float *array,
   return res;
 }
 
-inline std::vector<float> bfp16ebs8ToFloat(int size, uint8_t *array,
+inline std::vector<float> bfp16ebs8ToFloat(int size, uint8_t* array,
                                            int verbose = 0) {
   std::vector<float> res(size / 1.125);
 
@@ -134,9 +134,8 @@ inline std::vector<float> bfp16ebs8ToFloat(int size, uint8_t *array,
   return res;
 }
 
-inline std::vector<float>
-layout_transpose_1x2_8x8block(const std::vector<float> &input, int rows,
-                              int cols) {
+inline std::vector<float> layout_transpose_1x2_8x8block(
+    const std::vector<float>& input, int rows, int cols) {
   assert(rows % 8 == 0 && "rows must be divisible by 8");
   assert(cols % 8 == 0 && "cols must be divisible by 8");
   assert((cols / 8) % 2 == 0 && "cols/8 must be divisible by 2 for 1x2 layout");
@@ -169,9 +168,9 @@ layout_transpose_1x2_8x8block(const std::vector<float> &input, int rows,
   return output;
 }
 
-inline std::vector<float>
-layout_transpose_L1_1x2_8x8block(const std::vector<float> &input, int rows,
-                                 int cols, int L1_block_k, int L1_block_n) {
+inline std::vector<float> layout_transpose_L1_1x2_8x8block(
+    const std::vector<float>& input, int rows, int cols, int L1_block_k,
+    int L1_block_n) {
   assert(rows % L1_block_k == 0 && "rows must be divisible by L1_block_k");
   assert(cols % L1_block_n == 0 && "cols must be divisible by L1_block_n");
   assert(L1_block_k % 8 == 0 && "L1_block_k must be divisible by 8");
@@ -207,7 +206,7 @@ layout_transpose_L1_1x2_8x8block(const std::vector<float> &input, int rows,
   return output;
 }
 
-inline std::vector<float> layout_A_2x1_8x8block(const std::vector<float> &input,
+inline std::vector<float> layout_A_2x1_8x8block(const std::vector<float>& input,
                                                 int rows, int cols) {
   assert(rows % 8 == 0 && "rows must be divisible by 8");
   assert(cols % 8 == 0 && "cols must be divisible by 8");
@@ -239,9 +238,9 @@ inline std::vector<float> layout_A_2x1_8x8block(const std::vector<float> &input,
   return output;
 }
 
-inline std::vector<float>
-layout_A_L1_2x1_8x8block(const std::vector<float> &input, int rows, int cols,
-                         int L1_block_m, int L1_block_k) {
+inline std::vector<float> layout_A_L1_2x1_8x8block(
+    const std::vector<float>& input, int rows, int cols, int L1_block_m,
+    int L1_block_k) {
   assert(rows % L1_block_m == 0 && "rows must be divisible by L1_block_m");
   assert(cols % L1_block_k == 0 && "cols must be divisible by L1_block_k");
   assert(L1_block_m % 8 == 0 && "L1_block_m must be divisible by 8");
@@ -272,9 +271,8 @@ layout_A_L1_2x1_8x8block(const std::vector<float> &input, int rows, int cols,
   return output;
 }
 
-inline std::vector<float>
-layout_inverse_C_2x2_8x8block(const std::vector<float> &input, int L1_block_m,
-                              int L1_block_n) {
+inline std::vector<float> layout_inverse_C_2x2_8x8block(
+    const std::vector<float>& input, int L1_block_m, int L1_block_n) {
   std::vector<float> output(L1_block_m * L1_block_n);
   int input_idx = 0;
   int blocks_per_row = L1_block_n / 8;
@@ -302,9 +300,9 @@ layout_inverse_C_2x2_8x8block(const std::vector<float> &input, int L1_block_m,
   return output;
 }
 
-inline std::vector<float>
-layout_inverse_C_L1_2x2_8x8block(const std::vector<float> &input, int M, int N,
-                                 int L1_block_m, int L1_block_n) {
+inline std::vector<float> layout_inverse_C_L1_2x2_8x8block(
+    const std::vector<float>& input, int M, int N, int L1_block_m,
+    int L1_block_n) {
   assert(M % L1_block_m == 0 && "M must be divisible by L1_block_m");
   assert(N % L1_block_n == 0 && "N must be divisible by L1_block_n");
   assert(L1_block_m % 16 == 0 &&

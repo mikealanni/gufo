@@ -10,30 +10,38 @@
 // distinct contexts and an oversized state.
 int main(int argc, char** argv) {
   using namespace gufo;
-  if (argc < 2) return 2;
+  if (argc < 2)
+    return 2;
   std::string error;
   auto reader = core::GgufReader::OpenFile(argv[1], &error);
-  auto weights = reader ? models::lfm3::Weights::Bind(*reader, &error) : std::nullopt;
+  auto weights =
+      reader ? models::lfm3::Weights::Bind(*reader, &error) : std::nullopt;
   if (!weights) {
     std::cerr << error << '\n';
     return 1;
   }
   auto judge = models::d1::Judge::Create(
       *reader,
-      [&](auto tokens, auto groups, auto sequences, auto slots, auto vocabulary, auto logits) {
+      [&](auto tokens, auto groups, auto sequences, auto slots, auto vocabulary,
+          auto logits) {
         // Oracle: run every packed sequence on its own, then concatenate.
         const std::size_t seq_count = sequences.empty() ? 1 : sequences.size();
         std::size_t slot_at = 0;
         for (std::size_t q = 0; q < seq_count; ++q) {
           const std::size_t lo = sequences.empty() ? 0 : sequences[q];
-          const std::size_t hi = (!sequences.empty() && q + 1 < seq_count) ? sequences[q + 1] : tokens.size();
+          const std::size_t hi = (!sequences.empty() && q + 1 < seq_count)
+                                     ? sequences[q + 1]
+                                     : tokens.size();
           std::vector<std::uint32_t> own_slots;
-          while (slot_at + own_slots.size() < slots.size() && slots[slot_at + own_slots.size()] < hi)
+          while (slot_at + own_slots.size() < slots.size() &&
+                 slots[slot_at + own_slots.size()] < hi)
             own_slots.push_back(slots[slot_at + own_slots.size()] - lo);
           const auto out = models::lfm3::DecisionForward(
               *weights, tokens.subspan(lo, hi - lo),
-              groups.empty() ? groups : groups.subspan(lo, hi - lo), own_slots, vocabulary);
-          std::copy(out.begin(), out.end(), logits.begin() + slot_at * vocabulary.size());
+              groups.empty() ? groups : groups.subspan(lo, hi - lo), own_slots,
+              vocabulary);
+          std::copy(out.begin(), out.end(),
+                    logits.begin() + slot_at * vocabulary.size());
           slot_at += own_slots.size();
         }
         return true;
@@ -57,7 +65,8 @@ int main(int argc, char** argv) {
   const auto start = std::chrono::steady_clock::now();
   const auto verdicts = judge->Answer(items);
   const double ms = std::chrono::duration<double, std::milli>(
-                        std::chrono::steady_clock::now() - start).count();
+                        std::chrono::steady_clock::now() - start)
+                        .count();
   if (verdicts.size() != items.size()) {
     std::cerr << "judge failed\n";
     return 1;

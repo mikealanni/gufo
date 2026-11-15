@@ -12,7 +12,7 @@ struct Options {
   std::string gguf;
   std::string bf16;
   std::string programs;  // directory with xclbin + insts
-  std::string spec;      // optional: JSON model spec (defaults to built-in LFM3)
+  std::string spec;  // optional: JSON model spec (defaults to built-in LFM3)
   std::uint32_t context{8192};
 };
 
@@ -20,8 +20,9 @@ struct Options {
 /// GEMV programs) and all other work on the host CPU. No GPU is touched.
 /// Refactored (WP6): model-neutral runtime + spec-driven layer loop.
 class Engine {
- public:
-  static constexpr std::uint32_t kMaxRows = 64;  // m64 prefill (WP10); falls back to 16 without m64 programs
+public:
+  static constexpr std::uint32_t kMaxRows =
+      64;  // m64 prefill (WP10); falls back to 16 without m64 programs
   ~Engine();
   static std::unique_ptr<Engine> Create(const Options& options,
                                         std::string* error);
@@ -47,7 +48,7 @@ class Engine {
   void Draft(const float* hidden_row, std::uint32_t* out);
   struct Impl;
 
- private:
+private:
   explicit Engine(std::unique_ptr<Impl> impl);
   std::unique_ptr<Impl> impl_;
 };

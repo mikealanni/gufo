@@ -3,9 +3,9 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
-#include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -27,9 +27,9 @@
 #include <hip/hip_runtime.h>
 
 #include "src/models/lfm3/tokenizer.hpp"
-#include "src/models/qwen38_flash_next/kernels/rocm/npu_gemm.hpp"
 #include "src/models/qwen38_flash_next/d1_npu.hpp"
 #include "src/models/qwen38_flash_next/jev_npu.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/npu_gemm.hpp"
 #endif
 #if defined(ENGINE_ENABLE_HIP)
 #include "src/models/qwen38_flash_next/jev_model.hpp"
@@ -325,10 +325,12 @@ int RunJudge(std::span<const char* const> args) {
                    "Prompt-lookup draft tokens per pass, 0 = off (default 15)",
                    "Generate", &draft_len);
   parser.AddOption("", "--capture", "FILE",
-                   "Teacher-forced hidden states of documents (split by a line =====DOC=====)",
+                   "Teacher-forced hidden states of documents (split by a line "
+                   "=====DOC=====)",
                    "Generate", &capture_in);
   parser.AddOption("", "--gen-data", "FILE",
-                   "Greedy self-generated continuations of prompts (docs split by =====DOC=====)",
+                   "Greedy self-generated continuations of prompts (docs split "
+                   "by =====DOC=====)",
                    "Generate", &gen_data_in);
   parser.AddOption("", "--gen-out", "PREFIX", "Output prefix for --gen-data",
                    "Generate", &gen_data_out);
@@ -339,17 +341,20 @@ int RunJudge(std::span<const char* const> args) {
   parser.AddOption("", "--drafter", "FILE", "Drafter heads file for --generate",
                    "Generate", &drafter_path);
   parser.AddOption("", "--capture-out", "PREFIX",
-                   "Output prefix: PREFIX.tokens (u32), PREFIX.hidden (fp16), PREFIX.docs (u64 starts)",
+                   "Output prefix: PREFIX.tokens (u32), PREFIX.hidden (fp16), "
+                   "PREFIX.docs (u64 starts)",
                    "Generate", &capture_out);
   parser.AddFlag("", "--row-test",
                  "Compare one multi-row Step against sequential one-row Steps",
                  "Generate", &row_test);
-  parser.AddFlag("", "--npu-scale-bench",
-                 "Time the K=2048,N=1024 NPU GEMM at M=512..4096 (compute vs overhead)",
-                 "Battery", &npu_scale_bench);
-  parser.AddFlag("", "--pack-test",
-                 "Compare four different-context decisions: one by one vs one packed pass",
-                 "Battery", &pack_test);
+  parser.AddFlag(
+      "", "--npu-scale-bench",
+      "Time the K=2048,N=1024 NPU GEMM at M=512..4096 (compute vs overhead)",
+      "Battery", &npu_scale_bench);
+  parser.AddFlag(
+      "", "--pack-test",
+      "Compare four different-context decisions: one by one vs one packed pass",
+      "Battery", &pack_test);
   parser.AddFlag(
       "", "--batched",
       "Run --battery/--code through AnswerBatch (4 questions/NPU pass)",
@@ -390,7 +395,9 @@ int RunJudge(std::span<const char* const> args) {
     const std::string dir = dir_env ? dir_env : "tools/npu";
     hipStream_t stream;
     (void)hipStreamCreate(&stream);
-    struct Shape { std::uint32_t tile, k, n; };
+    struct Shape {
+      std::uint32_t tile, k, n;
+    };
     for (const Shape sh : {Shape{128, 2048, 1024}, Shape{64, 2048, 1024},
                            Shape{128, 2048, 6144}, Shape{64, 2048, 6144},
                            Shape{128, 2048, 15360}, Shape{64, 2048, 15360},
@@ -440,19 +447,22 @@ int RunJudge(std::span<const char* const> args) {
         (void)hipStreamSynchronize(stream);
       }
       const double ms = std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now() - t0).count() /
+                            std::chrono::steady_clock::now() - t0)
+                            .count() /
                         reps;
       const double mb = sh.k * sh.n / 8.0 * 9 / 1e6;
-      std::printf("tile %3u M=%u K=%u N=%u: %.3f ms  (%.1f TFLOP/s, weights %.1f MB = %.1f GB/s)\n",
-                  sh.tile, m, sh.k, sh.n, ms, 2.0 * m * sh.k * sh.n / ms / 1e9,
-                  mb, mb / ms);
+      std::printf(
+          "tile %3u M=%u K=%u N=%u: %.3f ms  (%.1f TFLOP/s, weights %.1f MB = "
+          "%.1f GB/s)\n",
+          sh.tile, m, sh.k, sh.n, ms, 2.0 * m * sh.k * sh.n / ms / 1e9, mb,
+          mb / ms);
     }
     return 0;
 #endif
   }
   if (!stdio && !battery && !code && !pack_test && question.empty() &&
-      generate_prompt.empty() && capture_in.empty() &&
-      gen_data_in.empty() && !row_test) {
+      generate_prompt.empty() && capture_in.empty() && gen_data_in.empty() &&
+      !row_test) {
     std::fprintf(stderr, "judge: --question, --battery or --code required\n");
     return 2;
   }
@@ -474,8 +484,12 @@ int RunJudge(std::span<const char* const> args) {
     }
     const std::vector<std::pair<std::string, std::string>> messages = {
         {"user", "Explain in a few sentences why the sky is blue."}};
-    const auto ids = tokenizer->Encode(models::lfm3::Tokenizer::Render(messages, false));
-    const std::uint32_t rows = std::getenv("GUFO_ROWS") ? static_cast<std::uint32_t>(std::atoi(std::getenv("GUFO_ROWS"))) : 8u;
+    const auto ids =
+        tokenizer->Encode(models::lfm3::Tokenizer::Render(messages, false));
+    const std::uint32_t rows =
+        std::getenv("GUFO_ROWS")
+            ? static_cast<std::uint32_t>(std::atoi(std::getenv("GUFO_ROWS")))
+            : 8u;
     std::vector<std::uint32_t> seq;
     std::vector<std::vector<float>> hid_seq(rows);
     std::vector<std::uint32_t> argmax_seq(rows);
@@ -507,10 +521,13 @@ int RunJudge(std::span<const char* const> args) {
       for (auto id : seq)
         ids_out << id << ' ';
       ids_out << '\n';
-      std::ofstream a("/tmp/rowtest_seq.f32", std::ios::binary), b("/tmp/rowtest_multi.f32", std::ios::binary);
+      std::ofstream a("/tmp/rowtest_seq.f32", std::ios::binary),
+          b("/tmp/rowtest_multi.f32", std::ios::binary);
       for (std::uint32_t i = 0; i < rows; ++i)
-        a.write(reinterpret_cast<const char*>(hid_seq[i].data()), hid_seq[i].size() * 4);
-      b.write(reinterpret_cast<const char*>(hid_multi.data()), hid_multi.size() * 4);
+        a.write(reinterpret_cast<const char*>(hid_seq[i].data()),
+                hid_seq[i].size() * 4);
+      b.write(reinterpret_cast<const char*>(hid_multi.data()),
+              hid_multi.size() * 4);
     }
     if (!drafter_path.empty() && model->LoadDrafter(drafter_path, &err)) {
       for (std::uint32_t i = 0; i < rows; ++i) {
@@ -525,11 +542,15 @@ int RunJudge(std::span<const char* const> args) {
     for (std::uint32_t i = 0; i < rows; ++i) {
       double worst = 0, scale = 0;
       for (std::size_t j = 0; j < hid_seq[i].size(); ++j) {
-        worst = std::max(worst, double(std::abs(hid_seq[i][j] - hid_multi[i * hid_seq[i].size() + j])));
+        worst = std::max(
+            worst, double(std::abs(hid_seq[i][j] -
+                                   hid_multi[i * hid_seq[i].size() + j])));
         scale = std::max(scale, double(std::abs(hid_seq[i][j])));
       }
-      std::printf("row %u: argmax seq %u multi %u  hidden max|diff| %.5f (max|h| %.3f)\n",
-                  i, argmax_seq[i], argmax_multi[i], worst, scale);
+      std::printf(
+          "row %u: argmax seq %u multi %u  hidden max|diff| %.5f (max|h| "
+          "%.3f)\n",
+          i, argmax_seq[i], argmax_multi[i], worst, scale);
     }
     return 0;
   }
@@ -538,7 +559,8 @@ int RunJudge(std::span<const char* const> args) {
     auto tokenizer = models::lfm3::Tokenizer::Load(*reader, &err);
     const std::uint32_t streams = static_cast<std::uint32_t>(gen_streams);
     const std::uint32_t max_prompt = 384;
-    const std::uint32_t ctx = max_prompt + static_cast<std::uint32_t>(gen_len) + 8;
+    const std::uint32_t ctx =
+        max_prompt + static_cast<std::uint32_t>(gen_len) + 8;
     if (!model || !tokenizer || !model->EnableGeneration(ctx, &err) ||
         !model->EnableBatch(streams, ctx, &err)) {
       std::fprintf(stderr, "judge: %s\n", err.c_str());
@@ -571,21 +593,24 @@ int RunJudge(std::span<const char* const> args) {
     std::uint64_t total = 0, generated = 0;
     const auto t0 = std::chrono::steady_clock::now();
     for (std::size_t base = 0; base < docs.size(); base += streams) {
-      const std::size_t count = std::min<std::size_t>(streams, docs.size() - base);
+      const std::size_t count =
+          std::min<std::size_t>(streams, docs.size() - base);
       std::vector<std::vector<std::uint32_t>> seqs(count);
       std::vector<std::uint32_t> cur(count), nxt(count);
       std::vector<char> done(count, 0);
       for (std::size_t i = 0; i < count; ++i) {
         auto ids = tokenizer->Encode(docs[base + i]);
         if (ids.size() > max_prompt)
-          ids.erase(ids.begin() + 1, ids.end() - (max_prompt - 1));  // keep BOS + tail
+          ids.erase(ids.begin() + 1,
+                    ids.end() - (max_prompt - 1));  // keep BOS + tail
         std::uint32_t first = 0;
         model->ResetState();
         for (std::size_t at = 0; at < ids.size();) {
           const std::size_t take =
               std::min<std::size_t>(model->PassRows(), ids.size() - at);
-          if (!model->Step(std::span<const std::uint32_t>(ids).subspan(at, take),
-                           std::span(&first, 1))) {
+          if (!model->Step(
+                  std::span<const std::uint32_t>(ids).subspan(at, take),
+                  std::span(&first, 1))) {
             std::fprintf(stderr, "judge: prefill failed\n");
             return 1;
           }
@@ -627,16 +652,18 @@ int RunJudge(std::span<const char* const> args) {
       }
       for (std::size_t i = 0; i < count; ++i) {
         doc_out.write(reinterpret_cast<const char*>(&total), sizeof(total));
-        tok_out.write(reinterpret_cast<const char*>(seqs[i].data()), seqs[i].size() * 4);
+        tok_out.write(reinterpret_cast<const char*>(seqs[i].data()),
+                      seqs[i].size() * 4);
         total += seqs[i].size();
         generated += seqs[i].size() - prompt_len[i];
         // reset this stream slot's batch position for the next group
       }
-      std::fprintf(stderr, "gen: %zu/%zu docs, %llu generated tokens, %.0f tok/s\n",
-                   base + count, docs.size(),
-                   static_cast<unsigned long long>(generated),
-                   generated / std::chrono::duration<double>(
-                                   std::chrono::steady_clock::now() - t0).count());
+      std::fprintf(
+          stderr, "gen: %zu/%zu docs, %llu generated tokens, %.0f tok/s\n",
+          base + count, docs.size(), static_cast<unsigned long long>(generated),
+          generated / std::chrono::duration<double>(
+                          std::chrono::steady_clock::now() - t0)
+                          .count());
     }
     std::printf("generated %llu tokens (%llu total) from %zu docs\n",
                 static_cast<unsigned long long>(generated),
@@ -654,16 +681,21 @@ int RunJudge(std::span<const char* const> args) {
     std::string line, doc;
     std::vector<std::string> docs;
     std::vector<std::vector<std::uint32_t>> token_docs;
-    if (capture_in.size() > 7 && capture_in.substr(capture_in.size() - 7) == ".tokens") {
-      // Pre-tokenized documents: PREFIX.tokens (u32) split by PREFIX.docs (u64 starts).
+    if (capture_in.size() > 7 &&
+        capture_in.substr(capture_in.size() - 7) == ".tokens") {
+      // Pre-tokenized documents: PREFIX.tokens (u32) split by PREFIX.docs (u64
+      // starts).
       const std::string prefix = capture_in.substr(0, capture_in.size() - 7);
       std::ifstream tokens_file(capture_in, std::ios::binary | std::ios::ate);
-      const std::size_t token_count = static_cast<std::size_t>(tokens_file.tellg()) / 4;
+      const std::size_t token_count =
+          static_cast<std::size_t>(tokens_file.tellg()) / 4;
       std::vector<std::uint32_t> all(token_count);
       tokens_file.seekg(0);
       tokens_file.read(reinterpret_cast<char*>(all.data()), token_count * 4);
-      std::ifstream starts_file(prefix + ".docs", std::ios::binary | std::ios::ate);
-      const std::size_t doc_count = static_cast<std::size_t>(starts_file.tellg()) / 8;
+      std::ifstream starts_file(prefix + ".docs",
+                                std::ios::binary | std::ios::ate);
+      const std::size_t doc_count =
+          static_cast<std::size_t>(starts_file.tellg()) / 8;
       std::vector<std::uint64_t> starts(doc_count);
       starts_file.seekg(0);
       starts_file.read(reinterpret_cast<char*>(starts.data()), doc_count * 8);
@@ -690,13 +722,16 @@ int RunJudge(std::span<const char* const> args) {
     std::ofstream doc_out(capture_out + ".docs", std::ios::binary);
     std::uint64_t total = 0;
     const auto t0 = std::chrono::steady_clock::now();
-    const std::size_t doc_total = token_docs.empty() ? docs.size() : token_docs.size();
+    const std::size_t doc_total =
+        token_docs.empty() ? docs.size() : token_docs.size();
     for (std::size_t d = 0; d < doc_total; ++d) {
-      auto ids = token_docs.empty() ? tokenizer->Encode(docs[d]) : token_docs[d];
+      auto ids =
+          token_docs.empty() ? tokenizer->Encode(docs[d]) : token_docs[d];
       if (ids.size() < 8)
         continue;
       const std::size_t cap = std::getenv("GUFO_CAPTURE_MAXTOK")
-                                  ? static_cast<std::size_t>(std::atoi(std::getenv("GUFO_CAPTURE_MAXTOK")))
+                                  ? static_cast<std::size_t>(std::atoi(
+                                        std::getenv("GUFO_CAPTURE_MAXTOK")))
                                   : 8192;
       if (ids.size() > cap)
         ids.resize(cap);
@@ -707,13 +742,15 @@ int RunJudge(std::span<const char* const> args) {
       }
       doc_out.write(reinterpret_cast<const char*>(&total), sizeof(total));
       tok_out.write(reinterpret_cast<const char*>(ids.data()), ids.size() * 4);
-      hid_out.write(reinterpret_cast<const char*>(hidden.data()), hidden.size() * 2);
+      hid_out.write(reinterpret_cast<const char*>(hidden.data()),
+                    hidden.size() * 2);
       total += ids.size();
       if (d % 50 == 0)
-        std::fprintf(stderr, "capture: doc %zu/%zu, %llu tokens, %.0f tok/s\n", d,
-                     doc_total, static_cast<unsigned long long>(total),
+        std::fprintf(stderr, "capture: doc %zu/%zu, %llu tokens, %.0f tok/s\n",
+                     d, doc_total, static_cast<unsigned long long>(total),
                      total / std::chrono::duration<double>(
-                                 std::chrono::steady_clock::now() - t0).count());
+                                 std::chrono::steady_clock::now() - t0)
+                                 .count());
     }
     std::printf("captured %llu tokens from %zu docs\n",
                 static_cast<unsigned long long>(total), doc_total);
@@ -722,7 +759,12 @@ int RunJudge(std::span<const char* const> args) {
   if (!use_gpu && !generate_prompt.empty()) {
     auto model = models::qwen38_flash_next::D1NpuModel::Create(*reader, &err);
     auto tokenizer = models::lfm3::Tokenizer::Load(*reader, &err);
-    if (!model || !tokenizer || !model->EnableGeneration(std::getenv("GUFO_D1_CTX") ? static_cast<std::uint32_t>(std::atoi(std::getenv("GUFO_D1_CTX"))) : 8192u, &err)) {
+    if (!model || !tokenizer ||
+        !model->EnableGeneration(std::getenv("GUFO_D1_CTX")
+                                     ? static_cast<std::uint32_t>(std::atoi(
+                                           std::getenv("GUFO_D1_CTX")))
+                                     : 8192u,
+                                 &err)) {
       std::fprintf(stderr, "judge: %s\n", err.c_str());
       return 1;
     }
@@ -740,7 +782,8 @@ int RunJudge(std::span<const char* const> args) {
         {"user", generate_prompt}};
     const auto ids = std::getenv("GUFO_RAW_PROMPT")
                          ? tokenizer->Encode(generate_prompt)
-                         : tokenizer->Encode(models::lfm3::Tokenizer::Render(messages, false));
+                         : tokenizer->Encode(models::lfm3::Tokenizer::Render(
+                               messages, false));
     models::qwen38_flash_next::D1NpuModel::GenerateOptions options;
     options.max_new = static_cast<std::uint32_t>(max_new);
     options.draft_max = static_cast<std::uint32_t>(std::max(0, draft_len));
@@ -794,11 +837,13 @@ int RunJudge(std::span<const char* const> args) {
     if (pack_test) {
       const std::vector<std::pair<std::string, std::string>> owned = {
           {"Will this command use the GPU or most of the machine's RAM?",
-           "The agent is about to run: python train.py --epochs 50 on a 20GB model."},
+           "The agent is about to run: python train.py --epochs 50 on a 20GB "
+           "model."},
           {"Is this a quick read-only shell command?",
            "The agent is about to run: ls -la /tmp"},
           {"Will this command use the GPU or most of the machine's RAM?",
-           "The agent is about to run: cargo build --release for a large workspace."},
+           "The agent is about to run: cargo build --release for a large "
+           "workspace."},
           {"Is this a quick read-only shell command?",
            "The agent is about to run: git status"}};
       std::vector<std::pair<std::string_view, std::string_view>> items;

@@ -21,8 +21,8 @@ struct JudgeVerdict {
 /// Yes/no judge over a d1 decision model: each (question, context) pair is a
 /// `noul` question over the context as its state. Pairs with the same context
 /// share one sequence (up to 16 questions); sequences from different contexts
-/// are packed into one forward pass while they fit the token limit. The forward is
-/// injected (NPU backbone in serving, the FP32 host oracle in tests).
+/// are packed into one forward pass while they fit the token limit. The forward
+/// is injected (NPU backbone in serving, the FP32 host oracle in tests).
 class Judge {
 public:
   /// Logits for `slots` over `vocabulary`, row-major slots x vocabulary.

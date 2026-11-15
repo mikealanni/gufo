@@ -60,7 +60,8 @@ public:
                           std::span<std::uint32_t> next_tokens) const;
   void Commit(std::uint32_t accepted) const;
   /// Debug: the final-norm hidden rows of the last Step (rows x hidden floats).
-  [[nodiscard]] bool LastHidden(std::vector<float>* out, std::uint32_t rows) const;
+  [[nodiscard]] bool LastHidden(std::vector<float>* out,
+                                std::uint32_t rows) const;
 
   /// Teacher-forced pass over `tokens` (any length, chunked): the final-norm
   /// hidden state of every row as fp16 bits (n x hidden), for drafter
@@ -74,7 +75,8 @@ public:
   /// Commit of its prompt); BatchStep feeds one token per stream.
   [[nodiscard]] bool EnableBatch(std::uint32_t streams, std::uint32_t ctx,
                                  std::string* error = nullptr);
-  [[nodiscard]] bool BatchLoad(std::uint32_t stream, std::uint32_t length) const;
+  [[nodiscard]] bool BatchLoad(std::uint32_t stream,
+                               std::uint32_t length) const;
   [[nodiscard]] bool BatchStep(std::span<const std::uint32_t> tokens,
                                std::span<std::uint32_t> next) const;
 

@@ -61,7 +61,8 @@ public:
   /// Submit + Wait for one run in a single stream callback: the run executes
   /// inline on the HIP callback thread, saving the worker-thread handoff and
   /// one callback hop per GEMM. Do not mix with outstanding Submit calls.
-  bool RunSync(hipStream_t stream, int a_id, int b_id, int c_id, int program = 0);
+  bool RunSync(hipStream_t stream, int a_id, int b_id, int c_id,
+               int program = 0);
   /// Loads another instruction stream for the same kernel (a runtime-K program
   /// serving a different reduction length) and returns its id for Submit, or
   /// -1. The A and B operand sizes for reduction length k are ABytes(k) and

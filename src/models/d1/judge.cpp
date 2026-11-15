@@ -104,8 +104,7 @@ std::vector<JudgeVerdict> Judge::Answer(
         for (std::size_t j = 0; j < count; ++j) {
           auto spec = json::Value::object();
           spec["type"] = "noul";
-          spec["instructions"] =
-              std::string(items[members[first + j]].first);
+          spec["instructions"] = std::string(items[members[first + j]].first);
           auto q = ParseQuestion(*m.tokenizer, "q" + std::to_string(j), spec);
           q.temperature = m.temperature;
           suffixes.push_back(Suffix(*m.tokenizer, q, plain(q.body)));
@@ -137,8 +136,9 @@ std::vector<JudgeVerdict> Judge::Answer(
           remap(q);
         seq.tokens = std::move(prompt.tokens);
         seq.slots = std::move(prompt.slots);
-        seq.groups = count > 1 ? std::move(prompt.groups)
-                               : std::vector<std::int32_t>(seq.tokens.size(), -1);
+        seq.groups = count > 1
+                         ? std::move(prompt.groups)
+                         : std::vector<std::int32_t>(seq.tokens.size(), -1);
         sequences.push_back(std::move(seq));
         done = true;
       }
@@ -164,7 +164,8 @@ std::vector<JudgeVerdict> Judge::Answer(
       groups.insert(groups.end(), seq.groups.begin(), seq.groups.end());
     }
     // A lone question in a lone sequence keeps the unmasked specialisation.
-    const bool lone = last - first == 1 && sequences[first].questions.size() == 1;
+    const bool lone =
+        last - first == 1 && sequences[first].questions.size() == 1;
     std::vector<float> logits(slots.size() * vocabulary.size());
     if (!m.forward(tokens, lone ? std::span<const std::int32_t>() : groups,
                    starts, slots, vocabulary, logits))
@@ -173,11 +174,11 @@ std::vector<JudgeVerdict> Judge::Answer(
     for (std::size_t i = first; i < last; ++i) {
       const auto& seq = sequences[i];
       for (std::size_t j = 0; j < seq.questions.size(); ++j, ++slot) {
-        const auto scores = Probabilities(
-            seq.questions[j].readout,
-            std::span<const float>(logits).subspan(slot * vocabulary.size(),
-                                                   vocabulary.size()),
-            seq.questions[j].temperature);
+        const auto scores =
+            Probabilities(seq.questions[j].readout,
+                          std::span<const float>(logits).subspan(
+                              slot * vocabulary.size(), vocabulary.size()),
+                          seq.questions[j].temperature);
         verdicts[seq.members[j]] = {static_cast<float>(scores[0]),
                                     static_cast<float>(scores[1])};
       }

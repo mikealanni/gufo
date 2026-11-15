@@ -1,8 +1,5 @@
 #include "src/models/qwen38_flash_next/jev_npu.hpp"
 
-#include "src/models/d1/judge.hpp"
-#include "src/models/qwen38_flash_next/d1_npu.hpp"
-
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -25,8 +22,10 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
 #include "src/core/quant/ggml_gemm.hpp"
+#include "src/models/d1/judge.hpp"
 #include "src/models/qwen/control_tokens.hpp"
 #include "src/models/qwen/tokenizer.hpp"
+#include "src/models/qwen38_flash_next/d1_npu.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/npu_gemm.hpp"
 
@@ -1317,8 +1316,8 @@ std::unique_ptr<JevNpuModel> JevNpuModel::LoadFromGguf(
                    std::span<const std::uint32_t> slots,
                    std::span<const std::uint32_t> vocabulary,
                    std::span<float> logits) {
-          return backbone->Forward(tokens, groups, sequences, slots,
-                                   vocabulary, logits);
+          return backbone->Forward(tokens, groups, sequences, slots, vocabulary,
+                                   logits);
         },
         backbone->PassRows(), error_msg);
     if (!impl->d1_judge)

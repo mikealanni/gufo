@@ -693,8 +693,8 @@ bool NpuGemm::Submit(hipStream_t stream, int a_id, const int* b_ids,
 
 bool NpuGemm::RunSync(hipStream_t stream, int a_id, int b_id, int c_id,
                       int program) {
-  auto* call = new Call{impl_.get(), a_id, {b_id}, {c_id}, ++impl_->submitted,
-                        program};
+  auto* call =
+      new Call{impl_.get(), a_id, {b_id}, {c_id}, ++impl_->submitted, program};
   const hipError_t status = hipLaunchHostFunc(
       stream,
       [](void* data) {

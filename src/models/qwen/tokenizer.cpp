@@ -232,7 +232,8 @@ std::size_t Qwen35ContractionEnd(std::string_view text,
   return offset;
 }
 
-std::size_t Qwen35PieceEnd(std::string_view text, std::size_t offset, std::size_t digit_group = 1) {
+std::size_t Qwen35PieceEnd(std::string_view text, std::size_t offset,
+                           std::size_t digit_group = 1) {
   if (const std::size_t contraction = Qwen35ContractionEnd(text, offset);
       contraction != offset) {
     return contraction;
@@ -271,7 +272,8 @@ std::size_t Qwen35PieceEnd(std::string_view text, std::size_t offset, std::size_
     std::size_t end = offset + first.length;
     for (std::size_t n = 1; n < digit_group && end < text.size(); ++n) {
       const Utf8CodePoint next = DecodeUtf8(text, end);
-      if (!IsUnicodeNumber(next.value)) break;
+      if (!IsUnicodeNumber(next.value))
+        break;
       end += next.length;
     }
     return end;
