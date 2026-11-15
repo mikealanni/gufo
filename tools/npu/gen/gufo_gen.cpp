@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/core/quant/ggml_dequant.hpp"
 #include "src/models/lfm3/weights.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 #include "src/npu/runtime/runtime.hpp"
@@ -53,6 +54,79 @@ float Bf(std::uint16_t b) {
   float f;
   std::memcpy(&f, &u, 4);
   return f;
+}
+
+float Fp16(std::uint16_t h) { return gufo::quant::Fp16ToFloat(h); }
+
+bool DecodeRowAny(const gufo::models::lfm3::Tensor& tn, std::uint32_t row, std::span<float> out) {
+  using gufo::core::GgmlType;
+  const std::uint8_t* d = static_cast<const std::uint8_t*>(tn.data) + std::size_t{row} * (tn.bytes / tn.rows);
+  const std::uint32_t cols = tn.cols;
+  switch (tn.type) {
+    case GgmlType::kQ4_1:
+      for (std::uint32_t b = 0; b < cols / 32; ++b) {
+        const std::uint8_t* blk = d + std::size_t{b} * 20;
+        std::uint16_t dh, mh;
+        std::memcpy(&dh, blk, 2);
+        std::memcpy(&mh, blk + 2, 2);
+        const float dd = Fp16(dh), mm = Fp16(mh);
+        for (int i = 0; i < 16; ++i) {
+          out[b * 32 + i] = dd * (blk[4 + i] & 0xF) + mm;
+          out[b * 32 + 16 + i] = dd * (blk[4 + i] >> 4) + mm;
+        }
+      }
+      return true;
+    case GgmlType::kQ5_0:
+      for (std::uint32_t b = 0; b < cols / 32; ++b) {
+        const std::uint8_t* blk = d + std::size_t{b} * 22;
+        std::uint16_t dh;
+        std::uint32_t qh;
+        std::memcpy(&dh, blk, 2);
+        std::memcpy(&qh, blk + 2, 4);
+        const float dd = Fp16(dh);
+        for (int i = 0; i < 16; ++i) {
+          const int x0 = ((blk[6 + i] & 0xF) | (((qh >> i) & 1) << 4)) - 16;
+          const int x1 = ((blk[6 + i] >> 4) | (((qh >> (i + 16)) & 1) << 4)) - 16;
+          out[b * 32 + i] = dd * x0;
+          out[b * 32 + 16 + i] = dd * x1;
+        }
+      }
+      return true;
+    case GgmlType::kQ5_1:
+      for (std::uint32_t b = 0; b < cols / 32; ++b) {
+        const std::uint8_t* blk = d + std::size_t{b} * 24;
+        std::uint16_t dh, mh;
+        std::uint32_t qh;
+        std::memcpy(&dh, blk, 2);
+        std::memcpy(&mh, blk + 2, 2);
+        std::memcpy(&qh, blk + 4, 4);
+        const float dd = Fp16(dh), mm = Fp16(mh);
+        for (int i = 0; i < 16; ++i) {
+          const int x0 = (blk[8 + i] & 0xF) | (((qh >> i) & 1) << 4);
+          const int x1 = (blk[8 + i] >> 4) | (((qh >> (i + 16)) & 1) << 4);
+          out[b * 32 + i] = dd * x0 + mm;
+          out[b * 32 + 16 + i] = dd * x1 + mm;
+        }
+      }
+      return true;
+    case GgmlType::kF32: case GgmlType::kF16: case GgmlType::kBF16: case GgmlType::kQ8_0: case GgmlType::kQ4_0:
+    case GgmlType::kQ4_K: case GgmlType::kQ5_K: case GgmlType::kQ6_K:
+      gufo::models::lfm3::DecodeRow(tn, row, out);
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool TypeOk(gufo::core::GgmlType t) {
+  using gufo::core::GgmlType;
+  switch (t) {
+    case GgmlType::kQ4_1: case GgmlType::kQ5_0: case GgmlType::kQ5_1: case GgmlType::kF32: case GgmlType::kF16: case GgmlType::kBF16:
+    case GgmlType::kQ8_0: case GgmlType::kQ4_0: case GgmlType::kQ4_K: case GgmlType::kQ5_K: case GgmlType::kQ6_K:
+      return true;
+    default:
+      return false;
+  }
 }
 
 struct Safetensors {
@@ -106,10 +180,14 @@ struct Safetensors {
       std::fprintf(stderr, "tensor %s size %zu expected %zu\n", name.c_str(), std::size_t{cols} * rows, expect);
       std::exit(1);
     }
+    if (!TypeOk(t->type)) {
+      std::fprintf(stderr, "tensor %s has unsupported type %s\n", name.c_str(), std::string(gufo::core::ToString(t->type)).c_str());
+      std::exit(1);
+    }
     const gufo::models::lfm3::Tensor tn{t->data, t->type, cols, rows, t->size_bytes};
 #pragma omp parallel for
     for (std::int64_t row = 0; row < rows; ++row)
-      gufo::models::lfm3::DecodeRow(tn, static_cast<std::uint32_t>(row), std::span<float>(dst + std::size_t(row) * cols, cols));
+      DecodeRowAny(tn, static_cast<std::uint32_t>(row), std::span<float>(dst + std::size_t(row) * cols, cols));
   }
   void LoadBf16(const std::string& name, std::vector<std::uint16_t>* out, std::size_t expect) const;
 };
@@ -127,13 +205,17 @@ void Safetensors::LoadBf16(const std::string& name, std::vector<std::uint16_t>* 
     std::exit(1);
   }
   out->resize(expect);
+  if (!TypeOk(t->type)) {
+    std::fprintf(stderr, "tensor %s has unsupported type %s\n", name.c_str(), std::string(gufo::core::ToString(t->type)).c_str());
+    std::exit(1);
+  }
   const gufo::models::lfm3::Tensor tn{t->data, t->type, cols, rows, t->size_bytes};
 #pragma omp parallel
   {
     std::vector<float> tmp(cols);
 #pragma omp for
     for (std::int64_t row = 0; row < rows; ++row) {
-      gufo::models::lfm3::DecodeRow(tn, static_cast<std::uint32_t>(row), std::span<float>(tmp.data(), cols));
+      DecodeRowAny(tn, static_cast<std::uint32_t>(row), std::span<float>(tmp.data(), cols));
       for (std::uint32_t i = 0; i < cols; ++i) (*out)[std::size_t(row) * cols + i] = Bf16Bits(tmp[i]);
     }
   }
