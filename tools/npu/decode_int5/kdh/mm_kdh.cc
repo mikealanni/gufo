@@ -576,26 +576,127 @@ void zero_kernel(bfp16ebs8 *__restrict cOut) {
 }
 
 
-// ---- gdn mode: gated delta rule. One core = one (head, 64-column half of the 128-wide value dim); state S[128][64] bf16
-// aliases c_bf16_2nd_half (16 KB, free outside the GEMM). Token record (1024 B): q[128] bf16, k[128] bf16, v[128] bf16,
-// decay f32 @768, beta f32 @772, reset i32 @776. Output 64 f32 per token (256 B).
+// ---- gdn mode: conv + silu + l2norm + gated delta rule. One core = one (head, 64-column half of the 128-wide value dim).
+// State S[128][64] bf16 aliases c_bf16_2nd_half (16 KB). Conv weights live in cw[4 taps][320 ch] (ch 0..127 q, 128..255 k, 256..319 v half),
+// the 3-token conv history in the unused tail of the C element (depth-1 fifo: same address every group), 3 x 320 bf16.
+// Header element (B): per-column weights q[4][128] @0, k[4][128] @1024, v head0 @2048, v head1 @3072 (bf16).
+// Token record (1024 B): raw q[128], k[128], v[128] bf16 (pre-conv in_proj output), decay f32 @768, beta f32 @772, reset i32 @776.
+// Output 64 f32 per token (256 B) per core.
+alignas(64) static bfloat16 cw[4 * 320];
+
 static inline aie::vector<float, 64> mulf(const aie::vector<float, 64> &a, const aie::vector<float, 64> &b) {
   return aie::mul(a, b).template to_vector<float>();
 }
 
 __attribute__((noinline)) void gdn_begin() { ::aie::set_rounding(::aie::rounding_mode::conv_even); }
 
-__attribute__((noinline)) static void gdn_token(const uint8_t *rec, int half, uint8_t *out) {
+__attribute__((noinline)) void gdn_hdr(const uint8_t *b, int row) {
+  const bfloat16 *w = (const bfloat16 *)b;
+  const int hs = row >> 1, half = row & 1;
+  for (int j = 0; j < 4; ++j) {
+    aie::store_v(cw + j * 320, aie::load_v<64>(w + j * 128));
+    aie::store_v(cw + j * 320 + 64, aie::load_v<64>(w + j * 128 + 64));
+    aie::store_v(cw + j * 320 + 128, aie::load_v<64>(w + 512 + j * 128));
+    aie::store_v(cw + j * 320 + 192, aie::load_v<64>(w + 512 + j * 128 + 64));
+    aie::store_v(cw + j * 320 + 256, aie::load_v<64>(w + 1024 + hs * 512 + j * 128 + half * 64));
+  }
+}
+
+// y = silu(w0*h0 + w1*h1 + w2*h2 + w3*x) for one 64-channel vector; h = history rows (3 x 320 bf16), ch = vector index 0..4.
+static inline aie::vector<bfloat16, 64> conv_vec(const bfloat16 *h, int ch, const aie::vector<bfloat16, 64> &x) {
+  aie::accum<accfloat, 64> a = aie::mul(aie::load_v<64>(cw + ch * 64), aie::load_v<64>(h + ch * 64));
+  a = aie::mac(a, aie::load_v<64>(cw + 320 + ch * 64), aie::load_v<64>(h + 320 + ch * 64));
+  a = aie::mac(a, aie::load_v<64>(cw + 640 + ch * 64), aie::load_v<64>(h + 640 + ch * 64));
+  a = aie::mac(a, aie::load_v<64>(cw + 960 + ch * 64), x);
+  const aie::vector<bfloat16, 64> y = a.template to_vector<bfloat16>();
+  const aie::vector<bfloat16, 64> half = aie::broadcast<bfloat16, 64>((bfloat16)0.5f);
+  const aie::vector<float, 64> yf = a.template to_vector<float>();
+  const aie::vector<bfloat16, 64> t = aie::tanh<bfloat16>(mulf(yf, aie::broadcast<float, 64>(0.5f)));
+  const aie::vector<bfloat16, 64> sg = aie::add(aie::mul(t, half).template to_vector<bfloat16>(), half);
+  return aie::mul(y, sg).template to_vector<bfloat16>();
+}
+
+__attribute__((always_inline)) static inline float sumsq2(const aie::vector<bfloat16, 64> &a, const aie::vector<bfloat16, 64> &b) {
+  aie::accum<accfloat, 64> s = aie::mul(a, a);
+  s = aie::mac(s, b, b);
+  return aie::reduce_add(s.template to_vector<float>());
+}
+
+// 1/sqrt of two values in lanes 0 and 1 (16-lane vector): bit trick plus two Newton steps. The core has no scalar FPU:
+// scalar float math is a software call, so everything stays in vector form.
+__attribute__((always_inline)) static inline aie::vector<float, 16> inv_sqrt2(float a, float b) {
+  aie::vector<float, 16> x = aie::broadcast<float, 16>(1e-6f);
+  x.set(a, 0);
+  x.set(b, 1);
+  x = aie::add(x, aie::broadcast<float, 16>(1e-6f));
+  const aie::vector<int32, 16> xi = x.template cast_to<int32>();
+  aie::vector<float, 16> y = aie::sub(aie::broadcast<int32, 16>(0x5f3759df), aie::downshift(xi, 1)).template cast_to<float>();
+  const aie::vector<float, 16> half = aie::broadcast<float, 16>(0.5f);
+  const aie::vector<float, 16> c15 = aie::broadcast<float, 16>(1.5f);
+  const aie::vector<float, 16> hx = aie::mul(x, half).template to_vector<float>();
+  for (int it = 0; it < 2; ++it) {
+    const aie::vector<float, 16> yy = aie::mul(y, y).template to_vector<float>();
+    y = aie::mul(y, aie::sub(c15, aie::mul(hx, yy).template to_vector<float>())).template to_vector<float>();
+  }
+  return y;
+}
+
+__attribute__((always_inline)) static inline aie::vector<float, 64> to_f(const aie::vector<bfloat16, 64> &v) {
+  aie::accum<accfloat, 64> a;
+  a.from_vector(v);
+  return a.template to_vector<float>();
+}
+
+__attribute__((always_inline)) static inline aie::vector<bfloat16, 64> to_b(const aie::vector<float, 64> &v) {
+  aie::accum<accfloat, 64> a;
+  a.from_vector(v);
+  return a.template to_vector<bfloat16>();
+}
+
+alignas(64) static bfloat16 qk[256];
+alignas(64) static bfloat16 vv[64];
+
+__attribute__((noinline)) static void gdn_conv(const uint8_t *rec, int half, bfloat16 *hist) {
   bfloat16 *S = c_bf16_2nd_half;
-  const bfloat16 *q = (const bfloat16 *)rec;
-  const bfloat16 *kk = q + 128;
-  const bfloat16 *v = q + 256 + half * 64;
-  const float decay = ((const float *)(rec + 768))[0];
-  const float beta = ((const float *)(rec + 768))[1];
+  const bfloat16 *r = (const bfloat16 *)rec;
   if (((const int32_t *)(rec + 768))[2]) {
     const aie::vector<bfloat16, 64> z = aie::zeros<bfloat16, 64>();
     for (int i = 0; i < 128; ++i) aie::store_v(S + i * 64, z);
+    for (int i = 0; i < 15; ++i) aie::store_v(hist + i * 64, z);
   }
+  {
+    const aie::vector<bfloat16, 64> x0 = aie::load_v<64>(r), x1 = aie::load_v<64>(r + 64);
+    const aie::vector<bfloat16, 64> x2 = aie::load_v<64>(r + 128), x3 = aie::load_v<64>(r + 192);
+    const aie::vector<bfloat16, 64> x4 = aie::load_v<64>(r + 256 + half * 64);
+    const aie::vector<bfloat16, 64> q0 = conv_vec(hist, 0, x0), q1 = conv_vec(hist, 1, x1);
+    const aie::vector<bfloat16, 64> k0 = conv_vec(hist, 2, x2), k1 = conv_vec(hist, 3, x3);
+    aie::store_v(vv, conv_vec(hist, 4, x4));
+    const aie::vector<float, 16> rs = inv_sqrt2(sumsq2(q0, q1), sumsq2(k0, k1));
+    const aie::vector<float, 64> vqs = mulf(aie::broadcast<float, 64>(rs.get(0)), aie::broadcast<float, 64>(0.08838834764831845f));
+    const aie::vector<float, 64> vks = aie::broadcast<float, 64>(rs.get(1));
+    aie::store_v(qk, to_b(mulf(to_f(q0), vqs)));
+    aie::store_v(qk + 64, to_b(mulf(to_f(q1), vqs)));
+    aie::store_v(qk + 128, to_b(mulf(to_f(k0), vks)));
+    aie::store_v(qk + 192, to_b(mulf(to_f(k1), vks)));
+    for (int c = 0; c < 5; ++c) {
+      aie::store_v(hist + c * 64, aie::load_v<64>(hist + 320 + c * 64));
+      aie::store_v(hist + 320 + c * 64, aie::load_v<64>(hist + 640 + c * 64));
+    }
+    aie::store_v(hist + 640, x0);
+    aie::store_v(hist + 704, x1);
+    aie::store_v(hist + 768, x2);
+    aie::store_v(hist + 832, x3);
+    aie::store_v(hist + 896, x4);
+  }
+}
+
+__attribute__((noinline)) static void gdn_core(const uint8_t *rec, uint8_t *out) {
+  bfloat16 *S = c_bf16_2nd_half;
+  const float decay = ((const float *)(rec + 768))[0];
+  const float beta = ((const float *)(rec + 768))[1];
+  const bfloat16 *q = qk;
+  const bfloat16 *kk = qk + 128;
+  const bfloat16 *v = vv;
   aie::accum<accfloat, 64> kv = aie::zeros<accfloat, 64>(), sq = aie::zeros<accfloat, 64>();
   aie::accum<accfloat, 64> kv2 = aie::zeros<accfloat, 64>(), sq2 = aie::zeros<accfloat, 64>();
   AIE_PREPARE_FOR_PIPELINING
@@ -625,9 +726,8 @@ __attribute__((noinline)) static void gdn_token(const uint8_t *rec, int half, ui
   ha.from_vector(dh);
   la.from_vector(aie::sub(d, ha.template to_vector<float>()));
   const aie::vector<bfloat16, 64> dl = la.template to_vector<bfloat16>();
-  const bfloat16 dhi = (bfloat16)decay;
-  const aie::vector<bfloat16, 64> vdh = aie::broadcast<bfloat16, 64>(dhi);
-  const aie::vector<bfloat16, 64> vdl = aie::broadcast<bfloat16, 64>((bfloat16)(decay - (float)dhi));
+  const aie::vector<bfloat16, 64> vdh = to_b(vdec);
+  const aie::vector<bfloat16, 64> vdl = to_b(aie::sub(vdec, to_f(vdh)));
   AIE_PREPARE_FOR_PIPELINING
   AIE_LOOP_MIN_ITERATION_COUNT(32)
   for (int i = 0; i < 128; i += 4) {
@@ -662,8 +762,15 @@ __attribute__((noinline)) static void gdn_token(const uint8_t *rec, int half, ui
   }
 }
 
+
+__attribute__((noinline)) static void gdn_token(const uint8_t *rec, int half, uint8_t *out, bfloat16 *hist) {
+  gdn_conv(rec, half, hist);
+  gdn_core(rec, out);
+}
+
 // b: 4 tokens x 2 heads x 1024 B (this column); row r: head r>>1, value half r&1; out: 4 tokens x 256 B at token slot jj*4.
+// The conv history lives at byte 16384 of the C element.
 __attribute__((noinline)) void gdn_elem(const uint8_t *b, uint8_t *c, int jj, int row) {
-  for (int t = 0; t < 4; ++t) gdn_token(b + (t * 2 + (row >> 1)) * 1024, row & 1, c + (jj * 4 + t) * 256);
+  for (int t = 0; t < 4; ++t) gdn_token(b + (t * 2 + (row >> 1)) * 1024, row & 1, c + (jj * 4 + t) * 256, (bfloat16 *)(c + 16384));
 }
 }

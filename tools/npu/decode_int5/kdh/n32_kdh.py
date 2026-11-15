@@ -208,6 +208,7 @@ def my_matmul(M, K, N, m, k, n, mode="gemm", noff=0, a2=0):
         set_k = external_func("set_k", inputs=[np.int32], link_with=f"mm_{m}x{k}x{n}.o")
         set_swi = external_func("set_swi", inputs=[np.int32], link_with=f"mm_{m}x{k}x{n}.o")
         gdn_begin = external_func("gdn_begin", inputs=[], link_with=f"mm_{m}x{k}x{n}.o")
+        gdn_hdr = external_func("gdn_hdr", inputs=[B_l1_ty, np.int32], link_with=f"mm_{m}x{k}x{n}.o")
         gdn_elem = external_func("gdn_elem", inputs=[B_l1_ty, C_l1_ty, np.int32, np.int32], link_with=f"mm_{m}x{k}x{n}.o")
         rtp_ty = np.ndarray[(6,), np.dtype[np.int32]]
         rtps = [[None] * n_aie_cols for _ in range(n_aie_rows)]
@@ -221,7 +222,7 @@ def my_matmul(M, K, N, m, k, n, mode="gemm", noff=0, a2=0):
         for row in range(n_aie_rows):
             for col in range(n_aie_cols):
 
-                @core(core_tiles[row][col], stack_size=0x1000)  # 0xF00?
+                @core(core_tiles[row][col], stack_size=0xF80)  # 0xF00?
                 def core_body():
                     for _ in range_(0xFFFFFFFF):
                         use_lock(rtp_locks[row][col], LockAction.Acquire, value=1)
@@ -261,6 +262,10 @@ def my_matmul(M, K, N, m, k, n, mode="gemm", noff=0, a2=0):
                         ci = lambda v: arith.constant(T.i32(), v)
                         ng = arith.index_cast(T.index(), memref.load(rtps[row][col], [arith.constant(T.index(), 5)]))
                         gdn_begin()
+                        for _ in range_(rr):
+                            eh = B_l2l1_fifos[col].acquire(ObjectFifoPort.Consume, 1)
+                            gdn_hdr(eh, ci(row))
+                            B_l2l1_fifos[col].release(ObjectFifoPort.Consume, 1)
                         for _ in range_(ng):
                             elem_out = C_l1l2_fifos[row][col].acquire(ObjectFifoPort.Produce, 1)
                             for jj in range_(16):
@@ -273,7 +278,7 @@ def my_matmul(M, K, N, m, k, n, mode="gemm", noff=0, a2=0):
         if mode == "gdn":
             TOK = M  # tokens per dispatch (-M), multiple of 64
             groups = TOK // 64
-            in_col = (TOK // 4) * 9216
+            in_col = (TOK // 4 + 1) * 9216
             out_col = groups * 4 * 18432
             u8 = np.dtype[np.uint8]
 
@@ -283,7 +288,7 @@ def my_matmul(M, K, N, m, k, n, mode="gemm", noff=0, a2=0):
                     for col in range(n_aie_cols):
                         npu_rtp_write(f"rtp_{row}_{col}", 0, 0)
                         npu_rtp_write(f"rtp_{row}_{col}", 1, 0)
-                        npu_rtp_write(f"rtp_{row}_{col}", 2, 0)
+                        npu_rtp_write(f"rtp_{row}_{col}", 2, 1)
                         npu_rtp_write(f"rtp_{row}_{col}", 3, 0)
                         npu_rtp_write(f"rtp_{row}_{col}", 4, 0)
                         npu_rtp_write(f"rtp_{row}_{col}", 5, groups)

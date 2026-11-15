@@ -205,11 +205,11 @@ struct GdnDev {
       }
       bx = xrt::bo(dev, 4, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(3));
       for (int i = 0; i < 2; ++i) {
-        bin[i] = xrt::bo(dev, std::size_t{8} * (kMaxTok / 4) * 9216, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(4));
+        bin[i] = xrt::bo(dev, std::size_t{8} * (kMaxTok / 4 + 1) * 9216, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(4));
         bout[i] = xrt::bo(dev, std::size_t{8} * (kMaxTok / 64) * 73728, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(5));
         in_h[i] = bin[i].map<std::uint8_t*>();
         out_h[i] = bout[i].map<std::uint8_t*>();
-        std::memset(in_h[i], 0, std::size_t{8} * (kMaxTok / 4) * 9216);
+        std::memset(in_h[i], 0, std::size_t{8} * (kMaxTok / 4 + 1) * 9216);
         std::memset(bout[i].map<void*>(), 0, std::size_t{8} * (kMaxTok / 64) * 73728);
       }
       return true;
@@ -264,10 +264,12 @@ struct Engine {
   std::vector<std::uint16_t> embed_raw;
   const std::uint16_t* embed{nullptr};
   Weights w;
+  double postms{0};
   double t_npu{0}, t_host{0}, ph[4]{0, 0, 0, 0}, mx[8]{0, 0, 0, 0, 0, 0, 0, 0};
   const char* qdir{std::getenv("Q35_QDIR")};
   bool bf16_state{std::getenv("Q35_BF16_STATE") != nullptr};
   bool gdn_emu{std::getenv("Q35_GDN_EMU") != nullptr};
+  bool conv_emu{std::getenv("Q35_CONV_EMU") != nullptr};
 
   bool Init(const std::string& model_dir, const std::string& programs) {
     if (!w.s[0].Open(model_dir + "/model-00001-of-00002.safetensors") || !w.s[1].Open(model_dir + "/model-00002-of-00002.safetensors")) {
@@ -530,13 +532,18 @@ struct Engine {
     const auto t0 = Clock::now();
     const std::uint32_t ne = GdnDev::Bucket(Tt);
     if (gdn_dev && ne) {
+      auto tprep = Clock::now();
+      GdnHdrDev(L, ne);
       for (const auto& sg : segs) GdnPrepDev(L, proj.data() + std::size_t{sg.first} * kGdnInN, z + std::size_t{sg.first} * kH, sg.second, sg.first, ne);
       GdnPadDev(Tt, ne, ne);
+      mx[4] += Ms(tprep);
       const auto td = Clock::now();
       gd.Run(0, ne);
       gd.Run(1, ne);
       mx[7] += Ms(td);
+      auto tpost = Clock::now();
       for (const auto& sg : segs) GdnPostDev(L, proj.data() + std::size_t{sg.first} * kGdnInN, sg.second, sg.first, ne, gated.data() + std::size_t{sg.first} * kValDim);
+      mx[2] += 0; mx[3] += 0; postms += Ms(tpost);
     } else {
       for (const auto& sg : segs) GdnHost(L, proj.data() + std::size_t{sg.first} * kGdnInN, z + std::size_t{sg.first} * kH, sg.second, gated.data() + std::size_t{sg.first} * kValDim);
     }
@@ -551,7 +558,23 @@ struct Engine {
     for (std::uint32_t t = 0; t < Tt; ++t) std::memcpy(out_h + std::size_t{t} * kH, &outp[std::size_t{t} * kOutN], kH * 4);
   }
 
+  void GdnHdrDev(Layer& L, std::uint32_t ne) {
+    for (std::uint32_t set = 0; set < 2; ++set)
+      for (std::uint32_t col = 0; col < 8; ++col) {
+        auto* w = reinterpret_cast<std::uint16_t*>(gd.in_h[set] + std::size_t{col} * (ne / 4 + 1) * 9216);
+        const std::uint32_t kh = 8 * set + col;
+        for (std::uint32_t j = 0; j < kConvK; ++j)
+          for (std::uint32_t i = 0; i < 128; ++i) {
+            w[j * 128 + i] = Bf16Bits(L.conv[std::size_t{kh * 128 + i} * kConvK + j]);
+            w[512 + j * 128 + i] = Bf16Bits(L.conv[std::size_t{kKeyDim + kh * 128 + i} * kConvK + j]);
+            for (std::uint32_t hs = 0; hs < 2; ++hs)
+              w[1024 + hs * 512 + j * 128 + i] = Bf16Bits(L.conv[std::size_t{2 * kKeyDim + (16 * set + 2 * col + hs) * 128 + i} * kConvK + j]);
+          }
+      }
+  }
+
   void GdnPrepDev(Layer& L, const float* proj, const float* z, std::uint32_t T, std::uint32_t tok_off, std::uint32_t ne) {
+    auto tq = Clock::now();
     std::vector<float> ab(std::size_t{T} * 2 * kVH);
 #pragma omp parallel for collapse(2)
     for (std::int64_t t = 0; t < T; ++t)
@@ -562,44 +585,18 @@ struct Engine {
         for (std::uint32_t i = 0; i < kH; ++i) s += wrow[i] * zr[i];
         ab[std::size_t(t) * 2 * kVH + h] = s;
       }
-    if (L.convT.empty()) {
-      L.convT.resize(std::size_t{kConvK} * kConvDim);
-      for (std::uint32_t c = 0; c < kConvDim; ++c)
-        for (std::uint32_t j = 0; j < kConvK; ++j) L.convT[std::size_t{j} * kConvDim + c] = L.conv[std::size_t{c} * kConvK + j];
-    }
-    s_qkv.resize(std::size_t{T} * kConvDim);
-    float* qkv = s_qkv.data();
-#pragma omp parallel for
-    for (std::int64_t t = 0; t < T; ++t) {
-      float* o = &qkv[std::size_t(t) * kConvDim];
-      std::fill(o, o + kConvDim, 0.f);
-      for (std::uint32_t j = 0; j < kConvK; ++j) {
-        const std::int64_t src = t - (kConvK - 1) + j;
-        if (src < 0) continue;
-        const float* in = proj + std::size_t(src) * kGdnInN;
-        const float* wj = &L.convT[std::size_t{j} * kConvDim];
-#pragma omp simd
-        for (std::uint32_t c = 0; c < kConvDim; ++c) o[c] += wj[c] * in[c];
-      }
-      for (std::uint32_t c = 0; c < kConvDim; ++c) o[c] = Silu(o[c]);
-    }
+    mx[5] += Ms(tq); tq = Clock::now();
 #pragma omp parallel for collapse(2)
     for (std::int64_t t = 0; t < T; ++t)
       for (std::uint32_t h = 0; h < kVH; ++h) {
         const std::uint32_t kh = h / (kVH / kKH);
-        const float* row = &qkv[std::size_t(t) * kConvDim];
-        float qn = 0, kn = 0;
-        for (std::uint32_t i = 0; i < kKD; ++i) {
-          qn += row[kh * kKD + i] * row[kh * kKD + i];
-          kn += row[kKeyDim + kh * kKD + i] * row[kKeyDim + kh * kKD + i];
-        }
-        const float qs = 1.0f / std::sqrt(qn + 1e-6f) / std::sqrt(static_cast<float>(kKD)), ks = 1.0f / std::sqrt(kn + 1e-6f);
+        const float* row = proj + std::size_t(t) * kGdnInN;
         const std::uint32_t g = tok_off + static_cast<std::uint32_t>(t), set = h / 16, hh = h % 16, col = hh / 2, hs = hh % 2;
-        std::uint8_t* rec = gd.in_h[set] + (std::size_t{col} * (ne / 4) + g / 4) * 9216 + ((g % 4) * 2 + hs) * 1024;
+        std::uint8_t* rec = gd.in_h[set] + (std::size_t{col} * (ne / 4 + 1) + 1 + g / 4) * 9216 + ((g % 4) * 2 + hs) * 1024;
         auto* b = reinterpret_cast<std::uint16_t*>(rec);
         for (std::uint32_t i = 0; i < kKD; ++i) {
-          b[i] = Bf16Bits(row[kh * kKD + i] * qs);
-          b[128 + i] = Bf16Bits(row[kKeyDim + kh * kKD + i] * ks);
+          b[i] = Bf16Bits(row[kh * kKD + i]);
+          b[128 + i] = Bf16Bits(row[kKeyDim + kh * kKD + i]);
           b[256 + i] = Bf16Bits(row[2 * kKeyDim + h * kVD + i]);
         }
         const float av = ab[std::size_t{static_cast<std::uint32_t>(t)} * 2 * kVH + h], bv = ab[std::size_t{static_cast<std::uint32_t>(t)} * 2 * kVH + kVH + h];
@@ -610,13 +607,14 @@ struct Engine {
         const std::int32_t reset = t == 0 ? 1 : 0;
         std::memcpy(rec + 776, &reset, 4);
       }
+    mx[6] += Ms(tq);
   }
 
   void GdnPadDev(std::uint32_t from, std::uint32_t to, std::uint32_t ne) {
     for (std::uint32_t g = from; g < to; ++g)
       for (std::uint32_t h = 0; h < kVH; ++h) {
         const std::uint32_t set = h / 16, hh = h % 16, col = hh / 2, hs = hh % 2;
-        std::uint8_t* rec = gd.in_h[set] + (std::size_t{col} * (ne / 4) + g / 4) * 9216 + ((g % 4) * 2 + hs) * 1024;
+        std::uint8_t* rec = gd.in_h[set] + (std::size_t{col} * (ne / 4 + 1) + 1 + g / 4) * 9216 + ((g % 4) * 2 + hs) * 1024;
         std::memset(rec, 0, 1024);
         const float sc[2] = {1.0f, 0.0f};
         std::memcpy(rec + 768, sc, 8);
@@ -1042,6 +1040,7 @@ int EvalBatch(const char* model, const char* programs, const char* path) {
     e.t_npu = e.t_host = 0;
     for (auto& v : e.ph) v = 0;
     for (auto& v : e.mx) v = 0;
+    e.postms = 0;
   }
   for (std::size_t g = 0; g < items.size(); g += group) {
     std::vector<Engine::Seq> sq;
@@ -1062,7 +1061,7 @@ int EvalBatch(const char* model, const char* programs, const char* path) {
   }
   }
   std::fprintf(stderr, "npu: enc %.0f syncA %.0f submit %.0f wait %.0f syncC %.0f dec %.0f ms\n", e.tim.enc, e.tim.syncA, e.tim.submit, e.tim.wait, e.tim.syncC, e.tim.dec);
-  std::fprintf(stderr, "mixer: gdn in %.0f host %.0f out %.0f alloc %.0f | attn in %.0f | ab %.0f conv %.0f gdn-dispatch %.0f\n", e.mx[0], e.mx[1], e.mx[2], e.mx[4], e.mx[3], e.mx[5], e.mx[6], e.mx[7]);
+  std::fprintf(stderr, "mixer: gdn in %.0f host %.0f out %.0f alloc %.0f | attn in %.0f | ab %.0f conv %.0f gdn-dispatch %.0f post %.0f\n", e.mx[0], e.mx[1], e.mx[2], e.mx[4], e.mx[3], e.mx[5], e.mx[6], e.mx[7], e.postms);
   std::fprintf(stderr, "phases: norm1 %.0f mixer %.0f resid+norm2 %.0f mlp %.0f ms\n", e.ph[0], e.ph[1], e.ph[2], e.ph[3]);
   std::fprintf(stderr, "eval: %d cases %llu tokens %.1f ms (%.1f ms/case, npu %.0f host %.0f) group %u\n", cases, static_cast<unsigned long long>(total), Ms(t0), Ms(t0) / cases, e.t_npu, e.t_host, group);
   return 0;
