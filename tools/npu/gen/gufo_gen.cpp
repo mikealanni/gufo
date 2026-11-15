@@ -1633,6 +1633,7 @@ struct HybridEngine : Engine {
   bool lm_mode{false};
   static constexpr bool kSpec = true;
   bool moe{false};
+  double moe_dec[3]{0, 0, 0};  // decode expert loop: wall ms, experts, layers
   // Multi-token prediction (the model's own next-token head) as the drafter for lossless speculation.
   bool mtp{false};
   std::vector<float> mtp_enorm, mtp_hnorm, mtp_out_norm, last_raw;  // last_raw: final residual rows of the last Step (before the output norm)
@@ -2436,7 +2437,7 @@ struct HybridEngine : Engine {
   // state at each sequence's marker.
   // ---- mixture of experts (qwen35moe) ----
   // One program set serves every expert of every layer: expert weights are copied into pinned scratch buffers (WeightSlot).
-  static constexpr int kExpSlots = 3;  // decode: experts in flight (weights are copied in ahead of the device)
+  static constexpr int kExpSlots = 8;  // decode: experts in flight (weights are copied in ahead of the device)
   struct ExpertSet {
     Program a, d;
     xrt::bo swc;
@@ -2546,8 +2547,10 @@ struct HybridEngine : Engine {
   void MoeLayer(Layer& L, const float* z, std::uint32_t T, float* out) {
     const std::uint32_t H = c.hidden;
     std::vector<float> sh(std::size_t{T} * H);
-    if (use_dec) DecMlp(L, z, T, sh.data());
+    // decode: the shared expert runs on the device while the host routes
+    if (use_dec) rt.FfnStart(L.dp_ffn, L.dq_ffn, z, T, &tim);
     else KMlp(L, z, T, sh.data(), small_ok && T <= 512);
+    std::vector<float> sgate(T);
     std::vector<std::uint32_t> top(std::size_t{T} * n_used);
     std::vector<float> wgt(std::size_t{T} * n_used);
 #pragma omp parallel
@@ -2581,9 +2584,13 @@ struct HybridEngine : Engine {
         float gs = 0;
         for (std::uint32_t i = 0; i < H; ++i) gs += L.sh_gate[i] * zt[i];
         const float sg = 1.0f / (1.0f + std::exp(-gs));
-        float* o = out + std::size_t(t) * H;
-        for (std::uint32_t i = 0; i < H; ++i) o[i] = sg * sh[std::size_t(t) * H + i];
+        sgate[t] = sg;
       }
+    }
+    if (use_dec) rt.FfnFinish(L.dp_ffn, L.dq_ffn, sh.data(), T, &tim, gu_strips, H);
+    for (std::uint32_t t = 0; t < T; ++t) {  // shared expert, scaled by its sigmoid gate
+      float* o = out + std::size_t{t} * H;
+      for (std::uint32_t i = 0; i < H; ++i) o[i] = sgate[t] * sh[std::size_t{t} * H + i];
     }
     std::vector<std::vector<std::pair<std::uint32_t, float>>> by_expert(n_exp);
     for (std::uint32_t t = 0; t < T; ++t)
@@ -2596,34 +2603,45 @@ struct HybridEngine : Engine {
       const std::size_t per = ex_qa + ex_qd;
       const auto copy = [&](std::size_t j) {
         WeightBuffer& slot = ed_slot[j % kExpSlots];
-        std::memcpy(slot.host, L.exp_q5->data() + active[j] * per, per);
-        slot.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);  // flush the CPU cache lines the device will read
+        // streaming stores: the weights go to memory without leaving dirty cache lines, so no flush is needed before the device reads them
+        const auto* src = reinterpret_cast<const __m512i*>(L.exp_q5->data() + active[j] * per);
+        auto* dst = reinterpret_cast<__m512i*>(slot.host);
+        for (std::size_t i = 0; i < per / 64; ++i) _mm512_stream_si512(dst + i, _mm512_loadu_si512(src + i));
+        _mm_sfence();
+        if (std::getenv("GEN_FLUSH_WEIGHTS")) slot.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
       };
+      const auto t_exp0 = Clock::now();
       std::vector<std::future<void>> ready(active.size());
-      const auto launch = std::getenv("GEN_SYNC_PREFETCH") ? std::launch::deferred : std::launch::async;
-      for (std::size_t j = 0; j < active.size() && j < kExpSlots; ++j) ready[j] = std::async(launch, copy, j);
-      std::vector<float> xe(std::size_t{T} * H), ye(std::size_t{T} * H);
-      for (std::size_t j = 0; j < active.size(); ++j) {
+      for (std::size_t j = 0; j < active.size() && j < kExpSlots; ++j) ready[j] = std::async(std::launch::async, copy, j);
+      // up to kExpSlots dispatches in flight: expert j is submitted as soon as its weights are in, the oldest is finished (decoded, accumulated) when the window is full
+      std::vector<float> xe(std::size_t{kExpSlots} * T * H), ye(std::size_t{kExpSlots} * T * H);
+      const auto finish_run = [&](std::size_t j) {
         const auto& list = by_expert[active[j]];
         const std::uint32_t n = static_cast<std::uint32_t>(list.size());
-        for (std::uint32_t r = 0; r < n; ++r) std::memcpy(&xe[std::size_t{r} * H], z + std::size_t{list[r].first} * H, std::size_t{H} * 4);
-        ready[j].get();
         const int sl = static_cast<int>(j % kExpSlots);
-        if (std::getenv("GEN_PIN_COPY")) {
-          WeightBuffer w;
-          w.host = const_cast<std::uint8_t*>(L.exp_q5->data()) + active[j] * per;
-          w.bytes = per;
-          rt.Ffn(ed_ffn[sl], w, xe.data(), n, ye.data(), &tim, gu_strips, H);
-        } else {
-          rt.Ffn(ed_ffn[sl], ed_slot[sl], xe.data(), n, ye.data(), &tim, gu_strips, H);
-        }
-        if (j + kExpSlots < active.size()) ready[j + kExpSlots] = std::async(launch, copy, j + kExpSlots);
+        float* y = &ye[std::size_t{static_cast<std::size_t>(sl)} * T * H];
+        rt.FfnFinish(ed_ffn[sl], ed_slot[sl], y, n, &tim, gu_strips, H);
+        if (j + kExpSlots < active.size()) ready[j + kExpSlots] = std::async(std::launch::async, copy, j + kExpSlots);
         for (std::uint32_t r = 0; r < n; ++r) {
           float* o = out + std::size_t{list[r].first} * H;
           const float w = list[r].second;
-          for (std::uint32_t i = 0; i < H; ++i) o[i] += w * ye[std::size_t{r} * H + i];
+          for (std::uint32_t i = 0; i < H; ++i) o[i] += w * y[std::size_t{r} * H + i];
         }
+      };
+      for (std::size_t j = 0; j < active.size(); ++j) {
+        const auto& list = by_expert[active[j]];
+        const std::uint32_t n = static_cast<std::uint32_t>(list.size());
+        const int sl = static_cast<int>(j % kExpSlots);
+        if (j >= kExpSlots) finish_run(j - kExpSlots);  // frees this slot's buffers
+        float* x = &xe[std::size_t{static_cast<std::size_t>(sl)} * T * H];
+        for (std::uint32_t r = 0; r < n; ++r) std::memcpy(&x[std::size_t{r} * H], z + std::size_t{list[r].first} * H, std::size_t{H} * 4);
+        ready[j].get();
+        rt.FfnStart(ed_ffn[sl], ed_slot[sl], x, n, &tim);
       }
+      for (std::size_t j = active.size() > kExpSlots ? active.size() - kExpSlots : 0; j < active.size(); ++j) finish_run(j);
+      moe_dec[0] += Ms(t_exp0);
+      moe_dec[1] += static_cast<double>(active.size());
+      moe_dec[2] += 1;
       return;
     }
     // Prefill: runs of up to 512 rows per expert, software-pipelined over two program sets.
@@ -3002,6 +3020,49 @@ int HybridQuality(const char* model, const char* programs, const char* text_path
   return 0;
 }
 
+// Timing probe of the fused FFN decode program: ffnbench PROGRAMS_DIR H I [int4]; synchronous vs 4 in flight.
+int FfnBench(const char* prog_dir, std::uint32_t H, std::uint32_t I, bool int4) {
+  NpuRuntime rt;
+  std::string err;
+  const std::string dir = std::string(prog_dir) + (int4 ? "/q4" : "");
+  if (!rt.Init(dir + "/final_16x64x128_ffn.xclbin", &err, int4)) return 1;
+  const std::uint32_t gu_strips = 2 * I / kStripRows, h_p = H;
+  const std::string insts = dir + "/insts_ffn_" + std::to_string(H) + "x" + std::to_string(I) + ".txt";
+  const std::size_t gu_b = std::size_t{gu_strips} * (H / kTileK) * 4 * QuarterBytesW();
+  const std::size_t dn_b = std::size_t{h_p / kStripRows} * (I / kTileK) * 4 * QuarterBytesW();
+  constexpr int kProg = 4;
+  Program p[kProg];
+  WeightBuffer w[kProg];
+  for (int i = 0; i < kProg; ++i) {
+    p[i] = rt.MakeProgram(H, H, insts, std::size_t{gu_strips + h_p / kStripRows} * kStripBytes, &err);
+    w[i] = rt.AllocWeightBo(gu_b + dn_b, 3);
+    std::vector<float> gu(std::size_t{2 * I} * H), dn(std::size_t{h_p} * I);
+    std::srand(7 + i);
+    for (auto& v : gu) v = (std::rand() / static_cast<float>(RAND_MAX) - 0.5f) * 0.1f;
+    for (auto& v : dn) v = (std::rand() / static_cast<float>(RAND_MAX) - 0.5f) * 0.1f;
+    PackMatInt5(gu.data(), 2 * I, H, w[i].host);
+    PackMatInt5(dn.data(), h_p, I, w[i].host + gu_b);
+    w[i].bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  }
+  std::vector<float> x(H, 0.1f), y(H);
+  for (int i = 0; i < kProg; ++i) rt.Ffn(p[i], w[i], x.data(), 1, y.data(), nullptr, gu_strips, H);
+  const int reps = 400;
+  NpuRuntime::Timings tm{};
+  auto t0 = Clock::now();
+  for (int i = 0; i < reps; ++i) rt.Ffn(p[i % kProg], w[i % kProg], x.data(), 1, y.data(), &tm, gu_strips, H);
+  const double sync_us = Ms(t0) * 1000.0 / reps;
+  std::printf("sync split us: enc %.1f syncA %.1f submit %.1f wait %.1f syncC %.1f dec %.1f\n", tm.enc * 1000 / reps, tm.syncA * 1000 / reps, tm.submit * 1000 / reps, tm.wait * 1000 / reps, tm.syncC * 1000 / reps, tm.dec * 1000 / reps);
+  t0 = Clock::now();
+  for (int i = 0; i < reps; ++i) {
+    if (i >= kProg) rt.FfnFinish(p[i % kProg], w[i % kProg], y.data(), 1, nullptr, gu_strips, H);
+    rt.FfnStart(p[i % kProg], w[i % kProg], x.data(), 1, nullptr);
+  }
+  for (int i = reps - kProg; i < reps; ++i) rt.FfnFinish(p[i % kProg], w[i % kProg], y.data(), 1, nullptr, gu_strips, H);
+  const double pipe_us = Ms(t0) * 1000.0 / reps;
+  std::printf("ffn H=%u I=%u %s: %.0f KB weights, synchronous %.1f us, pipelined %.1f us per dispatch\n", H, I, int4 ? "int4" : "int5", (gu_b + dn_b) / 1024.0, sync_us, pipe_us);
+  return 0;
+}
+
 int GemmBench64(const char* prog_dir, const char* inst, std::uint32_t K, std::uint32_t N) {
   NpuRuntime rt;
   std::string err;
@@ -3278,6 +3339,7 @@ int ChatT(const char* model, const char* programs, const std::string& prompt, st
   std::fprintf(stderr, "\nhost norm+resid %.0f ms | ffn %.0f ms | attention+rope %.0f ms | gemm enc %.0f dec %.0f sync+wait %.0f ms\n", g.ph[0], g.ph[1], g.ph[2], g.tim.enc, g.tim.dec, g.tim.wait + g.tim.syncA + g.tim.syncC);
   if (g.bad_head_rows) std::fprintf(stderr, "attention rows recomputed on the host: %llu\n", static_cast<unsigned long long>(g.bad_head_rows));
   if constexpr (std::is_same_v<E, HybridEngine>)
+    if (g.moe_dec[2] > 0 && std::getenv("GEN_MOE_PROF")) std::fprintf(stderr, "moe decode: %.0f layer-steps, %.3f ms per layer in the expert loop, %.1f experts per layer\n", g.moe_dec[2], g.moe_dec[0] / g.moe_dec[2], g.moe_dec[1] / g.moe_dec[2]);
     if (g.ph[23] > 0) std::fprintf(stderr, "moe runs %.0f: host prepare %.0f ms | device %.0f ms | host finish %.0f ms (sums over threads)\n", g.ph[23], g.ph[20], g.ph[21], g.ph[22]);
     std::fprintf(stderr, "stages (prefill+decode): delta-net %.0f ms (in-gemm %.0f | host prep %.0f | device %.0f | host post %.0f | out-gemm %.0f) | attention %.0f ms | mlp %.0f ms | norm+resid %.0f ms | host delta-net: gates %.0f conv %.0f recurrence %.0f\n", g.ph[8], g.ph[12], g.ph[13], g.ph[14], g.ph[15], g.ph[16], g.ph[9], g.ph[10], g.ph[11], g.ph[17], g.ph[18], g.ph[19]);
   std::fprintf(stderr, "\nprefill %zu tok %.1f ms (%.0f tok/s); decode %u tok %.1f ms (%.2f tok/s)\n", ids.size(), pf, ids.size() / pf * 1000, produced, dc, produced / dc * 1000);
@@ -3553,6 +3615,7 @@ int main(int argc, char** argv) {
   if (argc >= 5 && std::string(argv[1]) == "chat") return Chat(argv[2], argv[3], argv[4], argc > 5 ? std::atoi(argv[5]) : 256, false, 0);
   if (argc >= 5 && std::string(argv[1]) == "bench") return Chat(argv[2], argv[3], "", static_cast<std::uint32_t>(std::atoi(argv[5 < argc ? 5 : 4])), true, static_cast<std::uint32_t>(std::atoi(argv[4])));
   if (argc == 7 && std::string(argv[1]) == "quality") return HybridQuality(argv[2], argv[3], argv[4], static_cast<std::uint32_t>(std::atoi(argv[5])), argv[6]);
+  if (argc >= 5 && std::string(argv[1]) == "ffnbench") return FfnBench(argv[2], std::atoi(argv[3]), std::atoi(argv[4]), argc > 5);
   if (argc == 6 && std::string(argv[1]) == "gemmbench64") return GemmBench64(argv[2], argv[3], std::atoi(argv[4]), std::atoi(argv[5]));
   if (argc == 6 && std::string(argv[1]) == "gemmtest") return GemmTest(argv[2], argv[3], std::atoi(argv[4]), std::atoi(argv[5]));
   if (argc < 5) {

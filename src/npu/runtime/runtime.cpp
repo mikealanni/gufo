@@ -687,8 +687,7 @@ void NpuRuntime::GemmAtb(Program& p, WeightBuffer& wb, const float* x,
   if (t) ++t->calls;
 }
 
-void NpuRuntime::Ffn(Program& p, WeightBuffer& wb, const float* x,
-                     std::uint32_t n, float* y, Timings* t, std::uint32_t gu_strips, std::uint32_t out_n) {
+void NpuRuntime::FfnStart(Program& p, WeightBuffer& wb, const float* x, std::uint32_t n, Timings* t) {
   WeightBuffer& w = WeightSlot(wb, p);
   auto t0 = Clock::now();
   EncodeA(x, n, p.K, p);
@@ -699,7 +698,11 @@ void NpuRuntime::Ffn(Program& p, WeightBuffer& wb, const float* x,
   t0 = Clock::now();
   w.run.start();
   if (t) t->submit += Ms(t0);
-  t0 = Clock::now();
+}
+
+void NpuRuntime::FfnFinish(Program& p, WeightBuffer& wb, float* y, std::uint32_t n, Timings* t, std::uint32_t gu_strips, std::uint32_t out_n) {
+  WeightBuffer& w = p.wpin ? *p.wpin : WeightSlot(wb, p);  // never re-bind here: that would replace the run that is in flight
+  auto t0 = Clock::now();
   for (;;) {
     const auto st = w.run.state();
     if (st == ERT_CMD_STATE_COMPLETED)
@@ -722,6 +725,12 @@ void NpuRuntime::Ffn(Program& p, WeightBuffer& wb, const float* x,
   DecodeC(y, n, p, p.ch + std::size_t{gu_strips} * kStripBytes, out_n);
   if (t) t->dec += Ms(t0);
   if (t) ++t->calls;
+}
+
+void NpuRuntime::Ffn(Program& p, WeightBuffer& wb, const float* x,
+                     std::uint32_t n, float* y, Timings* t, std::uint32_t gu_strips, std::uint32_t out_n) {
+  FfnStart(p, wb, x, n, t);
+  FfnFinish(p, wb, y, n, t, gu_strips, out_n);
 }
 
 void NpuRuntime::Argmax(Program& p, WeightBuffer& wb, const float* x,

@@ -317,6 +317,9 @@ class NpuRuntime {
   };
   void Gemm(Program& p, WeightBuffer& wb, const float* x, std::uint32_t n,
             float* y, Timings* t = nullptr);
+  /// Split fused FFN: Start encodes and submits, Finish waits and decodes, so several programs can be in flight.
+  void FfnStart(Program& p, WeightBuffer& wb, const float* x, std::uint32_t n, Timings* t = nullptr);
+  void FfnFinish(Program& p, WeightBuffer& wb, float* y, std::uint32_t n, Timings* t = nullptr, std::uint32_t gu_strips = 120, std::uint32_t out_n = 2048);
   // Fused FFN: decode down-output from combined C buffer (offset after 120 strips).
   void Ffn(Program& p, WeightBuffer& wb, const float* x, std::uint32_t n,
            float* y, Timings* t = nullptr, std::uint32_t gu_strips = 120, std::uint32_t out_n = 2048);
