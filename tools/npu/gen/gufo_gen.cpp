@@ -2264,6 +2264,7 @@ int JudgeStdio(const char* model, const char* programs) {
   std::printf("READY\n");
   std::fflush(stdout);
   std::string line;
+  std::vector<std::uint32_t> last_ids;
   while (std::getline(std::cin, line)) {
     const auto tab = line.find('\t');
     const std::string question = UnescapeJev(std::string_view(line).substr(0, tab));
@@ -2274,10 +2275,24 @@ int JudgeStdio(const char* model, const char* programs) {
     body += "Question: " + question + "\nAnswer with Yes or No.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
     auto ids = tok->Encode(body);
     if (ids.size() + p0 + 8 > ctx) ids.erase(ids.begin(), ids.end() - (ctx - p0 - 8));
-    g.pos = p0;
+    // Causal model: keep the KV of the longest token prefix shared with the previous request (the last token is always recomputed for its hidden state).
+    std::size_t lcp = 0;
+    while (lcp < ids.size() && lcp < last_ids.size() && ids[lcp] == last_ids[lcp]) ++lcp;
+    if (lcp >= ids.size()) lcp = ids.size() - 1;
+    if (std::getenv("GEN_NO_PREFIX_REUSE")) lcp = 0;
+    last_ids = ids;
+    const std::uint32_t keep = p0 + static_cast<std::uint32_t>(lcp);
+    g.pos = keep;
     for (auto& L : g.layers)
-      for (auto& np : L.napps) np = std::min(np, p0);
-    feed(ids.data(), static_cast<std::uint32_t>(ids.size()));
+      for (auto& np : L.napps) np = std::min(np, keep);
+    double ph0[8];
+    std::copy(g.ph, g.ph + 8, ph0);
+    const auto tim0 = g.tim;
+    const double tn0 = g.t_npu;
+    feed(ids.data() + lcp, static_cast<std::uint32_t>(ids.size() - lcp));
+    if (std::getenv("GUFO_JUDGE_PROF"))
+      std::fprintf(stderr, "prof %zu tok: total %.1f | norm+resid %.1f ffn %.1f attn+rope %.1f | qkv/o gemm npu %.1f | enc %.1f dec %.1f wait %.1f syncA %.1f syncC %.1f\n", ids.size(), Ms(t0),
+                   g.ph[0] - ph0[0], g.ph[1] - ph0[1], g.ph[2] - ph0[2], g.t_npu - tn0, g.tim.enc - tim0.enc, g.tim.dec - tim0.dec, g.tim.wait - tim0.wait, g.tim.syncA - tim0.syncA, g.tim.syncC - tim0.syncC);
     const float* last = &hd[hd.size() - g.c.hidden];
     const float ly = g.LogitAt(last, yes_ids[0]), ln = g.LogitAt(last, no_ids[0]);
     const double m = std::max(ly, ln);
