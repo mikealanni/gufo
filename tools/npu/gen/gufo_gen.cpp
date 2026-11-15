@@ -332,8 +332,8 @@ struct Layer {
   Program ks_qkv, ks_o;  // 512-row programs for requests that fit in one small pass
   std::vector<MlpSlice> mlp;
   // int5 decode path (language-model mode): stream-bound m16 programs on the decode xclbin
-  WeightBuffer dq_in, dq_o, dq_gu, dq_dn;
-  Program dp_in, dp_o, dp_gu, dp_dn;
+  WeightBuffer dq_in, dq_o, dq_ffn;  // dq_ffn: gate/up strips followed by down strips (one fused dispatch)
+  Program dp_in, dp_o, dp_ffn;
   // mixture of experts: router (experts x hidden), shared-expert gate (hidden), packed routed experts (1024-row path and int5 decode path)
   std::vector<float> router, sh_gate;
   std::shared_ptr<ExpertBlob> exp_kd, exp_q5;
@@ -1684,8 +1684,11 @@ struct HybridEngine : Engine {
     if (dec_ok) {
       const std::string gi = "bash " + programs + "/../gen_insts.sh ";
       const auto n = [](std::uint32_t v) { return std::to_string(v); };
-      for (const auto& kn : {std::pair{H, kGdnInN}, std::pair{kValDim, h_p}, std::pair{H, attn_n}, std::pair{qd, h_p}, std::pair{H, 2 * I}, std::pair{I, h_p}})
+      for (const auto& kn : {std::pair{H, kGdnInN}, std::pair{kValDim, h_p}, std::pair{H, attn_n}, std::pair{qd, h_p}})
         NeedInsts(programs, plain_name(kn.first, kn.second), gi + "plain " + n(kn.first) + " " + n(kn.second));
+      nm.ffn16 = "insts_ffn_" + n(H) + "x" + n(I) + ".txt";
+      NeedInsts(programs, nm.ffn16, gi + "ffn " + n(H) + " " + n(2 * I) + " " + n(I) + " " + n(h_p) + " 1 " + nm.ffn16);
+      gu_strips = 2 * I / kStripRows;
       nm.argmax = "insts_argmax_" + n(H) + "x" + n(vp_n) + ".txt";
       NeedInsts(programs, nm.argmax, gi + "argmax " + n(H) + " " + n(vp_n) + " " + nm.argmax);
       p_argmax = rt.MakeProgram(H, vp_n, programs + "/" + nm.argmax, 0, &err);
@@ -1842,26 +1845,29 @@ struct HybridEngine : Engine {
           const std::uint32_t ko = h.linear ? kValDim : qd;
           L.dq_in = rt.PackWeightCached(wcache, b + "q5.in", in_rows, H, load_in);
           L.dq_o = rt.PackWeightCached(wcache, b + "q5.o", h_p, ko, load_o);
-          L.dq_gu = rt.PackWeightCached(wcache, b + "q5.gu", 2 * I, H, [&]() -> const float* {
-            ensure();
-            gu_buf.resize(std::size_t{2 * I} * H);
-            for (std::size_t f = 0; f < I / 8; ++f)
-              for (std::size_t i = 0; i < 8; ++i) {
-                std::memcpy(&gu_buf[(f * 16 + i) * H], &gate[(f * 8 + i) * H], std::size_t{H} * 4);
-                std::memcpy(&gu_buf[(f * 16 + 8 + i) * H], &up[(f * 8 + i) * H], std::size_t{H} * 4);
-              }
-            return gu_buf.data();
-          });
-          L.dq_dn = rt.PackWeightCached(wcache, b + "q5.dn", h_p, I, [&]() -> const float* {
-            ensure();
-            dn_buf.assign(std::size_t{h_p} * I, 0.f);
-            std::memcpy(dn_buf.data(), down.data(), down.size() * 4);
-            return dn_buf.data();
-          });
+          {
+            const std::size_t gu_b = std::size_t{gu_strips} * (H / kTileK) * 4 * kQuarterBytes;
+            const std::size_t dn_b = std::size_t{h_p / kStripRows} * (I / kTileK) * 4 * kQuarterBytes;
+            L.dq_ffn = rt.AllocWeightBo(gu_b + dn_b, 3);
+            if (!wcache.Load(b + "q5.ffn", L.dq_ffn.host, L.dq_ffn.bytes)) {
+              ensure();
+              gu_buf.resize(std::size_t{2 * I} * H);
+              for (std::size_t f = 0; f < I / 8; ++f)
+                for (std::size_t i = 0; i < 8; ++i) {
+                  std::memcpy(&gu_buf[(f * 16 + i) * H], &gate[(f * 8 + i) * H], std::size_t{H} * 4);
+                  std::memcpy(&gu_buf[(f * 16 + 8 + i) * H], &up[(f * 8 + i) * H], std::size_t{H} * 4);
+                }
+              dn_buf.assign(std::size_t{h_p} * I, 0.f);
+              std::memcpy(dn_buf.data(), down.data(), down.size() * 4);
+              PackMatInt5(gu_buf.data(), 2 * I, H, L.dq_ffn.host);
+              PackMatInt5(dn_buf.data(), h_p, I, L.dq_ffn.host + gu_b);
+              wcache.Store(b + "q5.ffn", L.dq_ffn.host, L.dq_ffn.bytes);
+            }
+            L.dq_ffn.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+          }
           L.dp_in = rt.MakeProgram(H, in_rows, programs + "/" + plain_name(H, in_rows), 0, &err);
           L.dp_o = rt.MakeProgram(ko, h_p, programs + "/" + plain_name(ko, h_p), 0, &err);
-          L.dp_gu = rt.MakeProgram(H, 2 * I, programs + "/" + plain_name(H, 2 * I), 0, &err);
-          L.dp_dn = rt.MakeProgram(I, h_p, programs + "/" + plain_name(I, h_p), 0, &err);
+          L.dp_ffn = rt.MakeProgram(H, H, programs + "/" + nm.ffn16, std::size_t{gu_strips + h_p / kStripRows} * kStripBytes, &err);
         }
       }
       if (l % 8 == 0) std::fprintf(stderr, "hybrid: packed layer %u (%.1f s)\n", l, Ms(t0) / 1000.0);
@@ -2182,9 +2188,10 @@ struct HybridEngine : Engine {
   // state at each sequence's marker.
   // ---- mixture of experts (qwen35moe) ----
   // One program set serves every expert of every layer: expert weights are copied into pinned scratch buffers (WeightSlot).
-  Program ep_a, ep_d, ed_a, ed_d;
+  static constexpr int kExpSlots = 3;  // decode: experts in flight (weights are copied in ahead of the device)
+  Program ep_a, ep_d, ed_ffn[kExpSlots];
   xrt::bo ep_swc;
-  WeightBuffer ep_slot_a, ep_slot_d, ed_slot_a, ed_slot_d;
+  WeightBuffer ep_slot_a, ep_slot_d, ed_slot[kExpSlots];
   std::size_t ex_a{0}, ex_d{0}, ex_qa{0}, ex_qd{0};  // packed bytes of one expert: gate/up and down, bfp16 and int5
 
   void PackExperts(Layer& L, const Safetensors& st, const std::string& b) {
@@ -2270,12 +2277,11 @@ struct HybridEngine : Engine {
     rk.WeightSlot(ep_slot_a, ep_a);
     rk.WeightSlot(ep_slot_d, ep_d);
     if (dec_ok) {
-      ed_a = rt.MakeProgram(plain_a_k, plain_a_n, programs + "/" + std::string("insts_plain_") + std::to_string(H) + "x" + std::to_string(2 * SI) + ".txt", 0, err);
-      ed_d = rt.MakeProgram(SI, h_p, programs + "/" + std::string("insts_plain_") + std::to_string(SI) + "x" + std::to_string(h_p) + ".txt", 0, err);
-      ed_slot_a = rt.AllocWeightBo(ex_qa, 3);
-      ed_slot_d = rt.AllocWeightBo(ex_qd, 3);
-      rt.WeightSlot(ed_slot_a, ed_a);
-      rt.WeightSlot(ed_slot_d, ed_d);
+      for (int i = 0; i < kExpSlots; ++i) {
+        ed_ffn[i] = rt.MakeProgram(H, H, programs + "/" + nm.ffn16, std::size_t{gu_strips + h_p / kStripRows} * kStripBytes, err);
+        ed_slot[i] = rt.AllocWeightBo(ex_qa + ex_qd, 3);
+        rt.WeightSlot(ed_slot[i], ed_ffn[i]);
+      }
     }
   }
 
@@ -2303,29 +2309,6 @@ struct HybridEngine : Engine {
     if (ky.size() < std::size_t{512} * h_p) ky.assign(std::size_t{1024} * kyn, 0.f);
     rk.DecodeCAtbRaw(ep_d.ch, ky.data(), 512, h_p, n);
     for (std::uint32_t r = 0; r < n; ++r) std::memcpy(y + std::size_t{r} * H, &ky[std::size_t{r} * h_p], std::size_t{H} * 4);
-  }
-
-  // The same expert for few rows on the int5 decode programs.
-  void ExpertRunDec(Layer& L, std::uint32_t e, const float* x, std::uint32_t n, float* y) {
-    const std::uint32_t H = c.hidden, SI = slice_i, h_p = PadN(H);
-    const std::size_t per = ex_qa + ex_qd;
-    WeightBuffer wa, wd;
-    wa.host = const_cast<std::uint8_t*>(L.exp_q5->data()) + e * per;
-    wa.bytes = ex_qa;
-    wd.host = wa.host + ex_qa;
-    wd.bytes = ex_qd;
-    s_gu.resize(std::size_t{n} * 2 * SI);
-    rt.Gemm(ed_a, wa, x, n, s_gu.data(), &tim);
-    s_act.resize(std::size_t{n} * SI);
-    for (std::uint32_t r = 0; r < n; ++r) {
-      const float* gu = &s_gu[std::size_t{r} * 2 * SI];
-      float* a = &s_act[std::size_t{r} * SI];
-      for (std::uint32_t f = 0; f < SI / 8; ++f)
-        for (std::uint32_t i = 0; i < 8; ++i) a[f * 8 + i] = SiluF(gu[f * 16 + i]) * gu[f * 16 + 8 + i];
-    }
-    s_dn.resize(std::size_t{n} * h_p);
-    rt.Gemm(ed_d, wd, s_act.data(), n, s_dn.data(), &tim);
-    for (std::uint32_t r = 0; r < n; ++r) std::memcpy(y + std::size_t{r} * H, &s_dn[std::size_t{r} * h_p], std::size_t{H} * 4);
   }
 
   // Routed experts (softmax over all experts, top-k, renormalised) plus the shared expert scaled by sigmoid(gate . x).
@@ -2374,15 +2357,52 @@ struct HybridEngine : Engine {
     std::vector<std::vector<std::pair<std::uint32_t, float>>> by_expert(n_exp);
     for (std::uint32_t t = 0; t < T; ++t)
       for (std::uint32_t k = 0; k < n_used; ++k) by_expert[top[std::size_t{t} * n_used + k]].emplace_back(t, wgt[std::size_t{t} * n_used + k]);
-    const std::uint32_t chunk = use_dec ? 16u : 512u;
+    if (use_dec) {
+      // Experts run one fused dispatch each; the next experts' weights are copied into rotating scratch buffers while the device works.
+      std::vector<std::uint32_t> active;
+      for (std::uint32_t e = 0; e < n_exp; ++e)
+        if (!by_expert[e].empty()) active.push_back(e);
+      const std::size_t per = ex_qa + ex_qd;
+      const auto copy = [&](std::size_t j) {
+        WeightBuffer& slot = ed_slot[j % kExpSlots];
+        std::memcpy(slot.host, L.exp_q5->data() + active[j] * per, per);
+        slot.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);  // flush the CPU cache lines the device will read
+      };
+      std::vector<std::future<void>> ready(active.size());
+      const auto launch = std::getenv("GEN_SYNC_PREFETCH") ? std::launch::deferred : std::launch::async;
+      for (std::size_t j = 0; j < active.size() && j < kExpSlots; ++j) ready[j] = std::async(launch, copy, j);
+      std::vector<float> xe(std::size_t{T} * H), ye(std::size_t{T} * H);
+      for (std::size_t j = 0; j < active.size(); ++j) {
+        const auto& list = by_expert[active[j]];
+        const std::uint32_t n = static_cast<std::uint32_t>(list.size());
+        for (std::uint32_t r = 0; r < n; ++r) std::memcpy(&xe[std::size_t{r} * H], z + std::size_t{list[r].first} * H, std::size_t{H} * 4);
+        ready[j].get();
+        const int sl = static_cast<int>(j % kExpSlots);
+        if (std::getenv("GEN_PIN_COPY")) {
+          WeightBuffer w;
+          w.host = const_cast<std::uint8_t*>(L.exp_q5->data()) + active[j] * per;
+          w.bytes = per;
+          rt.Ffn(ed_ffn[sl], w, xe.data(), n, ye.data(), &tim, gu_strips, H);
+        } else {
+          rt.Ffn(ed_ffn[sl], ed_slot[sl], xe.data(), n, ye.data(), &tim, gu_strips, H);
+        }
+        if (j + kExpSlots < active.size()) ready[j + kExpSlots] = std::async(launch, copy, j + kExpSlots);
+        for (std::uint32_t r = 0; r < n; ++r) {
+          float* o = out + std::size_t{list[r].first} * H;
+          const float w = list[r].second;
+          for (std::uint32_t i = 0; i < H; ++i) o[i] += w * ye[std::size_t{r} * H + i];
+        }
+      }
+      return;
+    }
+    const std::uint32_t chunk = 512u;
     std::vector<float> xe(std::size_t{chunk} * H), ye(std::size_t{chunk} * H);
     for (std::uint32_t e = 0; e < n_exp; ++e) {
       const auto& list = by_expert[e];
       for (std::size_t o0 = 0; o0 < list.size(); o0 += chunk) {
         const std::uint32_t n = static_cast<std::uint32_t>(std::min<std::size_t>(chunk, list.size() - o0));
         for (std::uint32_t r = 0; r < n; ++r) std::memcpy(&xe[std::size_t{r} * H], z + std::size_t{list[o0 + r].first} * H, std::size_t{H} * 4);
-        if (use_dec) ExpertRunDec(L, e, xe.data(), n, ye.data());
-        else ExpertRun(L, e, xe.data(), n, ye.data());
+        ExpertRun(L, e, xe.data(), n, ye.data());
         for (std::uint32_t r = 0; r < n; ++r) {
           float* o = out + std::size_t{list[o0 + r].first} * H;
           const float w = list[o0 + r].second;
@@ -2392,22 +2412,8 @@ struct HybridEngine : Engine {
     }
   }
 
-  // Decode-path MLP: fused gate/up GEMM (interleaved 8-row blocks), host swiglu, down GEMM.
-  void DecMlp(Layer& L, const float* z, std::uint32_t n, float* out) {
-    const std::uint32_t H = c.hidden, I = c.inter, h_p = PadN(H);
-    s_gu.resize(std::size_t{n} * 2 * I);
-    rt.Gemm(L.dp_gu, L.dq_gu, z, n, s_gu.data(), &tim);
-    s_act.resize(std::size_t{n} * I);
-    for (std::uint32_t r = 0; r < n; ++r) {
-      const float* g = &s_gu[std::size_t{r} * 2 * I];
-      float* a = &s_act[std::size_t{r} * I];
-      for (std::uint32_t f = 0; f < I / 8; ++f)
-        for (std::uint32_t i = 0; i < 8; ++i) a[f * 8 + i] = SiluF(g[f * 16 + i]) * g[f * 16 + 8 + i];
-    }
-    s_dn.resize(std::size_t{n} * h_p);
-    rt.Gemm(L.dp_dn, L.dq_dn, s_act.data(), n, s_dn.data(), &tim);
-    for (std::uint32_t r = 0; r < n; ++r) std::memcpy(out + std::size_t{r} * H, &s_dn[std::size_t{r} * h_p], std::size_t{H} * 4);
-  }
+  // Decode-path MLP: gate/up GEMM, swiglu and down GEMM in one dispatch.
+  void DecMlp(Layer& L, const float* z, std::uint32_t n, float* out) { rt.Ffn(L.dp_ffn, L.dq_ffn, z, n, out, &tim, gu_strips, c.hidden); }
 
   // All transformer layers over the T residual rows x (norms, delta-net or attention, MLP, residual adds).
   void Layers(std::vector<float>& x, std::uint32_t T, const std::vector<Seg>& segs) {
