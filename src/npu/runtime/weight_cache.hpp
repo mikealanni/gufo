@@ -8,12 +8,14 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <vector>
 
 namespace gufo::npu::runtime {
 
@@ -55,8 +57,51 @@ public:
                   static_cast<unsigned long long>(h));
     std::error_code ec;
     std::filesystem::create_directories(root + "/" + key, ec);
-    if (!ec)
-      dir_ = root + "/" + key;
+    if (ec)
+      return;
+    dir_ = root + "/" + key;
+    ::utimensat(AT_FDCWD, dir_.c_str(), nullptr, 0);
+    Evict(root, key);
+  }
+  /// Least-recently-opened model directories are removed until the cache fits
+  /// GUFO_WEIGHT_CACHE_GB (default 120, 0 = unlimited); the current model is
+  /// kept.
+  static void Evict(const std::string& root, const std::string& keep) {
+    std::uint64_t cap_gb = 120;
+    if (const char* c = std::getenv("GUFO_WEIGHT_CACHE_GB"))
+      cap_gb = std::strtoull(c, nullptr, 10);
+    if (cap_gb == 0)
+      return;
+    namespace fs = std::filesystem;
+    struct Entry {
+      fs::path path;
+      fs::file_time_type used;
+      std::uint64_t bytes;
+    };
+    std::vector<Entry> entries;
+    std::uint64_t total = 0;
+    std::error_code ec;
+    for (const auto& d : fs::directory_iterator(root, ec)) {
+      if (!d.is_directory(ec))
+        continue;
+      std::uint64_t bytes = 0;
+      for (const auto& f : fs::directory_iterator(d.path(), ec))
+        if (f.is_regular_file(ec))
+          bytes += f.file_size(ec);
+      total += bytes;
+      if (d.path().filename() != keep)
+        entries.push_back({d.path(), d.last_write_time(ec), bytes});
+    }
+    std::sort(entries.begin(), entries.end(),
+              [](const Entry& a, const Entry& b) { return a.used < b.used; });
+    const std::uint64_t cap = cap_gb << 30;
+    for (const Entry& e : entries) {
+      if (total <= cap)
+        break;
+      fs::remove_all(e.path, ec);
+      if (!ec)
+        total -= e.bytes;
+    }
   }
   [[nodiscard]] bool enabled() const { return !dir_.empty(); }
 
