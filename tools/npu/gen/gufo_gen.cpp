@@ -1502,6 +1502,7 @@ struct HybridEngine : Engine {
   bool dec_ok{false};   // int5 stream-bound decode path available (language-model mode)
   bool use_dec{false};  // the current Step runs on it (few rows)
   std::vector<float> s_gu, s_act, s_dn;
+  int moe_threads{std::getenv("GEN_MOE_THREADS") ? std::atoi(std::getenv("GEN_MOE_THREADS")) : 8};  // per host stage of the expert pipeline
   int attn_threads{std::getenv("GEN_ATTN_THREADS") ? std::atoi(std::getenv("GEN_ATTN_THREADS")) : 16};
   GdnDev gd;
   bool gdn_dev{std::getenv("GEN_GDN_HOST") == nullptr};
@@ -2294,9 +2295,14 @@ struct HybridEngine : Engine {
   // ---- mixture of experts (qwen35moe) ----
   // One program set serves every expert of every layer: expert weights are copied into pinned scratch buffers (WeightSlot).
   static constexpr int kExpSlots = 3;  // decode: experts in flight (weights are copied in ahead of the device)
-  Program ep_a, ep_d, ed_ffn[kExpSlots];
-  xrt::bo ep_swc;
-  WeightBuffer ep_slot_a, ep_slot_d, ed_slot[kExpSlots];
+  struct ExpertSet {
+    Program a, d;
+    xrt::bo swc;
+    WeightBuffer slot_a, slot_d;
+    std::vector<float> x, y;
+  } es[2];  // prefill: two sets so host work for the next expert overlaps the device run of the current one
+  Program ed_ffn[kExpSlots];
+  WeightBuffer ed_slot[kExpSlots];
   std::size_t ex_a{0}, ex_d{0}, ex_qa{0}, ex_qd{0};  // packed bytes of one expert: gate/up and down, bfp16 and int5
 
   void PackExperts(Layer& L, const Safetensors& st, const std::string& b) {
@@ -2369,18 +2375,22 @@ struct HybridEngine : Engine {
     ex_qa = std::size_t{(2 * SI) / kStrip} * (H / kTileK) * 4 * kQuarterBytes;
     ex_qd = std::size_t{h_p / kStripRows} * (SI / kTileK) * 4 * kQuarterBytes;
     const std::size_t abytes = std::size_t{1024} * SI / 8 * 9;
-    ep_swc = rk.MakeBo(2 * abytes, 3);
-    std::memset(ep_swc.map<void*>(), 0, 2 * abytes);
-    ep_swc.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    ep_a = rk.MakeProgram(H, 2 * half_a, programs + "/" + nm.swa + "_m512.txt", 64, err, 0, 32, 3, 5);
-    ep_a.c = ep_swc;
-    ep_a.ch = ep_swc.map<std::uint8_t*>();
-    ep_d = rk.MakeProgram(SI, h_p, programs + "/" + nm.dn2s + ".txt", std::size_t{512} * h_p / 8 * 9, err, 0, 32, 3, 5);
-    rk.RebindA(ep_d, ep_swc);
-    ep_slot_a = rk.AllocWeightBo(ex_a, 4);
-    ep_slot_d = rk.AllocWeightBo(ex_d, 4);
-    rk.WeightSlot(ep_slot_a, ep_a);
-    rk.WeightSlot(ep_slot_d, ep_d);
+    for (ExpertSet& e : es) {
+      e.swc = rk.MakeBo(2 * abytes, 3);
+      std::memset(e.swc.map<void*>(), 0, 2 * abytes);
+      e.swc.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      e.a = rk.MakeProgram(H, 2 * half_a, programs + "/" + nm.swa + "_m512.txt", 64, err, 0, 32, 3, 5);
+      e.a.c = e.swc;
+      e.a.ch = e.swc.map<std::uint8_t*>();
+      e.d = rk.MakeProgram(SI, h_p, programs + "/" + nm.dn2s + ".txt", std::size_t{512} * h_p / 8 * 9, err, 0, 32, 3, 5);
+      rk.RebindA(e.d, e.swc);
+      e.slot_a = rk.AllocWeightBo(ex_a, 4);
+      e.slot_d = rk.AllocWeightBo(ex_d, 4);
+      rk.WeightSlot(e.slot_a, e.a);
+      rk.WeightSlot(e.slot_d, e.d);
+      e.x.assign(std::size_t{512} * H, 0.f);
+      e.y.assign(std::size_t{512} * h_p, 0.f);
+    }
     if (dec_ok) {
       for (int i = 0; i < kExpSlots; ++i) {
         ed_ffn[i] = rt.MakeProgram(H, H, programs + "/" + nm.ffn16, std::size_t{gu_strips + h_p / kStripRows} * kStripBytes, err);
@@ -2388,32 +2398,6 @@ struct HybridEngine : Engine {
         rt.WeightSlot(ed_slot[i], ed_ffn[i]);
       }
     }
-  }
-
-  // One expert over n <= 512 gathered rows (x: n x H) -> y (n x H).
-  void ExpertRun(Layer& L, std::uint32_t e, const float* x, std::uint32_t n, float* y) {
-    const std::uint32_t H = c.hidden, h_p = PadN(H);
-    const std::size_t per = ex_a + ex_d;
-    WeightBuffer wa, wd;
-    wa.host = const_cast<std::uint8_t*>(L.exp_kd->data()) + e * per;
-    wa.bytes = ex_a;
-    wd.host = wa.host + ex_a;
-    wd.bytes = ex_d;
-    const std::uint32_t up = std::min(512u, (n + 127) / 128 * 128);
-    if (kxs[0].size() < std::size_t{1024} * kxn) {
-      kxs[0].assign(std::size_t{1024} * kxn, 0.f);
-      kxs[1].assign(std::size_t{1024} * kxn, 0.f);
-    }
-    std::memcpy(kxs[0].data(), x, std::size_t{n} * H * 4);
-    std::memset(kxs[0].data() + std::size_t{n} * H, 0, std::size_t{up - n} * H * 4);
-    rk.EncodeAAtbRaw(kxs[0].data(), 512, H, ep_a.ah, n);
-    ep_a.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    KDispatch(wa, ep_a);
-    KDispatch(wd, ep_d);
-    ep_d.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-    if (ky.size() < std::size_t{512} * h_p) ky.assign(std::size_t{1024} * kyn, 0.f);
-    rk.DecodeCAtbRaw(ep_d.ch, ky.data(), 512, h_p, n);
-    for (std::uint32_t r = 0; r < n; ++r) std::memcpy(y + std::size_t{r} * H, &ky[std::size_t{r} * h_p], std::size_t{H} * 4);
   }
 
   // Routed experts (softmax over all experts, top-k, renormalised) plus the shared expert scaled by sigmoid(gate . x).
@@ -2500,21 +2484,87 @@ struct HybridEngine : Engine {
       }
       return;
     }
-    const std::uint32_t chunk = 512u;
-    std::vector<float> xe(std::size_t{chunk} * H), ye(std::size_t{chunk} * H);
-    for (std::uint32_t e = 0; e < n_exp; ++e) {
-      const auto& list = by_expert[e];
-      for (std::size_t o0 = 0; o0 < list.size(); o0 += chunk) {
-        const std::uint32_t n = static_cast<std::uint32_t>(std::min<std::size_t>(chunk, list.size() - o0));
-        for (std::uint32_t r = 0; r < n; ++r) std::memcpy(&xe[std::size_t{r} * H], z + std::size_t{list[o0 + r].first} * H, std::size_t{H} * 4);
-        ExpertRun(L, e, xe.data(), n, ye.data());
-        for (std::uint32_t r = 0; r < n; ++r) {
-          float* o = out + std::size_t{list[o0 + r].first} * H;
-          const float w = list[o0 + r].second;
-          for (std::uint32_t i = 0; i < H; ++i) o[i] += w * ye[std::size_t{r} * H + i];
-        }
+    // Prefill: runs of up to 512 rows per expert, software-pipelined over two program sets.
+    struct Run {
+      std::uint32_t e;
+      std::size_t o0;
+      std::uint32_t n;
+    };
+    std::vector<Run> runs;
+    for (std::uint32_t e = 0; e < n_exp; ++e)
+      for (std::size_t o0 = 0; o0 < by_expert[e].size(); o0 += 512)
+        runs.push_back({e, o0, static_cast<std::uint32_t>(std::min<std::size_t>(512, by_expert[e].size() - o0))});
+    const std::uint32_t h_p = PadN(H);
+    const std::size_t per = ex_a + ex_d;
+    std::atomic<long> t_prep{0}, t_dev{0}, t_fin{0}, t_wcopy{0}, t_enc{0};
+    const auto us = [](Clock::time_point t) { return static_cast<long>(Ms(t) * 1000); };
+    const auto prepare = [&](std::size_t j) {
+      omp_set_num_threads(moe_threads);
+      const auto tp0 = Clock::now();
+      ExpertSet& e = es[j & 1];
+      const Run& r = runs[j];
+      const auto& list = by_expert[r.e];
+      // the expert's weights go into the pinned buffers on their own thread while this one gathers and encodes the rows
+      auto weights = std::async(std::launch::async, [&] {
+        const auto tw0 = Clock::now();
+        std::memcpy(e.slot_a.host, L.exp_kd->data() + r.e * per, ex_a);
+        std::memcpy(e.slot_d.host, L.exp_kd->data() + r.e * per + ex_a, ex_d);
+        e.slot_a.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        e.slot_d.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        t_wcopy += us(tw0);
+      });
+      for (std::uint32_t k = 0; k < r.n; ++k) std::memcpy(&e.x[std::size_t{k} * H], z + std::size_t{list[r.o0 + k].first} * H, std::size_t{H} * 4);
+      const std::uint32_t up = std::min(512u, (r.n + 127) / 128 * 128);
+      std::memset(&e.x[std::size_t{r.n} * H], 0, std::size_t{up - r.n} * H * 4);
+      omp_set_num_threads(moe_threads);
+      rk.EncodeAAtbRaw(e.x.data(), 512, H, e.a.ah, r.n);
+      e.a.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      weights.get();
+      t_prep += us(tp0);
+    };
+    const auto finish = [&](std::size_t j) {
+      omp_set_num_threads(moe_threads);
+      const auto tf0 = Clock::now();
+      ExpertSet& e = es[j & 1];
+      const Run& r = runs[j];
+      const auto& list = by_expert[r.e];
+      e.d.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+      rk.DecodeCAtbRaw(e.d.ch, e.y.data(), 512, h_p, r.n);
+      for (std::uint32_t k = 0; k < r.n; ++k) {
+        float* o = out + std::size_t{list[r.o0 + k].first} * H;
+        const float w = list[r.o0 + k].second;
+        const float* y = &e.y[std::size_t{k} * h_p];
+        for (std::uint32_t i = 0; i < H; ++i) o[i] += w * y[i];
       }
+      t_fin += us(tf0);
+    };
+    // run j: prepare(j) -> device(j) -> finish(j). prepare(j+1) waits for finish(j-1) (same program set); finishes stay in order (they add into shared rows).
+    std::future<void> prep;
+    std::shared_future<void> fin_prev;
+    if (!runs.empty()) prepare(0);
+    for (std::size_t j = 0; j < runs.size(); ++j) {
+      ExpertSet& e = es[j & 1];
+      if (prep.valid()) prep.get();
+      if (j + 1 < runs.size()) prep = std::async(std::launch::async, [&, j, fin_prev] {
+        if (fin_prev.valid()) fin_prev.wait();
+        prepare(j + 1);
+      });
+      const auto td0 = Clock::now();
+      KDispatch(e.slot_a, e.a);
+      KDispatch(e.slot_d, e.d);
+      t_dev += us(td0);
+      fin_prev = std::async(std::launch::async, [&, j, fin_prev] {
+        if (fin_prev.valid()) fin_prev.wait();
+        finish(j);
+      }).share();
     }
+    if (prep.valid()) prep.get();
+    if (fin_prev.valid()) fin_prev.wait();
+    ph[20] += t_prep / 1000.0;
+    ph[21] += t_dev / 1000.0;
+    ph[22] += t_fin / 1000.0;
+    ph[23] += static_cast<double>(runs.size());
+    if (std::getenv("GEN_MOE_PROF")) std::fprintf(stderr, "moe layer: runs %zu prep %.1f (weight copy+flush %.1f) dev %.1f fin %.1f ms\n", runs.size(), t_prep / 1000.0, t_wcopy / 1000.0, t_dev / 1000.0, t_fin / 1000.0);
   }
 
   // Decode-path MLP: gate/up GEMM, swiglu and down GEMM in one dispatch.
@@ -2559,7 +2609,8 @@ struct HybridEngine : Engine {
     lm_mode = true;
     return InitH(model, programs, context, {});
   }
-  std::uint32_t Chunk(std::uint32_t remaining) const { return std::min(remaining, 1024u); }
+  // MoE: every expert costs a fixed number of dispatches per chunk, so feed it big chunks (tokens per expert grow with the chunk).
+  std::uint32_t Chunk(std::uint32_t remaining) const { return std::min(remaining, moe ? 4096u : 1024u); }
   void Reset() {
     pos = 0;
     cached_ids.clear();
@@ -2925,6 +2976,7 @@ int ChatT(const char* model, const char* programs, const std::string& prompt, st
   std::fprintf(stderr, "\nhost norm+resid %.0f ms | ffn %.0f ms | attention+rope %.0f ms | gemm enc %.0f dec %.0f sync+wait %.0f ms\n", g.ph[0], g.ph[1], g.ph[2], g.tim.enc, g.tim.dec, g.tim.wait + g.tim.syncA + g.tim.syncC);
   if (g.bad_head_rows) std::fprintf(stderr, "attention rows recomputed on the host: %llu\n", static_cast<unsigned long long>(g.bad_head_rows));
   if constexpr (std::is_same_v<E, HybridEngine>)
+    if (g.ph[23] > 0) std::fprintf(stderr, "moe runs %.0f: host prepare %.0f ms | device %.0f ms | host finish %.0f ms (sums over threads)\n", g.ph[23], g.ph[20], g.ph[21], g.ph[22]);
     std::fprintf(stderr, "stages (prefill+decode): delta-net %.0f ms (in-gemm %.0f | host prep %.0f | device %.0f | host post %.0f | out-gemm %.0f) | attention %.0f ms | mlp %.0f ms | norm+resid %.0f ms\n", g.ph[8], g.ph[12], g.ph[13], g.ph[14], g.ph[15], g.ph[16], g.ph[9], g.ph[10], g.ph[11]);
   std::fprintf(stderr, "\nprefill %zu tok %.1f ms (%.0f tok/s); decode %u tok %.1f ms (%.2f tok/s)\n", ids.size(), pf, ids.size() / pf * 1000, produced, dc, produced / dc * 1000);
   return 0;
