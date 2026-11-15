@@ -1,6 +1,7 @@
 #ifndef GUFO_NPU_RUNTIME_HPP_
 #define GUFO_NPU_RUNTIME_HPP_
 
+#include "src/npu/runtime/weight_cache.hpp"
 #include <functional>
 #include <tuple>
 #include <immintrin.h>
@@ -211,6 +212,13 @@ class NpuRuntime {
   /// Allocate and pack a weight matrix (N rows x K cols, row-major float).
   WeightBuffer PackWeight(const float* W, std::uint32_t N, std::uint32_t K);
   WeightBuffer PackWeightQ(const std::int8_t* q, const std::uint16_t* sc, std::uint32_t N, std::uint32_t K);
+  /// Cached variants: `fill` returns the N x K float matrix and runs only when the cache has no entry for `tag`.
+  WeightBuffer PackWeightCached(WeightCache& cache, const std::string& tag, std::uint32_t N, std::uint32_t K,
+                                const std::function<const float*()>& fill);
+  WeightBuffer PackWeightAtbCached(WeightCache& cache, const std::string& tag, std::uint32_t N, std::uint32_t K, int b_group,
+                                   const std::function<const float*()>& fill);
+  /// Zero-filled host-mapped weight buffer of `bytes` bytes (fused buffers a caller packs itself).
+  WeightBuffer AllocWeightBo(std::size_t bytes, int group);
   /// Bind a weight buffer to a program (sets kernel args 0-5).
   void Attach(WeightBuffer& wb, Program& prog);
   /// WP10: this XRT/xdna stack keeps a program's FIRST weight buffer bound: later

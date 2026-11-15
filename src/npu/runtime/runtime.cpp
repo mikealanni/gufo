@@ -159,6 +159,45 @@ WeightBuffer NpuRuntime::PackWeight(const float* W, std::uint32_t N,
   return wb;
 }
 
+WeightBuffer NpuRuntime::AllocWeightBo(std::size_t bytes, int group) {
+  WeightBuffer wb;
+  wb.bytes = bytes;
+  wb.bo = xrt::bo(dev_, wb.bytes, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(group));
+  wb.host = wb.bo.map<std::uint8_t*>();
+  std::memset(wb.host, 0, wb.bytes);
+  return wb;
+}
+
+WeightBuffer NpuRuntime::PackWeightCached(WeightCache& cache, const std::string& tag, std::uint32_t N, std::uint32_t K,
+                                          const std::function<const float*()>& fill) {
+  const std::size_t bytes = std::size_t{N / kStrip} * (K / kTileK) * 4 * kQuarterBytes;
+  if (cache.enabled()) {
+    WeightBuffer wb = AllocWeightBo(bytes, 3);
+    if (cache.Load(tag, wb.host, bytes)) {
+      wb.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      return wb;
+    }
+  }
+  WeightBuffer wb = PackWeight(fill(), N, K);
+  cache.Store(tag, wb.host, wb.bytes);
+  return wb;
+}
+
+WeightBuffer NpuRuntime::PackWeightAtbCached(WeightCache& cache, const std::string& tag, std::uint32_t N, std::uint32_t K,
+                                             int b_group, const std::function<const float*()>& fill) {
+  const std::size_t bytes = std::size_t{K} * N / 8 * 9;
+  if (cache.enabled()) {
+    WeightBuffer wb = AllocWeightBo(bytes, b_group);
+    if (cache.Load(tag, wb.host, bytes)) {
+      wb.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      return wb;
+    }
+  }
+  WeightBuffer wb = PackWeightAtb(fill(), N, K, b_group);
+  cache.Store(tag, wb.host, wb.bytes);
+  return wb;
+}
+
 void NpuRuntime::AttachTo(xrt::run& run, WeightBuffer& wb, Program& prog) {
   run.set_arg(0, 3u);
   run.set_arg(1, prog.insts);

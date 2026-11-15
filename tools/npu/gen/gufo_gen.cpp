@@ -343,6 +343,7 @@ struct Engine {
   std::unique_ptr<AttnPrefill> apre;
   const char* qdir{std::getenv("GEN_QDIR")};
   double t_npu{0}, t_cpu{0}, ph[24]{};
+  gufo::npu::runtime::WeightCache wcache;
   bool small_ok{false};
   bool cpu_ref{std::getenv("GEN_CPU") != nullptr || std::getenv("GEN_CPU_OP") != nullptr};
   std::string cpu_ops{std::getenv("GEN_CPU") ? "qkv,out,ffn" : (std::getenv("GEN_CPU_OP") ? std::getenv("GEN_CPU_OP") : "")};
@@ -409,6 +410,17 @@ struct Engine {
     }
     Safetensors st;
     if (!st.Open(model_dir)) return false;
+    wcache.Open(model_dir);
+    {
+      static const char* const kRequired[] = {"token_embd.weight",    "output_norm.weight",   "blk.0.attn_norm.weight", "blk.0.attn_q.weight", "blk.0.attn_k.weight",
+                                              "blk.0.attn_v.weight",  "blk.0.attn_output.weight", "blk.0.ffn_norm.weight", "blk.0.ffn_gate.weight", "blk.0.ffn_up.weight",
+                                              "blk.0.ffn_down.weight"};
+      for (const char* name : kRequired)
+        if (!st.HasG(name)) {
+          std::fprintf(stderr, "gen: architecture '%s' is not supported (dense llama-style GGUF needed, tensor %s is missing)\n", st.arch.c_str(), name);
+          return false;
+        }
+    }
     {
       const auto& r = *st.r;
       const std::string a = st.arch + ".";
@@ -532,12 +544,23 @@ struct Engine {
       }
       L.p_ffn = rt.MakeProgram(H, H, programs + "/" + nm.ffn16,
                                std::size_t{gu_strips + h_p / kStripRows} * kStripBytes, &err);
-      buf.assign(std::size_t{qkv_p} * H, 0.f);
-      st.Load(pre + "self_attn.q_proj.weight", buf.data(), std::size_t{qd} * H);
-      st.Load(pre + "self_attn.k_proj.weight", buf.data() + std::size_t{qd} * H, std::size_t{kvd} * H);
-      st.Load(pre + "self_attn.v_proj.weight", buf.data() + std::size_t{qd + kvd} * H, std::size_t{kvd} * H);
-      if (cpu_ref) L.wqkv = buf;
-      if (qdir) {
+      const bool wc = wcache.enabled() && !qdir && !cpu_ref;
+      const std::string wtag = "l" + std::to_string(l) + ".";
+      const auto load_qkv = [&]() -> const float* {
+        buf.assign(std::size_t{qkv_p} * H, 0.f);
+        st.Load(pre + "self_attn.q_proj.weight", buf.data(), std::size_t{qd} * H);
+        st.Load(pre + "self_attn.k_proj.weight", buf.data() + std::size_t{qd} * H, std::size_t{kvd} * H);
+        st.Load(pre + "self_attn.v_proj.weight", buf.data() + std::size_t{qd + kvd} * H, std::size_t{kvd} * H);
+        return buf.data();
+      };
+      if (wc) {
+        L.qkv = rt.PackWeightCached(wcache, wtag + "qkv", qkv_p, H, load_qkv);
+      } else {
+        load_qkv();
+        if (cpu_ref) L.wqkv = buf;
+      }
+      if (wc) {
+      } else if (qdir) {
         QMat m;
         m.Resize(qkv_p, H);
         m.Load(qdir, std::to_string(l) + ".q", 0, qd);
@@ -547,10 +570,19 @@ struct Engine {
       } else {
         L.qkv = rt.PackWeight(buf.data(), qkv_p, H);
       }
-      buf.assign(std::size_t{h_p} * qd, 0.f);
-      st.Load(pre + "self_attn.o_proj.weight", buf.data(), std::size_t{H} * qd);
-      if (cpu_ref) L.wo.assign(buf.begin(), buf.begin() + std::size_t{H} * qd);
-      if (qdir) {
+      const auto load_out = [&]() -> const float* {
+        buf.assign(std::size_t{h_p} * qd, 0.f);
+        st.Load(pre + "self_attn.o_proj.weight", buf.data(), std::size_t{H} * qd);
+        return buf.data();
+      };
+      if (wc) {
+        L.out = rt.PackWeightCached(wcache, wtag + "out", h_p, qd, load_out);
+      } else {
+        load_out();
+        if (cpu_ref) L.wo.assign(buf.begin(), buf.begin() + std::size_t{H} * qd);
+      }
+      if (wc) {
+      } else if (qdir) {
         QMat m;
         m.Resize(h_p, qd);
         m.Load(qdir, std::to_string(l) + ".o", 0, H);
@@ -562,6 +594,32 @@ struct Engine {
       } else {
         L.out = rt.PackWeight(buf.data(), h_p, qd);
       }
+      if (wc) {
+        const std::size_t gu_b = std::size_t{gu_strips} * (H / kTileK) * 4 * kQuarterBytes;
+        const std::size_t dn_b = std::size_t{h_p / kStripRows} * (I / kTileK) * 4 * kQuarterBytes;
+        const auto load_down = [&]() -> const float* {
+          buf.assign(std::size_t{h_p} * I, 0.f);
+          st.Load(pre + "mlp.down_proj.weight", buf.data(), std::size_t{H} * I);
+          return buf.data();
+        };
+        WeightBuffer m = rt.AllocWeightBo(gu_b + dn_b, 3);
+        if (!wcache.Load(wtag + "ffn", m.host, m.bytes)) {
+          std::vector<float> gate(std::size_t{I} * H), up(std::size_t{I} * H), gu(std::size_t{2 * I} * H);
+          st.Load(pre + "mlp.gate_proj.weight", gate.data(), gate.size());
+          st.Load(pre + "mlp.up_proj.weight", up.data(), up.size());
+          for (std::size_t f = 0; f < I / 8; ++f)
+            for (std::size_t i = 0; i < 8; ++i) {
+              std::memcpy(&gu[(f * 16 + i) * H], &gate[(f * 8 + i) * H], H * 4);
+              std::memcpy(&gu[(f * 16 + 8 + i) * H], &up[(f * 8 + i) * H], H * 4);
+            }
+          PackMatInt5(gu.data(), 2 * I, H, m.host);
+          PackMatInt5(load_down(), h_p, I, m.host + gu_b);
+          wcache.Store(wtag + "ffn", m.host, m.bytes);
+        }
+        if (m64) L.ffn_dn = rt.PackWeightCached(wcache, wtag + "ffn_dn", h_p, I, load_down);
+        m.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        L.ffn = std::move(m);
+      } else {
       std::vector<float> gate(std::size_t{I} * H), up(std::size_t{I} * H);
       st.Load(pre + "mlp.gate_proj.weight", gate.data(), gate.size());
       st.Load(pre + "mlp.up_proj.weight", up.data(), up.size());
@@ -608,6 +666,7 @@ struct Engine {
       if (m64) L.ffn_dn = qdir ? rt.PackWeightQ(dn.q.data(), dn.s.data(), h_p, I) : rt.PackWeight(buf.data(), h_p, I);
       m.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
       L.ffn = std::move(m);
+      }
       if (npu_attn) {
         for (std::uint32_t p = 0; p < kvp; ++p) {
           L.als.push_back(rt.MakeAttnLayer(ctx));
@@ -623,10 +682,12 @@ struct Engine {
     if (!std::getenv("GEN_CPU_ARGMAX")) {
       const std::uint32_t vp = PadN(c.vocab);
       p_argmax = rt.MakeProgram(H, vp, programs + "/" + nm.argmax, 0, &err);
-      buf.assign(std::size_t{vp} * H, 0.f);
+      w_argmax = rt.PackWeightCached(wcache, "argmax", vp, H, [&]() -> const float* {
+        buf.assign(std::size_t{vp} * H, 0.f);
 #pragma omp parallel for
-      for (std::int64_t i = 0; i < static_cast<std::int64_t>(std::size_t{c.vocab} * H); ++i) buf[i] = Bf(head[i]);
-      w_argmax = rt.PackWeight(buf.data(), vp, H);
+        for (std::int64_t i = 0; i < static_cast<std::int64_t>(std::size_t{c.vocab} * H); ++i) buf[i] = Bf(head[i]);
+        return buf.data();
+      });
       npu_argmax = true;
     }
     std::fprintf(stderr, "gen: packed %u layers in %.1f s\n", c.layers, Ms(t0) / 1000.0);
@@ -785,20 +846,28 @@ struct Engine {
     const std::uint32_t H = c.hidden, I = c.inter, h_p = PadN(H);
     const std::uint32_t half_b = I - half_a;
     std::vector<float> buf;
-    std::vector<float> gate(std::size_t{I} * H), up(std::size_t{I} * H), ws;
-    st.Load(pre + "mlp.gate_proj.weight", gate.data(), gate.size());
-    st.Load(pre + "mlp.up_proj.weight", up.data(), up.size());
-    auto pack = [&](std::uint32_t c0, std::uint32_t n) {
-      ws.resize(std::size_t{2} * n * H);
-      for (std::uint32_t r = 0; r < 2 * n; ++r) {
-        const std::uint32_t q = r >> 4, rr = r & 15;
-        const float* src = (rr < 8 ? gate.data() : up.data()) + std::size_t{c0 + q * 8 + (rr & 7)} * H;
-        std::memcpy(ws.data() + std::size_t{r} * H, src, H * 4);
-      }
-      return rk.PackWeightAtb(ws.data(), 2 * n, H, 4);
+    std::vector<float> gate, up, ws;
+    const auto load_gu = [&] {
+      if (!gate.empty()) return;
+      gate.resize(std::size_t{I} * H);
+      up.resize(std::size_t{I} * H);
+      st.Load(pre + "mlp.gate_proj.weight", gate.data(), gate.size());
+      st.Load(pre + "mlp.up_proj.weight", up.data(), up.size());
     };
-    L.kw_a = pack(0, half_a);
-    L.kw_b = pack(half_a, half_b);
+    auto pack = [&](const char* tag, std::uint32_t c0, std::uint32_t n) {
+      return rk.PackWeightAtbCached(wcache, pre + "kd." + tag, 2 * n, H, 4, [&]() -> const float* {
+        load_gu();
+        ws.resize(std::size_t{2} * n * H);
+        for (std::uint32_t r = 0; r < 2 * n; ++r) {
+          const std::uint32_t q = r >> 4, rr = r & 15;
+          const float* src = (rr < 8 ? gate.data() : up.data()) + std::size_t{c0 + q * 8 + (rr & 7)} * H;
+          std::memcpy(ws.data() + std::size_t{r} * H, src, H * 4);
+        }
+        return ws.data();
+      });
+    };
+    L.kw_a = pack("a", 0, half_a);
+    L.kw_b = pack("b", half_a, half_b);
     const std::size_t abytes = std::size_t{1024} * I / 8 * 9;
     L.swc = rk.MakeBo(2 * abytes, 3);
     std::memset(L.swc.map<void*>(), 0, 2 * abytes);
@@ -811,9 +880,11 @@ struct Engine {
     L.kq_b.ch = L.kq_a.ch;
     L.kq_d = rk.MakeProgram(I, h_p, programs + "/" + nm.dn2 + ".txt", std::size_t{1024} * h_p / 8 * 9, err, 0, 64, 3, 5);
     rk.RebindA(L.kq_d, L.swc);
-    buf.assign(std::size_t{h_p} * I, 0.f);
-    st.Load(pre + "mlp.down_proj.weight", buf.data(), std::size_t{H} * I);
-    L.kw_d = rk.PackWeightAtb(buf.data(), h_p, I, 4);
+    L.kw_d = rk.PackWeightAtbCached(wcache, pre + "kd.d", h_p, I, 4, [&]() -> const float* {
+      buf.assign(std::size_t{h_p} * I, 0.f);
+      st.Load(pre + "mlp.down_proj.weight", buf.data(), std::size_t{H} * I);
+      return buf.data();
+    });
     rk.WeightSlot(L.kw_d, L.kq_d);
     L.swc2 = rk.MakeBo(2 * abytes, 3);
     std::memset(L.swc2.map<void*>(), 0, 2 * abytes);
@@ -838,16 +909,21 @@ struct Engine {
     const std::uint32_t H = c.hidden, I = c.inter, qd = c.heads * c.head_dim, kvd = c.kv_heads * c.head_dim;
     const std::uint32_t qkv_n = qd + 2 * kvd, qkv_p = PadN(qkv_n), h_p = PadN(H);
     const std::uint32_t half_b = I - half_a;
-    std::vector<float> buf(std::size_t{qkv_p} * H, 0.f);
-    st.Load(pre + "self_attn.q_proj.weight", buf.data(), std::size_t{qd} * H);
-    st.Load(pre + "self_attn.k_proj.weight", buf.data() + std::size_t{qd} * H, std::size_t{kvd} * H);
-    st.Load(pre + "self_attn.v_proj.weight", buf.data() + std::size_t{qd + kvd} * H, std::size_t{kvd} * H);
+    std::vector<float> buf;
     L.kp_qkv = rk.MakeProgram(H, qkv_p, programs + "/" + nm.kqkv + ".txt", std::size_t{1024} * qkv_p / 8 * 9, err, 0, 64, 3, 5);
-    L.kw_qkv = rk.PackWeightAtb(buf.data(), qkv_p, H, 4);
-    buf.assign(std::size_t{h_p} * qd, 0.f);
-    st.Load(pre + "self_attn.o_proj.weight", buf.data(), std::size_t{H} * qd);
+    L.kw_qkv = rk.PackWeightAtbCached(wcache, pre + "kd.qkv", qkv_p, H, 4, [&]() -> const float* {
+      buf.assign(std::size_t{qkv_p} * H, 0.f);
+      st.Load(pre + "self_attn.q_proj.weight", buf.data(), std::size_t{qd} * H);
+      st.Load(pre + "self_attn.k_proj.weight", buf.data() + std::size_t{qd} * H, std::size_t{kvd} * H);
+      st.Load(pre + "self_attn.v_proj.weight", buf.data() + std::size_t{qd + kvd} * H, std::size_t{kvd} * H);
+      return buf.data();
+    });
     L.kp_o = rk.MakeProgram(qd, h_p, programs + "/" + nm.ko + ".txt", std::size_t{1024} * h_p / 8 * 9, err, 0, 64, 3, 5);
-    L.kw_o = rk.PackWeightAtb(buf.data(), h_p, qd, 4);
+    L.kw_o = rk.PackWeightAtbCached(wcache, pre + "kd.o", h_p, qd, 4, [&]() -> const float* {
+      buf.assign(std::size_t{h_p} * qd, 0.f);
+      st.Load(pre + "self_attn.o_proj.weight", buf.data(), std::size_t{H} * qd);
+      return buf.data();
+    });
     PackKdMlp(L, st, pre, programs, err);
     L.kp_qkv2 = rk.MakeProgram(H, qkv_p, programs + "/" + nm.kqkv + ".txt", std::size_t{1024} * qkv_p / 8 * 9, err, 0, 64, 3, 5);
     L.kp_o2 = rk.MakeProgram(qd, h_p, programs + "/" + nm.ko + ".txt", std::size_t{1024} * h_p / 8 * 9, err, 0, 64, 3, 5);
@@ -1332,20 +1408,28 @@ struct HybridEngine : Engine {
   void PackKdMlpG(Layer& L, const Safetensors& st, const std::string& b, const std::string& programs, std::string* err) {
     const std::uint32_t H = c.hidden, I = c.inter, h_p = PadN(H);
     const std::uint32_t half_b = I - half_a;
-    std::vector<float> gate(std::size_t{I} * H), up(std::size_t{I} * H), ws, buf;
-    st.LoadG(b + "ffn_gate.weight", gate.data(), gate.size());
-    st.LoadG(b + "ffn_up.weight", up.data(), up.size());
-    auto pack = [&](std::uint32_t c0, std::uint32_t n) {
-      ws.resize(std::size_t{2} * n * H);
-      for (std::uint32_t r = 0; r < 2 * n; ++r) {
-        const std::uint32_t q = r >> 4, rr = r & 15;
-        const float* src = (rr < 8 ? gate.data() : up.data()) + std::size_t{c0 + q * 8 + (rr & 7)} * H;
-        std::memcpy(ws.data() + std::size_t{r} * H, src, H * 4);
-      }
-      return rk.PackWeightAtb(ws.data(), 2 * n, H, 4);
+    std::vector<float> gate, up, ws, buf;
+    const auto load_gu = [&] {
+      if (!gate.empty()) return;
+      gate.resize(std::size_t{I} * H);
+      up.resize(std::size_t{I} * H);
+      st.LoadG(b + "ffn_gate.weight", gate.data(), gate.size());
+      st.LoadG(b + "ffn_up.weight", up.data(), up.size());
     };
-    L.kw_a = pack(0, half_a);
-    L.kw_b = pack(half_a, half_b);
+    auto pack = [&](const char* tag, std::uint32_t c0, std::uint32_t n) {
+      return rk.PackWeightAtbCached(wcache, b + "kd." + tag, 2 * n, H, 4, [&]() -> const float* {
+        load_gu();
+        ws.resize(std::size_t{2} * n * H);
+        for (std::uint32_t r = 0; r < 2 * n; ++r) {
+          const std::uint32_t q = r >> 4, rr = r & 15;
+          const float* src = (rr < 8 ? gate.data() : up.data()) + std::size_t{c0 + q * 8 + (rr & 7)} * H;
+          std::memcpy(ws.data() + std::size_t{r} * H, src, H * 4);
+        }
+        return ws.data();
+      });
+    };
+    L.kw_a = pack("a", 0, half_a);
+    L.kw_b = pack("b", half_a, half_b);
     const std::size_t abytes = std::size_t{1024} * I / 8 * 9;
     for (int set = 0; set < 2; ++set) {
       xrt::bo& sw = set ? L.swc2 : L.swc;
@@ -1364,9 +1448,11 @@ struct HybridEngine : Engine {
       pd = rk.MakeProgram(I, h_p, programs + "/" + nm.dn2 + ".txt", std::size_t{1024} * h_p / 8 * 9, err, 0, 64, 3, 5);
       rk.RebindA(pd, sw);
       if (set == 0) {
-        buf.assign(std::size_t{h_p} * I, 0.f);
-        st.LoadG(b + "ffn_down.weight", buf.data(), std::size_t{H} * I);
-        L.kw_d = rk.PackWeightAtb(buf.data(), h_p, I, 4);
+        L.kw_d = rk.PackWeightAtbCached(wcache, b + "kd.d", h_p, I, 4, [&]() -> const float* {
+          buf.assign(std::size_t{h_p} * I, 0.f);
+          st.LoadG(b + "ffn_down.weight", buf.data(), std::size_t{H} * I);
+          return buf.data();
+        });
       }
       rk.WeightSlot(L.kw_d, pd);
     }
@@ -1383,6 +1469,7 @@ struct HybridEngine : Engine {
     programs_dir = programs;
     Safetensors st;
     if (!st.Open(model)) return false;
+    wcache.Open(model);
     const auto& r = *st.r;
     c.layers = *r.GetMetadataUint32("qwen35.block_count");
     c.hidden = *r.GetMetadataUint32("qwen35.embedding_length");
@@ -1496,6 +1583,8 @@ struct HybridEngine : Engine {
       L.ffn_norm.resize(H);
       st.LoadG(b + "attn_norm.weight", L.attn_norm.data(), H);
       st.LoadG(b + "post_attention_norm.weight", L.ffn_norm.data(), H);
+      std::function<const float*()> load_in, load_o;
+      std::uint32_t in_rows = 0;
       if (h.linear) {
         h.conv.resize(std::size_t{kConvDim} * kConvK);
         st.LoadG(b + "ssm_conv1d.weight", h.conv.data(), h.conv.size());
@@ -1526,49 +1615,58 @@ struct HybridEngine : Engine {
         }
         PermBlocks(h.w_a, 0, 1, H);
         PermBlocks(h.w_b, 0, 1, H);
-        buf.resize(std::size_t{kGdnInN} * H);
-        if (st.HasG(b + "attn_qkv_gate.weight")) {
-          st.LoadG(b + "attn_qkv_gate.weight", buf.data(), buf.size());
-        } else {
-          st.LoadG(b + "attn_qkv.weight", buf.data(), std::size_t{kConvDim} * H);
-          st.LoadG(b + "attn_gate.weight", buf.data() + std::size_t{kConvDim} * H, std::size_t{kValDim} * H);
-        }
-        {
+        load_in = [&]() -> const float* {
+          buf.resize(std::size_t{kGdnInN} * H);
+          if (st.HasG(b + "attn_qkv_gate.weight")) {
+            st.LoadG(b + "attn_qkv_gate.weight", buf.data(), buf.size());
+          } else {
+            st.LoadG(b + "attn_qkv.weight", buf.data(), std::size_t{kConvDim} * H);
+            st.LoadG(b + "attn_gate.weight", buf.data() + std::size_t{kConvDim} * H, std::size_t{kValDim} * H);
+          }
           std::vector<float> vb(buf.begin() + std::size_t{2 * kKeyDim} * H, buf.begin() + std::size_t{kConvDim} * H);
           PermBlocks(vb, 0, kVD, H);
           std::memcpy(&buf[std::size_t{2 * kKeyDim} * H], vb.data(), vb.size() * 4);
           std::vector<float> zb(buf.begin() + std::size_t{kConvDim} * H, buf.end());
           PermBlocks(zb, 0, kVD, H);
           std::memcpy(&buf[std::size_t{kConvDim} * H], zb.data(), zb.size() * 4);
-        }
+          return buf.data();
+        };
+        in_rows = kGdnInN;
         L.kp_qkv = rk.MakeProgram(H, kGdnInN, programs + "/" + gdn_in + ".txt", std::size_t{1024} * kGdnInN / 8 * 9, &err, 0, 64, 3, 5);
         L.kp_qkv2 = rk.MakeProgram(H, kGdnInN, programs + "/" + gdn_in + ".txt", std::size_t{1024} * kGdnInN / 8 * 9, &err, 0, 64, 3, 5);
-        L.kw_qkv = rk.PackWeightAtb(buf.data(), kGdnInN, H, 4);
-        buf.assign(std::size_t{h_p} * kValDim, 0.f);
-        {
+        load_o = [&]() -> const float* {
+          buf.assign(std::size_t{h_p} * kValDim, 0.f);
           std::vector<float> ow(std::size_t{H} * kValDim);
           st.LoadG(b + "ssm_out.weight", ow.data(), ow.size());
           PermCols(ow, H, kValDim, kVD);
           std::memcpy(buf.data(), ow.data(), ow.size() * 4);
-        }
+          return buf.data();
+        };
       } else {
         L.qn.resize(c.head_dim);
         L.kn.resize(c.head_dim);
         st.LoadG(b + "attn_q_norm.weight", L.qn.data(), c.head_dim);
         st.LoadG(b + "attn_k_norm.weight", L.kn.data(), c.head_dim);
-        buf.resize(std::size_t{attn_n} * H);
-        st.LoadG(b + "attn_q.weight", buf.data(), std::size_t{2 * qd} * H);
-        st.LoadG(b + "attn_k.weight", buf.data() + std::size_t{2 * qd} * H, std::size_t{kvd} * H);
-        st.LoadG(b + "attn_v.weight", buf.data() + std::size_t{2 * qd + kvd} * H, std::size_t{kvd} * H);
+        load_in = [&]() -> const float* {
+          buf.resize(std::size_t{attn_n} * H);
+          st.LoadG(b + "attn_q.weight", buf.data(), std::size_t{2 * qd} * H);
+          st.LoadG(b + "attn_k.weight", buf.data() + std::size_t{2 * qd} * H, std::size_t{kvd} * H);
+          st.LoadG(b + "attn_v.weight", buf.data() + std::size_t{2 * qd + kvd} * H, std::size_t{kvd} * H);
+          return buf.data();
+        };
+        in_rows = attn_n;
         L.kp_qkv = rk.MakeProgram(H, attn_n, programs + "/" + nm.kqkv + ".txt", std::size_t{1024} * attn_n / 8 * 9, &err, 0, 64, 3, 5);
         L.kp_qkv2 = rk.MakeProgram(H, attn_n, programs + "/" + nm.kqkv + ".txt", std::size_t{1024} * attn_n / 8 * 9, &err, 0, 64, 3, 5);
-        L.kw_qkv = rk.PackWeightAtb(buf.data(), attn_n, H, 4);
-        buf.assign(std::size_t{h_p} * qd, 0.f);
-        st.LoadG(b + "attn_output.weight", buf.data(), std::size_t{H} * qd);
+        load_o = [&]() -> const float* {
+          buf.assign(std::size_t{h_p} * qd, 0.f);
+          st.LoadG(b + "attn_output.weight", buf.data(), std::size_t{H} * qd);
+          return buf.data();
+        };
       }
       L.kp_o = rk.MakeProgram(kValDim, h_p, programs + "/" + nm.ko + ".txt", std::size_t{1024} * h_p / 8 * 9, &err, 0, 64, 3, 5);
       L.kp_o2 = rk.MakeProgram(kValDim, h_p, programs + "/" + nm.ko + ".txt", std::size_t{1024} * h_p / 8 * 9, &err, 0, 64, 3, 5);
-      L.kw_o = rk.PackWeightAtb(buf.data(), h_p, kValDim, 4);
+      L.kw_qkv = rk.PackWeightAtbCached(wcache, b + "kd.in", in_rows, H, 4, load_in);
+      L.kw_o = rk.PackWeightAtbCached(wcache, b + "kd.o", h_p, kValDim, 4, load_o);
       KDispatch(L.kw_qkv, L.kp_qkv);
       KDispatch(L.kw_qkv, L.kp_qkv2);
       KDispatch(L.kw_o, L.kp_o);
