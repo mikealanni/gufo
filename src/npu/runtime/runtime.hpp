@@ -336,6 +336,9 @@ class NpuRuntime {
   /// cache. `k_hist`/`v_hist` are the host bf16 caches ([slot][512], slot = token).
   void AttnAppend(AttnLayer& al, std::uint32_t pos, std::uint32_t n, const float* k,
                   const std::uint16_t* v_hist, Timings* tm = nullptr);
+  /// Same result for a 16-aligned pos and n a multiple of 16 on a full (non-ring) layer, parallel over chunks.
+  void AttnAppendBulk(AttnLayer& al, std::uint32_t pos, std::uint32_t n, const float* k,
+                      const std::uint16_t* v_hist, Timings* tm = nullptr);
   /// q: n x 2048 (16 heads x 128, after norm+rope). Writes normalized attention
   /// output (n x 2048, before the output gate). Returns false if a row's softmax
   /// mass is outside the safe range (caller falls back to the CPU path).

@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <iterator>
 #include <memory>
@@ -285,6 +286,8 @@ struct Layer {
   std::uint32_t napp{0};
   WeightBuffer kw_qkv, kw_o, kw_a, kw_b, kw_d;
   Program kp_qkv, kp_o, kq_a, kq_b, kq_d;
+  Program kp_qkv2, kp_o2, kq_a2, kq_b2, kq_d2;
+  xrt::bo swc2;
   xrt::bo swc;
   std::vector<std::uint16_t> kh, vh;
 };
@@ -319,6 +322,7 @@ struct Engine {
   bool kd{false};
   std::uint32_t kd_min{std::getenv("GEN_KD_MIN") ? static_cast<std::uint32_t>(std::atoi(std::getenv("GEN_KD_MIN"))) : 256u};
   std::vector<float> kx, ky, rcos, rsin, s_qa, s_kd;
+  std::vector<float> kxs[2], ymlp[2];
   std::size_t kxn{0}, kyn{0};
   std::uint32_t super_rows{std::getenv("GEN_SUPER") ? static_cast<std::uint32_t>(std::atoi(std::getenv("GEN_SUPER"))) : 4096u};
   bool npu_attn{std::getenv("GEN_HOST_ATTN") == nullptr};
@@ -735,24 +739,73 @@ struct Engine {
     st.Load(pre + "mlp.down_proj.weight", buf.data(), std::size_t{H} * I);
     L.kw_d = rk.PackWeightAtb(buf.data(), h_p, I, 4);
     rk.WeightSlot(L.kw_d, L.kq_d);
+    L.kp_qkv2 = rk.MakeProgram(H, qkv_p, programs + "/" + nm.kqkv + ".txt", std::size_t{1024} * qkv_p / 8 * 9, err, 0, 64, 3, 5);
+    L.kp_o2 = rk.MakeProgram(qd, h_p, programs + "/" + nm.ko + ".txt", std::size_t{1024} * h_p / 8 * 9, err, 0, 64, 3, 5);
+    L.swc2 = rk.MakeBo(2 * abytes, 3);
+    std::memset(L.swc2.map<void*>(), 0, 2 * abytes);
+    L.swc2.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    L.kq_a2 = rk.MakeProgram(H, 2 * half_a, programs + "/" + nm.swa + ".txt", 64, err, 0, 64, 3, 5);
+    L.kq_b2 = rk.MakeProgram(H, 2 * half_b, programs + "/" + nm.swb + ".txt", 64, err, 0, 64, 3, 5);
+    L.kq_a2.c = L.swc2;
+    L.kq_a2.ch = L.swc2.map<std::uint8_t*>();
+    L.kq_b2.c = L.swc2;
+    L.kq_b2.ch = L.kq_a2.ch;
+    L.kq_d2 = rk.MakeProgram(I, h_p, programs + "/" + nm.dn2 + ".txt", std::size_t{1024} * h_p / 8 * 9, err, 0, 64, 3, 5);
+    rk.RebindA(L.kq_d2, L.swc2);
+    rk.WeightSlot(L.kw_d, L.kq_d2);
+    KDispatch(L.kw_qkv, L.kp_qkv);
+    KDispatch(L.kw_qkv, L.kp_qkv2);
+    KDispatch(L.kw_o, L.kp_o);
+    KDispatch(L.kw_o, L.kp_o2);
+    for (int set = 0; set < 2; ++set) {
+      KDispatch(L.kw_a, set ? L.kq_a2 : L.kq_a);
+      KDispatch(L.kw_b, set ? L.kq_b2 : L.kq_b);
+      KDispatch(L.kw_d, set ? L.kq_d2 : L.kq_d);
+    }
   }
 
-  void KGemm(Program& p, WeightBuffer& wb, const float* z, std::uint32_t n_all, std::uint32_t K, float* out) {
-    if (kx.size() < std::size_t{1024} * kxn) kx.assign(std::size_t{1024} * kxn, 0.f);
-    if (ky.size() < std::size_t{1024} * kyn) ky.assign(std::size_t{1024} * kyn, 0.f);
-    for (std::uint32_t o = 0; o < n_all; o += 1024) {
-      const std::uint32_t n = std::min(1024u, n_all - o);
-      const float* src = z + std::size_t{o} * K;
-      float* dst = out + std::size_t{o} * p.N;
-      if (n == 1024) {
-        rk.GemmAtb(p, wb, src, 1024, dst, &tim);
-        continue;
-      }
-      std::memcpy(kx.data(), src, std::size_t{n} * K * 4);
-      std::memset(kx.data() + std::size_t{n} * K, 0, std::size_t{1024 - n} * K * 4);
-      rk.GemmAtb(p, wb, kx.data(), 1024, ky.data(), &tim);
-      std::memcpy(dst, ky.data(), std::size_t{n} * p.N * 4);
+  // Chunk pipeline: while the device runs chunk i the host encodes chunk i+1 (second program, own A buffer) and decodes chunk i-1.
+  void KGemm(Program& p0, Program& p1, WeightBuffer& wb, const float* z, std::uint32_t n_all, std::uint32_t K, float* out) {
+    if (kxs[0].size() < std::size_t{1024} * kxn) {
+      kxs[0].assign(std::size_t{1024} * kxn, 0.f);
+      kxs[1].assign(std::size_t{1024} * kxn, 0.f);
     }
+    if (ky.size() < std::size_t{1024} * kyn) ky.assign(std::size_t{1024} * kyn, 0.f);
+    const std::uint32_t nch = (n_all + 1023) / 1024;
+    Program* pr[2] = {&p0, &p1};
+    auto encode = [&](std::uint32_t i) {
+      const std::uint32_t o = i * 1024, n = std::min(1024u, n_all - o);
+      const float* src = z + std::size_t{o} * K;
+      if (n < 1024) {
+        std::memcpy(kxs[i & 1].data(), src, std::size_t{n} * K * 4);
+        std::memset(kxs[i & 1].data() + std::size_t{n} * K, 0, std::size_t{1024 - n} * K * 4);
+        src = kxs[i & 1].data();
+      }
+      rk.EncodeAAtb(src, 1024, K, *pr[i & 1]);
+      pr[i & 1]->a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    };
+    auto decode = [&](std::uint32_t i) {
+      const std::uint32_t o = i * 1024, n = std::min(1024u, n_all - o);
+      Program& p = *pr[i & 1];
+      p.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+      if (n == 1024) {
+        rk.DecodeCAtb(out + std::size_t{o} * p.N, 1024, p.N, p);
+      } else {
+        rk.DecodeCAtb(ky.data(), 1024, p.N, p);
+        std::memcpy(out + std::size_t{o} * p.N, ky.data(), std::size_t{n} * p.N * 4);
+      }
+    };
+    encode(0);
+    std::future<void> dec;
+    for (std::uint32_t i = 0; i < nch; ++i) {
+      std::future<void> enc;
+      if (i + 1 < nch) enc = std::async(std::launch::async, [&, i] { encode(i + 1); });
+      KDispatch(wb, *pr[i & 1]);
+      if (enc.valid()) enc.get();
+      if (dec.valid()) dec.get();
+      dec = std::async(std::launch::async, [&, i] { decode(i); });
+    }
+    if (dec.valid()) dec.get();
   }
 
   void KDispatch(WeightBuffer& wb, Program& p) {
@@ -768,29 +821,49 @@ struct Engine {
 
   void KMlp(Layer& L, const float* z_all, std::uint32_t n_all, float* out_all) {
     const std::uint32_t H = c.hidden, h_p = PadN(H);
-    if (kx.size() < std::size_t{1024} * kxn) kx.assign(std::size_t{1024} * kxn, 0.f);
-    if (ky.size() < std::size_t{1024} * kyn) ky.assign(std::size_t{1024} * kyn, 0.f);
-    for (std::uint32_t o = 0; o < n_all; o += 1024) {
-      const std::uint32_t n = std::min(1024u, n_all - o);
-      const float* z = z_all + std::size_t{o} * H;
-      float* out_h = out_all + std::size_t{o} * H;
-      const float* src = z;
-      if (n < 1024) {
-        std::memcpy(kx.data(), z, std::size_t{n} * H * 4);
-        std::memset(kx.data() + std::size_t{n} * H, 0, std::size_t{1024 - n} * H * 4);
-        src = kx.data();
-      }
-      rk.EncodeAAtbRaw(src, 1024, H, L.kq_a.ah);
-      std::memcpy(L.kq_b.ah, L.kq_a.ah, std::size_t{1024} * H / 8 * 9);
-      L.kq_a.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-      L.kq_b.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-      KDispatch(L.kw_a, L.kq_a);
-      KDispatch(L.kw_b, L.kq_b);
-      KDispatch(L.kw_d, L.kq_d);
-      L.kq_d.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-      rk.DecodeCAtbRaw(L.kq_d.ch, ky.data(), 1024, h_p);
-      for (std::uint32_t r = 0; r < n; ++r) std::memcpy(out_h + std::size_t{r} * H, &ky[std::size_t{r} * h_p], H * 4);
+    if (kxs[0].size() < std::size_t{1024} * kxn) {
+      kxs[0].assign(std::size_t{1024} * kxn, 0.f);
+      kxs[1].assign(std::size_t{1024} * kxn, 0.f);
     }
+    if (ky.size() < std::size_t{1024} * kyn) ky.assign(std::size_t{1024} * kyn, 0.f);
+    const std::uint32_t nch = (n_all + 1023) / 1024;
+    Program* qa[2] = {&L.kq_a, &L.kq_a2};
+    Program* qb[2] = {&L.kq_b, &L.kq_b2};
+    Program* qd[2] = {&L.kq_d, &L.kq_d2};
+    auto encode = [&](std::uint32_t i) {
+      const std::uint32_t o = i * 1024, n = std::min(1024u, n_all - o);
+      const float* src = z_all + std::size_t{o} * H;
+      if (n < 1024) {
+        std::memcpy(kxs[i & 1].data(), src, std::size_t{n} * H * 4);
+        std::memset(kxs[i & 1].data() + std::size_t{n} * H, 0, std::size_t{1024 - n} * H * 4);
+        src = kxs[i & 1].data();
+      }
+      rk.EncodeAAtbRaw(src, 1024, H, qa[i & 1]->ah);
+      std::memcpy(qb[i & 1]->ah, qa[i & 1]->ah, std::size_t{1024} * H / 8 * 9);
+      qa[i & 1]->a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      qb[i & 1]->a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    };
+    auto decode = [&](std::uint32_t i) {
+      const std::uint32_t o = i * 1024, n = std::min(1024u, n_all - o);
+      qd[i & 1]->c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+      std::vector<float>& yb = ymlp[i & 1];
+      if (yb.size() < std::size_t{1024} * h_p) yb.resize(std::size_t{1024} * h_p);
+      rk.DecodeCAtbRaw(qd[i & 1]->ch, yb.data(), 1024, h_p);
+      for (std::uint32_t r = 0; r < n; ++r) std::memcpy(out_all + std::size_t{o + r} * H, &yb[std::size_t{r} * h_p], H * 4);
+    };
+    encode(0);
+    std::future<void> dec;
+    for (std::uint32_t i = 0; i < nch; ++i) {
+      std::future<void> enc;
+      if (i + 1 < nch) enc = std::async(std::launch::async, [&, i] { encode(i + 1); });
+      KDispatch(L.kw_a, *qa[i & 1]);
+      KDispatch(L.kw_b, *qb[i & 1]);
+      KDispatch(L.kw_d, *qd[i & 1]);
+      if (enc.valid()) enc.get();
+      if (dec.valid()) dec.get();
+      dec = std::async(std::launch::async, [&, i] { decode(i); });
+    }
+    if (dec.valid()) dec.get();
   }
 
   void Step(const std::uint32_t* tok, std::uint32_t n, std::vector<float>* hidden) {
@@ -810,7 +883,7 @@ struct Engine {
       auto t0 = Clock::now();
       const bool u64 = m64 && n > kRows;
       const bool ukd = kd && n >= kd_min && n <= super_rows;
-      if (ukd) KGemm(L.kp_qkv, L.kw_qkv, z.data(), n, H, qkv.data());
+      if (ukd) KGemm(L.kp_qkv, L.kp_qkv2, L.kw_qkv, z.data(), n, H, qkv.data());
       else if (Cpu("qkv")) MatVec(L.wqkv.data(), qkv_n, H, z.data(), n, qkv.data());
       else rt.Gemm(u64 ? L.p_qkv64 : L.p_qkv, L.qkv, z.data(), n, qkv.data(), &tim);
       t_npu += Ms(t0);
@@ -852,8 +925,12 @@ struct Engine {
           L.napp = pos + n;
           apre->SetExact(pos + n <= kExactCtx);
           const auto tap = Clock::now();
-          for (std::uint32_t o = 0; o < n; o += 16)
-            rt.AttnAppend(L.al, pos + o, std::min(16u, n - o), &kd[std::size_t{o} * kAttnKv], L.vh.data(), &tim);
+          if (pos % 16 == 0 && n % 16 == 0) {
+            rt.AttnAppendBulk(L.al, pos, n, kd.data(), L.vh.data(), &tim);
+          } else {
+            for (std::uint32_t o = 0; o < n; o += 16)
+              rt.AttnAppend(L.al, pos + o, std::min(16u, n - o), &kd[std::size_t{o} * kAttnKv], L.vh.data(), &tim);
+          }
           ph[5] += Ms(tap);
           std::vector<AttnPrefill::Pass> passes;
           for (std::uint32_t o = 0; o < n; o += 128)
@@ -914,7 +991,7 @@ struct Engine {
       ph[2] += Ms(t0);
       t0 = Clock::now();
       if (ukd) {
-        KGemm(L.kp_o, L.kw_o, att.data(), n, qd, br.data());
+        KGemm(L.kp_o, L.kp_o2, L.kw_o, att.data(), n, qd, br.data());
         for (std::uint32_t r = 0; r < n; ++r) std::memcpy(&brh[std::size_t{r} * H], &br[std::size_t{r} * h_p], H * 4);
       } else if (Cpu("out")) MatVec(L.wo.data(), H, qd, att.data(), n, brh.data());
       else {
@@ -1077,6 +1154,7 @@ int Chat(const char* model, const char* programs, const std::string& prompt, std
     next = g.Argmax(hd.data());
   }
   const double dc = Ms(t1);
+  std::fprintf(stderr, "\nmlp host enc+dec %.0f ms | mlp device %.0f ms\n", g.ph[6], g.ph[7]);
   std::fprintf(stderr, "\nattention parts: rope+dup+convert %.0f ms | AttnAppend %.0f ms | prefill-attention run %.0f ms\n", g.ph[3], g.ph[5], g.ph[4]);
   std::fprintf(stderr, "\nhost norm+resid %.0f ms | ffn %.0f ms | attention+rope %.0f ms | gemm enc %.0f dec %.0f sync+wait %.0f ms\n", g.ph[0], g.ph[1], g.ph[2], g.tim.enc, g.tim.dec, g.tim.wait + g.tim.syncA + g.tim.syncC);
   std::fprintf(stderr, "\nprefill %zu tok %.1f ms (%.0f tok/s); decode %u tok %.1f ms (%.2f tok/s)\n", ids.size(), pf, ids.size() / pf * 1000, produced, dc, produced / dc * 1000);

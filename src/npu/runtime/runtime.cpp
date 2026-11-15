@@ -1024,6 +1024,49 @@ void NpuRuntime::AttnReset(AttnLayer& al) {
   std::fill(al.kpre.begin(), al.kpre.end(), 0.f);
 }
 
+// Whole-chunk append for 16-aligned ranges of the full (non-ring) layout: the K prefix bound is computed in order first,
+// then every (chunk, kv head) is encoded independently.
+void NpuRuntime::AttnAppendBulk(AttnLayer& al, std::uint32_t pos, std::uint32_t n, const float* k,
+                                const std::uint16_t* v_hist, Timings* tm) {
+  const auto t_start = Clock::now();
+  const std::uint32_t kvd = kAttnKvh * kAttnHd;
+  for (std::uint32_t t = 0; t < n; ++t)
+    for (std::uint32_t r = 0; r < kAttnKvh; ++r) {
+      float s2 = 0;
+      for (std::uint32_t d = 0; d < kAttnHd; ++d) s2 += k[std::size_t{t} * kvd + r * kAttnHd + d] * k[std::size_t{t} * kvd + r * kAttnHd + d];
+      al.kmax2[r] = std::max(al.kmax2[r], s2);
+      if (!al.kpre.empty()) al.kpre[std::size_t{pos + t} * kAttnKvh + r] = al.kmax2[r];
+    }
+  const std::uint32_t q0 = pos / 16, nq = n / 16;
+#pragma omp parallel for collapse(2) schedule(static)
+  for (std::int64_t ci = 0; ci < nq; ++ci)
+    for (std::int32_t r = 0; r < static_cast<std::int32_t>(kAttnKvh); ++r) {
+      const std::uint32_t q = q0 + static_cast<std::uint32_t>(ci);
+      alignas(64) std::uint8_t chunk[4608];
+      for (std::uint32_t tt = 0; tt < 16; ++tt) {
+        const std::uint32_t tok = q * 16 + tt;
+        const std::uint32_t kb = tt / 8, i8 = tt % 8;
+        for (std::uint32_t ks = 0; ks < 16; ++ks) {
+          float v8[8];
+          std::memcpy(v8, k + std::size_t{tok - pos} * kvd + r * kAttnHd + ks * 8, 32);
+          EncGroup(v8, chunk + (std::size_t{kb} * 16 + ks) * 8 * 9 + i8 * 9);
+        }
+      }
+      for (std::uint32_t kb = 0; kb < 2; ++kb) {
+        const std::uint32_t t0 = q * 16 + kb * 8;
+        for (std::uint32_t db = 0; db < 16; ++db)
+          for (std::uint32_t g = 0; g < 8; ++g) {
+            float v8[8];
+            for (std::uint32_t i8 = 0; i8 < 8; ++i8) v8[i8] = Bf16Float(v_hist[std::size_t{t0 + i8} * kvd + r * kAttnHd + db * 8 + g]);
+            EncGroup(v8, chunk + 2304 + ((std::size_t{kb} * 16 + db) * 8 + g) * 9);
+          }
+      }
+      AttnStoreChunk(al.host, q, r, chunk);
+    }
+  SyncToDevice(al.kv, std::size_t{q0} * kAttnChunkBytes, std::size_t{nq} * kAttnChunkBytes);
+  if (tm) tm->attn_append += Ms(t_start);
+}
+
 void NpuRuntime::AttnAppend(AttnLayer& al, std::uint32_t pos, std::uint32_t n, const float* k,
                             const std::uint16_t* v_hist, Timings* tm) {
   const auto t_start = Clock::now();
