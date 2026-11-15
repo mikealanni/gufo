@@ -329,6 +329,8 @@ struct Layer {
   WeightBuffer qkv, out, ffn, ffn_dn;
   Program p_qkv, p_out, p_ffn, p_qkv64, p_out64, p_gu64, p_dn64;
   std::vector<float> k, v;
+  std::vector<std::uint16_t> kmir, vmir;  // bf16 mirror of k, v for single-query attention (half the bytes); rows below kmir_n are valid
+  std::size_t kmir_n{0};
   std::vector<float> qn, kn;
   std::vector<float> wqkv, wo, wgate, wup, wdown;
   std::vector<AttnLayer> als;
@@ -1046,7 +1048,26 @@ struct Engine {
   int attn_threads{std::getenv("GEN_ATTN_THREADS") ? std::atoi(std::getenv("GEN_ATTN_THREADS")) : 16};
 
   void Attend(Layer& L, const float* q, std::uint32_t p, float* out) {
-    BlockedAttention<float>(q, L.k.data(), L.v.data(), nullptr, 1, p, true, out);
+    // Long contexts read the bf16 mirror: the key/value scan is memory-bound and the mirror halves the bytes.
+    constexpr std::uint32_t kMirrorMinCtx = 1024;
+    if (p < kMirrorMinCtx || std::getenv("GEN_NO_KV_MIRROR")) {
+      BlockedAttention<float>(q, L.k.data(), L.v.data(), nullptr, 1, p, true, out);
+      return;
+    }
+    const std::uint32_t kvd = c.kv_heads * c.head_dim;
+    if (L.kmir.size() != L.k.size()) {
+      L.kmir.assign(L.k.size(), 0);
+      L.vmir.assign(L.v.size(), 0);
+      L.kmir_n = 0;
+    }
+    if (L.kmir_n <= p) {
+      for (std::size_t i = L.kmir_n * kvd; i < std::size_t{p + 1} * kvd; ++i) {
+        L.kmir[i] = Bf16Bits(L.k[i]);
+        L.vmir[i] = Bf16Bits(L.v[i]);
+      }
+      L.kmir_n = std::size_t{p} + 1;
+    }
+    BlockedAttention<std::uint16_t>(q, L.kmir.data(), L.vmir.data(), nullptr, 1, p, true, out);
   }
 
   // MLP weights/programs for the 1024-row path. `ensure` fills gate/up (I x H) and down (H x I) from the model; it only runs on a weight-cache miss.
@@ -1328,6 +1349,7 @@ struct Engine {
         s_kd.resize(std::size_t{kvp} * n * kAttnKv);
         s_ap.resize(std::size_t{n} * 2048);
         auto tprep = Clock::now();
+        L.kmir_n = std::min<std::size_t>(L.kmir_n, pos);
 #pragma omp parallel for
         for (std::int64_t r = 0; r < n; ++r) {
           float* row = &qkv[std::size_t(r) * stride];
@@ -1357,6 +1379,7 @@ struct Engine {
         }
         ph[3] += Ms(tprep);
         if (pos + n <= (n <= (dec_int4 ? kRows : 2u) ? std::max(host_ctx, host_ctx_dec) : host_ctx)) {
+          L.kmir_n = std::min<std::size_t>(L.kmir_n, pos);
           for (std::uint32_t r = 0; r < n; ++r) {
             const float* row = &qkv[std::size_t{r} * stride];
             std::memcpy(&L.k[std::size_t{pos + r} * kvd], row + qd, kvd * 4);
@@ -1445,6 +1468,7 @@ struct Engine {
         }
         if (std::getenv("GEN_ATTN_CHECK")) {
           std::vector<float> ref(std::size_t{n} * qd);
+          L.kmir_n = std::min<std::size_t>(L.kmir_n, pos);
           for (std::uint32_t r = 0; r < n; ++r) {
             const float* row = &qkv[std::size_t{r} * (Cpu("qkv") ? qkv_n : qkv_p)];
             std::memcpy(&L.k[std::size_t{pos + r} * kvd], row + qd, kvd * 4);
@@ -1462,6 +1486,7 @@ struct Engine {
           std::fprintf(stderr, "attn check layer %u pos %u n %u rel_err %.4f mean_err %.2e gain %.4f\n", l, pos, n, std::sqrt(num / den), sg / ref.size(), dot / den);
         }
       } else {
+      L.kmir_n = std::min<std::size_t>(L.kmir_n, pos);
       for (std::uint32_t r = 0; r < n; ++r) {
         float* row = &qkv[std::size_t{r} * (Cpu("qkv") ? qkv_n : qkv_p)];
         QkNorm(L, row, qd);
