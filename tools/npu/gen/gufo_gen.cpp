@@ -1858,6 +1858,7 @@ struct HybridEngine : Engine {
       });
       npu_argmax = true;
     }
+    zero_copy = moe && dec_ok && !std::getenv("GEN_EXPERT_COPY");
     if (moe) InitExpertPrograms(programs, &err, H, 2 * slice_i);
     // The model's own next-token-prediction layer (index c.layers) is loaded like any attention layer and drives speculation.
     // MoE: a verification step routes each row to its own experts, which costs more than the drafts save (GEN_MTP_MOE=1 forces it on)
@@ -1869,6 +1870,7 @@ struct HybridEngine : Engine {
       lm.resize(total);
       row0.resize(total);
       row1.resize(total);
+      if (zero_copy) zx.resize(total);
     }
     std::vector<float> buf;
     const auto t0 = Clock::now();
@@ -2006,7 +2008,10 @@ struct HybridEngine : Engine {
           st.LoadG(b + "ffn_gate_inp_shexp.weight", L.sh_gate.data(), H);
         }
         PackMlp(L, b + "kd.", programs, &err, ensure, gate, up, down);
-        if (moe) PackExperts(L, st, b);
+        if (moe) {
+          PackExperts(L, st, b);
+          if (zero_copy) ZeroCopyLayer(l, programs, &err);
+        }
         if (dec_ok) {
           // int5 decode copy of the layer: m16 programs on the decode xclbin, streamed once per token
           std::vector<float> gu_buf, dn_buf;
@@ -2447,6 +2452,16 @@ struct HybridEngine : Engine {
   } es[2];  // prefill: two sets so host work for the next expert overlaps the device run of the current one
   Program ed_ffn[kExpSlots];
   WeightBuffer ed_slot[kExpSlots];
+  // Zero-copy decode experts: each layer's experts live in one device buffer; a program per slot is pinned to it and the weight
+  // addresses in its instruction stream (DDR-patch ops of the weight argument) are rewritten per dispatch to select the expert.
+  struct ZeroCopyExperts {
+    WeightBuffer wb;                  // owns the layer's expert buffer
+    std::vector<WeightBuffer> view;   // one handle (with its own run) per in-flight slot, all on the same buffer
+    std::vector<Program> prog;        // one per in-flight slot
+  };
+  std::vector<ZeroCopyExperts> zx;
+  std::vector<std::uint32_t> zb_word, zb_orig;  // word index and original value of each weight-address patch
+  bool zero_copy{false};
   std::size_t ex_a{0}, ex_d{0}, ex_qa{0}, ex_qd{0};  // packed bytes of one expert: gate/up and down, bfp16 and int5
 
   void PackExperts(Layer& L, const Safetensors& st, const std::string& b) {
@@ -2510,6 +2525,49 @@ struct HybridEngine : Engine {
     };
     if (need_kd) publish(*L.exp_kd, tag_kd);
     if (need_q5) publish(*L.exp_q5, tag_q5);
+  }
+
+  // Moves a layer's int4/int5 experts into one device buffer and creates its slot programs (aliasing the shared per-slot A/C buffers).
+  void ZeroCopyLayer(std::uint32_t l, const std::string& programs, std::string* err) {
+    const std::uint32_t H = c.hidden, h_p = PadN(H);
+    const std::size_t per = ex_qa + ex_qd;
+    ZeroCopyExperts& z = zx[l];
+    z.wb = rt.AllocWeightBo(per * n_exp, 3);
+    std::memcpy(z.wb.host, layers[l].exp_q5->data(), per * n_exp);
+    z.wb.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    z.prog.resize(kExpSlots);
+    z.view.assign(kExpSlots, z.wb);
+    for (int sl = 0; sl < kExpSlots; ++sl) {
+      Program& p = z.prog[sl];
+      p = rt.MakeProgram(H, H, programs + "/" + nm.ffn16, std::size_t{gu_strips + h_p / kStripRows} * kStripBytes, err);
+      p.a = ed_ffn[sl].a;  // the slot's activation / result buffers are shared by every layer's program of that slot
+      p.ah = ed_ffn[sl].ah;
+      p.c = ed_ffn[sl].c;
+      p.ch = ed_ffn[sl].ch;
+      rt.WeightSlot(z.view[sl], p);  // pin the layer buffer
+    }
+    if (zb_word.empty()) {  // locate the weight-address patches (argument 1) in the instruction stream
+      const auto* w = z.prog[0].insts.map<const std::uint32_t*>();
+      const std::size_t words = z.prog[0].words;
+      for (std::size_t i = 4; i + 12 <= words;) {
+        const std::uint32_t op = w[i] & 0xff;
+        std::size_t sz = op == 0 ? 6 : op == 3 ? 7 : op == 128 ? 4 : op == 129 ? 12 : op == 1 ? w[i + 3] / 4 : 0;
+        if (sz == 0) break;
+        if (op == 129 && w[i + 8] == 1) {
+          zb_word.push_back(static_cast<std::uint32_t>(i + 10));
+          zb_orig.push_back(w[i + 10]);
+        }
+        i += sz;
+      }
+      std::fprintf(stderr, "moe: %zu weight-address patches found in the expert program\n", zb_word.size());
+    }
+  }
+
+  void PatchExpert(Program& p, std::uint32_t e) {
+    auto* w = p.insts.map<std::uint32_t*>();
+    const std::uint32_t off = static_cast<std::uint32_t>(e * (ex_qa + ex_qd));
+    for (std::size_t k = 0; k < zb_word.size(); ++k) w[zb_word[k]] = zb_orig[k] + off;
+    p.insts.sync(XCL_BO_SYNC_BO_TO_DEVICE);
   }
 
   void InitExpertPrograms(const std::string& programs, std::string* err, std::uint32_t plain_a_k, std::uint32_t plain_a_n) {
@@ -2596,6 +2654,42 @@ struct HybridEngine : Engine {
     std::vector<std::vector<std::pair<std::uint32_t, float>>> by_expert(n_exp);
     for (std::uint32_t t = 0; t < T; ++t)
       for (std::uint32_t k = 0; k < n_used; ++k) by_expert[top[std::size_t{t} * n_used + k]].emplace_back(t, wgt[std::size_t{t} * n_used + k]);
+    if (use_dec && zero_copy) {
+      // No weight copies: the slot program is pinned to this layer's expert buffer and only its weight addresses are rewritten.
+      ZeroCopyExperts& zc = zx[static_cast<std::size_t>(&L - layers.data())];
+      std::vector<std::uint32_t> active;
+      for (std::uint32_t e = 0; e < n_exp; ++e)
+        if (!by_expert[e].empty()) active.push_back(e);
+      const auto t_exp0 = Clock::now();
+      std::vector<float> xe(std::size_t{kExpSlots} * T * H), ye(std::size_t{kExpSlots} * T * H);
+      const auto finish_run = [&](std::size_t j) {
+        const auto& list = by_expert[active[j]];
+        const std::uint32_t n = static_cast<std::uint32_t>(list.size());
+        const std::size_t sl = j % kExpSlots;
+        float* y = &ye[sl * T * H];
+        rt.FfnFinish(zc.prog[sl], zc.view[sl], y, n, &tim, gu_strips, H);
+        for (std::uint32_t r = 0; r < n; ++r) {
+          float* o = out + std::size_t{list[r].first} * H;
+          const float w = list[r].second;
+          for (std::uint32_t i = 0; i < H; ++i) o[i] += w * y[std::size_t{r} * H + i];
+        }
+      };
+      for (std::size_t j = 0; j < active.size(); ++j) {
+        const auto& list = by_expert[active[j]];
+        const std::uint32_t n = static_cast<std::uint32_t>(list.size());
+        const std::size_t sl = j % kExpSlots;
+        if (j >= kExpSlots) finish_run(j - kExpSlots);  // frees this slot
+        float* x = &xe[sl * T * H];
+        for (std::uint32_t r = 0; r < n; ++r) std::memcpy(&x[std::size_t{r} * H], z + std::size_t{list[r].first} * H, std::size_t{H} * 4);
+        PatchExpert(zc.prog[sl], active[j]);
+        rt.FfnStart(zc.prog[sl], zc.view[sl], x, n, &tim);
+      }
+      for (std::size_t j = active.size() > kExpSlots ? active.size() - kExpSlots : 0; j < active.size(); ++j) finish_run(j);
+      moe_dec[0] += Ms(t_exp0);
+      moe_dec[1] += static_cast<double>(active.size());
+      moe_dec[2] += 1;
+      return;
+    }
     if (use_dec) {
       // Experts run one fused dispatch each; the next experts' weights are copied into rotating scratch buffers while the device works.
       std::vector<std::uint32_t> active;
@@ -3036,7 +3130,23 @@ int FfnBench(const char* prog_dir, std::uint32_t H, std::uint32_t I, bool int4) 
   WeightBuffer w[kProg];
   for (int i = 0; i < kProg; ++i) {
     p[i] = rt.MakeProgram(H, H, insts, std::size_t{gu_strips + h_p / kStripRows} * kStripBytes, &err);
-    w[i] = rt.AllocWeightBo(gu_b + dn_b, 3);
+    if (const char* hm = std::getenv("FFN_HUGE")) {
+      // weights in 2 MB pages (hm = "thp": transparent huge pages via madvise, "hugetlb": reserved huge pages): fewer IOMMU translations per stream
+      const std::size_t bytes = ((gu_b + dn_b) + (2u << 20) - 1) & ~std::size_t{(2u << 20) - 1};
+      void* mem = std::string(hm) == "hugetlb" ? mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0)
+                                               : aligned_alloc(2u << 20, bytes);
+      if (mem == MAP_FAILED || !mem) {
+        std::fprintf(stderr, "huge allocation failed\n");
+        return 1;
+      }
+      if (std::string(hm) == "thp") madvise(mem, bytes, MADV_HUGEPAGE);
+      std::memset(mem, 0, bytes);
+      w[i].host = static_cast<std::uint8_t*>(mem);
+      w[i].bytes = gu_b + dn_b;
+      w[i].bo = xrt::bo(rt.device(), mem, bytes, XRT_BO_FLAGS_HOST_ONLY, rt.kernel().group_id(3));
+    } else {
+      w[i] = rt.AllocWeightBo(gu_b + dn_b, 3);
+    }
     std::vector<float> gu(std::size_t{2 * I} * H), dn(std::size_t{h_p} * I);
     std::srand(7 + i);
     for (auto& v : gu) v = (std::rand() / static_cast<float>(RAND_MAX) - 0.5f) * 0.1f;
