@@ -1998,6 +1998,30 @@ int DecideEval(const char* model, const char* programs, const char* path, const 
 
 }  // namespace
 
+// Timing probe of one int5 m64 program: gemmbench64 PROGRAMS INSTS K N
+int GemmBench64(const char* prog_dir, const char* inst, std::uint32_t K, std::uint32_t N) {
+  NpuRuntime rt;
+  std::string err;
+  if (!rt.Init(std::string(prog_dir) + "/final_16x64x128_ffn.xclbin", &err)) return 1;
+  std::vector<std::int8_t> q(std::size_t{N} * K);
+  std::vector<std::uint16_t> sc(std::size_t{N} * K / 32, 0x3c00);
+  std::srand(1);
+  for (auto& v : q) v = static_cast<std::int8_t>(std::rand() % 31 - 15);
+  auto prog = rt.MakeProgram(K, N, std::string(prog_dir) + "/" + inst, 0, &err, 0, 4);
+  auto wb = rt.PackWeightQ(q.data(), sc.data(), N, K);
+  std::vector<float> x(std::size_t{64} * K, 0.1f), y(std::size_t{64} * N);
+  double best = 1e9;
+  NpuRuntime::Timings tm{};
+  for (int i = 0; i < 40; ++i) {
+    if (i == 10) tm = NpuRuntime::Timings{};
+    const auto t0 = Clock::now();
+    rt.Gemm(prog, wb, x.data(), 64, y.data(), &tm);
+    if (i > 2) best = std::min(best, Ms(t0));
+  }
+  std::printf("%s K=%u N=%u: best %.3f ms | per call enc %.3f syncA %.3f submit %.3f wait %.3f syncC %.3f dec %.3f (%.1f MB int5)\n", inst, K, N, best, tm.enc / 30, tm.syncA / 30, tm.submit / 30, tm.wait / 30, tm.syncC / 30, tm.dec / 30, wb.bytes / 1e6);
+  return 0;
+}
+
 int GemmTest(const char* prog_dir, const char* inst, std::uint32_t K, std::uint32_t N) {
   NpuRuntime rt;
   std::string err;
@@ -2249,6 +2273,13 @@ int JudgeStdio(const char* model, const char* programs) {
     std::fprintf(stderr, "gguf: %s\n", e.c_str());
     return 1;
   }
+  constexpr double kMaxJudgeParams = 9e9;
+  double params = 0;
+  for (const auto& t : reader->GetTensors()) params += static_cast<double>(t.ElementCount());
+  if (params >= kMaxJudgeParams) {
+    std::fprintf(stderr, "judge: refusing a %.1f B parameter model; a decision judge must be under 9 B parameters (it has to answer in about a decode step)\n", params / 1e9);
+    return 1;
+  }
   auto tok = gufo::tokenization::QwenTokenizer::CreateFromGguf(*reader, &e);
   if (!tok) {
     std::fprintf(stderr, "tokenizer: %s\n", e.c_str());
@@ -2319,6 +2350,7 @@ int main(int argc, char** argv) {
   if (argc >= 4 && std::string(argv[1]) == "interactive") return Interactive(argv[2], argv[3]);
   if (argc >= 5 && std::string(argv[1]) == "chat") return Chat(argv[2], argv[3], argv[4], argc > 5 ? std::atoi(argv[5]) : 256, false, 0);
   if (argc >= 5 && std::string(argv[1]) == "bench") return Chat(argv[2], argv[3], "", static_cast<std::uint32_t>(std::atoi(argv[5 < argc ? 5 : 4])), true, static_cast<std::uint32_t>(std::atoi(argv[4])));
+  if (argc == 6 && std::string(argv[1]) == "gemmbench64") return GemmBench64(argv[2], argv[3], std::atoi(argv[4]), std::atoi(argv[5]));
   if (argc == 6 && std::string(argv[1]) == "gemmtest") return GemmTest(argv[2], argv[3], std::atoi(argv[4]), std::atoi(argv[5]));
   if (argc < 5) {
     std::fprintf(stderr, "usage: gufo-gen chat|bench|nll|top|generate|judge MODEL.gguf PROGRAMS ...\n");
