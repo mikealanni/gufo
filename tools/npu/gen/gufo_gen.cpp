@@ -326,7 +326,7 @@ struct Engine {
   std::uint32_t host_ctx{std::getenv("GEN_HOST_CTX") ? static_cast<std::uint32_t>(std::atoi(std::getenv("GEN_HOST_CTX"))) : 256u};
   std::unique_ptr<AttnPrefill> apre;
   const char* qdir{std::getenv("GEN_QDIR")};
-  double t_npu{0}, t_cpu{0};
+  double t_npu{0}, t_cpu{0}, ph[4]{0, 0, 0, 0};
   bool cpu_ref{std::getenv("GEN_CPU") != nullptr || std::getenv("GEN_CPU_OP") != nullptr};
   std::string cpu_ops{std::getenv("GEN_CPU") ? "qkv,out,ffn" : (std::getenv("GEN_CPU_OP") ? std::getenv("GEN_CPU_OP") : "")};
   bool Cpu(const char* op) const { return cpu_ops.find(op) != std::string::npos; }
@@ -779,7 +779,10 @@ struct Engine {
       for (std::uint32_t i = 0; i < H; ++i) x[std::size_t{r} * H + i] = Bf(embed[std::size_t{tok[r]} * H + i]);
     for (std::uint32_t l = 0; l < c.layers; ++l) {
       Layer& L = layers[l];
-      for (std::uint32_t r = 0; r < n; ++r) RmsNorm(&x[std::size_t{r} * H], L.attn_norm.data(), &z[std::size_t{r} * H], H, c.eps);
+      auto tp = Clock::now();
+#pragma omp parallel for
+      for (std::int64_t r = 0; r < n; ++r) RmsNorm(&x[std::size_t(r) * H], L.attn_norm.data(), &z[std::size_t(r) * H], H, c.eps);
+      ph[0] += Ms(tp);
       auto t0 = Clock::now();
       const bool u64 = m64 && n > kRows;
       const bool ukd = kd && n >= kd_min && n <= 1024;
@@ -874,6 +877,7 @@ struct Engine {
       }
       }
       t_cpu += Ms(t0);
+      ph[2] += Ms(t0);
       t0 = Clock::now();
       if (ukd) {
         KGemm(L.kp_o, L.kw_o, att.data(), n, qd, br.data());
@@ -884,8 +888,12 @@ struct Engine {
         for (std::uint32_t r = 0; r < n; ++r) std::memcpy(&brh[std::size_t{r} * H], &br[std::size_t{r} * h_p], H * 4);
       }
       t_npu += Ms(t0);
-      for (std::size_t i = 0; i < std::size_t{n} * H; ++i) x[i] += brh[i];
-      for (std::uint32_t r = 0; r < n; ++r) RmsNorm(&x[std::size_t{r} * H], L.ffn_norm.data(), &z[std::size_t{r} * H], H, c.eps);
+      tp = Clock::now();
+#pragma omp parallel for
+      for (std::int64_t i = 0; i < static_cast<std::int64_t>(std::size_t{n} * H); ++i) x[i] += brh[i];
+#pragma omp parallel for
+      for (std::int64_t r = 0; r < n; ++r) RmsNorm(&x[std::size_t(r) * H], L.ffn_norm.data(), &z[std::size_t(r) * H], H, c.eps);
+      ph[0] += Ms(tp);
       t0 = Clock::now();
       if (ukd) {
         KMlp(L, z.data(), n, brh.data());
@@ -903,7 +911,11 @@ struct Engine {
         rt.Ffn(L.p_ffn, L.ffn, z.data(), n, brh.data(), &tim, gu_strips, H);
       }
       t_npu += Ms(t0);
-      for (std::size_t i = 0; i < std::size_t{n} * H; ++i) x[i] += brh[i];
+      ph[1] += Ms(t0);
+      tp = Clock::now();
+#pragma omp parallel for
+      for (std::int64_t i = 0; i < static_cast<std::int64_t>(std::size_t{n} * H); ++i) x[i] += brh[i];
+      ph[0] += Ms(tp);
     }
     pos += n;
     if (hidden) {
@@ -1031,6 +1043,7 @@ int Chat(const char* model, const char* programs, const std::string& prompt, std
     next = g.Argmax(hd.data());
   }
   const double dc = Ms(t1);
+  std::fprintf(stderr, "\nhost norm+resid %.0f ms | ffn %.0f ms | attention+rope %.0f ms | gemm enc %.0f dec %.0f sync+wait %.0f ms\n", g.ph[0], g.ph[1], g.ph[2], g.tim.enc, g.tim.dec, g.tim.wait + g.tim.syncA + g.tim.syncC);
   std::fprintf(stderr, "\nprefill %zu tok %.1f ms (%.0f tok/s); decode %u tok %.1f ms (%.2f tok/s)\n", ids.size(), pf, ids.size() / pf * 1000, produced, dc, produced / dc * 1000);
   return 0;
 }
