@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include <immintrin.h>
+#include <omp.h>
 
 #include <algorithm>
 #include <chrono>
@@ -334,6 +335,8 @@ struct Engine {
     std::string qkv16, out16, qkv64, out64, dn64, gu64, ffn16, argmax, kqkv, ko, swa, swb, dn2;
   } nm;
   std::uint32_t half_a{0};
+  int dec_threads{std::getenv("GEN_DEC_THREADS") ? std::atoi(std::getenv("GEN_DEC_THREADS")) : 2};
+  int pre_threads{std::getenv("GEN_PRE_THREADS") ? std::atoi(std::getenv("GEN_PRE_THREADS")) : 8};
 
   void EnsureProgs(const std::string& programs, std::uint32_t H, std::uint32_t qd, std::uint32_t qkv_p, std::uint32_t h_p, std::uint32_t I, std::uint32_t vp) {
     const std::string repo = programs + "/..";
@@ -767,6 +770,7 @@ struct Engine {
   }
 
   void Step(const std::uint32_t* tok, std::uint32_t n, std::vector<float>* hidden) {
+    omp_set_num_threads(n <= 2 ? dec_threads : pre_threads);
     const std::uint32_t H = c.hidden, qd = c.heads * c.head_dim, kvd = c.kv_heads * c.head_dim;
     const std::uint32_t qkv_n = qd + 2 * kvd, qkv_p = PadN(qkv_n), h_p = PadN(H);
     std::vector<float> x(std::size_t{n} * H), z(std::size_t{n} * H), qkv(std::size_t{n} * qkv_p),
