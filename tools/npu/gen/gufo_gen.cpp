@@ -318,6 +318,9 @@ struct Layer {
   Program kp_qkv, kp_o, kp_qkv2, kp_o2;
   Program ks_qkv, ks_o;  // 512-row programs for requests that fit in one small pass
   std::vector<MlpSlice> mlp;
+  // int5 decode path (language-model mode): stream-bound m16 programs on the decode xclbin
+  WeightBuffer dq_in, dq_o, dq_gu, dq_dn;
+  Program dp_in, dp_o, dp_gu, dp_dn;
   std::vector<std::vector<std::uint16_t>> khs, vhs;
 };
 
@@ -376,6 +379,17 @@ struct Engine {
   std::uint32_t mlp_slices{1}, slice_i{0};        // the fused gate/up program bakes the intermediate width into a DMA stride (limit 4 MB)
   int dec_threads{std::getenv("GEN_DEC_THREADS") ? std::atoi(std::getenv("GEN_DEC_THREADS")) : 2};
   int pre_threads{std::getenv("GEN_PRE_THREADS") ? std::atoi(std::getenv("GEN_PRE_THREADS")) : 8};
+
+  // Generates a missing instruction stream with the shared toolchain scripts (gen_insts.sh / kdyn/gen_kd.sh / kdh/gen_kdh.sh).
+  static void NeedInsts(const std::string& programs, const std::string& file, const std::string& cmd) {
+    if (std::ifstream(programs + "/" + file).good()) return;
+    std::fprintf(stderr, "gen: generating %s\n", file.c_str());
+    const std::string full = "bash -c 'source " + programs + "/../../gen/env.sh; " + cmd + "' >/dev/null";
+    if (std::system(full.c_str()) != 0) {
+      std::fprintf(stderr, "gen: failed to generate %s (toolchain env: tools/npu/gen/env.sh)\n", file.c_str());
+      std::exit(1);
+    }
+  }
 
   void EnsureProgs(const std::string& programs, std::uint32_t H, std::uint32_t qd, std::uint32_t qkv_p, std::uint32_t h_p, std::uint32_t I, std::uint32_t vp) {
     const std::string repo = programs + "/..";
@@ -1457,6 +1471,9 @@ struct HybridEngine : Engine {
   std::vector<LmState> lm;
   std::vector<std::uint16_t> head_bf;  // output projection, bf16 (vocab x hidden)
   bool lm_mode{false};
+  bool dec_ok{false};   // int5 stream-bound decode path available (language-model mode)
+  bool use_dec{false};  // the current Step runs on it (few rows)
+  std::vector<float> s_gu, s_act, s_dn;
   GdnDev gd;
   bool gdn_dev{std::getenv("GEN_GDN_HOST") == nullptr};
   std::vector<float> readout;
@@ -1526,6 +1543,11 @@ struct HybridEngine : Engine {
       return false;
     }
     kd = true;
+    dec_ok = lm_mode && !std::getenv("GEN_NO_INT5_DECODE");
+    if (dec_ok && !rt.Init(programs + "/final_16x64x128_ffn.xclbin", &err)) {
+      std::fprintf(stderr, "npu init (decode): %s\n", err.c_str());
+      dec_ok = false;
+    }
     const std::uint32_t H = c.hidden, I = c.inter, qd = c.heads * c.head_dim, kvd = c.kv_heads * c.head_dim;
     const std::uint32_t attn_n = 2 * qd + 2 * kvd, h_p = PadN(H);
     SetupMlpSlices();
@@ -1618,6 +1640,25 @@ struct HybridEngine : Engine {
     }
     kxn = std::max({H, qd, I, kValDim});
     kyn = std::max<std::size_t>(kGdnInN, h_p);
+    const auto plain_name = [](std::uint32_t K, std::uint32_t N) { return "insts_plain_" + std::to_string(K) + "x" + std::to_string(N) + ".txt"; };
+    const std::uint32_t vp_n = PadN(c.vocab);
+    if (dec_ok) {
+      const std::string gi = "bash " + programs + "/../gen_insts.sh ";
+      const auto n = [](std::uint32_t v) { return std::to_string(v); };
+      for (const auto& kn : {std::pair{H, kGdnInN}, std::pair{kValDim, h_p}, std::pair{H, attn_n}, std::pair{qd, h_p}, std::pair{H, 2 * I}, std::pair{I, h_p}})
+        NeedInsts(programs, plain_name(kn.first, kn.second), gi + "plain " + n(kn.first) + " " + n(kn.second));
+      nm.argmax = "insts_argmax_" + n(H) + "x" + n(vp_n) + ".txt";
+      NeedInsts(programs, nm.argmax, gi + "argmax " + n(H) + " " + n(vp_n) + " " + nm.argmax);
+      p_argmax = rt.MakeProgram(H, vp_n, programs + "/" + nm.argmax, 0, &err);
+      std::vector<float> argbuf;
+      w_argmax = rt.PackWeightCached(wcache, "argmax", vp_n, H, [&]() -> const float* {
+        argbuf.assign(std::size_t{vp_n} * H, 0.f);
+#pragma omp parallel for
+        for (std::int64_t i = 0; i < static_cast<std::int64_t>(std::size_t{c.vocab} * H); ++i) argbuf[i] = Bf(head_bf[i]);
+        return argbuf.data();
+      });
+      npu_argmax = true;
+    }
     layers.resize(c.layers);
     hl.resize(c.layers);
     if (lm_mode) lm.resize(c.layers);
@@ -1738,17 +1779,43 @@ struct HybridEngine : Engine {
       }
       {
         std::vector<float> gate, up, down;
-        PackMlp(L, b + "kd.", programs, &err,
-                [&] {
-                  if (!gate.empty()) return;
-                  gate.resize(std::size_t{I} * H);
-                  up.resize(std::size_t{I} * H);
-                  down.resize(std::size_t{H} * I);
-                  st.LoadG(b + "ffn_gate.weight", gate.data(), gate.size());
-                  st.LoadG(b + "ffn_up.weight", up.data(), up.size());
-                  st.LoadG(b + "ffn_down.weight", down.data(), down.size());
-                },
-                gate, up, down);
+        const auto ensure = [&] {
+          if (!gate.empty()) return;
+          gate.resize(std::size_t{I} * H);
+          up.resize(std::size_t{I} * H);
+          down.resize(std::size_t{H} * I);
+          st.LoadG(b + "ffn_gate.weight", gate.data(), gate.size());
+          st.LoadG(b + "ffn_up.weight", up.data(), up.size());
+          st.LoadG(b + "ffn_down.weight", down.data(), down.size());
+        };
+        PackMlp(L, b + "kd.", programs, &err, ensure, gate, up, down);
+        if (dec_ok) {
+          // int5 decode copy of the layer: m16 programs on the decode xclbin, streamed once per token
+          std::vector<float> gu_buf, dn_buf;
+          const std::uint32_t ko = h.linear ? kValDim : qd;
+          L.dq_in = rt.PackWeightCached(wcache, b + "q5.in", in_rows, H, load_in);
+          L.dq_o = rt.PackWeightCached(wcache, b + "q5.o", h_p, ko, load_o);
+          L.dq_gu = rt.PackWeightCached(wcache, b + "q5.gu", 2 * I, H, [&]() -> const float* {
+            ensure();
+            gu_buf.resize(std::size_t{2 * I} * H);
+            for (std::size_t f = 0; f < I / 8; ++f)
+              for (std::size_t i = 0; i < 8; ++i) {
+                std::memcpy(&gu_buf[(f * 16 + i) * H], &gate[(f * 8 + i) * H], std::size_t{H} * 4);
+                std::memcpy(&gu_buf[(f * 16 + 8 + i) * H], &up[(f * 8 + i) * H], std::size_t{H} * 4);
+              }
+            return gu_buf.data();
+          });
+          L.dq_dn = rt.PackWeightCached(wcache, b + "q5.dn", h_p, I, [&]() -> const float* {
+            ensure();
+            dn_buf.assign(std::size_t{h_p} * I, 0.f);
+            std::memcpy(dn_buf.data(), down.data(), down.size() * 4);
+            return dn_buf.data();
+          });
+          L.dp_in = rt.MakeProgram(H, in_rows, programs + "/" + plain_name(H, in_rows), 0, &err);
+          L.dp_o = rt.MakeProgram(ko, h_p, programs + "/" + plain_name(ko, h_p), 0, &err);
+          L.dp_gu = rt.MakeProgram(H, 2 * I, programs + "/" + plain_name(H, 2 * I), 0, &err);
+          L.dp_dn = rt.MakeProgram(I, h_p, programs + "/" + plain_name(I, h_p), 0, &err);
+        }
       }
       if (l % 8 == 0) std::fprintf(stderr, "hybrid: packed layer %u (%.1f s)\n", l, Ms(t0) / 1000.0);
     }
@@ -1930,7 +1997,8 @@ struct HybridEngine : Engine {
     s_gated.resize(std::size_t{Tt} * kValDim);
     auto tg = Clock::now();
     const bool sm = small_ok && Tt <= 512;
-    KGemm(sm ? L.ks_qkv : L.kp_qkv, sm ? L.ks_qkv : L.kp_qkv2, L.kw_qkv, z, Tt, H, s_proj.data());
+    if (use_dec) rt.Gemm(L.dp_in, L.dq_in, z, Tt, s_proj.data(), &tim);
+    else KGemm(sm ? L.ks_qkv : L.kp_qkv, sm ? L.ks_qkv : L.kp_qkv2, L.kw_qkv, z, Tt, H, s_proj.data());
     ph[12] += Ms(tg);
     tg = Clock::now();
     const std::uint32_t ne = GdnDev::Bucket(Tt);
@@ -1953,7 +2021,8 @@ struct HybridEngine : Engine {
     }
     s_outp.resize(std::size_t{Tt} * h_p);
     tg = Clock::now();
-    KGemm(sm ? L.ks_o : L.kp_o, sm ? L.ks_o : L.kp_o2, L.kw_o, s_gated.data(), Tt, kValDim, s_outp.data());
+    if (use_dec) rt.Gemm(L.dp_o, L.dq_o, s_gated.data(), Tt, s_outp.data(), &tim);
+    else KGemm(sm ? L.ks_o : L.kp_o, sm ? L.ks_o : L.kp_o2, L.kw_o, s_gated.data(), Tt, kValDim, s_outp.data());
     ph[16] += Ms(tg);
     for (std::uint32_t t = 0; t < Tt; ++t) std::memcpy(out_h + std::size_t{t} * H, &s_outp[std::size_t{t} * h_p], std::size_t{H} * 4);
   }
@@ -2048,10 +2117,12 @@ struct HybridEngine : Engine {
     s_proj.resize(std::size_t{Tt} * attn_n);
     s_att.resize(std::size_t{Tt} * qd);
     const bool sm = small_ok && Tt <= 512;
-    KGemm(sm ? L.ks_qkv : L.kp_qkv, sm ? L.ks_qkv : L.kp_qkv2, L.kw_qkv, z, Tt, H, s_proj.data());
+    if (use_dec) rt.Gemm(L.dp_in, L.dq_in, z, Tt, s_proj.data(), &tim);
+    else KGemm(sm ? L.ks_qkv : L.kp_qkv, sm ? L.ks_qkv : L.kp_qkv2, L.kw_qkv, z, Tt, H, s_proj.data());
     for (const auto& sg : segs) AttnHost(L, s_proj.data() + std::size_t{sg.first} * attn_n, sg.second, s_att.data() + std::size_t{sg.first} * qd, pos, lm_mode);
     s_outp.resize(std::size_t{Tt} * h_p);
-    KGemm(sm ? L.ks_o : L.kp_o, sm ? L.ks_o : L.kp_o2, L.kw_o, s_att.data(), Tt, qd, s_outp.data());
+    if (use_dec) rt.Gemm(L.dp_o, L.dq_o, s_att.data(), Tt, s_outp.data(), &tim);
+    else KGemm(sm ? L.ks_o : L.kp_o, sm ? L.ks_o : L.kp_o2, L.kw_o, s_att.data(), Tt, qd, s_outp.data());
     for (std::uint32_t t = 0; t < Tt; ++t) std::memcpy(out_h + std::size_t{t} * H, &s_outp[std::size_t{t} * h_p], std::size_t{H} * 4);
   }
 
@@ -2062,6 +2133,23 @@ struct HybridEngine : Engine {
 
   // Layer-major forward over a batch of sequences (rows of all sequences share the GEMM chunks). Returns the final-norm hidden
   // state at each sequence's marker.
+  // Decode-path MLP: fused gate/up GEMM (interleaved 8-row blocks), host swiglu, down GEMM.
+  void DecMlp(Layer& L, const float* z, std::uint32_t n, float* out) {
+    const std::uint32_t H = c.hidden, I = c.inter, h_p = PadN(H);
+    s_gu.resize(std::size_t{n} * 2 * I);
+    rt.Gemm(L.dp_gu, L.dq_gu, z, n, s_gu.data(), &tim);
+    s_act.resize(std::size_t{n} * I);
+    for (std::uint32_t r = 0; r < n; ++r) {
+      const float* g = &s_gu[std::size_t{r} * 2 * I];
+      float* a = &s_act[std::size_t{r} * I];
+      for (std::uint32_t f = 0; f < I / 8; ++f)
+        for (std::uint32_t i = 0; i < 8; ++i) a[f * 8 + i] = SiluF(g[f * 16 + i]) * g[f * 16 + 8 + i];
+    }
+    s_dn.resize(std::size_t{n} * h_p);
+    rt.Gemm(L.dp_dn, L.dq_dn, s_act.data(), n, s_dn.data(), &tim);
+    for (std::uint32_t r = 0; r < n; ++r) std::memcpy(out + std::size_t{r} * H, &s_dn[std::size_t{r} * h_p], std::size_t{H} * 4);
+  }
+
   // All transformer layers over the T residual rows x (norms, delta-net or attention, MLP, residual adds).
   void Layers(std::vector<float>& x, std::uint32_t T, const std::vector<Seg>& segs) {
     const std::uint32_t H = c.hidden;
@@ -2085,7 +2173,8 @@ struct HybridEngine : Engine {
       norm_rows(L.ffn_norm.data());
       ph[11] += Ms(tl);
       tl = Clock::now();
-      KMlp(L, z.data(), T, br.data(), small_ok && T <= 512);
+      if (use_dec) DecMlp(L, z.data(), T, br.data());
+      else KMlp(L, z.data(), T, br.data(), small_ok && T <= 512);
       ph[10] += Ms(tl);
       tl = Clock::now();
 #pragma omp parallel for
@@ -2115,12 +2204,19 @@ struct HybridEngine : Engine {
     std::vector<float> x(std::size_t{n} * H);
     for (std::uint32_t r = 0; r < n; ++r)
       for (std::uint32_t i = 0; i < H; ++i) x[std::size_t{r} * H + i] = Bf(embed[std::size_t{tok[r]} * H + i]);
+    use_dec = dec_ok && n <= 16;
     Layers(x, n, {{0, n}});
+    use_dec = false;
     pos += n;
     hidden->resize(H);
     RmsNorm(&x[std::size_t{n - 1} * H], norm_w.data(), hidden->data(), H, c.eps);
   }
-  std::uint32_t Argmax(const float* hid) const {
+  std::uint32_t Argmax(const float* hid) {
+    if (npu_argmax) {
+      std::uint32_t id = 0;
+      rt.Argmax(p_argmax, w_argmax, hid, 1, &id, &tim);
+      if (id < c.vocab) return id;
+    }
     const std::uint32_t H = c.hidden;
     float best = -INFINITY;
     std::uint32_t arg = 0;
