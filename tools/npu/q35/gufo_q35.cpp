@@ -177,6 +177,66 @@ void RmsNormRows(const float* x, const float* w, float* out, std::uint32_t rows,
 
 float Silu(float x) { return x / (1.0f + std::exp(-x)); }
 
+struct GdnDev {
+  xrt::device dev;
+  xrt::hw_context ctx;
+  xrt::kernel kern;
+  std::vector<std::pair<std::uint32_t, xrt::bo>> insts;
+  std::vector<std::uint32_t> inst_words;
+  xrt::bo bin, bx, bout;
+  std::uint8_t* in_h{nullptr};
+  const float* out_h{nullptr};
+  static constexpr std::uint32_t kMaxNe = 512;
+  static constexpr std::uint32_t kMaxTok = 4 * kMaxNe;
+  bool Init(const std::string& programs) {
+    try {
+      dev = xrt::device(0u);
+      const xrt::xclbin xb{programs + "/final_gdn.xclbin"};
+      dev.register_xclbin(xb);
+      ctx = xrt::hw_context(dev, xb.get_uuid());
+      kern = xrt::kernel(ctx, xb.get_kernels().at(0).get_name());
+      for (std::uint32_t ne : {16u, 32u, 64u, 128u, 256u, 512u}) {
+        std::ifstream f(programs + "/insts_gdn_" + std::to_string(ne) + ".txt", std::ios::binary | std::ios::ate);
+        if (!f) return false;
+        const std::size_t n = static_cast<std::size_t>(f.tellg());
+        f.seekg(0);
+        std::vector<char> v(n);
+        f.read(v.data(), static_cast<std::streamsize>(n));
+        xrt::bo b(dev, n, XCL_BO_FLAGS_CACHEABLE, kern.group_id(1));
+        std::memcpy(b.map<void*>(), v.data(), n);
+        b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        insts.emplace_back(ne, b);
+        inst_words.push_back(static_cast<std::uint32_t>(n / 4));
+      }
+      bin = xrt::bo(dev, std::size_t{8} * kMaxNe * 4 * 4096, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(3));
+      bx = xrt::bo(dev, 4, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(4));
+      bout = xrt::bo(dev, std::size_t{8} * kMaxNe * 4 * 2048, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(5));
+      in_h = bin.map<std::uint8_t*>();
+      out_h = bout.map<float*>();
+      std::memset(in_h, 0, std::size_t{8} * kMaxNe * 4 * 4096);
+      std::memset(bout.map<void*>(), 0, std::size_t{8} * kMaxNe * 4 * 2048);
+      return true;
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "gdn device: %s\n", e.what());
+      return false;
+    }
+  }
+  static std::uint32_t Bucket(std::uint32_t tokens) {
+    for (std::uint32_t ne : {16u, 32u, 64u, 128u, 256u, 512u})
+      if (tokens <= 4 * ne) return ne;
+    return 0;
+  }
+  void Run(std::uint32_t ne) {
+    std::size_t idx = 0;
+    for (; idx < insts.size(); ++idx)
+      if (insts[idx].first == ne) break;
+    bin.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    auto run = kern(3, insts[idx].second, inst_words[idx], bin, bx, bout);
+    run.wait();
+    bout.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+  }
+};
+
 struct Layer {
   bool linear{false};
   std::vector<float> ln1, ln2;
@@ -196,6 +256,8 @@ struct Layer {
 
 struct Engine {
   NpuRuntime rt, rk;
+  GdnDev gd;
+  bool gdn_dev{std::getenv("Q35_GDN_DEV") != nullptr};
   NpuRuntime::Timings tim{};
   bool kd{std::getenv("Q35_KD") != nullptr};
   std::vector<Layer> layers;
@@ -226,6 +288,7 @@ struct Engine {
     }
     embed = w.Raw("language_model.embed_tokens.weight", 0 + std::size_t{248320} * kH);
     norm_w = w.Vec("language_model.norm.weight", kH, 1.0f);
+    if (gdn_dev && !gd.Init(programs)) gdn_dev = false;
     layers.resize(kLayers);
     const auto t0 = Clock::now();
     std::vector<float> buf;
@@ -466,7 +529,17 @@ struct Engine {
     else Gemm(L.p_in, L.w_in, z, Tt, kH, proj.data());
     mx[0] += Ms(ta);
     const auto t0 = Clock::now();
-    for (const auto& sg : segs) GdnHost(L, proj.data() + std::size_t{sg.first} * kGdnInN, z + std::size_t{sg.first} * kH, sg.second, gated.data() + std::size_t{sg.first} * kValDim);
+    const std::uint32_t ne = GdnDev::Bucket(Tt);
+    if (gdn_dev && ne) {
+      for (const auto& sg : segs) GdnPrepDev(L, proj.data() + std::size_t{sg.first} * kGdnInN, z + std::size_t{sg.first} * kH, sg.second, sg.first, ne);
+      GdnPadDev(Tt, 4 * ne, ne);
+      const auto td = Clock::now();
+      gd.Run(ne);
+      mx[7] += Ms(td);
+      for (const auto& sg : segs) GdnPostDev(L, proj.data() + std::size_t{sg.first} * kGdnInN, sg.second, sg.first, ne, gated.data() + std::size_t{sg.first} * kValDim);
+    } else {
+      for (const auto& sg : segs) GdnHost(L, proj.data() + std::size_t{sg.first} * kGdnInN, z + std::size_t{sg.first} * kH, sg.second, gated.data() + std::size_t{sg.first} * kValDim);
+    }
     t_host += Ms(t0);
     mx[1] += Ms(t0);
     ta = Clock::now();
@@ -476,6 +549,93 @@ struct Engine {
     else Gemm(L.p_out, L.w_out, gated.data(), Tt, kValDim, outp.data());
     mx[2] += Ms(ta);
     for (std::uint32_t t = 0; t < Tt; ++t) std::memcpy(out_h + std::size_t{t} * kH, &outp[std::size_t{t} * kOutN], kH * 4);
+  }
+
+  void GdnPrepDev(Layer& L, const float* proj, const float* z, std::uint32_t T, std::uint32_t tok_off, std::uint32_t ne) {
+    std::vector<float> ab(std::size_t{T} * 2 * kVH);
+#pragma omp parallel for collapse(2)
+    for (std::int64_t t = 0; t < T; ++t)
+      for (std::uint32_t h = 0; h < 2 * kVH; ++h) {
+        const float* wrow = (h < kVH ? L.w_a.data() : L.w_b.data()) + std::size_t{h % kVH} * kH;
+        const float* zr = z + std::size_t(t) * kH;
+        float s = 0;
+        for (std::uint32_t i = 0; i < kH; ++i) s += wrow[i] * zr[i];
+        ab[std::size_t(t) * 2 * kVH + h] = s;
+      }
+    if (L.convT.empty()) {
+      L.convT.resize(std::size_t{kConvK} * kConvDim);
+      for (std::uint32_t c = 0; c < kConvDim; ++c)
+        for (std::uint32_t j = 0; j < kConvK; ++j) L.convT[std::size_t{j} * kConvDim + c] = L.conv[std::size_t{c} * kConvK + j];
+    }
+    s_qkv.resize(std::size_t{T} * kConvDim);
+    float* qkv = s_qkv.data();
+#pragma omp parallel for
+    for (std::int64_t t = 0; t < T; ++t) {
+      float* o = &qkv[std::size_t(t) * kConvDim];
+      std::fill(o, o + kConvDim, 0.f);
+      for (std::uint32_t j = 0; j < kConvK; ++j) {
+        const std::int64_t src = t - (kConvK - 1) + j;
+        if (src < 0) continue;
+        const float* in = proj + std::size_t(src) * kGdnInN;
+        const float* wj = &L.convT[std::size_t{j} * kConvDim];
+#pragma omp simd
+        for (std::uint32_t c = 0; c < kConvDim; ++c) o[c] += wj[c] * in[c];
+      }
+      for (std::uint32_t c = 0; c < kConvDim; ++c) o[c] = Silu(o[c]);
+    }
+#pragma omp parallel for collapse(2)
+    for (std::int64_t t = 0; t < T; ++t)
+      for (std::uint32_t h = 0; h < kVH; ++h) {
+        const std::uint32_t kh = h / (kVH / kKH);
+        const float* row = &qkv[std::size_t(t) * kConvDim];
+        float qn = 0, kn = 0;
+        for (std::uint32_t i = 0; i < kKD; ++i) {
+          qn += row[kh * kKD + i] * row[kh * kKD + i];
+          kn += row[kKeyDim + kh * kKD + i] * row[kKeyDim + kh * kKD + i];
+        }
+        const float qs = 1.0f / std::sqrt(qn + 1e-6f) / std::sqrt(static_cast<float>(kKD)), ks = 1.0f / std::sqrt(kn + 1e-6f);
+        const std::uint32_t g = tok_off + static_cast<std::uint32_t>(t), col = h / 4, rw = h % 4, e = g / 4, tt = g % 4;
+        std::uint8_t* rec = gd.in_h + ((((std::size_t{col} * ne + e) * 4 + rw) * 4) + tt) * 1024;
+        auto* b = reinterpret_cast<std::uint16_t*>(rec);
+        for (std::uint32_t i = 0; i < kKD; ++i) {
+          b[i] = Bf16Bits(row[kh * kKD + i] * qs);
+          b[128 + i] = Bf16Bits(row[kKeyDim + kh * kKD + i] * ks);
+          b[256 + i] = Bf16Bits(row[2 * kKeyDim + h * kVD + i]);
+        }
+        const float av = ab[std::size_t{static_cast<std::uint32_t>(t)} * 2 * kVH + h], bv = ab[std::size_t{static_cast<std::uint32_t>(t)} * 2 * kVH + kVH + h];
+        const float x = av + L.dt_bias[h];
+        const float sp = x > 20.f ? x : std::log1p(std::exp(x));
+        const float sc[2] = {std::exp(-std::exp(L.a_log[h]) * sp), 1.0f / (1.0f + std::exp(-bv))};
+        std::memcpy(rec + 768, sc, 8);
+        const std::int32_t reset = t == 0 ? 1 : 0;
+        std::memcpy(rec + 776, &reset, 4);
+      }
+  }
+
+  void GdnPadDev(std::uint32_t from, std::uint32_t to, std::uint32_t ne) {
+    for (std::uint32_t g = from; g < to; ++g)
+      for (std::uint32_t h = 0; h < kVH; ++h) {
+        const std::uint32_t col = h / 4, rw = h % 4, e = g / 4, tt = g % 4;
+        std::uint8_t* rec = gd.in_h + ((((std::size_t{col} * ne + e) * 4 + rw) * 4) + tt) * 1024;
+        std::memset(rec, 0, 1024);
+        const float sc[2] = {1.0f, 0.0f};
+        std::memcpy(rec + 768, sc, 8);
+      }
+  }
+
+  void GdnPostDev(Layer& L, const float* proj, std::uint32_t T, std::uint32_t tok_off, std::uint32_t ne, float* gated) {
+#pragma omp parallel for collapse(2)
+    for (std::int64_t t = 0; t < T; ++t)
+      for (std::uint32_t h = 0; h < kVH; ++h) {
+        const std::uint32_t g = tok_off + static_cast<std::uint32_t>(t), col = h / 4, rw = h % 4, e = g / 4, tt = g % 4;
+        const float* o = gd.out_h + (((std::size_t{col} * ne + e) * 4 + rw) * 4 + tt) * 128;
+        float ss = 0;
+        for (std::uint32_t j = 0; j < kVD; ++j) ss += o[j] * o[j];
+        const float rs = 1.0f / std::sqrt(ss / kVD + kEps);
+        const float* zz = &proj[std::size_t(t) * kGdnInN + kConvDim + h * kVD];
+        float* gt = &gated[std::size_t(t) * kValDim + h * kVD];
+        for (std::uint32_t j = 0; j < kVD; ++j) gt[j] = L.gnorm[j] * (o[j] * rs) * Silu(zz[j]);
+      }
   }
 
   void GdnHost(Layer& L, const float* proj, const float* z, std::uint32_t T, float* gated) {
@@ -897,7 +1057,7 @@ int EvalBatch(const char* model, const char* programs, const char* path) {
   }
   }
   std::fprintf(stderr, "npu: enc %.0f syncA %.0f submit %.0f wait %.0f syncC %.0f dec %.0f ms\n", e.tim.enc, e.tim.syncA, e.tim.submit, e.tim.wait, e.tim.syncC, e.tim.dec);
-  std::fprintf(stderr, "mixer: gdn in %.0f host %.0f out %.0f alloc %.0f | attn in %.0f | ab %.0f conv %.0f\n", e.mx[0], e.mx[1], e.mx[2], e.mx[4], e.mx[3], e.mx[5], e.mx[6]);
+  std::fprintf(stderr, "mixer: gdn in %.0f host %.0f out %.0f alloc %.0f | attn in %.0f | ab %.0f conv %.0f gdn-dispatch %.0f\n", e.mx[0], e.mx[1], e.mx[2], e.mx[4], e.mx[3], e.mx[5], e.mx[6], e.mx[7]);
   std::fprintf(stderr, "phases: norm1 %.0f mixer %.0f resid+norm2 %.0f mlp %.0f ms\n", e.ph[0], e.ph[1], e.ph[2], e.ph[3]);
   std::fprintf(stderr, "eval: %d cases %llu tokens %.1f ms (%.1f ms/case, npu %.0f host %.0f) group %u\n", cases, static_cast<unsigned long long>(total), Ms(t0), Ms(t0) / cases, e.t_npu, e.t_host, group);
   return 0;
