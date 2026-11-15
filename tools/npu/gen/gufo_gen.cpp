@@ -115,6 +115,18 @@ bool DecodeRowAny(const gufo::models::lfm3::Tensor& tn, std::uint32_t row, std::
     case GgmlType::kQ4_K: case GgmlType::kQ5_K: case GgmlType::kQ6_K:
       gufo::models::lfm3::DecodeRow(tn, row, out);
       return true;
+    case GgmlType::kQ3_K:
+      gufo::quant::DequantizeQ3_K(d, out.data(), cols);
+      return true;
+    case GgmlType::kIQ4_NL:
+      gufo::quant::DequantizeIQ4_NL(d, out.data(), cols);
+      return true;
+    case GgmlType::kIQ4_XS:
+      gufo::quant::DequantizeIQ4_XS(d, out.data(), cols);
+      return true;
+    case GgmlType::kIQ3_S:
+      gufo::quant::DequantizeIQ3_S(d, out.data(), cols);
+      return true;
     default:
       return false;
   }
@@ -125,6 +137,7 @@ bool TypeOk(gufo::core::GgmlType t) {
   switch (t) {
     case GgmlType::kQ4_1: case GgmlType::kQ5_0: case GgmlType::kQ5_1: case GgmlType::kF32: case GgmlType::kF16: case GgmlType::kBF16:
     case GgmlType::kQ8_0: case GgmlType::kQ4_0: case GgmlType::kQ4_K: case GgmlType::kQ5_K: case GgmlType::kQ6_K:
+    case GgmlType::kQ3_K: case GgmlType::kIQ4_NL: case GgmlType::kIQ4_XS: case GgmlType::kIQ3_S:
       return true;
     default:
       return false;
@@ -283,6 +296,15 @@ struct QMat {
   }
 };
 
+// One slice of the MLP intermediate dimension: fused gate/up/swiglu programs (two halves of the slice), the down projection over the slice,
+// two buffer sets for the chunk pipeline and the 512-row variants. The slices' down outputs are summed.
+struct MlpSlice {
+  WeightBuffer kw_a, kw_b, kw_d;
+  Program kq_a, kq_b, kq_d, kq_a2, kq_b2, kq_d2;
+  Program ks_a, ks_b, ks_d;
+  xrt::bo swc, swc2;
+};
+
 struct Layer {
   std::vector<float> attn_norm, ffn_norm;
   WeightBuffer qkv, out, ffn, ffn_dn;
@@ -292,12 +314,10 @@ struct Layer {
   std::vector<float> wqkv, wo, wgate, wup, wdown;
   std::vector<AttnLayer> als;
   std::vector<std::uint32_t> napps;
-  WeightBuffer kw_qkv, kw_o, kw_a, kw_b, kw_d;
-  Program kp_qkv, kp_o, kq_a, kq_b, kq_d;
-  Program kp_qkv2, kp_o2, kq_a2, kq_b2, kq_d2;
-  Program ks_qkv, ks_o, ks_a, ks_b, ks_d;  // 512-row programs for requests that fit in one small pass
-  xrt::bo swc2;
-  xrt::bo swc;
+  WeightBuffer kw_qkv, kw_o;
+  Program kp_qkv, kp_o, kp_qkv2, kp_o2;
+  Program ks_qkv, ks_o;  // 512-row programs for requests that fit in one small pass
+  std::vector<MlpSlice> mlp;
   std::vector<std::vector<std::uint16_t>> khs, vhs;
 };
 
@@ -333,7 +353,7 @@ struct Engine {
   std::vector<float> kx, ky, rcos, rsin, s_qa, s_kd, s_ap;
   std::uint32_t kvp{1};
   std::uint64_t bad_head_rows{0};
-  std::vector<float> kxs[2], ymlp[2];
+  std::vector<float> kxs[2], ymlp[2], ymlp_part;
   std::size_t kxn{0}, kyn{0};
   std::uint32_t super_rows{std::getenv("GEN_SUPER") ? static_cast<std::uint32_t>(std::atoi(std::getenv("GEN_SUPER"))) : 4096u};
   bool npu_attn{std::getenv("GEN_HOST_ATTN") == nullptr};
@@ -350,9 +370,10 @@ struct Engine {
   bool Cpu(const char* op) const { return cpu_ops.find(op) != std::string::npos; }
 
   struct Names {
-    std::string qkv16, out16, qkv64, out64, dn64, gu64, ffn16, argmax, kqkv, ko, swa, swb, dn2;
+    std::string qkv16, out16, qkv64, out64, dn64, gu64, ffn16, argmax, kqkv, ko, swa, swb, dn2, dn2s;
   } nm;
-  std::uint32_t half_a{0};
+  std::uint32_t half_a{0};                        // half of one slice's intermediate width, multiple of 512
+  std::uint32_t mlp_slices{1}, slice_i{0};        // the fused gate/up program bakes the intermediate width into a DMA stride (limit 4 MB)
   int dec_threads{std::getenv("GEN_DEC_THREADS") ? std::atoi(std::getenv("GEN_DEC_THREADS")) : 2};
   int pre_threads{std::getenv("GEN_PRE_THREADS") ? std::atoi(std::getenv("GEN_PRE_THREADS")) : 8};
 
@@ -386,10 +407,20 @@ struct Engine {
       const std::string base = "-M 1024 ";
       need(nm.kqkv + ".txt", gk + nm.kqkv + " " + n(I) + " " + base + "-K " + n(H) + " -N " + n(qkv_p));
       need(nm.ko + ".txt", gk + nm.ko + " " + n(I) + " " + base + "-K " + n(qd) + " -N " + n(h_p));
-      need(nm.swa + ".txt", gk + nm.swa + " " + n(I) + " " + base + "-K " + n(H) + " -N " + n(2 * half_a) + " --mode swigu --noff 0");
-      need(nm.swb + ".txt", gk + nm.swb + " " + n(I) + " " + base + "-K " + n(H) + " -N " + n(2 * (I - half_a)) + " --mode swigu --noff " + n(half_a / 64));
-      need(nm.dn2 + ".txt", gk + nm.dn2 + " " + n(I) + " " + base + "-K " + n(I) + " -N " + n(h_p) + " --a2 1");
+      need(nm.swa + ".txt", gk + nm.swa + " " + n(slice_i) + " " + base + "-K " + n(H) + " -N " + n(2 * half_a) + " --mode swigu --noff 0");
+      need(nm.swb + ".txt", gk + nm.swb + " " + n(slice_i) + " " + base + "-K " + n(H) + " -N " + n(2 * (slice_i - half_a)) + " --mode swigu --noff " + n(half_a / 64));
+      need(nm.dn2 + ".txt", gk + nm.dn2 + " " + n(slice_i) + " " + base + "-K " + n(slice_i) + " -N " + n(h_p) + " --a2 1");
     }
+  }
+
+  // Splits the intermediate dimension so every slice stays under the fused-program stride limit.
+  void SetupMlpSlices() {
+    constexpr std::uint32_t kMaxSliceInter = 14336;
+    const std::uint32_t I = c.inter;
+    mlp_slices = (I + kMaxSliceInter - 1) / kMaxSliceInter;
+    while (I % (mlp_slices * 512) != 0) ++mlp_slices;
+    slice_i = I / mlp_slices;
+    half_a = (slice_i / 2) / 512 * 512;
   }
 
   bool Init(const std::string& model_dir, const std::string& programs, std::uint32_t context) {
@@ -502,12 +533,13 @@ struct Engine {
     nm.gu64 = "insts_ffngu64_" + mk + ".txt";
     nm.ffn16 = "insts_ffn_" + mk + ".txt";
     nm.argmax = "insts_argmax_" + std::to_string(H) + "x" + std::to_string(vp_n) + ".txt";
-    half_a = (I / 2) / 512 * 512;
+    SetupMlpSlices();
+    const std::string mks = std::to_string(H) + "x" + std::to_string(slice_i);
     nm.kqkv = "insts_kd_1024x" + std::to_string(H) + "x" + std::to_string(qkv_p);
     nm.ko = "insts_kd_1024x" + std::to_string(qd) + "x" + std::to_string(h_p);
-    nm.swa = "insts_kd_swi_a_" + mk + "_" + std::to_string(half_a);
-    nm.swb = "insts_kd_swi_b_" + mk + "_" + std::to_string(half_a);
-    nm.dn2 = "insts_kd_dn2_1024x" + std::to_string(I) + "x" + std::to_string(h_p);
+    nm.swa = "insts_kd_swi_a_" + mks + "_" + std::to_string(half_a);
+    nm.swb = "insts_kd_swi_b_" + mks + "_" + std::to_string(half_a);
+    nm.dn2 = "insts_kd_dn2_1024x" + std::to_string(slice_i) + "x" + std::to_string(h_p);
     EnsureProgs(programs, H, qd, qkv_p, h_p, I, vp_n);
     st.LoadBf16("model.embed_tokens.weight", &embed, std::size_t{c.vocab} * H);
     if (!c.tied) st.LoadBf16("lm_head.weight", &head, std::size_t{c.vocab} * H);
@@ -842,66 +874,77 @@ struct Engine {
     }
   }
 
-  void PackKdMlp(Layer& L, const Safetensors& st, const std::string& pre, const std::string& programs, std::string* err) {
-    const std::uint32_t H = c.hidden, I = c.inter, h_p = PadN(H);
-    const std::uint32_t half_b = I - half_a;
-    std::vector<float> buf;
-    std::vector<float> gate, up, ws;
-    const auto load_gu = [&] {
-      if (!gate.empty()) return;
-      gate.resize(std::size_t{I} * H);
-      up.resize(std::size_t{I} * H);
-      st.Load(pre + "mlp.gate_proj.weight", gate.data(), gate.size());
-      st.Load(pre + "mlp.up_proj.weight", up.data(), up.size());
-    };
-    auto pack = [&](const char* tag, std::uint32_t c0, std::uint32_t n) {
-      return rk.PackWeightAtbCached(wcache, pre + "kd." + tag, 2 * n, H, 4, [&]() -> const float* {
-        load_gu();
-        ws.resize(std::size_t{2} * n * H);
-        for (std::uint32_t r = 0; r < 2 * n; ++r) {
-          const std::uint32_t q = r >> 4, rr = r & 15;
-          const float* src = (rr < 8 ? gate.data() : up.data()) + std::size_t{c0 + q * 8 + (rr & 7)} * H;
-          std::memcpy(ws.data() + std::size_t{r} * H, src, H * 4);
-        }
-        return ws.data();
-      });
-    };
-    L.kw_a = pack("a", 0, half_a);
-    L.kw_b = pack("b", half_a, half_b);
-    const std::size_t abytes = std::size_t{1024} * I / 8 * 9;
-    L.swc = rk.MakeBo(2 * abytes, 3);
-    std::memset(L.swc.map<void*>(), 0, 2 * abytes);
-    L.swc.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    L.kq_a = rk.MakeProgram(H, 2 * half_a, programs + "/" + nm.swa + ".txt", 64, err, 0, 64, 3, 5);
-    L.kq_b = rk.MakeProgram(H, 2 * half_b, programs + "/" + nm.swb + ".txt", 64, err, 0, 64, 3, 5);
-    L.kq_a.c = L.swc;
-    L.kq_a.ch = L.swc.map<std::uint8_t*>();
-    L.kq_b.c = L.swc;
-    L.kq_b.ch = L.kq_a.ch;
-    L.kq_d = rk.MakeProgram(I, h_p, programs + "/" + nm.dn2 + ".txt", std::size_t{1024} * h_p / 8 * 9, err, 0, 64, 3, 5);
-    rk.RebindA(L.kq_d, L.swc);
-    L.kw_d = rk.PackWeightAtbCached(wcache, pre + "kd.d", h_p, I, 4, [&]() -> const float* {
-      buf.assign(std::size_t{h_p} * I, 0.f);
-      st.Load(pre + "mlp.down_proj.weight", buf.data(), std::size_t{H} * I);
-      return buf.data();
-    });
-    rk.WeightSlot(L.kw_d, L.kq_d);
-    L.swc2 = rk.MakeBo(2 * abytes, 3);
-    std::memset(L.swc2.map<void*>(), 0, 2 * abytes);
-    L.swc2.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    L.kq_a2 = rk.MakeProgram(H, 2 * half_a, programs + "/" + nm.swa + ".txt", 64, err, 0, 64, 3, 5);
-    L.kq_b2 = rk.MakeProgram(H, 2 * half_b, programs + "/" + nm.swb + ".txt", 64, err, 0, 64, 3, 5);
-    L.kq_a2.c = L.swc2;
-    L.kq_a2.ch = L.swc2.map<std::uint8_t*>();
-    L.kq_b2.c = L.swc2;
-    L.kq_b2.ch = L.kq_a2.ch;
-    L.kq_d2 = rk.MakeProgram(I, h_p, programs + "/" + nm.dn2 + ".txt", std::size_t{1024} * h_p / 8 * 9, err, 0, 64, 3, 5);
-    rk.RebindA(L.kq_d2, L.swc2);
-    rk.WeightSlot(L.kw_d, L.kq_d2);
-    for (int set = 0; set < 2; ++set) {
-      KDispatch(L.kw_a, set ? L.kq_a2 : L.kq_a);
-      KDispatch(L.kw_b, set ? L.kq_b2 : L.kq_b);
-      KDispatch(L.kw_d, set ? L.kq_d2 : L.kq_d);
+  // MLP weights/programs for the 1024-row path. `ensure` fills gate/up (I x H) and down (H x I) from the model; it only runs on a weight-cache miss.
+  void PackMlp(Layer& L, const std::string& tag, const std::string& programs, std::string* err, const std::function<void()>& ensure,
+               const std::vector<float>& gate, const std::vector<float>& up, const std::vector<float>& down) {
+    const std::uint32_t H = c.hidden, I = c.inter, h_p = PadN(H), SI = slice_i, half_b = SI - half_a;
+    const std::size_t abytes = std::size_t{1024} * SI / 8 * 9;
+    std::vector<float> ws, dbuf;
+    L.mlp.assign(mlp_slices, MlpSlice{});
+    for (std::uint32_t sl = 0; sl < mlp_slices; ++sl) {
+      MlpSlice& m = L.mlp[sl];
+      const std::uint32_t i0 = sl * SI;
+      const std::string sfx = mlp_slices == 1 ? "" : "." + std::to_string(sl);
+      const auto pack = [&](const char* name, std::uint32_t c0, std::uint32_t n) {
+        return rk.PackWeightAtbCached(wcache, tag + name + sfx, 2 * n, H, 4, [&]() -> const float* {
+          ensure();
+          ws.resize(std::size_t{2} * n * H);
+          for (std::uint32_t r = 0; r < 2 * n; ++r) {
+            const std::uint32_t q = r >> 4, rr = r & 15;
+            const float* src = (rr < 8 ? gate.data() : up.data()) + std::size_t{i0 + c0 + q * 8 + (rr & 7)} * H;
+            std::memcpy(ws.data() + std::size_t{r} * H, src, H * 4);
+          }
+          return ws.data();
+        });
+      };
+      m.kw_a = pack("a", 0, half_a);
+      m.kw_b = pack("b", half_a, half_b);
+      for (int set = 0; set < 2; ++set) {
+        xrt::bo& sw = set ? m.swc2 : m.swc;
+        sw = rk.MakeBo(2 * abytes, 3);
+        std::memset(sw.map<void*>(), 0, 2 * abytes);
+        sw.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        Program& pa = set ? m.kq_a2 : m.kq_a;
+        Program& pb = set ? m.kq_b2 : m.kq_b;
+        Program& pd = set ? m.kq_d2 : m.kq_d;
+        pa = rk.MakeProgram(H, 2 * half_a, programs + "/" + nm.swa + ".txt", 64, err, 0, 64, 3, 5);
+        pb = rk.MakeProgram(H, 2 * half_b, programs + "/" + nm.swb + ".txt", 64, err, 0, 64, 3, 5);
+        pa.c = sw;
+        pa.ch = sw.map<std::uint8_t*>();
+        pb.c = sw;
+        pb.ch = pa.ch;
+        pd = rk.MakeProgram(SI, h_p, programs + "/" + nm.dn2 + ".txt", std::size_t{1024} * h_p / 8 * 9, err, 0, 64, 3, 5);
+        rk.RebindA(pd, sw);
+        if (set == 0)
+          m.kw_d = rk.PackWeightAtbCached(wcache, tag + "d" + sfx, h_p, SI, 4, [&]() -> const float* {
+            ensure();
+            dbuf.assign(std::size_t{h_p} * SI, 0.f);
+            for (std::uint32_t r = 0; r < H; ++r) std::memcpy(&dbuf[std::size_t{r} * SI], &down[std::size_t{r} * I + i0], std::size_t{SI} * 4);
+            return dbuf.data();
+          });
+        rk.WeightSlot(m.kw_d, pd);
+      }
+      if (small_ok) {
+        m.ks_a = rk.MakeProgram(H, 2 * half_a, programs + "/" + nm.swa + "_m512.txt", 64, err, 0, 32, 3, 5);
+        m.ks_b = rk.MakeProgram(H, 2 * half_b, programs + "/" + nm.swb + "_m512.txt", 64, err, 0, 32, 3, 5);
+        m.ks_a.c = m.swc;
+        m.ks_a.ch = m.swc.map<std::uint8_t*>();
+        m.ks_b.c = m.swc;
+        m.ks_b.ch = m.ks_a.ch;
+        m.ks_d = rk.MakeProgram(SI, h_p, programs + "/" + nm.dn2s + ".txt", std::size_t{512} * h_p / 8 * 9, err, 0, 32, 3, 5);
+        rk.RebindA(m.ks_d, m.swc);
+        rk.WeightSlot(m.kw_d, m.ks_d);
+      }
+      for (int set = 0; set < 2; ++set) {
+        KDispatch(m.kw_a, set ? m.kq_a2 : m.kq_a);
+        KDispatch(m.kw_b, set ? m.kq_b2 : m.kq_b);
+        KDispatch(m.kw_d, set ? m.kq_d2 : m.kq_d);
+      }
+      if (small_ok) {
+        KDispatch(m.kw_a, m.ks_a);
+        KDispatch(m.kw_b, m.ks_b);
+        KDispatch(m.kw_d, m.ks_d);
+      }
     }
   }
 
@@ -924,7 +967,19 @@ struct Engine {
       st.Load(pre + "self_attn.o_proj.weight", buf.data(), std::size_t{H} * qd);
       return buf.data();
     });
-    PackKdMlp(L, st, pre, programs, err);
+    std::vector<float> gate, up, down;
+    PackMlp(L, pre + "kd.", programs, err,
+            [&] {
+              if (!gate.empty()) return;
+              const std::uint32_t Hh = c.hidden, Ii = c.inter;
+              gate.resize(std::size_t{Ii} * Hh);
+              up.resize(std::size_t{Ii} * Hh);
+              down.resize(std::size_t{Hh} * Ii);
+              st.Load(pre + "mlp.gate_proj.weight", gate.data(), gate.size());
+              st.Load(pre + "mlp.up_proj.weight", up.data(), up.size());
+              st.Load(pre + "mlp.down_proj.weight", down.data(), down.size());
+            },
+            gate, up, down);
     L.kp_qkv2 = rk.MakeProgram(H, qkv_p, programs + "/" + nm.kqkv + ".txt", std::size_t{1024} * qkv_p / 8 * 9, err, 0, 64, 3, 5);
     L.kp_o2 = rk.MakeProgram(qd, h_p, programs + "/" + nm.ko + ".txt", std::size_t{1024} * h_p / 8 * 9, err, 0, 64, 3, 5);
     KDispatch(L.kw_qkv, L.kp_qkv);
@@ -996,38 +1051,54 @@ struct Engine {
     }
   }
 
+  // Fused MLP over every slice of the intermediate dimension; the slices' down outputs are summed.
   void KMlp(Layer& L, const float* z_all, std::uint32_t n_all, float* out_all, bool small = false) {
-    const std::uint32_t R = small ? 512u : 1024u;
     const std::uint32_t H = c.hidden, h_p = PadN(H);
+    const std::uint32_t R = small ? 512u : 1024u;
     if (kxs[0].size() < std::size_t{1024} * kxn) {
       kxs[0].assign(std::size_t{1024} * kxn, 0.f);
       kxs[1].assign(std::size_t{1024} * kxn, 0.f);
     }
     if (ky.size() < std::size_t{1024} * kyn) ky.assign(std::size_t{1024} * kyn, 0.f);
     const std::uint32_t nch = (n_all + R - 1) / R;
-    Program* qa[2] = {small ? &L.ks_a : &L.kq_a, &L.kq_a2};
-    Program* qb[2] = {small ? &L.ks_b : &L.kq_b, &L.kq_b2};
-    Program* qd[2] = {small ? &L.ks_d : &L.kq_d, &L.kq_d2};
+    const auto pa = [&](MlpSlice& m, std::uint32_t set) -> Program& { return small ? m.ks_a : (set ? m.kq_a2 : m.kq_a); };
+    const auto pb = [&](MlpSlice& m, std::uint32_t set) -> Program& { return small ? m.ks_b : (set ? m.kq_b2 : m.kq_b); };
+    const auto pd = [&](MlpSlice& m, std::uint32_t set) -> Program& { return small ? m.ks_d : (set ? m.kq_d2 : m.kq_d); };
     auto encode = [&](std::uint32_t i) {
       const std::uint32_t o = i * R, n = std::min(R, n_all - o);
       const float* src = z_all + std::size_t{o} * H;
+      const std::uint32_t up = std::min(R, (n + 127) / 128 * 128);
       if (n < R) {
-        const std::uint32_t up = std::min(R, (n + 127) / 128 * 128);
         std::memcpy(kxs[i & 1].data(), src, std::size_t{n} * H * 4);
         std::memset(kxs[i & 1].data() + std::size_t{n} * H, 0, std::size_t{up - n} * H * 4);
         src = kxs[i & 1].data();
       }
-      rk.EncodeAAtbRaw(src, R, H, qa[i & 1]->ah, n);
-      std::memcpy(qb[i & 1]->ah, qa[i & 1]->ah, std::size_t{std::min(R, (n + 127) / 128 * 128)} * H / 8 * 9);
-      qa[i & 1]->a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-      qb[i & 1]->a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      std::uint8_t* first = pa(L.mlp[0], i & 1).ah;
+      rk.EncodeAAtbRaw(src, R, H, first, n);
+      const std::size_t bytes = std::size_t{up} * H / 8 * 9;
+      for (MlpSlice& m : L.mlp) {
+        if (pa(m, i & 1).ah != first) std::memcpy(pa(m, i & 1).ah, first, bytes);
+        std::memcpy(pb(m, i & 1).ah, first, bytes);
+        pa(m, i & 1).a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        pb(m, i & 1).a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      }
     };
     auto decode = [&](std::uint32_t i) {
       const std::uint32_t o = i * R, n = std::min(R, n_all - o);
-      qd[i & 1]->c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
       std::vector<float>& yb = ymlp[i & 1];
       if (yb.size() < std::size_t{R} * h_p) yb.resize(std::size_t{R} * h_p);
-      rk.DecodeCAtbRaw(qd[i & 1]->ch, yb.data(), R, h_p, n);
+      for (std::size_t sl = 0; sl < L.mlp.size(); ++sl) {
+        Program& d = pd(L.mlp[sl], i & 1);
+        d.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        if (sl == 0) {
+          rk.DecodeCAtbRaw(d.ch, yb.data(), R, h_p, n);
+        } else {
+          std::vector<float>& part = ymlp_part;
+          if (part.size() < std::size_t{R} * h_p) part.resize(std::size_t{R} * h_p);
+          rk.DecodeCAtbRaw(d.ch, part.data(), R, h_p, n);
+          for (std::size_t k = 0; k < std::size_t{n} * h_p; ++k) yb[k] += part[k];
+        }
+      }
       for (std::uint32_t r = 0; r < n; ++r) std::memcpy(out_all + std::size_t{o + r} * H, &yb[std::size_t{r} * h_p], H * 4);
     };
     encode(0);
@@ -1035,9 +1106,11 @@ struct Engine {
     for (std::uint32_t i = 0; i < nch; ++i) {
       std::future<void> enc;
       if (i + 1 < nch) enc = std::async(std::launch::async, [&, i] { encode(i + 1); });
-      KDispatch(L.kw_a, *qa[i & 1]);
-      KDispatch(L.kw_b, *qb[i & 1]);
-      KDispatch(L.kw_d, *qd[i & 1]);
+      for (MlpSlice& m : L.mlp) {
+        KDispatch(m.kw_a, pa(m, i & 1));
+        KDispatch(m.kw_b, pb(m, i & 1));
+        KDispatch(m.kw_d, pd(m, i & 1));
+      }
       if (enc.valid()) enc.get();
       if (dec.valid()) dec.get();
       dec = std::async(std::launch::async, [&, i] { decode(i); });
@@ -1310,9 +1383,7 @@ std::vector<std::int32_t> ReadTokens(const std::string& path) {
 // Same engine core as the dense path (pipelined 1024-row GEMM and fused MLP chunks, scratch reuse); only the layer kinds and
 // the layer-major loop over a batch of sequences differ.
 // ---------------------------------------------------------------------------------------------------------------------
-constexpr std::uint32_t kKH = 16, kVH = 32, kKD = 128, kVD = 128, kConvK = 4, kRotDim = 64;
-constexpr std::uint32_t kKeyDim = kKH * kKD, kValDim = kVH * kVD, kConvDim = 2 * kKeyDim + kValDim;
-constexpr std::uint32_t kGdnInN = kConvDim + kValDim;
+constexpr std::uint32_t kMaxHeadDim = 256;  // upper bound for per-head scratch arrays
 
 float SiluF(float x) { return x / (1.0f + std::exp(-x)); }
 
@@ -1379,6 +1450,13 @@ struct HybridEngine : Engine {
     std::vector<float> conv, convT, a_neg, dt_bias, gnorm, w_a, w_b;
   };
   std::vector<HL> hl;
+  // Language-model mode: the delta-net recurrence and conv window persist across calls, attention keeps a KV cache.
+  struct LmState {
+    std::vector<float> S, hist;
+  };
+  std::vector<LmState> lm;
+  std::vector<std::uint16_t> head_bf;  // output projection, bf16 (vocab x hidden)
+  bool lm_mode{false};
   GdnDev gd;
   bool gdn_dev{std::getenv("GEN_GDN_HOST") == nullptr};
   std::vector<float> readout;
@@ -1386,80 +1464,25 @@ struct HybridEngine : Engine {
   std::vector<float> s_proj, s_gated, s_outp, s_att, s_qkv;
   double mx[8]{0, 0, 0, 0, 0, 0, 0, 0};
 
-  static std::uint32_t HfHead(std::uint32_t j) { return j < 16 ? 2 * j : 2 * (j - 16) + 1; }
+  // Delta-net geometry, read from the GGUF: key heads, value heads, key/value head dims, conv taps, rotary dims.
+  std::uint32_t kKH{16}, kVH{32}, kKD{128}, kVD{128}, kConvK{4}, kRotDim{64};
+  std::uint32_t kKeyDim{0}, kValDim{0}, kConvDim{0}, kGdnInN{0};
 
-  // GGUF stores the 32 value heads grouped even-first; rebuild the reference (repeat-interleave) order.
-  static void PermBlocks(std::vector<float>& data, std::size_t first_row, std::uint32_t block_rows, std::size_t cols) {
+  // The GGUF tiles the value heads (group index outer, key head inner); the reference repeat-interleaves them.
+  std::uint32_t HfHead(std::uint32_t j) const { return (j % kKH) * (kVH / kKH) + j / kKH; }
+
+  void PermBlocks(std::vector<float>& data, std::size_t first_row, std::uint32_t block_rows, std::size_t cols) const {
     std::vector<float> tmp(std::size_t{kVH} * block_rows * cols);
     std::memcpy(tmp.data(), &data[first_row * cols], tmp.size() * 4);
     for (std::uint32_t j = 0; j < kVH; ++j)
       std::memcpy(&data[(first_row + std::size_t{HfHead(j)} * block_rows) * cols], &tmp[std::size_t{j} * block_rows * cols], std::size_t{block_rows} * cols * 4);
   }
-  static void PermCols(std::vector<float>& data, std::size_t rows, std::size_t cols, std::uint32_t block_cols) {
+  void PermCols(std::vector<float>& data, std::size_t rows, std::size_t cols, std::uint32_t block_cols) const {
     std::vector<float> tmp(cols);
     for (std::size_t r = 0; r < rows; ++r) {
       float* row = &data[r * cols];
       std::memcpy(tmp.data(), row, cols * 4);
       for (std::uint32_t j = 0; j < kVH; ++j) std::memcpy(row + std::size_t{HfHead(j)} * block_cols, &tmp[std::size_t{j} * block_cols], std::size_t{block_cols} * 4);
-    }
-  }
-
-  // MLP weights from the GGUF names (ffn_gate/up/down), same packing as the dense path.
-  void PackKdMlpG(Layer& L, const Safetensors& st, const std::string& b, const std::string& programs, std::string* err) {
-    const std::uint32_t H = c.hidden, I = c.inter, h_p = PadN(H);
-    const std::uint32_t half_b = I - half_a;
-    std::vector<float> gate, up, ws, buf;
-    const auto load_gu = [&] {
-      if (!gate.empty()) return;
-      gate.resize(std::size_t{I} * H);
-      up.resize(std::size_t{I} * H);
-      st.LoadG(b + "ffn_gate.weight", gate.data(), gate.size());
-      st.LoadG(b + "ffn_up.weight", up.data(), up.size());
-    };
-    auto pack = [&](const char* tag, std::uint32_t c0, std::uint32_t n) {
-      return rk.PackWeightAtbCached(wcache, b + "kd." + tag, 2 * n, H, 4, [&]() -> const float* {
-        load_gu();
-        ws.resize(std::size_t{2} * n * H);
-        for (std::uint32_t r = 0; r < 2 * n; ++r) {
-          const std::uint32_t q = r >> 4, rr = r & 15;
-          const float* src = (rr < 8 ? gate.data() : up.data()) + std::size_t{c0 + q * 8 + (rr & 7)} * H;
-          std::memcpy(ws.data() + std::size_t{r} * H, src, H * 4);
-        }
-        return ws.data();
-      });
-    };
-    L.kw_a = pack("a", 0, half_a);
-    L.kw_b = pack("b", half_a, half_b);
-    const std::size_t abytes = std::size_t{1024} * I / 8 * 9;
-    for (int set = 0; set < 2; ++set) {
-      xrt::bo& sw = set ? L.swc2 : L.swc;
-      sw = rk.MakeBo(2 * abytes, 3);
-      std::memset(sw.map<void*>(), 0, 2 * abytes);
-      sw.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-      Program& pa = set ? L.kq_a2 : L.kq_a;
-      Program& pb = set ? L.kq_b2 : L.kq_b;
-      Program& pd = set ? L.kq_d2 : L.kq_d;
-      pa = rk.MakeProgram(H, 2 * half_a, programs + "/" + nm.swa + ".txt", 64, err, 0, 64, 3, 5);
-      pb = rk.MakeProgram(H, 2 * half_b, programs + "/" + nm.swb + ".txt", 64, err, 0, 64, 3, 5);
-      pa.c = sw;
-      pa.ch = sw.map<std::uint8_t*>();
-      pb.c = sw;
-      pb.ch = pa.ch;
-      pd = rk.MakeProgram(I, h_p, programs + "/" + nm.dn2 + ".txt", std::size_t{1024} * h_p / 8 * 9, err, 0, 64, 3, 5);
-      rk.RebindA(pd, sw);
-      if (set == 0) {
-        L.kw_d = rk.PackWeightAtbCached(wcache, b + "kd.d", h_p, I, 4, [&]() -> const float* {
-          buf.assign(std::size_t{h_p} * I, 0.f);
-          st.LoadG(b + "ffn_down.weight", buf.data(), std::size_t{H} * I);
-          return buf.data();
-        });
-      }
-      rk.WeightSlot(L.kw_d, pd);
-    }
-    for (int set = 0; set < 2; ++set) {
-      KDispatch(L.kw_a, set ? L.kq_a2 : L.kq_a);
-      KDispatch(L.kw_b, set ? L.kq_b2 : L.kq_b);
-      KDispatch(L.kw_d, set ? L.kq_d2 : L.kq_d);
     }
   }
 
@@ -1472,6 +1495,7 @@ struct HybridEngine : Engine {
     wcache.Open(model);
     const auto& r = *st.r;
     c.layers = *r.GetMetadataUint32("qwen35.block_count");
+    if (const auto mtp = r.GetMetadataUint32("qwen35.nextn_predict_layers")) c.layers -= *mtp;
     c.hidden = *r.GetMetadataUint32("qwen35.embedding_length");
     c.inter = *r.GetMetadataUint32("qwen35.feed_forward_length");
     c.heads = *r.GetMetadataUint32("qwen35.attention.head_count");
@@ -1480,12 +1504,22 @@ struct HybridEngine : Engine {
     c.theta = *r.GetMetadataFloat32("qwen35.rope.freq_base");
     c.eps = *r.GetMetadataFloat32("qwen35.attention.layer_norm_rms_epsilon");
     const std::uint32_t interval = *r.GetMetadataUint32("qwen35.full_attention_interval");
-    if (c.head_dim != 256 || c.heads != 16 || c.kv_heads != 4 || *r.GetMetadataUint32("qwen35.ssm.time_step_rank") != kVH ||
-        *r.GetMetadataUint32("qwen35.ssm.group_count") != kKH || *r.GetMetadataUint32("qwen35.ssm.state_size") != kKD ||
-        *r.GetMetadataUint32("qwen35.rope.dimension_count") != kRotDim || c.hidden % 64 || c.inter % 512) {
-      std::fprintf(stderr, "hybrid: unsupported qwen35 shape\n");
+    kVH = *r.GetMetadataUint32("qwen35.ssm.time_step_rank");
+    kKH = *r.GetMetadataUint32("qwen35.ssm.group_count");
+    kKD = kVD = *r.GetMetadataUint32("qwen35.ssm.state_size");
+    kConvK = *r.GetMetadataUint32("qwen35.ssm.conv_kernel");
+    kRotDim = *r.GetMetadataUint32("qwen35.rope.dimension_count");
+    kKeyDim = kKH * kKD;
+    kValDim = kVH * kVD;
+    kConvDim = 2 * kKeyDim + kValDim;
+    kGdnInN = kConvDim + kValDim;
+    if (kKH == 0 || kVH % kKH != 0 || kKD > kMaxHeadDim || c.head_dim > kMaxHeadDim || kRotDim > c.head_dim || c.heads % c.kv_heads != 0 ||
+        c.hidden % 64 || c.inter % 512 || kValDim % 64 || c.heads * c.head_dim % 64) {
+      std::fprintf(stderr, "hybrid: unsupported qwen35 shape (heads %u/%u, head_dim %u, ssm %u/%u x %u)\n", c.heads, c.kv_heads, c.head_dim, kKH, kVH, kKD);
       return false;
     }
+    // The device delta-net program is built for 16 key heads, 2 value heads per key head and 128-wide heads.
+    if (kKH != 16 || kVH != 32 || kKD != 128) gdn_dev = false;
     std::string err;
     if (!rk.Init(programs + "/final_kdh.xclbin", &err)) {
       std::fprintf(stderr, "npu init: %s\n", err.c_str());
@@ -1494,19 +1528,20 @@ struct HybridEngine : Engine {
     kd = true;
     const std::uint32_t H = c.hidden, I = c.inter, qd = c.heads * c.head_dim, kvd = c.kv_heads * c.head_dim;
     const std::uint32_t attn_n = 2 * qd + 2 * kvd, h_p = PadN(H);
-    half_a = (I / 2) / 512 * 512;
-    const std::string mk = std::to_string(H) + "x" + std::to_string(I);
+    SetupMlpSlices();
+    const std::string mk = std::to_string(H) + "x" + std::to_string(slice_i);
     nm.kqkv = "insts_kdh_1024x" + std::to_string(H) + "x" + std::to_string(attn_n);
     nm.ko = "insts_kdh_1024x" + std::to_string(kValDim) + "x" + std::to_string(h_p);
     nm.swa = "insts_kdh_swi_a_" + mk + "_" + std::to_string(half_a);
     nm.swb = "insts_kdh_swi_b_" + mk + "_" + std::to_string(half_a);
-    nm.dn2 = "insts_kdh_dn2_1024x" + std::to_string(I) + "x" + std::to_string(h_p);
+    nm.dn2 = "insts_kdh_dn2_1024x" + std::to_string(slice_i) + "x" + std::to_string(h_p);
     const std::string gdn_in = "insts_kdh_1024x" + std::to_string(H) + "x" + std::to_string(kGdnInN);
     small_ok = !std::getenv("GEN_NO_SMALL");
     const std::string s_gdn_in = "insts_kdh_512x" + std::to_string(H) + "x" + std::to_string(kGdnInN);
     const std::string s_kqkv = "insts_kdh_512x" + std::to_string(H) + "x" + std::to_string(attn_n);
     const std::string s_ko = "insts_kdh_512x" + std::to_string(kValDim) + "x" + std::to_string(h_p);
-    const std::string s_dn2 = "insts_kdh_dn2_512x" + std::to_string(I) + "x" + std::to_string(h_p);
+    const std::string s_dn2 = "insts_kdh_dn2_512x" + std::to_string(slice_i) + "x" + std::to_string(h_p);
+    nm.dn2s = s_dn2;
     {
       const std::string env = "source " + programs + "/../../gen/env.sh; ";
       const std::string gk = "bash " + programs + "/../kdh/gen_kdh.sh ";
@@ -1524,17 +1559,17 @@ struct HybridEngine : Engine {
       need(gdn_in + ".txt", gk + gdn_in + " " + n(I) + " " + base + "-K " + n(H) + " -N " + n(kGdnInN));
       need(nm.kqkv + ".txt", gk + nm.kqkv + " " + n(I) + " " + base + "-K " + n(H) + " -N " + n(attn_n));
       need(nm.ko + ".txt", gk + nm.ko + " " + n(I) + " " + base + "-K " + n(kValDim) + " -N " + n(h_p));
-      need(nm.swa + ".txt", gk + nm.swa + " " + n(I) + " " + base + "-K " + n(H) + " -N " + n(2 * half_a) + " --mode swigu --noff 0");
-      need(nm.swb + ".txt", gk + nm.swb + " " + n(I) + " " + base + "-K " + n(H) + " -N " + n(2 * (I - half_a)) + " --mode swigu --noff " + n(half_a / 64));
-      need(nm.dn2 + ".txt", gk + nm.dn2 + " " + n(I) + " " + base + "-K " + n(I) + " -N " + n(h_p) + " --a2 1");
+      need(nm.swa + ".txt", gk + nm.swa + " " + n(slice_i) + " " + base + "-K " + n(H) + " -N " + n(2 * half_a) + " --mode swigu --noff 0");
+      need(nm.swb + ".txt", gk + nm.swb + " " + n(slice_i) + " " + base + "-K " + n(H) + " -N " + n(2 * (slice_i - half_a)) + " --mode swigu --noff " + n(half_a / 64));
+      need(nm.dn2 + ".txt", gk + nm.dn2 + " " + n(slice_i) + " " + base + "-K " + n(slice_i) + " -N " + n(h_p) + " --a2 1");
       if (small_ok) {
         const std::string sm = "-M 512 ";
         need(s_gdn_in + ".txt", gk + s_gdn_in + " " + n(I) + " " + sm + "-K " + n(H) + " -N " + n(kGdnInN));
         need(s_kqkv + ".txt", gk + s_kqkv + " " + n(I) + " " + sm + "-K " + n(H) + " -N " + n(attn_n));
         need(s_ko + ".txt", gk + s_ko + " " + n(I) + " " + sm + "-K " + n(kValDim) + " -N " + n(h_p));
-        need(nm.swa + "_m512.txt", gk + nm.swa + "_m512 " + n(I) + " " + sm + "-K " + n(H) + " -N " + n(2 * half_a) + " --mode swigu --noff 0");
-        need(nm.swb + "_m512.txt", gk + nm.swb + "_m512 " + n(I) + " " + sm + "-K " + n(H) + " -N " + n(2 * (I - half_a)) + " --mode swigu --noff " + n(half_a / 64));
-        need(s_dn2 + ".txt", gk + s_dn2 + " " + n(I) + " " + sm + "-K " + n(I) + " -N " + n(h_p) + " --a2 1");
+        need(nm.swa + "_m512.txt", gk + nm.swa + "_m512 " + n(slice_i) + " " + sm + "-K " + n(H) + " -N " + n(2 * half_a) + " --mode swigu --noff 0");
+        need(nm.swb + "_m512.txt", gk + nm.swb + "_m512 " + n(slice_i) + " " + sm + "-K " + n(H) + " -N " + n(2 * (slice_i - half_a)) + " --mode swigu --noff " + n(half_a / 64));
+        need(s_dn2 + ".txt", gk + s_dn2 + " " + n(slice_i) + " " + sm + "-K " + n(slice_i) + " -N " + n(h_p) + " --a2 1");
       }
       for (std::uint32_t t : {64u, 128u, 256u, 512u, 1024u, 2048u})
         need("insts_kdh_gdn_" + n(t) + ".txt", gk + "insts_kdh_gdn_" + n(t) + " 7680 -M " + n(t) + " -K 64 -N 128 --mode gdn");
@@ -1560,10 +1595,23 @@ struct HybridEngine : Engine {
     norm_w.resize(H);
     st.LoadG("output_norm.weight", norm_w.data(), H);
     {
+      const char* head_name = st.HasG("output.weight") ? "output.weight" : "token_embd.weight";
       std::uint32_t cc, rr;
-      st.DimsG("output.weight", &cc, &rr);
-      const auto* t = r.FindTensor("output.weight");
+      st.DimsG(head_name, &cc, &rr);
+      const auto* t = r.FindTensor(head_name);
       const gufo::models::lfm3::Tensor tn{t->data, t->type, cc, rr, t->size_bytes};
+      if (lm_mode) {
+        head_bf.resize(std::size_t{rr} * cc);
+#pragma omp parallel
+        {
+          std::vector<float> tmp(cc);
+#pragma omp for
+          for (std::int64_t row = 0; row < rr; ++row) {
+            DecodeRowAny(tn, static_cast<std::uint32_t>(row), std::span<float>(tmp.data(), cc));
+            for (std::uint32_t i = 0; i < cc; ++i) head_bf[std::size_t(row) * cc + i] = Bf16Bits(tmp[i]);
+          }
+        }
+      }
       n_codes = static_cast<std::uint32_t>(code_ids.size());
       readout.resize(std::size_t{n_codes} * H);
       for (std::uint32_t k = 0; k < n_codes; ++k) DecodeRowAny(tn, code_ids[k], std::span<float>(&readout[std::size_t{k} * H], H));
@@ -1572,6 +1620,7 @@ struct HybridEngine : Engine {
     kyn = std::max<std::size_t>(kGdnInN, h_p);
     layers.resize(c.layers);
     hl.resize(c.layers);
+    if (lm_mode) lm.resize(c.layers);
     std::vector<float> buf;
     const auto t0 = Clock::now();
     for (std::uint32_t l = 0; l < c.layers; ++l) {
@@ -1579,6 +1628,15 @@ struct HybridEngine : Engine {
       HL& h = hl[l];
       const std::string b = "blk." + std::to_string(l) + ".";
       h.linear = (l % interval) != interval - 1;
+      if (lm_mode) {
+        if (h.linear) {
+          lm[l].S.assign(std::size_t{kVH} * kKD * kVD, 0.f);
+          lm[l].hist.assign(std::size_t{kConvK - 1} * kConvDim, 0.f);
+        } else {
+          L.k.assign(std::size_t{ctx} * c.kv_heads * c.head_dim, 0.f);
+          L.v.assign(std::size_t{ctx} * c.kv_heads * c.head_dim, 0.f);
+        }
+      }
       L.attn_norm.resize(H);
       L.ffn_norm.resize(H);
       st.LoadG(b + "attn_norm.weight", L.attn_norm.data(), H);
@@ -1678,21 +1736,19 @@ struct HybridEngine : Engine {
         KDispatch(L.kw_qkv, L.ks_qkv);
         KDispatch(L.kw_o, L.ks_o);
       }
-      PackKdMlpG(L, st, b, programs, &err);
-      if (small_ok) {
-        const std::uint32_t I2 = c.inter, half_b2 = I2 - half_a;
-        L.ks_a = rk.MakeProgram(H, 2 * half_a, programs + "/" + nm.swa + "_m512.txt", 64, &err, 0, 32, 3, 5);
-        L.ks_b = rk.MakeProgram(H, 2 * half_b2, programs + "/" + nm.swb + "_m512.txt", 64, &err, 0, 32, 3, 5);
-        L.ks_a.c = L.swc;
-        L.ks_a.ch = L.swc.map<std::uint8_t*>();
-        L.ks_b.c = L.swc;
-        L.ks_b.ch = L.ks_a.ch;
-        L.ks_d = rk.MakeProgram(I2, h_p, programs + "/" + s_dn2 + ".txt", std::size_t{512} * h_p / 8 * 9, &err, 0, 32, 3, 5);
-        rk.RebindA(L.ks_d, L.swc);
-        rk.WeightSlot(L.kw_d, L.ks_d);
-        KDispatch(L.kw_a, L.ks_a);
-        KDispatch(L.kw_b, L.ks_b);
-        KDispatch(L.kw_d, L.ks_d);
+      {
+        std::vector<float> gate, up, down;
+        PackMlp(L, b + "kd.", programs, &err,
+                [&] {
+                  if (!gate.empty()) return;
+                  gate.resize(std::size_t{I} * H);
+                  up.resize(std::size_t{I} * H);
+                  down.resize(std::size_t{H} * I);
+                  st.LoadG(b + "ffn_gate.weight", gate.data(), gate.size());
+                  st.LoadG(b + "ffn_up.weight", up.data(), up.size());
+                  st.LoadG(b + "ffn_down.weight", down.data(), down.size());
+                },
+                gate, up, down);
       }
       if (l % 8 == 0) std::fprintf(stderr, "hybrid: packed layer %u (%.1f s)\n", l, Ms(t0) / 1000.0);
     }
@@ -1771,7 +1827,7 @@ struct HybridEngine : Engine {
     for (std::int64_t t = 0; t < T; ++t)
       for (std::uint32_t v = 0; v < kVH; ++v) {
         const std::uint32_t g = tok_off + static_cast<std::uint32_t>(t), set = v / 16, hh = v % 16, col = hh / 2, hs = hh % 2;
-        float o[kVD];
+        float o[kMaxHeadDim];
         for (std::uint32_t half = 0; half < 2; ++half) {
           const std::uint32_t row = hs * 2 + half;
           const std::uint8_t* src = gd.out_h[set] + (std::size_t{col} * (ne / 64) + g / 64) * 73728 + std::size_t{row} * 18432 + std::size_t{g % 64} * 256;
@@ -1787,7 +1843,8 @@ struct HybridEngine : Engine {
   }
 
   // Host reference of the whole delta-net stage (conv, norms, recurrence, gated norm), fp32 state.
-  void GdnHost(const HL& h, const float* proj, const float* z, std::uint32_t T, float* gated) {
+  // Sall (kVH x kKD x kVD) and hist ((kConvK-1) x kConvDim) carry the recurrence and the conv window across calls (language-model mode).
+  void GdnHost(const HL& h, const float* proj, const float* z, std::uint32_t T, float* gated, float* Sall = nullptr, float* hist = nullptr) {
     std::vector<float> ab;
     Gates(h, z, T, &ab);
     std::vector<float> qkv(std::size_t{T} * kConvDim);
@@ -1799,14 +1856,25 @@ struct HybridEngine : Engine {
         for (std::uint32_t j = 0; j < kConvK; ++j) {
           const std::int64_t src = t - (kConvK - 1) + j;
           if (src >= 0) s += h.conv[std::size_t{ch} * kConvK + j] * proj[std::size_t(src) * kGdnInN + ch];
+          else if (hist) s += h.conv[std::size_t{ch} * kConvK + j] * hist[std::size_t(src + kConvK - 1) * kConvDim + ch];
         }
         o[ch] = SiluF(s);
       }
+    }
+    if (hist) {
+      std::vector<float> next(std::size_t{kConvK - 1} * kConvDim);
+      for (std::uint32_t i = 0; i + 1 < kConvK; ++i) {
+        const std::int64_t r = static_cast<std::int64_t>(T) - (kConvK - 1) + i;
+        for (std::uint32_t ch = 0; ch < kConvDim; ++ch)
+          next[std::size_t{i} * kConvDim + ch] = r >= 0 ? proj[std::size_t(r) * kGdnInN + ch] : hist[std::size_t(r + kConvK - 1) * kConvDim + ch];
+      }
+      std::memcpy(hist, next.data(), next.size() * 4);
     }
 #pragma omp parallel for
     for (std::int64_t v = 0; v < kVH; ++v) {
       const std::uint32_t kh = static_cast<std::uint32_t>(v) / (kVH / kKH);
       std::vector<float> S(std::size_t{kKD} * kVD, 0.f), q(kKD), k(kKD), kv(kVD), o(kVD);
+      if (Sall) std::memcpy(S.data(), Sall + std::size_t(v) * kKD * kVD, S.size() * 4);
       for (std::uint32_t t = 0; t < T; ++t) {
         const float* row = &qkv[std::size_t{t} * kConvDim];
         std::memcpy(q.data(), row + kh * kKD, kKD * 4);
@@ -1850,6 +1918,7 @@ struct HybridEngine : Engine {
         float* gt = &gated[std::size_t{t} * kValDim + v * kVD];
         for (std::uint32_t j = 0; j < kVD; ++j) gt[j] = h.gnorm[j] * (o[j] * rs) * SiluF(zz[j]);
       }
+      if (Sall) std::memcpy(Sall + std::size_t(v) * kKD * kVD, S.data(), S.size() * 4);
     }
   }
 
@@ -1865,7 +1934,7 @@ struct HybridEngine : Engine {
     ph[12] += Ms(tg);
     tg = Clock::now();
     const std::uint32_t ne = GdnDev::Bucket(Tt);
-    if (gdn_dev && ne) {
+    if (gdn_dev && ne && !lm_mode) {
       GdnHdrDev(h, ne);
       for (const auto& sg : segs) GdnPrepDev(h, s_proj.data() + std::size_t{sg.first} * kGdnInN, z + std::size_t{sg.first} * H, sg.second, sg.first, ne);
       GdnPadDev(Tt, ne, ne);
@@ -1878,7 +1947,9 @@ struct HybridEngine : Engine {
       for (const auto& sg : segs) GdnPostDev(h, s_proj.data() + std::size_t{sg.first} * kGdnInN, sg.second, sg.first, ne, s_gated.data() + std::size_t{sg.first} * kValDim);
       ph[15] += Ms(tg);
     } else {
-      for (const auto& sg : segs) GdnHost(h, s_proj.data() + std::size_t{sg.first} * kGdnInN, z + std::size_t{sg.first} * H, sg.second, s_gated.data() + std::size_t{sg.first} * kValDim);
+      LmState* ls = lm_mode ? &lm[static_cast<std::size_t>(&h - hl.data())] : nullptr;
+      for (const auto& sg : segs)
+        GdnHost(h, s_proj.data() + std::size_t{sg.first} * kGdnInN, z + std::size_t{sg.first} * H, sg.second, s_gated.data() + std::size_t{sg.first} * kValDim, ls ? ls->S.data() : nullptr, ls ? ls->hist.data() : nullptr);
     }
     s_outp.resize(std::size_t{Tt} * h_p);
     tg = Clock::now();
@@ -1888,13 +1959,20 @@ struct HybridEngine : Engine {
   }
 
   // ---- gated, non-causal full attention (head_dim 256, partial rope) on the host ----
-  void AttnHost(const Layer& L, const float* proj, std::uint32_t T, float* att) {
+  // pos0/causal: language-model mode appends K/V to the layer cache and attends to the whole prefix; otherwise the T rows attend to each other.
+  void AttnHost(Layer& L, const float* proj, std::uint32_t T, float* att, std::uint32_t pos0 = 0, bool causal = false) {
     const std::uint32_t qd = c.heads * c.head_dim, kvd = c.kv_heads * c.head_dim, hd = c.head_dim, attn_n = 2 * qd + 2 * kvd;
-    std::vector<float> q(std::size_t{T} * qd), gate(std::size_t{T} * qd), k(std::size_t{T} * kvd), v(std::size_t{T} * kvd);
+    std::vector<float> q(std::size_t{T} * qd), gate(std::size_t{T} * qd), kloc, vloc;
+    if (!causal) {
+      kloc.resize(std::size_t{T} * kvd);
+      vloc.resize(std::size_t{T} * kvd);
+    }
+    float* const kbase = causal ? L.k.data() : kloc.data();
+    float* const vbase = causal ? L.v.data() : vloc.data();
     std::vector<float> cs(std::size_t{T} * (kRotDim / 2)), sn(std::size_t{T} * (kRotDim / 2));
     for (std::uint32_t t = 0; t < T; ++t)
       for (std::uint32_t i = 0; i < kRotDim / 2; ++i) {
-        const double ang = static_cast<double>(t) * std::pow(static_cast<double>(c.theta), -2.0 * i / kRotDim);
+        const double ang = static_cast<double>(pos0 + t) * std::pow(static_cast<double>(c.theta), -2.0 * i / kRotDim);
         cs[std::size_t{t} * (kRotDim / 2) + i] = static_cast<float>(std::cos(ang));
         sn[std::size_t{t} * (kRotDim / 2) + i] = static_cast<float>(std::sin(ang));
       }
@@ -1920,25 +1998,27 @@ struct HybridEngine : Engine {
         norm_rope(qh, L.qn.data(), static_cast<std::uint32_t>(t));
       }
       for (std::uint32_t h = 0; h < c.kv_heads; ++h) {
-        float* kh = &k[std::size_t(t) * kvd + h * hd];
+        const std::size_t wi = causal ? pos0 + static_cast<std::size_t>(t) : static_cast<std::size_t>(t);
+        float* kh = &kbase[wi * kvd + h * hd];
         std::memcpy(kh, row + 2 * qd + h * hd, hd * 4);
         norm_rope(kh, L.kn.data(), static_cast<std::uint32_t>(t));
-        std::memcpy(&v[std::size_t(t) * kvd + h * hd], row + 2 * qd + kvd + h * hd, hd * 4);
+        std::memcpy(&vbase[wi * kvd + h * hd], row + 2 * qd + kvd + h * hd, hd * 4);
       }
     }
     const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
     const std::uint32_t grp = c.heads / c.kv_heads;
 #pragma omp parallel
     {
-      std::vector<float> sc(T);
+      std::vector<float> sc(std::size_t{pos0} + T);
 #pragma omp for collapse(2) schedule(dynamic, 4)
       for (std::int64_t t = 0; t < T; ++t)
         for (std::uint32_t h = 0; h < c.heads; ++h) {
           const float* qh = &q[std::size_t(t) * qd + h * hd];
           const std::uint32_t kh = h / grp;
+          const std::uint32_t nk = causal ? pos0 + static_cast<std::uint32_t>(t) + 1 : T;
           float mx2 = -INFINITY;
-          for (std::uint32_t u = 0; u < T; ++u) {
-            const float* kk = &k[std::size_t{u} * kvd + kh * hd];
+          for (std::uint32_t u = 0; u < nk; ++u) {
+            const float* kk = &kbase[std::size_t{u} * kvd + kh * hd];
             float s = 0;
             for (std::uint32_t i = 0; i < hd; ++i) s += qh[i] * kk[i];
             s *= scale;
@@ -1946,15 +2026,15 @@ struct HybridEngine : Engine {
             mx2 = std::max(mx2, s);
           }
           float den = 0;
-          for (std::uint32_t u = 0; u < T; ++u) {
+          for (std::uint32_t u = 0; u < nk; ++u) {
             sc[u] = std::exp(sc[u] - mx2);
             den += sc[u];
           }
           float* o = &att[std::size_t(t) * qd + h * hd];
           std::fill(o, o + hd, 0.f);
-          for (std::uint32_t u = 0; u < T; ++u) {
+          for (std::uint32_t u = 0; u < nk; ++u) {
             const float wgt = sc[u] / den;
-            const float* vv = &v[std::size_t{u} * kvd + kh * hd];
+            const float* vv = &vbase[std::size_t{u} * kvd + kh * hd];
             for (std::uint32_t i = 0; i < hd; ++i) o[i] += wgt * vv[i];
           }
           const float* gg = &gate[std::size_t(t) * qd + h * hd];
@@ -1969,7 +2049,7 @@ struct HybridEngine : Engine {
     s_att.resize(std::size_t{Tt} * qd);
     const bool sm = small_ok && Tt <= 512;
     KGemm(sm ? L.ks_qkv : L.kp_qkv, sm ? L.ks_qkv : L.kp_qkv2, L.kw_qkv, z, Tt, H, s_proj.data());
-    for (const auto& sg : segs) AttnHost(L, s_proj.data() + std::size_t{sg.first} * attn_n, sg.second, s_att.data() + std::size_t{sg.first} * qd);
+    for (const auto& sg : segs) AttnHost(L, s_proj.data() + std::size_t{sg.first} * attn_n, sg.second, s_att.data() + std::size_t{sg.first} * qd, pos, lm_mode);
     s_outp.resize(std::size_t{Tt} * h_p);
     KGemm(sm ? L.ks_o : L.kp_o, sm ? L.ks_o : L.kp_o2, L.kw_o, s_att.data(), Tt, qd, s_outp.data());
     for (std::uint32_t t = 0; t < Tt; ++t) std::memcpy(out_h + std::size_t{t} * H, &s_outp[std::size_t{t} * h_p], std::size_t{H} * 4);
@@ -1982,19 +2062,10 @@ struct HybridEngine : Engine {
 
   // Layer-major forward over a batch of sequences (rows of all sequences share the GEMM chunks). Returns the final-norm hidden
   // state at each sequence's marker.
-  void ForwardBatch(const std::vector<Seq>& seqs, std::vector<float>* hidden) {
+  // All transformer layers over the T residual rows x (norms, delta-net or attention, MLP, residual adds).
+  void Layers(std::vector<float>& x, std::uint32_t T, const std::vector<Seg>& segs) {
     const std::uint32_t H = c.hidden;
-    std::vector<Seg> segs;
-    std::uint32_t T = 0;
-    for (const auto& q : seqs) {
-      segs.push_back({T, q.len});
-      T += q.len;
-    }
-    std::vector<float> x(std::size_t{T} * H), z(std::size_t{T} * H), br(std::size_t{T} * H);
-    for (std::size_t i = 0; i < seqs.size(); ++i)
-#pragma omp parallel for
-      for (std::int64_t t = 0; t < seqs[i].len; ++t)
-        for (std::uint32_t k = 0; k < H; ++k) x[std::size_t(segs[i].first + t) * H + k] = Bf(embed[std::size_t(seqs[i].tok[t]) * H + k]);
+    std::vector<float> z(std::size_t{T} * H), br(std::size_t{T} * H);
     auto norm_rows = [&](const float* w) {
 #pragma omp parallel for
       for (std::int64_t r = 0; r < T; ++r) RmsNorm(&x[std::size_t(r) * H], w, &z[std::size_t(r) * H], H, c.eps);
@@ -2021,6 +2092,80 @@ struct HybridEngine : Engine {
       for (std::int64_t i = 0; i < static_cast<std::int64_t>(x.size()); ++i) x[i] += br[i];
       ph[11] += Ms(tl);
     }
+  }
+
+  // ---- causal language-model mode: Init/Chunk/Step/Argmax mirror Engine so chat and bench drive either engine ----
+  bool Init(const std::string& model, const std::string& programs, std::uint32_t context) {
+    lm_mode = true;
+    return InitH(model, programs, context, {});
+  }
+  std::uint32_t Chunk(std::uint32_t remaining) const { return std::min(remaining, 1024u); }
+  void Reset() {
+    pos = 0;
+    cached_ids.clear();
+    for (auto& st : lm) {
+      std::fill(st.S.begin(), st.S.end(), 0.f);
+      std::fill(st.hist.begin(), st.hist.end(), 0.f);
+    }
+  }
+  // Feeds n tokens at position `pos`; *hidden receives the final-normed hidden state of the last token.
+  void Step(const std::uint32_t* tok, std::uint32_t n, std::vector<float>* hidden) {
+    omp_set_num_threads(n <= 2 ? dec_threads : pre_threads);
+    const std::uint32_t H = c.hidden;
+    std::vector<float> x(std::size_t{n} * H);
+    for (std::uint32_t r = 0; r < n; ++r)
+      for (std::uint32_t i = 0; i < H; ++i) x[std::size_t{r} * H + i] = Bf(embed[std::size_t{tok[r]} * H + i]);
+    Layers(x, n, {{0, n}});
+    pos += n;
+    hidden->resize(H);
+    RmsNorm(&x[std::size_t{n - 1} * H], norm_w.data(), hidden->data(), H, c.eps);
+  }
+  std::uint32_t Argmax(const float* hid) const {
+    const std::uint32_t H = c.hidden;
+    float best = -INFINITY;
+    std::uint32_t arg = 0;
+#pragma omp parallel
+    {
+      float lb = -INFINITY;
+      std::uint32_t la = 0;
+#pragma omp for nowait
+      for (std::int64_t v = 0; v < c.vocab; ++v) {
+        const std::uint16_t* row = &head_bf[std::size_t(v) * H];
+        float s = 0;
+        for (std::uint32_t i = 0; i < H; ++i) {
+          std::uint32_t bits = static_cast<std::uint32_t>(row[i]) << 16;
+          float w;
+          std::memcpy(&w, &bits, 4);
+          s += w * hid[i];
+        }
+        if (s > lb) {
+          lb = s;
+          la = static_cast<std::uint32_t>(v);
+        }
+      }
+#pragma omp critical
+      if (lb > best) {
+        best = lb;
+        arg = la;
+      }
+    }
+    return arg;
+  }
+
+  void ForwardBatch(const std::vector<Seq>& seqs, std::vector<float>* hidden) {
+    const std::uint32_t H = c.hidden;
+    std::vector<Seg> segs;
+    std::uint32_t T = 0;
+    for (const auto& q : seqs) {
+      segs.push_back({T, q.len});
+      T += q.len;
+    }
+    std::vector<float> x(std::size_t{T} * H);
+    for (std::size_t i = 0; i < seqs.size(); ++i)
+#pragma omp parallel for
+      for (std::int64_t t = 0; t < seqs[i].len; ++t)
+        for (std::uint32_t k = 0; k < H; ++k) x[std::size_t(segs[i].first + t) * H + k] = Bf(embed[std::size_t(seqs[i].tok[t]) * H + k]);
+    Layers(x, T, segs);
     hidden->resize(seqs.size() * H);
     for (std::size_t i = 0; i < seqs.size(); ++i)
       RmsNorm(&x[std::size_t{segs[i].first + seqs[i].marker} * H], norm_w.data(), &(*hidden)[i * H], H, c.eps);
@@ -2144,7 +2289,8 @@ int GemmTest(const char* prog_dir, const char* inst, std::uint32_t K, std::uint3
   return 0;
 }
 
-int Chat(const char* model, const char* programs, const std::string& prompt, std::uint32_t max_new, bool bench_synth, std::uint32_t bench_prompt) {
+template <class E>
+int ChatT(const char* model, const char* programs, const std::string& prompt, std::uint32_t max_new, bool bench_synth, std::uint32_t bench_prompt) {
   std::string e;
   auto reader = gufo::core::GgufReader::OpenFile(model, &e);
   if (!reader) {
@@ -2174,7 +2320,7 @@ int Chat(const char* model, const char* programs, const std::string& prompt, std
     const auto v = tok->Encode(sp);
     if (v.size() == 1) stop.push_back(v[0]);
   }
-  Engine g;
+  E g;
   if (!g.Init(model, programs, static_cast<std::uint32_t>(ids.size()) + max_new + 1024)) return 1;
   std::vector<float> hd;
   const auto t0 = Clock::now();
@@ -2188,6 +2334,7 @@ int Chat(const char* model, const char* programs, const std::string& prompt, std
   std::uint32_t produced = 0;
   std::string out;
   for (std::uint32_t i = 0; i < max_new; ++i) {
+    if (std::getenv("GEN_TRACE")) std::fprintf(stderr, "[tok %u]", next);
     if (!bench_synth && std::find(stop.begin(), stop.end(), next) != stop.end()) break;
     ++produced;
     if (!bench_synth) {
@@ -2206,6 +2353,19 @@ int Chat(const char* model, const char* programs, const std::string& prompt, std
   if (g.bad_head_rows) std::fprintf(stderr, "attention rows recomputed on the host: %llu\n", static_cast<unsigned long long>(g.bad_head_rows));
   std::fprintf(stderr, "\nprefill %zu tok %.1f ms (%.0f tok/s); decode %u tok %.1f ms (%.2f tok/s)\n", ids.size(), pf, ids.size() / pf * 1000, produced, dc, produced / dc * 1000);
   return 0;
+}
+
+// One entry for every architecture: the GGUF decides which engine runs it.
+int Chat(const char* model, const char* programs, const std::string& prompt, std::uint32_t max_new, bool bench_synth, std::uint32_t bench_prompt) {
+  std::string e;
+  auto reader = gufo::core::GgufReader::OpenFile(model, &e);
+  if (!reader) {
+    std::fprintf(stderr, "gguf: %s\n", e.c_str());
+    return 1;
+  }
+  const auto arch = reader->GetMetadataString("general.architecture");
+  if (arch && *arch == "qwen35") return ChatT<HybridEngine>(model, programs, prompt, max_new, bench_synth, bench_prompt);
+  return ChatT<Engine>(model, programs, prompt, max_new, bench_synth, bench_prompt);
 }
 
 int Interactive(const char* model, const char* programs) {
