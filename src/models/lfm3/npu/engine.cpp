@@ -241,6 +241,8 @@ struct Engine::Impl {
   bool have_st{false};
   Options opt;
   bool devres_ok{false};
+  bool dec_on{false};
+  const std::int32_t* dec_groups{nullptr};
   std::unique_ptr<gufo::npu::runtime::AttnDevPrep> dprep;
   std::vector<bool> dprep_layer;
   std::vector<std::vector<xrt::bo>>
@@ -824,7 +826,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens,
                      std::getenv("GUFO_ATTN_EXACT"));
   const std::uint32_t H = s.H, I = s.I, hd = s.hd, heads = s.heads, kvh = s.kvh,
                       kvd = s.kvd, qd = s.qd;
-  const bool devres = s.devres_ok && nTot > 64;
+  const bool devres = !s.dec_on && s.devres_ok && nTot > 64;
   std::uint32_t kChunk = 1024;
   const std::uint32_t nChunks = (nTot + kChunk - 1) / kChunk;
   if (devres)
@@ -857,7 +859,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens,
       DecodeRow(s.w->embedding, tokens[cs.row0 + i],
                 std::span<float>(&cs.X[std::size_t{i} * H], H));
   }
-  const bool dp_ok = s.dprep && css.back().n > 64;
+  const bool dp_ok = !s.dec_on && s.dprep && css.back().n > 64;
   const auto dev_prep_chunks = [&](std::size_t l,
                                    std::vector<ChunkState*> chunks) -> bool {
     std::lock_guard<std::mutex> g_(npu_mu);
@@ -1413,7 +1415,8 @@ bool Engine::Step(std::span<const std::uint32_t> tokens,
             }
             std::copy(gate.begin(), gate.end(),
                       GATE.begin() + std::size_t{o} * heads);
-          } else if (s.m_attn[l].host && !s.int4) {
+          } else if (s.m_attn[l].host && !s.int4 &&
+                     !(s.dec_on && c.layers[l] == LayerType::kFullAttention)) {
             // Attn kernel is m16: one append+run pass per 16-row block.
             npu_done = true;
             TlScope tl_attn_("attn", l);
@@ -1479,7 +1482,8 @@ bool Engine::Step(std::span<const std::uint32_t> tokens,
               const std::uint32_t P = lpos + t;
               const std::uint32_t first =
                   swa && P + 1 > s.window ? P + 1 - s.window : 0;
-              const std::uint32_t len = P + 1 - first;
+              const bool dec_g = s.dec_on && !swa;
+              const std::uint32_t len = dec_g ? nTot : P + 1 - first;
               for (std::uint32_t h = 0; h < heads; ++h) {
                 const std::uint32_t idx = t * heads + h;
                 firsts[idx] = first;
@@ -1521,6 +1525,12 @@ bool Engine::Step(std::span<const std::uint32_t> tokens,
                 float mx = -1e30f;
                 for (std::uint32_t i = 0; i < len; ++i) {
                   const std::uint32_t u = first + i;
+                  if (s.dec_on && !swa && s.dec_groups &&
+                      s.dec_groups[t] >= 0 && s.dec_groups[u] >= 0 &&
+                      s.dec_groups[u] != s.dec_groups[t]) {
+                    sc[i] = -1e30f;
+                    continue;
+                  }
                   const std::uint16_t* kr =
                       &s.k_cache[l][std::size_t{u % cap} * kvd + kh * hd];
                   __m512 acc = _mm512_setzero_ps();
@@ -1714,6 +1724,69 @@ bool Engine::Step(std::span<const std::uint32_t> tokens,
         const auto ta1 = Clock::now();
         bool many_ok = cs.attn_done;
         cs.attn_done = false;
+        if (s.dec_on && c.layers[l] == LayerType::kFullAttention) {
+          // d1 decision pass: bidirectional global attention on the host (the
+          // NPU kernel is causal).
+          const float inv_sqrt = 1.0f / std::sqrt(static_cast<float>(hd));
+          const std::uint32_t cap = s.capacity[l];
+#pragma omp parallel for schedule(dynamic, 1)
+          for (std::int64_t item = 0; item < std::int64_t{nTot} * heads;
+               ++item) {
+            const std::uint32_t t = static_cast<std::uint32_t>(item / heads),
+                                h = static_cast<std::uint32_t>(item % heads);
+            const std::uint32_t kh = h / (heads / kvh);
+            const float* qh = &QALL[std::size_t{t} * qd + h * hd];
+            const std::int32_t own = s.dec_groups ? s.dec_groups[t] : -1;
+            std::vector<float> sc(nTot);
+            float mx = -1e30f;
+            for (std::uint32_t u = 0; u < nTot; ++u) {
+              if (s.dec_groups && own >= 0 && s.dec_groups[u] >= 0 &&
+                  s.dec_groups[u] != own) {
+                sc[u] = -1e30f;
+                continue;
+              }
+              const std::uint16_t* kr =
+                  &s.k_cache[l][std::size_t{u % cap} * kvd + kh * hd];
+              __m512 acc = _mm512_setzero_ps();
+              for (std::uint32_t d = 0; d < hd; d += 16) {
+                const __m256i kb = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i*>(kr + d));
+                acc = _mm512_fmadd_ps(_mm512_loadu_ps(qh + d),
+                                      _mm512_castsi512_ps(_mm512_slli_epi32(
+                                          _mm512_cvtepu16_epi32(kb), 16)),
+                                      acc);
+              }
+              sc[u] = _mm512_reduce_add_ps(acc) * inv_sqrt;
+              mx = std::max(mx, sc[u]);
+            }
+            float sum = 0.0f;
+            for (std::uint32_t u = 0; u < nTot; ++u) {
+              sc[u] = sc[u] <= -1e29f ? 0.0f : std::exp(sc[u] - mx);
+              sum += sc[u];
+            }
+            alignas(64) float acco[128] = {0};
+            for (std::uint32_t u = 0; u < nTot; ++u) {
+              if (sc[u] == 0.0f)
+                continue;
+              const __m512 wv = _mm512_set1_ps(sc[u] / sum);
+              const std::uint16_t* vr =
+                  &s.v_cache[l][std::size_t{u % cap} * kvd + kh * hd];
+              for (std::uint32_t d = 0; d < hd; d += 16) {
+                const __m256i vb = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i*>(vr + d));
+                _mm512_storeu_ps(
+                    acco + d,
+                    _mm512_fmadd_ps(wv,
+                                    _mm512_castsi512_ps(_mm512_slli_epi32(
+                                        _mm512_cvtepu16_epi32(vb), 16)),
+                                    _mm512_loadu_ps(acco + d)));
+              }
+            }
+            std::memcpy(&ATT[std::size_t{t} * qd + h * hd], acco,
+                        hd * sizeof(float));
+          }
+          many_ok = true;
+        }
         if (!many_ok && cs.dev_prep && s.dprep && !dev_prep_chunks(l, {&cs}))
           cs.dev_prep = false;
         if (!many_ok && cs.dev_prep && s.dprep) {
@@ -2221,6 +2294,57 @@ void Engine::Commit(std::uint32_t k) {
     }
   s.pos += k;
   s.pending = 0;
+}
+
+bool Engine::Decide(std::span<const std::uint32_t> tokens,
+                    std::span<const std::int32_t> groups,
+                    std::span<const std::uint32_t> sequences,
+                    std::span<const std::uint32_t> slots,
+                    std::span<const std::uint32_t> vocabulary,
+                    std::span<float> logits) {
+  Impl& s = *impl_;
+  if (!s.atb || !s.apre)
+    return false;
+  const std::uint32_t H = s.H, n = static_cast<std::uint32_t>(tokens.size());
+  const std::size_t cols =
+      vocabulary.empty() ? s.w->embedding.rows : vocabulary.size();
+  if (logits.size() < slots.size() * cols)
+    return false;
+  std::vector<std::uint32_t> starts(sequences.begin(), sequences.end());
+  if (starts.empty())
+    starts.push_back(0);
+  starts.push_back(n);
+  std::vector<float> hidden;
+  bool ok = true;
+  for (std::size_t q = 0; ok && q + 1 < starts.size(); ++q) {
+    const std::uint32_t a = starts[q], b = starts[q + 1];
+    Reset();
+    s.dec_on = true;
+    s.dec_groups = groups.empty() ? nullptr : groups.data() + a;
+    ok = Step(tokens.subspan(a, b - a), &hidden);
+    s.dec_on = false;
+    s.dec_groups = nullptr;
+    if (!ok)
+      break;
+    for (std::size_t j = 0; j < slots.size(); ++j) {
+      if (slots[j] < a || slots[j] >= b)
+        continue;
+      const float* hrow = &hidden[std::size_t{slots[j] - a} * H];
+      std::vector<float> erow(H);
+      for (std::size_t v = 0; v < cols; ++v) {
+        DecodeRow(
+            s.w->embedding,
+            vocabulary.empty() ? static_cast<std::uint32_t>(v) : vocabulary[v],
+            erow);
+        float dot = 0.0f;
+        for (std::uint32_t k = 0; k < H; ++k)
+          dot += erow[k] * hrow[k];
+        logits[j * cols + v] = dot;
+      }
+    }
+  }
+  Reset();
+  return ok;
 }
 
 void Engine::Logits(const float* hidden_row, std::vector<float>* logits) {

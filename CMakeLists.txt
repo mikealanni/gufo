@@ -290,7 +290,7 @@ if (GUFO_BUILD_NPU_ENGINE)
     tools/npu/gen/gufo_gen.cpp)
   target_include_directories(gufo-gen PRIVATE ${PROJECT_SOURCE_DIR} ${GUFO_XRT_INCLUDE_DIR})
   target_compile_options(gufo-gen PRIVATE -O3 -march=native -ffast-math -fno-finite-math-only)
-  target_link_libraries(gufo-gen PRIVATE gufo_lfm3 OpenMP::OpenMP_CXX
+  target_link_libraries(gufo-gen PRIVATE gufo_lfm3 gufo_lfm3_reference gufo_d1_prompt OpenMP::OpenMP_CXX
     ${GUFO_XRT_LIB_DIR}/libxrt_coreutil.so.2 ${GUFO_XRT_LIB_DIR}/libxrt_core.so.2)
   add_executable(sbtest-prefill
     src/npu/runtime/runtime.cpp

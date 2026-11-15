@@ -26,6 +26,8 @@
 #include "src/core/quant/ggml_dequant.hpp"
 #include "src/models/lfm3/weights.hpp"
 #include "src/models/lfm3/npu/engine.hpp"
+#include "src/models/d1/judge.hpp"
+#include "src/models/lfm3/decision_forward.hpp"
 #include "src/models/lfm3/tokenizer.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 #include "src/npu/runtime/runtime.hpp"
@@ -3775,6 +3777,63 @@ int JudgeLoop(const char* model, const char* programs, gufo::core::GgufReader& r
   return 0;
 }
 
+// d1 decision model (lfm3 architecture): the shared host prompt/packing library drives, the NPU engine runs the decision pass.
+int D1Stdio(const char* model, const char* programs, gufo::core::GgufReader& reader) {
+  setenv("GUFO_ATB", "1", 0);
+  setenv("GUFO_ATB_KDYN", "1", 0);
+  gufo::models::lfm3::npu::Options opt;
+  opt.gguf = model;
+  opt.programs = programs;
+  opt.context = 4096;
+  std::string err;
+  auto engine = gufo::models::lfm3::npu::Engine::Create(opt, &err);
+  if (!engine) {
+    std::fprintf(stderr, "d1 engine: %s\n", err.c_str());
+    return 1;
+  }
+  auto oracle = std::getenv("GUFO_D1_ORACLE") ? gufo::models::lfm3::Weights::Bind(reader, &err) : std::nullopt;
+  const auto forward = [&](std::span<const std::uint32_t> tokens, std::span<const std::int32_t> groups, std::span<const std::uint32_t> sequences,
+                           std::span<const std::uint32_t> slots, std::span<const std::uint32_t> vocabulary, std::span<float> logits) {
+    if (!oracle) return engine->Decide(tokens, groups, sequences, slots, vocabulary, logits);
+    const std::size_t seq_count = sequences.empty() ? 1 : sequences.size();
+    std::size_t slot_at = 0;
+    for (std::size_t q = 0; q < seq_count; ++q) {
+      const std::size_t lo = sequences.empty() ? 0 : sequences[q];
+      const std::size_t hi = (!sequences.empty() && q + 1 < seq_count) ? sequences[q + 1] : tokens.size();
+      std::vector<std::uint32_t> own;
+      while (slot_at + own.size() < slots.size() && slots[slot_at + own.size()] < hi) own.push_back(slots[slot_at + own.size()] - lo);
+      const auto out = gufo::models::lfm3::DecisionForward(*oracle, tokens.subspan(lo, hi - lo), groups.empty() ? groups : groups.subspan(lo, hi - lo), own, vocabulary);
+      std::copy(out.begin(), out.end(), logits.begin() + slot_at * vocabulary.size());
+      slot_at += own.size();
+    }
+    return true;
+  };
+  constexpr std::uint32_t kMaxD1Tokens = 1024;
+  auto judge = gufo::models::d1::Judge::Create(reader, forward, kMaxD1Tokens, &err);
+  if (!judge) {
+    std::fprintf(stderr, "d1 judge: %s\n", err.c_str());
+    return 1;
+  }
+  std::printf("READY\n");
+  std::fflush(stdout);
+  std::string line;
+  while (std::getline(std::cin, line)) {
+    const auto tab = line.find('\t');
+    const std::string question = UnescapeJev(std::string_view(line).substr(0, tab));
+    const std::string context = tab == std::string::npos ? std::string() : UnescapeJev(std::string_view(line).substr(tab + 1));
+    const auto t0 = Clock::now();
+    const std::pair<std::string_view, std::string_view> item{question, context};
+    const auto verdicts = judge->Answer(std::span<const std::pair<std::string_view, std::string_view>>(&item, 1));
+    if (verdicts.empty()) {
+      std::printf("Error 0.000 0.000 %.1f\n", Ms(t0));
+    } else {
+      std::printf("%s %.3f %.3f %.1f\n", verdicts[0].yes >= verdicts[0].no ? "Yes" : "No", verdicts[0].yes, verdicts[0].no, Ms(t0));
+    }
+    std::fflush(stdout);
+  }
+  return 0;
+}
+
 int JudgeStdio(const char* model, const char* programs) {
   std::string e;
   auto reader = gufo::core::GgufReader::OpenFile(model, &e);
@@ -3795,6 +3854,7 @@ int JudgeStdio(const char* model, const char* programs) {
     return 1;
   }
   const std::string arch = std::string(reader->GetMetadataString("general.architecture").value_or("llama"));
+  if (arch == "lfm3" && reader->FindMetadata("lfm3.decision.type") != nullptr) return D1Stdio(model, programs, *reader);
   if (reader->FindMetadata(arch + ".decision.type") != nullptr) {
     // A decision model (state + question -> option probabilities); its temperature comes with the file.
     const float temperature = reader->GetMetadataFloat32(arch + ".decision.temperature.noul").value_or(1.3302962111834522f);

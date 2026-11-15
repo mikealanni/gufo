@@ -33,6 +33,16 @@ public:
   /// Runs up to kMaxRows tokens from the current position. `hidden` (optional)
   /// receives the final-norm rows, tokens.size() x hidden floats.
   bool Step(std::span<const std::uint32_t> tokens, std::vector<float>* hidden);
+  /// d1 decision pass: one forward over `tokens` from position 0 with the
+  /// global attention bidirectional (masked by `groups` when non-empty);
+  /// `logits` receives slots x vocabulary rows (all tokens when empty).
+  /// `sequences` are ascending start offsets of independent sequences.
+  bool Decide(std::span<const std::uint32_t> tokens,
+              std::span<const std::int32_t> groups,
+              std::span<const std::uint32_t> sequences,
+              std::span<const std::uint32_t> slots,
+              std::span<const std::uint32_t> vocabulary,
+              std::span<float> logits);
   /// Logits for one final-norm row against the tied Q8_0 embedding.
   void Logits(const float* hidden_row, std::vector<float>* logits);
   /// Index of the largest logit (greedy token), without storing all logits.
