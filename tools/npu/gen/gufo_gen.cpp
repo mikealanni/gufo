@@ -1511,7 +1511,8 @@ struct Engine {
   }
   bool LoadHeads(const std::string&) { return false; }
   std::uint32_t HeadCount() const { return 0; }
-  void Draft(const float*, std::uint32_t*) {}
+  std::uint32_t MaxFed() const { return 16; }
+  void Draft(const float*, std::uint32_t, const std::uint32_t*, std::uint32_t, std::uint32_t*) {}
 
   std::uint32_t Argmax(const float* h) {
     std::uint32_t id = 0;
@@ -1630,8 +1631,16 @@ struct HybridEngine : Engine {
   std::vector<LmState> lm;
   std::vector<std::uint16_t> head_bf;  // output projection, bf16 (vocab x hidden)
   bool lm_mode{false};
-  static constexpr bool kSpec = false;  // delta-net state cannot be rolled back cheaply
+  static constexpr bool kSpec = true;
   bool moe{false};
+  // Multi-token prediction (the model's own next-token head) as the drafter for lossless speculation.
+  bool mtp{false};
+  std::vector<float> mtp_enorm, mtp_hnorm, mtp_out_norm, last_raw;  // last_raw: final residual rows of the last Step (before the output norm)
+  WeightBuffer mtp_kq_eh, mtp_dq_eh;
+  Program mtp_kp_eh, mtp_kp_eh2, mtp_dp_eh;
+  std::uint32_t step_start{0}, step_rows{0};
+  bool snap_on{false};
+  std::vector<LmState> row0, row1;  // delta-net state after the first / second row of a 2-3 row step (a draft may be rejected there)
   std::uint32_t n_exp{0}, n_used{0};
   bool dec_ok{false};   // int5 stream-bound decode path available (language-model mode)
   bool use_dec{false};  // the current Step runs on it (few rows)
@@ -1840,16 +1849,23 @@ struct HybridEngine : Engine {
       npu_argmax = true;
     }
     if (moe) InitExpertPrograms(programs, &err, H, 2 * slice_i);
-    layers.resize(c.layers);
-    hl.resize(c.layers);
-    if (lm_mode) lm.resize(c.layers);
+    // The model's own next-token-prediction layer (index c.layers) is loaded like any attention layer and drives speculation.
+    mtp = lm_mode && dec_ok && !std::getenv("GEN_NO_MTP") && st.HasG("blk." + std::to_string(c.layers) + ".nextn.eh_proj.weight");
+    const std::uint32_t total = c.layers + (mtp ? 1 : 0);
+    layers.resize(total);
+    hl.resize(total);
+    if (lm_mode) {
+      lm.resize(total);
+      row0.resize(total);
+      row1.resize(total);
+    }
     std::vector<float> buf;
     const auto t0 = Clock::now();
-    for (std::uint32_t l = 0; l < c.layers; ++l) {
+    for (std::uint32_t l = 0; l < total; ++l) {
       Layer& L = layers[l];
       HL& h = hl[l];
       const std::string b = "blk." + std::to_string(l) + ".";
-      h.linear = (l % interval) != interval - 1;
+      h.linear = l < c.layers && (l % interval) != interval - 1;
       if (lm_mode) {
         if (h.linear) {
           lm[l].S.assign(std::size_t{kVH} * kKD * kVD, 0.f);
@@ -2013,7 +2029,90 @@ struct HybridEngine : Engine {
       }
       if (l % 8 == 0) std::fprintf(stderr, "hybrid: packed layer %u (%.1f s)\n", l, Ms(t0) / 1000.0);
     }
+    if (mtp) {
+      const std::string b = "blk." + std::to_string(c.layers) + ".nextn.";
+      mtp_enorm.resize(H);
+      mtp_hnorm.resize(H);
+      mtp_out_norm.resize(H);
+      st.LoadG(b + "enorm.weight", mtp_enorm.data(), H);
+      st.LoadG(b + "hnorm.weight", mtp_hnorm.data(), H);
+      st.LoadG(b + "shared_head_norm.weight", mtp_out_norm.data(), H);
+      std::vector<float> eh;
+      const auto load_eh = [&]() -> const float* {
+        eh.assign(std::size_t{h_p} * 2 * H, 0.f);
+        st.LoadG(b + "eh_proj.weight", eh.data(), std::size_t{H} * 2 * H);
+        return eh.data();
+      };
+      const std::string gi = "bash " + programs + "/../gen_insts.sh ";
+      const std::string gk = "bash " + programs + "/../kdh/gen_kdh.sh ";
+      const std::string kn = "insts_kdh_1024x" + std::to_string(2 * H) + "x" + std::to_string(h_p);
+      NeedInsts(programs, plain_name(2 * H, h_p), gi + "plain " + std::to_string(2 * H) + " " + std::to_string(h_p));
+      NeedInsts(programs, kn + ".txt", gk + kn + " " + std::to_string(c.inter) + " -M 1024 -K " + std::to_string(2 * H) + " -N " + std::to_string(h_p));
+      mtp_dq_eh = rt.PackWeightCached(wcache, "mtp.q5.eh", h_p, 2 * H, load_eh);
+      mtp_dp_eh = rt.MakeProgram(2 * H, h_p, programs + "/" + plain_name(2 * H, h_p), 0, &err);
+      mtp_kq_eh = rk.PackWeightAtbCached(wcache, "mtp.kd.eh", h_p, 2 * H, 4, load_eh);
+      mtp_kp_eh = rk.MakeProgram(2 * H, h_p, programs + "/" + kn + ".txt", std::size_t{1024} * h_p / 8 * 9, &err, 0, 64, 3, 5);
+      mtp_kp_eh2 = rk.MakeProgram(2 * H, h_p, programs + "/" + kn + ".txt", std::size_t{1024} * h_p / 8 * 9, &err, 0, 64, 3, 5);
+      KDispatch(mtp_kq_eh, mtp_kp_eh);
+      KDispatch(mtp_kq_eh, mtp_kp_eh2);
+      std::fprintf(stderr, "hybrid: MTP layer %u loaded (speculative drafts)\n", c.layers);
+    }
     return true;
+  }
+
+  // MTP input rows: [enorm(embed(next token)) ; hnorm(final residual)] for each row.
+  void MtpInputs(const std::uint32_t* next_tok, const float* raw, std::uint32_t rows, std::vector<float>* cat) const {
+    const std::uint32_t H = c.hidden;
+    cat->assign(std::size_t{rows} * 2 * H, 0.f);
+    std::vector<float> e(H);
+    for (std::uint32_t r = 0; r < rows; ++r) {
+      for (std::uint32_t i = 0; i < H; ++i) e[i] = Bf(embed[std::size_t{next_tok[r]} * H + i]);
+      RmsNorm(e.data(), mtp_enorm.data(), &(*cat)[std::size_t{r} * 2 * H], H, c.eps);
+      RmsNorm(raw + std::size_t{r} * H, mtp_hnorm.data(), &(*cat)[std::size_t{r} * 2 * H + H], H, c.eps);
+    }
+  }
+
+  // Runs the MTP layer over `rows` rows starting at position p0 (the rows' own positions) and returns the residual rows.
+  void MtpRun(const std::vector<float>& cat, std::uint32_t rows, std::uint32_t p0, bool dec, std::vector<float>* x) {
+    const std::uint32_t H = c.hidden, h_p = PadN(H);
+    std::vector<float> o(std::size_t{rows} * h_p);
+    if (dec) rt.Gemm(mtp_dp_eh, mtp_dq_eh, cat.data(), rows, o.data(), &tim);
+    else KGemm(mtp_kp_eh, mtp_kp_eh2, mtp_kq_eh, cat.data(), rows, 2 * H, o.data());
+    x->resize(std::size_t{rows} * H);
+    for (std::uint32_t r = 0; r < rows; ++r) std::memcpy(&(*x)[std::size_t{r} * H], &o[std::size_t{r} * h_p], std::size_t{H} * 4);
+    const std::uint32_t saved = pos;
+    pos = p0;
+    use_dec = dec;
+    Layers(*x, rows, {{0, rows}}, c.layers, c.layers + 1);
+    use_dec = false;
+    pos = saved;
+  }
+
+  // Prefill: fill the MTP layer's KV for rows 0..n-2 of the chunk (their next token is in the chunk).
+  void MtpPopulate(const std::uint32_t* tok, std::uint32_t n, const std::vector<float>& raw) {
+    std::vector<float> cat, x;
+    MtpInputs(tok + 1, raw.data(), n - 1, &cat);
+    MtpRun(cat, n - 1, step_start, false, &x);
+  }
+
+  // After a step: draft the token following `next`. fed[0..j] were verified/accepted, so row q's own next token is fed[q+1] (next for the last row).
+  void Draft(const float*, std::uint32_t j, const std::uint32_t* fed, std::uint32_t next, std::uint32_t* out) {
+    const std::uint32_t H = c.hidden, rows = j + 1;
+    std::uint32_t toks[16];
+    for (std::uint32_t q = 0; q < rows; ++q) toks[q] = q < j ? fed[q + 1] : next;
+    std::vector<float> cat, x;
+    MtpInputs(toks, last_raw.data(), rows, &cat);
+    MtpRun(cat, rows, step_start, true, &x);
+    std::vector<float> hn(H);
+    RmsNorm(&x[std::size_t{j} * H], mtp_out_norm.data(), hn.data(), H, c.eps);
+    out[0] = Argmax(hn.data());
+    // second draft: the layer applied again to its own output with the first draft as input, one position further
+    std::vector<float> cat2, x2(&x[std::size_t{j} * H], &x[std::size_t{j} * H] + H);
+    MtpInputs(&out[0], x2.data(), 1, &cat2);
+    std::vector<float> y;
+    MtpRun(cat2, 1, step_start + rows, true, &y);
+    RmsNorm(y.data(), mtp_out_norm.data(), hn.data(), H, c.eps);
+    out[1] = Argmax(hn.data());
   }
 
   // ---- delta-net layer ----
@@ -2105,7 +2204,7 @@ struct HybridEngine : Engine {
 
   // Host reference of the whole delta-net stage (conv, norms, recurrence, gated norm), fp32 state.
   // Sall (kVH x kKD x kVD) and hist ((kConvK-1) x kConvDim) carry the recurrence and the conv window across calls (language-model mode).
-  void GdnHost(const HL& h, const float* proj, const float* z, std::uint32_t T, float* gated, float* Sall = nullptr, float* hist = nullptr) {
+  void GdnHost(const HL& h, const float* proj, const float* z, std::uint32_t T, float* gated, float* Sall = nullptr, float* hist = nullptr, LmState* after_first = nullptr, LmState* after_second = nullptr) {
     const auto tg0 = Clock::now();
     std::vector<float> ab;
     Gates(h, z, T, &ab);
@@ -2127,6 +2226,17 @@ struct HybridEngine : Engine {
     }
     ph[18] += Ms(tc0);
     const auto tr0 = Clock::now();
+    const auto snap_window = [&](LmState* snap, std::uint32_t row) {  // conv window after `row`
+      snap->hist.resize(std::size_t{kConvK - 1} * kConvDim);
+      snap->S.resize(std::size_t{kVH} * kKD * kVD);
+      for (std::uint32_t w = 0; w + 1 < kConvK; ++w) {
+        const std::int64_t at = static_cast<std::int64_t>(row) - (kConvK - 2) + w;  // input row index (negative = history)
+        for (std::uint32_t ch = 0; ch < kConvDim; ++ch)
+          snap->hist[std::size_t{w} * kConvDim + ch] = at >= 0 ? proj[std::size_t(at) * kGdnInN + ch] : hist[std::size_t(at + kConvK - 1) * kConvDim + ch];
+      }
+    };
+    if (after_first && hist && T > 1) snap_window(after_first, 0);
+    if (after_second && hist && T > 2) snap_window(after_second, 1);
     if (hist) {
       std::vector<float> next(std::size_t{kConvK - 1} * kConvDim);
       for (std::uint32_t i = 0; i + 1 < kConvK; ++i) {
@@ -2143,6 +2253,8 @@ struct HybridEngine : Engine {
       if (Sall) std::memcpy(S.data(), Sall + std::size_t(v) * kKD * kVD, S.size() * 4);
       for (std::uint32_t t = 0; t < T; ++t) {
         const float* row = &qkv[std::size_t{t} * kConvDim];
+        if (after_first && t == 1 && Sall) std::memcpy(after_first->S.data() + std::size_t(v) * kKD * kVD, S.data(), S.size() * 4);
+        if (after_second && t == 2 && Sall) std::memcpy(after_second->S.data() + std::size_t(v) * kKD * kVD, S.data(), S.size() * 4);
         std::memcpy(q.data(), row + kh * kKD, kKD * 4);
         std::memcpy(k.data(), row + kKeyDim + kh * kKD, kKD * 4);
         const float* vv = row + 2 * kKeyDim + v * kVD;
@@ -2222,7 +2334,8 @@ struct HybridEngine : Engine {
     } else {
       LmState* ls = lm_mode ? &lm[static_cast<std::size_t>(&h - hl.data())] : nullptr;
       for (const auto& sg : segs)
-        GdnHost(h, s_proj.data() + std::size_t{sg.first} * kGdnInN, z + std::size_t{sg.first} * H, sg.second, s_gated.data() + std::size_t{sg.first} * kValDim, ls ? ls->S.data() : nullptr, ls ? ls->hist.data() : nullptr);
+        GdnHost(h, s_proj.data() + std::size_t{sg.first} * kGdnInN, z + std::size_t{sg.first} * H, sg.second, s_gated.data() + std::size_t{sg.first} * kValDim, ls ? ls->S.data() : nullptr, ls ? ls->hist.data() : nullptr,
+                snap_on && ls ? &row0[static_cast<std::size_t>(&h - hl.data())] : nullptr, snap_on && ls ? &row1[static_cast<std::size_t>(&h - hl.data())] : nullptr);
     }
     s_outp.resize(std::size_t{Tt} * h_p);
     tg = Clock::now();
@@ -2591,14 +2704,15 @@ struct HybridEngine : Engine {
   void DecMlp(Layer& L, const float* z, std::uint32_t n, float* out) { rt.Ffn(L.dp_ffn, L.dq_ffn, z, n, out, &tim, gu_strips, c.hidden); }
 
   // All transformer layers over the T residual rows x (norms, delta-net or attention, MLP, residual adds).
-  void Layers(std::vector<float>& x, std::uint32_t T, const std::vector<Seg>& segs) {
+  void Layers(std::vector<float>& x, std::uint32_t T, const std::vector<Seg>& segs, std::uint32_t l0 = 0, std::uint32_t l1 = ~0u) {
     const std::uint32_t H = c.hidden;
+    if (l1 == ~0u) l1 = c.layers;  // the MTP layer (index c.layers) only runs when asked for
     std::vector<float> z(std::size_t{T} * H), br(std::size_t{T} * H);
     auto norm_rows = [&](const float* w) {
 #pragma omp parallel for
       for (std::int64_t r = 0; r < T; ++r) RmsNorm(&x[std::size_t(r) * H], w, &z[std::size_t(r) * H], H, c.eps);
     };
-    for (std::uint32_t l = 0; l < c.layers; ++l) {
+    for (std::uint32_t l = l0; l < l1; ++l) {
       Layer& L = layers[l];
       auto tl = Clock::now();
       norm_rows(L.attn_norm.data());
@@ -2639,6 +2753,24 @@ struct HybridEngine : Engine {
       std::fill(st.hist.begin(), st.hist.end(), 0.f);
     }
   }
+  // Keeps the accepted rows of the last step; a half-rejected 2-row step restores the state saved after row 0.
+  void Commit(std::uint32_t k) {
+    if (snap_on && k < step_rows) lm = (k == 1 ? row0 : row1);
+    pos = step_start + k;
+  }
+  void ArgmaxRows(const float* hid, std::uint32_t rows, std::uint32_t* out) {
+    if (npu_argmax && rows <= 16) {
+      rt.Argmax(p_argmax, w_argmax, hid, rows, out, &tim);
+      bool ok = true;
+      for (std::uint32_t r = 0; r < rows; ++r) ok = ok && out[r] < c.vocab;
+      if (ok) return;
+    }
+    for (std::uint32_t r = 0; r < rows; ++r) out[r] = Argmax(hid + std::size_t{r} * c.hidden);
+  }
+  std::uint32_t MaxFed() const { return 3; }  // two chained MTP drafts per step
+  std::uint32_t HeadCount() const { return mtp ? 2u : 0u; }
+  bool LoadHeads(const std::string&) { return false; }
+
   // The delta-net state cannot be rewound to an arbitrary position: keep one checkpoint (the fixed prompt prefix) to restore.
   std::vector<LmState> snap;
   std::vector<std::uint32_t> snap_ids;
@@ -2682,11 +2814,16 @@ struct HybridEngine : Engine {
     for (std::uint32_t r = 0; r < n; ++r)
       for (std::uint32_t i = 0; i < H; ++i) x[std::size_t{r} * H + i] = Bf(embed[std::size_t{tok[r]} * H + i]);
     use_dec = dec_ok && n <= 16;
+    step_start = pos;
+    step_rows = n;
+    snap_on = lm_mode && n >= 2 && n <= 3;  // a verification step may be rejected part-way: keep the delta-net state after rows 0 and 1
     Layers(x, n, {{0, n}});
     use_dec = false;
+    if (mtp && n > 16 && n > 1) MtpPopulate(tok, n, x);
     pos += n;
-    hidden->resize(H);
-    RmsNorm(&x[std::size_t{n - 1} * H], norm_w.data(), hidden->data(), H, c.eps);
+    hidden->resize(std::size_t{n} * H);
+    for (std::uint32_t r = 0; r < n; ++r) RmsNorm(&x[std::size_t{r} * H], norm_w.data(), &(*hidden)[std::size_t{r} * H], H, c.eps);
+    last_raw = std::move(x);
   }
   std::uint32_t Argmax(const float* hid) {
     if (npu_argmax) {
@@ -2912,7 +3049,8 @@ struct Lfm3Engine {
     return true;
   }
   std::uint32_t HeadCount() const { return e->HeadCount(); }
-  void Draft(const float* hid, std::uint32_t* out) { e->Draft(hid, out); }
+  std::uint32_t MaxFed() const { return 16; }
+  void Draft(const float* hid, std::uint32_t, const std::uint32_t*, std::uint32_t, std::uint32_t* out) { e->Draft(hid, out); }
 };
 
 // What chat needs from a tokenizer, whatever the model family.
@@ -3003,9 +3141,10 @@ int ChatT(const char* model, const char* programs, const std::string& prompt, st
    if (use_spec) {
     // Prompt-lookup drafts (longest recent n-gram match, then the tokens that followed it) plus the engine's draft heads, verified in one pass.
     if (const char* hp = std::getenv("GEN_HEADS")) g.LoadHeads(hp);
-    const std::size_t max_fed = std::getenv("GEN_MAXFED") ? std::stoul(std::getenv("GEN_MAXFED")) : 16;
+    const std::size_t max_fed = std::min<std::size_t>(g.MaxFed(), std::getenv("GEN_MAXFED") ? std::stoul(std::getenv("GEN_MAXFED")) : 16);
     std::vector<std::uint32_t> hist = ids, head_draft, pred;
     bool done = false;
+    std::size_t spec_steps = 0, spec_drafted = 0, spec_accepted = 0;
     const std::uint32_t hidden = g.c.hidden;
     while (!done && produced < max_new) {
       if (!bench_synth && ct.stop(next)) break;
@@ -3030,6 +3169,8 @@ int ChatT(const char* model, const char* programs, const std::string& prompt, st
         for (auto t : head_draft)
           if (fed.size() < max_fed) fed.push_back(t);
       g.Step(fed.data(), static_cast<std::uint32_t>(fed.size()), &hd);
+      ++spec_steps;
+      spec_drafted += fed.size() - 1;
       pred.assign(fed.size(), 0);
       std::size_t have = 0, j = 0;
       for (;;) {  // greedy rows are produced lazily: the first few, then the rest only while drafts keep matching
@@ -3054,15 +3195,17 @@ int ChatT(const char* model, const char* programs, const std::string& prompt, st
           std::fflush(stdout);
         }
       }
+      spec_accepted += j;
       g.Commit(static_cast<std::uint32_t>(j + 1));
       if (j >= have) pred[j] = 0;
       next = pred[j];
       head_draft.clear();
       if (g.HeadCount() && !done) {
         head_draft.resize(g.HeadCount());
-        g.Draft(hd.data() + j * hidden, head_draft.data());
+        g.Draft(hd.data() + j * hidden, static_cast<std::uint32_t>(j), fed.data(), next, head_draft.data());
       }
     }
+    if (std::getenv("GEN_SPEC_STATS")) std::fprintf(stderr, "\nspec: %zu steps, %zu drafted, %zu accepted (%.0f%%), %.2f tokens/step\n", spec_steps, spec_drafted, spec_accepted, spec_drafted ? 100.0 * spec_accepted / spec_drafted : 0.0, spec_steps ? double(produced) / spec_steps : 0.0);
    }
   }
   for (std::uint32_t i = 0; !use_spec && i < max_new; ++i) {
