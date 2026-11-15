@@ -20,6 +20,7 @@ import os
 
 RTP_BLOCK = os.environ.get("RTP_BLOCK", "1") == "1"
 TRACE = os.environ.get("TRACE", "0") == "1"  # hardware trace of a few tiles into the tail of the C buffer
+DUAL_B = os.environ.get("DUAL_B", "0") == "1"  # weights over both shim MM2S channels of a column (rows 0-1 / rows 2-3)
 TRACE_SIZE = 65536
 _rtp_globals = {}
 
@@ -133,17 +134,32 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None, 
         C_l1l2 = [[None] * n_aie_cols for _ in range(n_aie_rows)]
         C_l2l3 = [None] * n_aie_cols
         for col in range(n_aie_cols):
-            B_l3l2[col] = object_fifo(f"B_L3L2_{col}", shim_tiles[col], mem_tiles[col], 2, B_l2_ty)
+            if DUAL_B:
+                B_half_ty = np.ndarray[(n_aie_rows // 2 * BQ,), np.dtype[np.uint8]]
+                B_l3l2[col] = [
+                    object_fifo(f"B_L3L2_{col}_{h}", shim_tiles[col], mem_tiles[col], 2, B_half_ty) for h in range(2)
+                ]
+            else:
+                B_l3l2[col] = object_fifo(f"B_L3L2_{col}", shim_tiles[col], mem_tiles[col], 2, B_l2_ty)
             for row in range(n_aie_rows):
                 B_l2l1[row][col] = object_fifo(
                     f"B_L2L1_{col}_{row}", mem_tiles[col], core_tiles[row][col], 2, B_l1_ty
                 )
-            object_fifo_link(
-                B_l3l2[col],
-                [B_l2l1[row][col] for row in range(n_aie_rows)],
-                [],
-                [BQ * row for row in range(n_aie_rows)],
-            )
+            if DUAL_B:
+                for h in range(2):
+                    object_fifo_link(
+                        B_l3l2[col][h],
+                        [B_l2l1[row][col] for row in range(2 * h, 2 * h + 2)],
+                        [],
+                        [BQ * r for r in range(2)],
+                    )
+            else:
+                object_fifo_link(
+                    B_l3l2[col],
+                    [B_l2l1[row][col] for row in range(n_aie_rows)],
+                    [],
+                    [BQ * row for row in range(n_aie_rows)],
+                )
             for row in range(n_aie_rows):
                 C_l1l2[row][col] = object_fifo(
                     f"C_L1L2_{col}_{row}", core_tiles[row][col], mem_tiles[col], 1, C_l1_ty
@@ -287,6 +303,7 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None, 
                             (1, b_total), (bi * per_bd * n_aie_cols + col) * chunk_bytes,
                             [1, inner, chunk_bytes // 1024, 1024],
                             [1, n_aie_cols * chunk_bytes, 1024, 1])
+                        assert not DUAL_B, 'attn mode unsupported with DUAL_B'
                         b_tasks.append(shim_dma_single_bd_task(B_l3l2[col], B, tap=b_tap, issue_token=False))
                         dma_start_task(b_tasks[-1])
                 for col in range(n_aie_cols):
@@ -358,9 +375,22 @@ def my_matmul(M, K, N, m, k, n, mode="ffn", k1=None, n1=None, k2=None, n2=None, 
                         b_tap = TensorAccessPattern(
                             (1, gu_bytes + dn_bytes), b_off_fn(g * n_aie_cols + col), [1, 1, 1, b_len], [0, 0, 0, 1]
                         )
-                        b_task = shim_dma_single_bd_task(B_l3l2[col], B, tap=b_tap, issue_token=False)
-                        dma_start_task(b_task)
-                        in_groups[g % tb_max].append(b_task)
+                        if DUAL_B:
+                            steps = b_len // (n_aie_rows * BQ_)
+                            b_off = b_off_fn(g * n_aie_cols + col)
+                            for h in range(2):
+                                hb_tap = TensorAccessPattern(
+                                    (1, gu_bytes + dn_bytes), b_off + h * 2 * BQ_,
+                                    [1, 1, steps, 2 * BQ_], [0, 0, n_aie_rows * BQ_, 1]
+                                )
+                                hb_task = shim_dma_single_bd_task(B_l3l2[col][h], B, tap=hb_tap, issue_token=False)
+                                dma_start_task(hb_task)
+                                in_groups[g % tb_max].append(hb_task)
+                            continue_b = True
+                        else:
+                            b_task = shim_dma_single_bd_task(B_l3l2[col], B, tap=b_tap, issue_token=False)
+                            dma_start_task(b_task)
+                            in_groups[g % tb_max].append(b_task)
                     for col in range(n_aie_cols):
                         c_tap = TensorAccessPattern(
                             (1, c_total), c_off_fn(g * n_aie_cols + col),

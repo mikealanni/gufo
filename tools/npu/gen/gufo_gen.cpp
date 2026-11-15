@@ -1899,8 +1899,7 @@ struct HybridEngine : Engine {
     zero_copy = moe && dec_ok && !std::getenv("GEN_EXPERT_COPY");
     if (moe) InitExpertPrograms(programs, &err, H, 2 * slice_i);
     // The model's own next-token-prediction layer (index c.layers) is loaded like any attention layer and drives speculation.
-    // MoE: a verification step routes each row to its own experts, which costs more than the drafts save (GEN_MTP_MOE=1 forces it on)
-    mtp = lm_mode && dec_ok && !std::getenv("GEN_NO_MTP") && (!moe || std::getenv("GEN_MTP_MOE")) && st.HasG("blk." + std::to_string(c.layers) + ".nextn.eh_proj.weight");
+    mtp = lm_mode && dec_ok && !std::getenv("GEN_NO_MTP") && st.HasG("blk." + std::to_string(c.layers) + ".nextn.eh_proj.weight");
     const std::uint32_t total = c.layers + (mtp ? 1 : 0);
     layers.resize(total);
     hl.resize(total);
