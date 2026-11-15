@@ -264,7 +264,10 @@ Engine::~Engine() {
   }
 }
 
-std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* error) {
+std::unique_ptr<Engine> Engine::Create(const Options& options_in, std::string* error) {
+  Options options = options_in;
+  const bool int4 = std::getenv("GUFO_LFM3_INT4") != nullptr;
+  if (int4) options.programs += "/q4";
   try {
     auto im = std::make_unique<Impl>();
     Impl& s = *im;
@@ -291,7 +294,7 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
     if (!options.bf16.empty()) s.have_st = s.st.Open(options.bf16);
 
     const std::string xclbin = options.programs + "/final_16x64x128_ffn.xclbin";
-    if (!s.rt.Init(xclbin, error)) return nullptr;
+    if (!s.rt.Init(xclbin, error, int4)) return nullptr;
 
     // Programs needed (driven by spec/constraints; LFM3 uses these 4)
     s.p_conv = s.rt.MakeProgram(2048, 2048, options.programs + "/insts_conv.txt", std::size_t{64} * gufo::npu::runtime::kStripBytes, error, 64);
@@ -304,7 +307,7 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
     if (have_conv64)
       s.p_conv64 = s.rt.MakeProgram(2048, 2048, options.programs + "/insts_conv_m64.txt", std::size_t{64} * 4 * gufo::npu::runtime::kStripBytes, error, 64, 4);
     // 64-row prefill programs (WP10). GUFO_NO_M64=1 falls back to 16-row passes.
-    s.m64 = std::getenv("GUFO_NO_M64") == nullptr &&
+    s.m64 = !int4 && std::getenv("GUFO_NO_M64") == nullptr &&
             have_m64("insts_plain_2048x2048_m64.txt") && have_m64("insts_plain_2048x3072_m64.txt") &&
             have_m64("insts_ffngu64.txt") && have_m64("insts_plain_7680x2048_m64.txt");
 
@@ -325,7 +328,7 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
     const std::size_t L = c.layers.size();
     s.m_conv.resize(L); s.m_conv64.resize(L); s.m_attn.resize(L); s.m_out.resize(L);
     s.programs_dir = options.programs;
-    s.npu_attn = !std::getenv("GUFO_CPU_ATTN") && options.context >= 1; s.m_qkv.resize(L); s.m_ffn.resize(L);
+    s.npu_attn = !int4 && !std::getenv("GUFO_CPU_ATTN") && options.context >= 1; s.m_qkv.resize(L); s.m_ffn.resize(L);
     s.m_ffn_dn.resize(L);
     s.gate_w.resize(L); s.k_cache.resize(L); s.v_cache.resize(L);
     s.capacity.assign(L, 0);
@@ -411,8 +414,8 @@ std::unique_ptr<Engine> Engine::Create(const Options& options, std::string* erro
             std::memcpy(&buf[(f * 16 + i) * 2048], &gate[(f * 8 + i) * 2048], 2048 * 4);
             std::memcpy(&buf[(f * 16 + 8 + i) * 2048], &up[(f * 8 + i) * 2048], 2048 * 4);
           }
-        const std::size_t gu_bytes = std::size_t{120} * 32 * 4 * kQuarterBytes;
-        const std::size_t dn_bytes = std::size_t{16} * 120 * 4 * kQuarterBytes;
+        const std::size_t gu_bytes = std::size_t{120} * 32 * 4 * gufo::npu::runtime::QuarterBytesW();
+        const std::size_t dn_bytes = std::size_t{16} * 120 * 4 * gufo::npu::runtime::QuarterBytesW();
         gufo::npu::runtime::WeightBuffer m;
         m.bytes = gu_bytes + dn_bytes;
         m.bo = xrt::bo(s.rt.device(), m.bytes, XRT_BO_FLAGS_HOST_ONLY, s.rt.kernel().group_id(3));

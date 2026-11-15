@@ -825,8 +825,8 @@ ConvLayer NpuRuntime::PackConv(const float* w_in, const float* conv_w,
   std::memset(cl.prog.ch, 0, cb);
   cl.prog.c.sync(XCL_BO_SYNC_BO_TO_DEVICE);
   const std::uint32_t K = hidden, tk = K / kTileK;
-  const std::size_t in_bytes = std::size_t{3 * hidden / kStrip} * (tk + 1) * 4 * kQuarterBytes;
-  const std::size_t out_bytes = std::size_t{hidden / kStrip} * tk * 4 * kQuarterBytes;
+  const std::size_t in_bytes = std::size_t{3 * hidden / kStrip} * (tk + 1) * 4 * QuarterBytesW();
+  const std::size_t out_bytes = std::size_t{hidden / kStrip} * tk * 4 * QuarterBytesW();
   cl.w.bytes = in_bytes + out_bytes;
   cl.w.bo = xrt::bo(dev_, cl.w.bytes, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(3));
   cl.w.host = cl.w.bo.map<std::uint8_t*>();
@@ -856,7 +856,7 @@ ConvLayer NpuRuntime::PackConv(const float* w_in, const float* conv_w,
     for (std::uint32_t col = 0; col < 8; ++col)
       for (std::uint32_t r = 0; r < 4; ++r) {
         const std::uint32_t s2 = g * 8 + col, j = g / 3;
-        std::uint8_t* tile = cl.w.host + ((std::size_t{s2} * (tk + 1) + tk) * 4 + r) * kQuarterBytes;
+        std::uint8_t* tile = cl.w.host + ((std::size_t{s2} * (tk + 1) + tk) * 4 + r) * QuarterBytesW();
         auto* tp = reinterpret_cast<std::uint16_t*>(tile + kConvTapOffset);
         for (std::uint32_t t = 0; t < taps; ++t)
           for (std::uint32_t cbk = 0; cbk < 4; ++cbk)
@@ -875,12 +875,12 @@ void NpuRuntime::ConvReset(ConvLayer& cl) {
   for (std::uint32_t g = 1; g < groups; g += 3)
     for (std::uint32_t col = 0; col < 8; ++col)
       for (std::uint32_t r = 0; r < 4; ++r)
-        std::memset(cl.w.host + ((std::size_t{g * 8 + col} * (tk + 1) + tk) * 4 + r) * kQuarterBytes +
+        std::memset(cl.w.host + ((std::size_t{g * 8 + col} * (tk + 1) + tk) * 4 + r) * QuarterBytesW() +
                         kConvHistOffset, 0, 4 * 6 * 16);
   for (std::uint32_t g = 1; g < groups; g += 3)
     for (std::uint32_t col = 0; col < 8; ++col)
-      SyncToDevice(cl.w.bo, (std::size_t{(g * 8 + col)} * (tk + 1) + tk) * 4 * kQuarterBytes,
-                   4 * kQuarterBytes);
+      SyncToDevice(cl.w.bo, (std::size_t{(g * 8 + col)} * (tk + 1) + tk) * 4 * QuarterBytesW(),
+                   4 * QuarterBytesW());
 }
 
 void NpuRuntime::ConvStep(ConvLayer& cl, const float* z, std::uint32_t n, float* y,
@@ -930,7 +930,7 @@ void NpuRuntime::ConvCommit(ConvLayer& cl, std::uint32_t k, bool settle) {
       for (std::uint32_t r = 0; r < 4; ++r) {
         const std::uint32_t s2 = g * 8 + col;
         auto* dst = reinterpret_cast<std::uint16_t*>(
-            cl.w.host + ((std::size_t{s2} * (tk + 1) + tk) * 4 + r) * kQuarterBytes + kConvHistOffset);
+            cl.w.host + ((std::size_t{s2} * (tk + 1) + tk) * 4 + r) * QuarterBytesW() + kConvHistOffset);
         // role-1 bx output: per mb a 1024B region, per cbk 256B, per rh(8 rows) 128B, per row 16B.
         const std::uint8_t* sbase =
             cl.prog.ch + std::size_t{16 + j * 8 + col} * cl.prog.mrows * kStripBytes + std::size_t{r} * kRowBytes;
@@ -962,8 +962,8 @@ void NpuRuntime::ConvCommit(ConvLayer& cl, std::uint32_t k, bool settle) {
     static const int nsync = std::getenv("GUFO_SYNC_N") ? std::atoi(std::getenv("GUFO_SYNC_N")) : 1;
     for (int it = 0; it < nsync; ++it)
       for (std::uint32_t col = 0; col < 8; ++col)
-        SyncToDevice(cl.w.bo, (std::size_t{(g * 8 + col)} * (tk + 1) + tk) * 4 * kQuarterBytes,
-                     4 * kQuarterBytes);
+        SyncToDevice(cl.w.bo, (std::size_t{(g * 8 + col)} * (tk + 1) + tk) * 4 * QuarterBytesW(),
+                     4 * QuarterBytesW());
   }
       // WP10: weight-page TO_DEVICE syncs on this XRT/xdna stack become visible to
   // the program's next dispatch only ~1 ms later, and no BO operation waits for
@@ -987,7 +987,7 @@ void NpuRuntime::ConvGetHistory(const ConvLayer& cl, std::uint16_t* rows6) {
     for (std::uint32_t col = 0; col < 8; ++col)
       for (std::uint32_t r = 0; r < 4; ++r) {
         const auto* src = reinterpret_cast<const std::uint16_t*>(
-            cl.w.host + ((std::size_t{g * 8 + col} * (tk + 1) + tk) * 4 + r) * kQuarterBytes + kConvHistOffset);
+            cl.w.host + ((std::size_t{g * 8 + col} * (tk + 1) + tk) * 4 + r) * QuarterBytesW() + kConvHistOffset);
         for (std::uint32_t cbk = 0; cbk < 4; ++cbk)
           for (std::uint32_t row = 0; row < hist; ++row)
             for (std::uint32_t i = 0; i < 8; ++i) {
@@ -1005,7 +1005,7 @@ void NpuRuntime::ConvSetHistory(ConvLayer& cl, const std::uint16_t* rows6) {
     for (std::uint32_t col = 0; col < 8; ++col) {
       for (std::uint32_t r = 0; r < 4; ++r) {
         auto* dst = reinterpret_cast<std::uint16_t*>(
-            cl.w.host + ((std::size_t{g * 8 + col} * (tk + 1) + tk) * 4 + r) * kQuarterBytes + kConvHistOffset);
+            cl.w.host + ((std::size_t{g * 8 + col} * (tk + 1) + tk) * 4 + r) * QuarterBytesW() + kConvHistOffset);
         for (std::uint32_t cbk = 0; cbk < 4; ++cbk)
           for (std::uint32_t row = 0; row < hist; ++row)
             for (std::uint32_t i = 0; i < 8; ++i) {
@@ -1015,7 +1015,7 @@ void NpuRuntime::ConvSetHistory(ConvLayer& cl, const std::uint16_t* rows6) {
         for (const char* q = reinterpret_cast<const char*>(dst); q < reinterpret_cast<const char*>(dst) + 4 * hist * 16 + 64; q += 64)
           _mm_clflushopt(const_cast<char*>(q));
       }
-      SyncToDevice(cl.w.bo, (std::size_t{(g * 8 + col)} * (tk + 1) + tk) * 4 * kQuarterBytes, 4 * kQuarterBytes);
+      SyncToDevice(cl.w.bo, (std::size_t{(g * 8 + col)} * (tk + 1) + tk) * 4 * QuarterBytesW(), 4 * QuarterBytesW());
     }
   }
   _mm_mfence();
@@ -1026,11 +1026,11 @@ void NpuRuntime::ConvCopyHistory(ConvLayer& dst, const ConvLayer& src) {
   for (std::uint32_t g = 1; g < groups; g += 3)
     for (std::uint32_t col = 0; col < 8; ++col) {
       for (std::uint32_t r = 0; r < 4; ++r) {
-        const std::size_t off = ((std::size_t{g * 8 + col} * (tk + 1) + tk) * 4 + r) * kQuarterBytes + kConvHistOffset;
+        const std::size_t off = ((std::size_t{g * 8 + col} * (tk + 1) + tk) * 4 + r) * QuarterBytesW() + kConvHistOffset;
         std::memcpy(dst.w.host + off, src.w.host + off, 4 * 6 * 16);
         for (std::size_t q = 0; q < 4 * 6 * 16 + 64; q += 64) _mm_clflushopt(dst.w.host + off + q);
       }
-      SyncToDevice(dst.w.bo, (std::size_t{(g * 8 + col)} * (tk + 1) + tk) * 4 * kQuarterBytes, 4 * kQuarterBytes);
+      SyncToDevice(dst.w.bo, (std::size_t{(g * 8 + col)} * (tk + 1) + tk) * 4 * QuarterBytesW(), 4 * QuarterBytesW());
     }
   _mm_mfence();
 }
@@ -1041,10 +1041,10 @@ void NpuRuntime::ConvRefresh(ConvLayer& cl) {
     for (std::uint32_t col = 0; col < 8; ++col) {
       for (std::uint32_t r = 0; r < 4; ++r) {
         auto* dst = reinterpret_cast<volatile std::uint8_t*>(
-            cl.w.host + ((std::size_t{g * 8 + col} * (tk + 1) + tk) * 4 + r) * kQuarterBytes + kConvHistOffset);
+            cl.w.host + ((std::size_t{g * 8 + col} * (tk + 1) + tk) * 4 + r) * QuarterBytesW() + kConvHistOffset);
         for (std::uint32_t i = 0; i < 4 * 6 * 16; ++i) dst[i] = dst[i];
       }
-      SyncToDevice(cl.w.bo, (std::size_t{(g * 8 + col)} * (tk + 1) + tk) * 4 * kQuarterBytes, 4 * kQuarterBytes);
+      SyncToDevice(cl.w.bo, (std::size_t{(g * 8 + col)} * (tk + 1) + tk) * 4 * QuarterBytesW(), 4 * QuarterBytesW());
     }
 }
 
