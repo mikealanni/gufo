@@ -662,7 +662,7 @@ struct Engine {
     std::vector<float> kd(std::size_t{16} * kAttnKv);
     for (std::uint32_t p = 0; p < kvp; ++p)
       while (L.napps[p] < upto) {
-        const std::uint32_t m = std::min(16u, upto - L.napps[p]);
+        const std::uint32_t m = std::min({16u, upto - L.napps[p], 16u - L.napps[p] % 16u});
         for (std::uint32_t r = 0; r < m; ++r)
           for (std::uint32_t h = 0; h < 4; ++h) std::memcpy(&kd[std::size_t{r} * kAttnKv + h * hd], &L.k[std::size_t{L.napps[p] + r} * kvd + KvSrc(p, h) * hd], hd * 4);
         rt.AttnAppend(L.als[p], L.napps[p], m, kd.data(), L.vhs[p].data(), &tim);
@@ -1026,8 +1026,10 @@ struct Engine {
               if (pos % 16 == 0 && n % 16 == 0) {
                 rt.AttnAppendBulk(al, pos, n, kdp, vh.data(), &tim);
               } else {
-                for (std::uint32_t o = 0; o < n; o += 16)
-                  rt.AttnAppend(al, pos + o, std::min(16u, n - o), &kdp[std::size_t{o} * kAttnKv], vh.data(), &tim);
+                for (std::uint32_t o = 0, m = 0; o < n; o += m) {
+                  m = std::min({16u, n - o, 16u - (pos + o) % 16u});
+                  rt.AttnAppend(al, pos + o, m, &kdp[std::size_t{o} * kAttnKv], vh.data(), &tim);
+                }
               }
               ph[5] += Ms(tap);
               std::vector<AttnPrefill::Pass> passes;
