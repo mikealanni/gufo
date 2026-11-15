@@ -3318,6 +3318,7 @@ struct Lfm3Engine {
     // The 1024-row prefill path of the engine is selected by environment; default it on like the other engines do.
     setenv("GUFO_ATB", "1", 0);
     setenv("GUFO_ATB_KDYN", "1", 0);
+    if (context <= 4096 && !std::getenv("GUFO_LFM3_INT5")) setenv("GUFO_LFM3_INT4", "1", 0);
     gufo::models::lfm3::npu::Options opt;
     opt.gguf = model;
     opt.programs = programs;

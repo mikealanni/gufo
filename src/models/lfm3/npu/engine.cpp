@@ -210,6 +210,7 @@ struct Engine::Impl {
   std::vector<gufo::npu::runtime::ConvLayer> m_conv64;
   std::vector<gufo::npu::runtime::AttnLayer> m_attn;
   bool npu_attn{false};
+  bool int4{false};
   std::string programs_dir;
   gufo::npu::runtime::NpuRuntime::Timings tim;
   std::uint32_t H{}, I{}, heads{}, hd{}, kvh{}, qd{}, kvd{}, taps{}, window{};
@@ -267,7 +268,7 @@ Engine::~Engine() {
 std::unique_ptr<Engine> Engine::Create(const Options& options_in, std::string* error) {
   Options options = options_in;
   const bool int4 = std::getenv("GUFO_LFM3_INT4") != nullptr;
-  if (int4) options.programs += "/q4";
+  const std::string pdir = int4 ? options.programs + "/q4" : options.programs;
   try {
     auto im = std::make_unique<Impl>();
     Impl& s = *im;
@@ -293,21 +294,21 @@ std::unique_ptr<Engine> Engine::Create(const Options& options_in, std::string* e
     if (auto e = s.reader->GetMetadataUint32("tokenizer.ggml.eos_token_id")) s.spec.eos_id = *e;
     if (!options.bf16.empty()) s.have_st = s.st.Open(options.bf16);
 
-    const std::string xclbin = options.programs + "/final_16x64x128_ffn.xclbin";
+    const std::string xclbin = pdir + "/final_16x64x128_ffn.xclbin";
     if (!s.rt.Init(xclbin, error, int4)) return nullptr;
 
     // Programs needed (driven by spec/constraints; LFM3 uses these 4)
-    s.p_conv = s.rt.MakeProgram(2048, 2048, options.programs + "/insts_conv.txt", std::size_t{64} * gufo::npu::runtime::kStripBytes, error, 64);
+    s.p_conv = s.rt.MakeProgram(2048, 2048, pdir + "/insts_conv.txt", std::size_t{64} * gufo::npu::runtime::kStripBytes, error, 64);
     // WP10 m64 prefill programs: rows batch 4x16 -> weight streams amortized 4x.
-    const auto have_m64 = [options](const char* f) {
-      std::ifstream t(options.programs + "/" + f);
+    const auto have_m64 = [pdir](const char* f) {
+      std::ifstream t(pdir + "/" + f);
       return t.good();
     };
     const bool have_conv64 = have_m64("insts_conv_m64.txt");
     if (have_conv64)
-      s.p_conv64 = s.rt.MakeProgram(2048, 2048, options.programs + "/insts_conv_m64.txt", std::size_t{64} * 4 * gufo::npu::runtime::kStripBytes, error, 64, 4);
+      s.p_conv64 = s.rt.MakeProgram(2048, 2048, pdir + "/insts_conv_m64.txt", std::size_t{64} * 4 * gufo::npu::runtime::kStripBytes, error, 64, 4);
     // 64-row prefill programs (WP10). GUFO_NO_M64=1 falls back to 16-row passes.
-    s.m64 = !int4 && std::getenv("GUFO_NO_M64") == nullptr &&
+    s.m64 = std::getenv("GUFO_NO_M64") == nullptr &&
             have_m64("insts_plain_2048x2048_m64.txt") && have_m64("insts_plain_2048x3072_m64.txt") &&
             have_m64("insts_ffngu64.txt") && have_m64("insts_plain_7680x2048_m64.txt");
 
@@ -328,7 +329,8 @@ std::unique_ptr<Engine> Engine::Create(const Options& options_in, std::string* e
     const std::size_t L = c.layers.size();
     s.m_conv.resize(L); s.m_conv64.resize(L); s.m_attn.resize(L); s.m_out.resize(L);
     s.programs_dir = options.programs;
-    s.npu_attn = !int4 && !std::getenv("GUFO_CPU_ATTN") && options.context >= 1; s.m_qkv.resize(L); s.m_ffn.resize(L);
+    s.int4 = int4;
+    s.npu_attn = (!int4 || std::getenv("GUFO_ATB")) && !std::getenv("GUFO_CPU_ATTN") && options.context >= 1; s.m_qkv.resize(L); s.m_ffn.resize(L);
     s.m_ffn_dn.resize(L);
     s.gate_w.resize(L); s.k_cache.resize(L); s.v_cache.resize(L);
     s.capacity.assign(L, 0);
@@ -345,13 +347,13 @@ std::unique_ptr<Engine> Engine::Create(const Options& options_in, std::string* e
     for (std::size_t l = 0; l < L; ++l) {
       const auto& lw = s.w->layers[l];
       const std::string pre = "model.layers." + std::to_string(l) + ".";
-      s.pH[l] = s.rt.MakeProgram(2048, 2048, options.programs + "/insts_plain_2048x2048.txt", 0, error);
-      s.pQkv[l] = s.rt.MakeProgram(2048, 3072, options.programs + "/insts_plain_2048x3072.txt", 0, error);
-      s.pFfn[l] = s.rt.MakeProgram(2048, 2048, options.programs + "/insts_ffn.txt",
+      s.pH[l] = s.rt.MakeProgram(2048, 2048, pdir + "/insts_plain_2048x2048.txt", 0, error);
+      s.pQkv[l] = s.rt.MakeProgram(2048, 3072, pdir + "/insts_plain_2048x3072.txt", 0, error);
+      s.pFfn[l] = s.rt.MakeProgram(2048, 2048, pdir + "/insts_ffn.txt",
                                    std::size_t{136} * gufo::npu::runtime::kStripBytes, error);
       if (s.m64) {
-        s.pH64[l] = s.rt.MakeProgram(2048, 2048, options.programs + "/insts_plain_2048x2048_m64.txt", 0, error, 0, 4);
-        s.pQkv64[l] = s.rt.MakeProgram(2048, 3072, options.programs + "/insts_plain_2048x3072_m64.txt", 0, error, 0, 4);
+        s.pH64[l] = s.rt.MakeProgram(2048, 2048, pdir + "/insts_plain_2048x2048_m64.txt", 0, error, 0, 4);
+        s.pQkv64[l] = s.rt.MakeProgram(2048, 3072, pdir + "/insts_plain_2048x3072_m64.txt", 0, error, 0, 4);
       }
       if (c.layers[l] == LayerType::kConvolution) {
         buf.resize(std::size_t{6144} * 2048);
@@ -435,8 +437,8 @@ std::unique_ptr<Engine> Engine::Create(const Options& options_in, std::string* e
         }
         m.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
         if (s.m64) {
-          s.pGu64[l] = s.rt.MakeProgram(2048, 15360, options.programs + "/insts_ffngu64.txt", 0, error, 0, 4);
-          s.pDn64[l] = s.rt.MakeProgram(7680, 2048, options.programs + "/insts_plain_7680x2048_m64.txt", 0, error, 0, 4);
+          s.pGu64[l] = s.rt.MakeProgram(2048, 15360, pdir + "/insts_ffngu64.txt", 0, error, 0, 4);
+          s.pDn64[l] = s.rt.MakeProgram(7680, 2048, pdir + "/insts_plain_7680x2048_m64.txt", 0, error, 0, 4);
         }
         s.m_ffn[l] = std::move(m);
         (void)0;
@@ -485,7 +487,7 @@ std::unique_ptr<Engine> Engine::Create(const Options& options_in, std::string* e
     // WP4: pack tied embedding as int5 head for NPU argmax, if program exists.
     s.npu_argmax = false;
     if (std::getenv("GUFO_CPU_ARGMAX") == nullptr) {
-      const std::string ainst = options.programs + "/insts_argmax_2048x128000.txt";
+      const std::string ainst = pdir + "/insts_argmax_2048x128000.txt";
       std::ifstream af(ainst, std::ios::binary);
       if (af.good()) {
         af.close();
@@ -984,7 +986,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens, std::vector<float>* hid
         std::copy(q.begin(), q.end(), QALL.begin() + std::size_t{o} * qd);
         }
         std::copy(gate.begin(), gate.end(), GATE.begin() + std::size_t{o} * heads);
-      } else if (s.m_attn[l].host) {
+      } else if (s.m_attn[l].host && !s.int4) {
         // Attn kernel is m16: one append+run pass per 16-row block.
         npu_done = true;
         TlScope tl_attn_("attn", l);
