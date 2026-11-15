@@ -189,6 +189,8 @@ struct Engine {
   bool m64{std::getenv("MC5_NO_M64") == nullptr};
   bool npu_attn{std::getenv("MC5_HOST_ATTN") == nullptr};
   std::string programs_dir;
+  std::vector<float> ogain;
+  std::uint32_t host_ctx{std::getenv("MC5_HOST_CTX") ? static_cast<std::uint32_t>(std::atoi(std::getenv("MC5_HOST_CTX"))) : 256u};
   std::unique_ptr<AttnPrefill> apre;
   const char* qdir{std::getenv("MC5_QDIR")};
   double t_npu{0}, t_cpu{0};
@@ -199,6 +201,11 @@ struct Engine {
   bool Init(const std::string& model_dir, const std::string& programs, std::uint32_t context) {
     ctx = context;
     programs_dir = programs;
+    if (const char* gp = std::getenv("MC5_OGAIN")) {
+      std::ifstream gf(gp);
+      float gv;
+      while (gf >> gv) ogain.push_back(gv);
+    }
     if (npu_attn && !std::getenv("MC5_NO_ATTNP")) {
       auto ap = std::make_unique<AttnPrefill>();
       std::string aerr;
@@ -267,6 +274,10 @@ struct Engine {
         QMat m;
         m.Resize(h_p, qd);
         m.Load(qdir, std::to_string(l) + ".o", 0, H);
+        if (ogain.size() == c.layers) {
+          const float inv = 1.0f / ogain[l];
+          for (auto& sc : m.s) sc = Bf16Bits(Bf(sc) * inv);
+        }
         L.out = rt.PackWeightQ(m.q.data(), m.s.data(), h_p, qd);
       } else {
         L.out = rt.PackWeight(buf.data(), h_p, qd);
@@ -427,7 +438,17 @@ struct Engine {
             }
           }
         }
-        if (apre && n > kRows) {
+        if (pos + n <= host_ctx) {
+          for (std::uint32_t r = 0; r < n; ++r) {
+            const float* row = &qkv[std::size_t{r} * (Cpu("qkv") ? qkv_n : qkv_p)];
+            std::memcpy(&L.k[std::size_t{pos + r} * kvd], row + qd, kvd * 4);
+            std::memcpy(&L.v[std::size_t{pos + r} * kvd], row + qd + kvd, kvd * 4);
+          }
+#pragma omp parallel for
+          for (std::int64_t r = 0; r < n; ++r) Attend(L, &qa[std::size_t(r) * qd], pos + static_cast<std::uint32_t>(r), &att[std::size_t(r) * qd]);
+          for (std::uint32_t o = 0; o < n; o += 16)
+            rt.AttnAppend(L.al, pos + o, std::min(16u, n - o), &kd[std::size_t{o} * kAttnKv], L.vh.data(), &tim);
+        } else if (apre && n > kRows) {
           apre->SetExact(pos + n <= kExactCtx);
           for (std::uint32_t o = 0; o < n; o += 16)
             rt.AttnAppend(L.al, pos + o, std::min(16u, n - o), &kd[std::size_t{o} * kAttnKv], L.vh.data(), &tim);
