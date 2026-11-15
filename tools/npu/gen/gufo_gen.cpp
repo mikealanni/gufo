@@ -338,6 +338,7 @@ struct Layer {
   Program dp_in, dp_o, dp_ffn;
   // mixture of experts: router (experts x hidden), shared-expert gate (hidden), packed routed experts (1024-row path and int5 decode path)
   std::vector<float> router, sh_gate;
+  std::vector<std::uint16_t> kbf, vbf;  // language-model mode: bf16 KV cache of attention layers
   std::shared_ptr<ExpertBlob> exp_kd, exp_q5;
   std::vector<std::vector<std::uint16_t>> khs, vhs;
 };
@@ -1501,6 +1502,7 @@ struct HybridEngine : Engine {
   bool dec_ok{false};   // int5 stream-bound decode path available (language-model mode)
   bool use_dec{false};  // the current Step runs on it (few rows)
   std::vector<float> s_gu, s_act, s_dn;
+  int attn_threads{std::getenv("GEN_ATTN_THREADS") ? std::atoi(std::getenv("GEN_ATTN_THREADS")) : 16};
   GdnDev gd;
   bool gdn_dev{std::getenv("GEN_GDN_HOST") == nullptr};
   std::vector<float> readout;
@@ -1719,8 +1721,8 @@ struct HybridEngine : Engine {
           lm[l].S.assign(std::size_t{kVH} * kKD * kVD, 0.f);
           lm[l].hist.assign(std::size_t{kConvK - 1} * kConvDim, 0.f);
         } else {
-          L.k.assign(std::size_t{ctx} * c.kv_heads * c.head_dim, 0.f);
-          L.v.assign(std::size_t{ctx} * c.kv_heads * c.head_dim, 0.f);
+          L.kbf.assign(std::size_t{ctx} * c.kv_heads * c.head_dim, 0);
+          L.vbf.assign(std::size_t{ctx} * c.kv_heads * c.head_dim, 0);
         }
       }
       L.attn_norm.resize(H);
@@ -2087,12 +2089,10 @@ struct HybridEngine : Engine {
   void AttnHost(Layer& L, const float* proj, std::uint32_t T, float* att, std::uint32_t pos0 = 0, bool causal = false) {
     const std::uint32_t qd = c.heads * c.head_dim, kvd = c.kv_heads * c.head_dim, hd = c.head_dim, attn_n = 2 * qd + 2 * kvd;
     std::vector<float> q(std::size_t{T} * qd), gate(std::size_t{T} * qd), kloc, vloc;
-    if (!causal) {
-      kloc.resize(std::size_t{T} * kvd);
-      vloc.resize(std::size_t{T} * kvd);
-    }
-    float* const kbase = causal ? L.k.data() : kloc.data();
-    float* const vbase = causal ? L.v.data() : vloc.data();
+    kloc.resize(std::size_t{T} * kvd);  // this call's keys/values (causal mode appends them to the bf16 cache afterwards)
+    vloc.resize(std::size_t{T} * kvd);
+    float* const kbase = kloc.data();
+    float* const vbase = vloc.data();
     std::vector<float> cs(std::size_t{T} * (kRotDim / 2)), sn(std::size_t{T} * (kRotDim / 2));
     for (std::uint32_t t = 0; t < T; ++t)
       for (std::uint32_t i = 0; i < kRotDim / 2; ++i) {
@@ -2122,49 +2122,152 @@ struct HybridEngine : Engine {
         norm_rope(qh, L.qn.data(), static_cast<std::uint32_t>(t));
       }
       for (std::uint32_t h = 0; h < c.kv_heads; ++h) {
-        const std::size_t wi = causal ? pos0 + static_cast<std::size_t>(t) : static_cast<std::size_t>(t);
+        const std::size_t wi = static_cast<std::size_t>(t);
         float* kh = &kbase[wi * kvd + h * hd];
         std::memcpy(kh, row + 2 * qd + h * hd, hd * 4);
         norm_rope(kh, L.kn.data(), static_cast<std::uint32_t>(t));
         std::memcpy(&vbase[wi * kvd + h * hd], row + 2 * qd + kvd + h * hd, hd * 4);
       }
     }
+    if (causal) {
+      for (std::uint32_t t = 0; t < T; ++t)
+        for (std::uint32_t i = 0; i < kvd; ++i) {
+          L.kbf[std::size_t{pos0 + t} * kvd + i] = Bf16Bits(kbase[std::size_t{t} * kvd + i]);
+          L.vbf[std::size_t{pos0 + t} * kvd + i] = Bf16Bits(vbase[std::size_t{t} * kvd + i]);
+        }
+      BlockedAttention<std::uint16_t>(q.data(), L.kbf.data(), L.vbf.data(), gate.data(), T, pos0, true, att);
+    } else {
+      BlockedAttention<float>(q.data(), kbase, vbase, gate.data(), T, pos0, false, att);
+    }
+  }
+
+  // Gated multi-head attention over cached K/V (kvd floats per position). Queries are processed in blocks against key tiles so every K/V row
+  // is reused across the block (online softmax); a single query (decode) splits its keys across threads instead.
+  template <class KV>
+  static const float* KvRow(const KV* p, float* tmp, std::uint32_t n) {
+    if constexpr (std::is_same_v<KV, float>) {
+      (void)tmp;
+      (void)n;
+      return p;
+    } else {
+      for (std::uint32_t i = 0; i < n; i += 16) {  // n is a multiple of 16 (head dimensions are)
+        const __m512i w = _mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + i))), 16);
+        _mm512_storeu_ps(tmp + i, _mm512_castsi512_ps(w));
+      }
+      return tmp;
+    }
+  }
+
+  template <class KV>
+  void BlockedAttention(const float* q, const KV* kb, const KV* vb, const float* gate, std::uint32_t T, std::uint32_t pos0, bool causal, float* att) {
+    constexpr std::uint32_t kBq = 16, kBk = 128;
+    const std::uint32_t hd = c.head_dim, qd = c.heads * hd, kvd = c.kv_heads * hd, grp = c.heads / c.kv_heads;
     const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
-    const std::uint32_t grp = c.heads / c.kv_heads;
-#pragma omp parallel
-    {
-      std::vector<float> sc(std::size_t{pos0} + T);
-#pragma omp for collapse(2) schedule(dynamic, 4)
-      for (std::int64_t t = 0; t < T; ++t)
-        for (std::uint32_t h = 0; h < c.heads; ++h) {
-          const float* qh = &q[std::size_t(t) * qd + h * hd];
-          const std::uint32_t kh = h / grp;
-          const std::uint32_t nk = causal ? pos0 + static_cast<std::uint32_t>(t) + 1 : T;
-          float mx2 = -INFINITY;
-          for (std::uint32_t u = 0; u < nk; ++u) {
-            const float* kk = &kbase[std::size_t{u} * kvd + kh * hd];
-            float s = 0;
-            for (std::uint32_t i = 0; i < hd; ++i) s += qh[i] * kk[i];
-            s *= scale;
-            sc[u] = s;
-            mx2 = std::max(mx2, s);
+    const auto gated = [&](float* o, const float* gg) {
+      for (std::uint32_t i = 0; i < hd; ++i) o[i] *= 1.0f / (1.0f + std::exp(-gg[i]));
+    };
+    if (T == 1) {
+      // flash-decoding: one query, the visible keys split into chunks that run in parallel and merge by their running max
+      const std::uint32_t nk = causal ? pos0 + 1 : 1;
+      constexpr std::uint32_t kChunk = 512;
+      const std::uint32_t nchunks = (nk + kChunk - 1) / kChunk;
+      std::vector<float> cm(std::size_t{c.heads} * nchunks), cl(std::size_t{c.heads} * nchunks), co(std::size_t{c.heads} * nchunks * hd);
+#pragma omp parallel for collapse(2) schedule(dynamic, 1) num_threads(attn_threads)
+      for (std::int64_t h = 0; h < c.heads; ++h)
+        for (std::int64_t ch = 0; ch < nchunks; ++ch) {
+          float rowtmp[kMaxHeadDim];
+          const float* qh = q + std::size_t(h) * hd;
+          const std::uint32_t kh = static_cast<std::uint32_t>(h) / grp, u0 = static_cast<std::uint32_t>(ch) * kChunk, u1 = std::min(nk, u0 + kChunk);
+          float sc[kChunk], mx = -INFINITY;
+          for (std::uint32_t u = u0; u < u1; ++u) {
+            const float* kk = KvRow(kb + std::size_t{u} * kvd + kh * hd, rowtmp, hd);
+            float sacc = 0;
+            for (std::uint32_t i = 0; i < hd; ++i) sacc += qh[i] * kk[i];
+            sc[u - u0] = sacc * scale;
+            mx = std::max(mx, sc[u - u0]);
           }
           float den = 0;
-          for (std::uint32_t u = 0; u < nk; ++u) {
-            sc[u] = std::exp(sc[u] - mx2);
-            den += sc[u];
-          }
-          float* o = &att[std::size_t(t) * qd + h * hd];
+          float* o = &co[(std::size_t(h) * nchunks + ch) * hd];
           std::fill(o, o + hd, 0.f);
-          for (std::uint32_t u = 0; u < nk; ++u) {
-            const float wgt = sc[u] / den;
-            const float* vv = &vbase[std::size_t{u} * kvd + kh * hd];
-            for (std::uint32_t i = 0; i < hd; ++i) o[i] += wgt * vv[i];
+          for (std::uint32_t u = u0; u < u1; ++u) {
+            const float p = std::exp(sc[u - u0] - mx);
+            den += p;
+            const float* vv = KvRow(vb + std::size_t{u} * kvd + kh * hd, rowtmp, hd);
+            for (std::uint32_t i = 0; i < hd; ++i) o[i] += p * vv[i];
           }
-          const float* gg = &gate[std::size_t(t) * qd + h * hd];
-          for (std::uint32_t i = 0; i < hd; ++i) o[i] *= 1.0f / (1.0f + std::exp(-gg[i]));
+          cm[std::size_t(h) * nchunks + ch] = mx;
+          cl[std::size_t(h) * nchunks + ch] = den;
         }
+      for (std::uint32_t h = 0; h < c.heads; ++h) {
+        float mx = -INFINITY;
+        for (std::uint32_t ch = 0; ch < nchunks; ++ch) mx = std::max(mx, cm[std::size_t{h} * nchunks + ch]);
+        float den = 0;
+        float* o = att + std::size_t{h} * hd;
+        std::fill(o, o + hd, 0.f);
+        for (std::uint32_t ch = 0; ch < nchunks; ++ch) {
+          const float w = std::exp(cm[std::size_t{h} * nchunks + ch] - mx);
+          den += w * cl[std::size_t{h} * nchunks + ch];
+          const float* co_h = &co[(std::size_t{h} * nchunks + ch) * hd];
+          for (std::uint32_t i = 0; i < hd; ++i) o[i] += w * co_h[i];
+        }
+        for (std::uint32_t i = 0; i < hd; ++i) o[i] /= den;
+        gated(o, gate + std::size_t{h} * hd);
+      }
+      return;
     }
+    const std::uint32_t nqb = (T + kBq - 1) / kBq;
+#pragma omp parallel for collapse(2) schedule(dynamic, 1) num_threads(attn_threads)
+    for (std::int64_t qb = 0; qb < nqb; ++qb)
+      for (std::int64_t h = 0; h < c.heads; ++h) {
+        float rowtmp[kMaxHeadDim];
+        const std::uint32_t q0 = static_cast<std::uint32_t>(qb) * kBq, nq = std::min(kBq, T - q0), kh = static_cast<std::uint32_t>(h) / grp;
+        const std::uint32_t last = causal ? pos0 + q0 + nq - 1 : T - 1;  // last key any query of the block sees
+        float m[kBq], l[kBq], acc[kBq][kMaxHeadDim], s[kBq][kBk];
+        for (std::uint32_t i = 0; i < nq; ++i) {
+          m[i] = -INFINITY;
+          l[i] = 0.f;
+          std::fill(acc[i], acc[i] + hd, 0.f);
+        }
+        for (std::uint32_t k0 = 0; k0 <= last; k0 += kBk) {
+          const std::uint32_t nk = std::min(kBk, last + 1 - k0);
+          for (std::uint32_t u = 0; u < nk; ++u) {
+            const float* kk = KvRow(kb + std::size_t{k0 + u} * kvd + kh * hd, rowtmp, hd);
+            for (std::uint32_t i = 0; i < nq; ++i) {
+              const float* qi = q + std::size_t{q0 + i} * qd + std::size_t(h) * hd;
+              float sacc = 0;
+              for (std::uint32_t d = 0; d < hd; ++d) sacc += qi[d] * kk[d];
+              s[i][u] = (causal && k0 + u > pos0 + q0 + i) ? -INFINITY : sacc * scale;
+            }
+          }
+          for (std::uint32_t i = 0; i < nq; ++i) {
+            float mt = -INFINITY;
+            for (std::uint32_t u = 0; u < nk; ++u) mt = std::max(mt, s[i][u]);
+            const float nm = std::max(m[i], mt);
+            if (nm == -INFINITY) continue;
+            const float corr = std::exp(m[i] - nm);
+            for (std::uint32_t d = 0; d < hd; ++d) acc[i][d] *= corr;
+            l[i] *= corr;
+            for (std::uint32_t u = 0; u < nk; ++u) {
+              s[i][u] = std::exp(s[i][u] - nm);
+              l[i] += s[i][u];
+            }
+            m[i] = nm;
+          }
+          for (std::uint32_t u = 0; u < nk; ++u) {
+            const float* vv = KvRow(vb + std::size_t{k0 + u} * kvd + kh * hd, rowtmp, hd);
+            for (std::uint32_t i = 0; i < nq; ++i) {
+              const float p = s[i][u];
+              for (std::uint32_t d = 0; d < hd; ++d) acc[i][d] += p * vv[d];
+            }
+          }
+        }
+        for (std::uint32_t i = 0; i < nq; ++i) {
+          float* o = att + std::size_t{q0 + i} * qd + std::size_t(h) * hd;
+          const float inv = 1.0f / l[i];
+          for (std::uint32_t d = 0; d < hd; ++d) o[d] = acc[i][d] * inv;
+          gated(o, gate + std::size_t{q0 + i} * qd + std::size_t(h) * hd);
+        }
+      }
   }
 
   void AttnLayer(Layer& L, const float* z, std::uint32_t Tt, const std::vector<Seg>& segs, float* out_h) {
