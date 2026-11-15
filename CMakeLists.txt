@@ -189,6 +189,8 @@ target_link_libraries(gufo_core PUBLIC ICU::uc ICU::i18n Threads::Threads
   PNG::PNG JPEG::JPEG PkgConfig::WEBP CURL::libcurl OpenSSL::Crypto)
 
 add_subdirectory(src/models/qwen)
+add_subdirectory(src/models/lfm3)
+add_subdirectory(src/models/d1)
 add_subdirectory(src/models/qwen_image_21)
 
 target_link_libraries(gufo_qwen3_tts PUBLIC gufo_core)
@@ -266,6 +268,64 @@ add_library(gufo_http STATIC
 )
 target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_qwen3_tts
   gufo_qwen3_asr gufo_qwen_image_21 gufo_qwen38_flash_next)
+
+option(GUFO_BUILD_NPU_ENGINE "Build gufo-npu, the GPU-free NPU engine" OFF)
+if (GUFO_BUILD_NPU_ENGINE)
+  find_package(OpenMP REQUIRED COMPONENTS CXX)
+  set(GUFO_XRT_INCLUDE_DIR "" CACHE PATH "Directory holding xrt/xrt_bo.h")
+  set(GUFO_XRT_LIB_DIR "/opt/xilinx/xrt/lib" CACHE PATH "XRT runtime libraries")
+  add_executable(gufo-npu
+    src/models/lfm3/npu/engine.cpp
+    src/npu/runtime/runtime.cpp
+    src/npu/model_spec.cpp
+    tools/npu/decode_int5/gufo_npu_main.cpp)
+  target_include_directories(gufo-npu PRIVATE ${PROJECT_SOURCE_DIR} ${GUFO_XRT_INCLUDE_DIR})
+  target_compile_options(gufo-npu PRIVATE -O3 -march=native -ffast-math -fno-finite-math-only)
+  target_link_libraries(gufo-npu PRIVATE gufo_lfm3 OpenMP::OpenMP_CXX
+    ${GUFO_XRT_LIB_DIR}/libxrt_coreutil.so.2 ${GUFO_XRT_LIB_DIR}/libxrt_core.so.2)
+  add_executable(gufo-gen
+    src/models/lfm3/npu/engine.cpp
+    src/npu/runtime/runtime.cpp
+    src/npu/model_spec.cpp
+    tools/npu/gen/gufo_gen.cpp)
+  target_include_directories(gufo-gen PRIVATE ${PROJECT_SOURCE_DIR} ${GUFO_XRT_INCLUDE_DIR})
+  target_compile_options(gufo-gen PRIVATE -O3 -march=native -ffast-math -fno-finite-math-only)
+  target_link_libraries(gufo-gen PRIVATE gufo_lfm3 gufo_lfm3_reference gufo_d1_prompt OpenMP::OpenMP_CXX
+    ${GUFO_XRT_LIB_DIR}/libxrt_coreutil.so.2 ${GUFO_XRT_LIB_DIR}/libxrt_core.so.2)
+  add_executable(sbtest-prefill
+    src/npu/runtime/runtime.cpp
+    tools/npu/decode_int5/sbtest_prefill.cpp)
+  target_include_directories(sbtest-prefill PRIVATE ${PROJECT_SOURCE_DIR} ${GUFO_XRT_INCLUDE_DIR})
+  target_compile_options(sbtest-prefill PRIVATE -O3 -march=native -ffast-math -fno-finite-math-only)
+  target_link_libraries(sbtest-prefill PRIVATE OpenMP::OpenMP_CXX
+    ${GUFO_XRT_LIB_DIR}/libxrt_coreutil.so.2 ${GUFO_XRT_LIB_DIR}/libxrt_core.so.2)
+  add_executable(sbtest-gemm64
+    src/npu/runtime/runtime.cpp
+    tools/npu/decode_int5/sbtest_gemm64.cpp)
+  add_executable(sbtest-ffn64
+    src/npu/runtime/runtime.cpp
+    tools/npu/decode_int5/sbtest_ffn64.cpp)
+  add_executable(sbtest-ffn64b
+    src/npu/runtime/runtime.cpp
+    tools/npu/decode_int5/sbtest_ffn64b.cpp)
+  target_include_directories(sbtest-gemm64 PRIVATE ${PROJECT_SOURCE_DIR} ${GUFO_XRT_INCLUDE_DIR})
+  target_compile_options(sbtest-gemm64 PRIVATE -O3 -march=native -ffast-math -fno-finite-math-only)
+  target_link_libraries(sbtest-gemm64 PRIVATE OpenMP::OpenMP_CXX
+    ${GUFO_XRT_LIB_DIR}/libxrt_coreutil.so.2 ${GUFO_XRT_LIB_DIR}/libxrt_core.so.2)
+  target_include_directories(sbtest-ffn64 PRIVATE ${PROJECT_SOURCE_DIR} ${GUFO_XRT_INCLUDE_DIR})
+  target_include_directories(sbtest-ffn64b PRIVATE ${PROJECT_SOURCE_DIR} ${GUFO_XRT_INCLUDE_DIR})
+  target_compile_options(sbtest-ffn64 PRIVATE -O3 -march=native -ffast-math -fno-finite-math-only)
+  target_compile_options(sbtest-ffn64b PRIVATE -O3 -march=native -ffast-math -fno-finite-math-only)
+  target_link_libraries(sbtest-ffn64 PRIVATE OpenMP::OpenMP_CXX
+    ${GUFO_XRT_LIB_DIR}/libxrt_coreutil.so.2 ${GUFO_XRT_LIB_DIR}/libxrt_core.so.2)
+  target_link_libraries(sbtest-ffn64b PRIVATE OpenMP::OpenMP_CXX
+    ${GUFO_XRT_LIB_DIR}/libxrt_coreutil.so.2 ${GUFO_XRT_LIB_DIR}/libxrt_core.so.2)
+  add_executable(rmsnorm-ref-test
+    tools/npu/decode_int5/rmsnorm_ref_test.cpp)
+  target_include_directories(rmsnorm-ref-test PRIVATE ${PROJECT_SOURCE_DIR})
+  target_compile_options(rmsnorm-ref-test PRIVATE -O3 -march=native -ffast-math -fno-finite-math-only)
+  target_link_libraries(rmsnorm-ref-test PRIVATE OpenMP::OpenMP_CXX)
+endif()
 
 add_executable(gufo
   src/cli/main.cpp

@@ -1,0 +1,50 @@
+{
+  "name": "Example-Dense-GQA-LlamaStyle",
+  "hidden": 2048,
+  "layers": 2,
+  "context": 4096,
+  "norm_eps": 1e-5,
+  "rope_theta": 500000.0,
+  "eos_id": 2,
+  "output_norm": "model.norm.weight",
+  "embedding": { "tensor": "model.embed_tokens.weight", "bits": "q8_0", "tied_output": false },
+  "notes": "Second dense model description (WP6 generality proof). Dense GQA transformer (Llama/Qwen3-style): RMSNorm, RoPE, SwiGLU, no conv/hybrid, no per-head gate. Uses only existing GEMM program shapes where they fit; mismatched shapes reported with padding/constraints (K%64==0, N%1024==0).",
+  "layer_specs": [
+    {
+      "kind": "attention",
+      "norm": "input_layernorm.weight",
+      "post_norm": "",
+      "ffn_norm": "post_attention_layernorm.weight",
+      "post_ffn_norm": "",
+      "attention": {
+        "heads": 16, "kv_heads": 4, "head_dim": 128, "window": 0,
+        "rope": "normal", "rope_theta": 500000.0, "qk_norm": false, "has_gate": false,
+        "q_proj": "self_attn.q_proj.weight", "k_proj": "self_attn.k_proj.weight",
+        "v_proj": "self_attn.v_proj.weight", "o_proj": "self_attn.o_proj.weight"
+      },
+      "ffn": { "kind": "swiglu", "intermediate": 8192,
+        "gate": "mlp.gate_proj.weight", "up": "mlp.up_proj.weight", "down": "mlp.down_proj.weight" }
+    },
+    {
+      "kind": "attention",
+      "norm": "input_layernorm.weight",
+      "post_norm": "",
+      "ffn_norm": "post_attention_layernorm.weight",
+      "post_ffn_norm": "",
+      "attention": {
+        "heads": 16, "kv_heads": 4, "head_dim": 128, "window": 0,
+        "rope": "normal", "rope_theta": 500000.0, "qk_norm": false, "has_gate": false,
+        "q_proj": "self_attn.q_proj.weight", "k_proj": "self_attn.k_proj.weight",
+        "v_proj": "self_attn.v_proj.weight", "o_proj": "self_attn.o_proj.weight"
+      },
+      "ffn": { "kind": "swiglu", "intermediate": 8192,
+        "gate": "mlp.gate_proj.weight", "up": "mlp.up_proj.weight", "down": "mlp.down_proj.weight" }
+    }
+  ],
+  "constraint_report": [
+    "qkv projection N = heads*hd + 2*kv_heads*hd = 2048+512+512 = 3072 (multiple of 1024) -> fits plain 2048x3072 program.",
+    "o_proj N = 2048 -> fits plain 2048x2048.",
+    "FFN intermediate 8192 != 7680: fused FFN kernel constants assume N1=15360 (gate+up, 2*7680) and K2=7680. For I=8192 need N1=16384, K2=8192 (both %1024/%64 ok) but requires rebuilding xclbin/instruction streams with those constants (one xclbin build per model shape set).",
+    "No conv layers, no attention gate, no sliding-window mix in this example -> CPU glue path is the dense-GQA subset of the existing runtime."
+  ]
+}

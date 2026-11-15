@@ -4537,8 +4537,9 @@ __device__ __forceinline__ __attribute__((convergent)) void SyncLds() {
 // sparse selection: keys at or past the query's incomplete tail block are
 // always visible, earlier blocks only when their bit is set.
 // Debug probes for the fused attention kernel (inf/NaN counters filled through
-// `dbg`, printed when GUFO_ATTN_DBG=1). Compiled out by default: they sit inside
-// the key sweep and cost register pressure and speed at depth even when unused.
+// `dbg`, printed when GUFO_ATTN_DBG=1). Compiled out by default: they sit
+// inside the key sweep and cost register pressure and speed at depth even when
+// unused.
 #ifndef GUFO_ATTN_PROBE
 #define GUFO_ATTN_PROBE 0
 #endif

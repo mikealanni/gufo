@@ -1,0 +1,302 @@
+{
+  "name": "LFM3-1.7B",
+  "hidden": 2048,
+  "layers": 24,
+  "context": 262144,
+  "norm_eps": 1e-05,
+  "rope_theta": 1000000.0,
+  "rope_theta_swa": 10000.0,
+  "eos_id": 7,
+  "output_norm": "output_norm.weight",
+  "rope_freqs": "rope_freqs.weight",
+  "embedding": {
+    "tensor": "token_embd.weight",
+    "bits": "q8_0",
+    "tied_output": true
+  },
+  "layer_specs": [
+    {
+      "kind": "conv",
+      "conv": {
+        "width": 7
+      }
+    },
+    {
+      "kind": "conv",
+      "conv": {
+        "width": 7
+      }
+    },
+    {
+      "kind": "attention",
+      "attention": {
+        "heads": 16,
+        "kv_heads": 4,
+        "head_dim": 128,
+        "window": 0,
+        "rope": "normal",
+        "rope_theta": 1000000.0,
+        "has_gate": true
+      },
+      "ffn": {
+        "kind": "swiglu",
+        "intermediate": 7680
+      }
+    },
+    {
+      "kind": "conv",
+      "conv": {
+        "width": 7
+      }
+    },
+    {
+      "kind": "attention",
+      "attention": {
+        "heads": 16,
+        "kv_heads": 4,
+        "head_dim": 128,
+        "window": 256,
+        "rope": "normal",
+        "rope_theta": 10000.0,
+        "has_gate": true
+      },
+      "ffn": {
+        "kind": "swiglu",
+        "intermediate": 7680
+      }
+    },
+    {
+      "kind": "conv",
+      "conv": {
+        "width": 7
+      }
+    },
+    {
+      "kind": "attention",
+      "attention": {
+        "heads": 16,
+        "kv_heads": 4,
+        "head_dim": 128,
+        "window": 0,
+        "rope": "normal",
+        "rope_theta": 1000000.0,
+        "has_gate": true
+      },
+      "ffn": {
+        "kind": "swiglu",
+        "intermediate": 7680
+      }
+    },
+    {
+      "kind": "conv",
+      "conv": {
+        "width": 7
+      }
+    },
+    {
+      "kind": "attention",
+      "attention": {
+        "heads": 16,
+        "kv_heads": 4,
+        "head_dim": 128,
+        "window": 256,
+        "rope": "normal",
+        "rope_theta": 10000.0,
+        "has_gate": true
+      },
+      "ffn": {
+        "kind": "swiglu",
+        "intermediate": 7680
+      }
+    },
+    {
+      "kind": "conv",
+      "conv": {
+        "width": 7
+      }
+    },
+    {
+      "kind": "attention",
+      "attention": {
+        "heads": 16,
+        "kv_heads": 4,
+        "head_dim": 128,
+        "window": 0,
+        "rope": "normal",
+        "rope_theta": 1000000.0,
+        "has_gate": true
+      },
+      "ffn": {
+        "kind": "swiglu",
+        "intermediate": 7680
+      }
+    },
+    {
+      "kind": "conv",
+      "conv": {
+        "width": 7
+      }
+    },
+    {
+      "kind": "attention",
+      "attention": {
+        "heads": 16,
+        "kv_heads": 4,
+        "head_dim": 128,
+        "window": 256,
+        "rope": "normal",
+        "rope_theta": 10000.0,
+        "has_gate": true
+      },
+      "ffn": {
+        "kind": "swiglu",
+        "intermediate": 7680
+      }
+    },
+    {
+      "kind": "conv",
+      "conv": {
+        "width": 7
+      }
+    },
+    {
+      "kind": "attention",
+      "attention": {
+        "heads": 16,
+        "kv_heads": 4,
+        "head_dim": 128,
+        "window": 0,
+        "rope": "normal",
+        "rope_theta": 1000000.0,
+        "has_gate": true
+      },
+      "ffn": {
+        "kind": "swiglu",
+        "intermediate": 7680
+      }
+    },
+    {
+      "kind": "conv",
+      "conv": {
+        "width": 7
+      }
+    },
+    {
+      "kind": "attention",
+      "attention": {
+        "heads": 16,
+        "kv_heads": 4,
+        "head_dim": 128,
+        "window": 256,
+        "rope": "normal",
+        "rope_theta": 10000.0,
+        "has_gate": true
+      },
+      "ffn": {
+        "kind": "swiglu",
+        "intermediate": 7680
+      }
+    },
+    {
+      "kind": "conv",
+      "conv": {
+        "width": 7
+      }
+    },
+    {
+      "kind": "attention",
+      "attention": {
+        "heads": 16,
+        "kv_heads": 4,
+        "head_dim": 128,
+        "window": 0,
+        "rope": "normal",
+        "rope_theta": 1000000.0,
+        "has_gate": true
+      },
+      "ffn": {
+        "kind": "swiglu",
+        "intermediate": 7680
+      }
+    },
+    {
+      "kind": "conv",
+      "conv": {
+        "width": 7
+      }
+    },
+    {
+      "kind": "attention",
+      "attention": {
+        "heads": 16,
+        "kv_heads": 4,
+        "head_dim": 128,
+        "window": 256,
+        "rope": "normal",
+        "rope_theta": 10000.0,
+        "has_gate": true
+      },
+      "ffn": {
+        "kind": "swiglu",
+        "intermediate": 7680
+      }
+    },
+    {
+      "kind": "conv",
+      "conv": {
+        "width": 7
+      }
+    },
+    {
+      "kind": "attention",
+      "attention": {
+        "heads": 16,
+        "kv_heads": 4,
+        "head_dim": 128,
+        "window": 0,
+        "rope": "normal",
+        "rope_theta": 1000000.0,
+        "has_gate": true
+      },
+      "ffn": {
+        "kind": "swiglu",
+        "intermediate": 7680
+      }
+    },
+    {
+      "kind": "conv",
+      "conv": {
+        "width": 7
+      }
+    }
+  ],
+  "notes": "LFM3 first-model spec instance. 24 layers: 13 shortconv (kv_heads=0) + 6 full-attention + 5 sliding-window (window 256). Conv tap count = shortconv.l_cache = 7. Layer pattern is also read from GGUF config by the engine; layer_specs here is the explicit neutral description.",
+  "programs": [
+    {
+      "mode": "plain",
+      "K": 2048,
+      "N": 6144,
+      "inst": "insts_plain_2048x6144.txt"
+    },
+    {
+      "mode": "plain",
+      "K": 2048,
+      "N": 3072,
+      "inst": "insts_plain_2048x3072.txt"
+    },
+    {
+      "mode": "plain",
+      "K": 2048,
+      "N": 2048,
+      "inst": "insts_plain_2048x2048.txt"
+    },
+    {
+      "mode": "ffn",
+      "K1": 2048,
+      "N1": 15360,
+      "K2": 7680,
+      "N2": 2048,
+      "inst": "insts_ffn.txt"
+    }
+  ]
+}

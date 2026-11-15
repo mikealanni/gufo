@@ -94,6 +94,11 @@ bool NpuGemm::Wait(hipStream_t /*stream*/, std::uint64_t /*ticket*/) {
   return false;
 }
 
+bool NpuGemm::RunSync(hipStream_t /*stream*/, int /*a_id*/, int /*b_id*/,
+                      int /*c_id*/, int /*program*/) {
+  return false;
+}
+
 bool NpuGemm::Wait(hipStream_t /*stream*/) {
   return false;
 }

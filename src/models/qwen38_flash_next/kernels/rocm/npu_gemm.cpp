@@ -691,6 +691,24 @@ bool NpuGemm::Submit(hipStream_t stream, int a_id, const int* b_ids,
   return true;
 }
 
+bool NpuGemm::RunSync(hipStream_t stream, int a_id, int b_id, int c_id,
+                      int program) {
+  auto* call =
+      new Call{impl_.get(), a_id, {b_id}, {c_id}, ++impl_->submitted, program};
+  const hipError_t status = hipLaunchHostFunc(
+      stream,
+      [](void* data) {
+        std::unique_ptr<Call> c(static_cast<Call*>(data));
+        static_cast<Impl*>(c->impl)->Process(*c);
+      },
+      call);
+  if (status != hipSuccess) {
+    delete call;
+    return false;
+  }
+  return true;
+}
+
 void* NpuGemm::Staged(hipStream_t /*stream*/, int id) {
   return impl_->buffers.at(id).device;
 }

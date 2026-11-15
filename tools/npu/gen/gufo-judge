@@ -1,0 +1,18 @@
+#!/bin/bash
+# Drop-in for `gufo judge --model MODEL --stdio` (the jev guard protocol) running on the generic NPU engine.
+# Point the guard at it with --gufo-bin. Environment: GUFO_JUDGE_QDIR (optional GPTQ weights for the decode path).
+ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
+# Any other gufo subcommand (serve, bench, ...) goes to the real binary, so the guard can use this one for everything.
+if [ "$1" != "judge" ]; then exec "${GUFO_REAL_BIN:-$HOME/gufo/build/release/gufo}" "$@"; fi
+model=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --model) model=$2; shift 2 ;;
+    judge|--stdio) shift ;;
+    *) shift ;;
+  esac
+done
+export LD_LIBRARY_PATH=$HOME/npu-work/boostshim:/opt/xilinx/xrt/lib
+export GEN_KD=${GEN_KD-1} GUFO_ATB=${GUFO_ATB-1} GEN_HOST_CTX=${GEN_HOST_CTX-512} GEN_KD_MIN=${GEN_KD_MIN-512}
+export GOMP_SPINCOUNT=${GOMP_SPINCOUNT-1000} OMP_NUM_THREADS=${OMP_NUM_THREADS-8}
+exec ~/npu-lock.sh "$ROOT/build/npu/gufo-gen" judge-stdio "$model" "$ROOT/tools/npu/decode_int5/runtime"
