@@ -1267,6 +1267,7 @@ struct Engine {
   }
 
   void Step(const std::uint32_t* tok, std::uint32_t n, std::vector<float>* hidden) {
+    step_start = pos;
     omp_set_num_threads(n <= 2 ? dec_threads : pre_threads);
     const std::uint32_t H = c.hidden, qd = c.heads * c.head_dim, kvd = c.kv_heads * c.head_dim;
     const std::uint32_t qkv_n = qd + 2 * kvd, qkv_p = PadN(qkv_n), h_p = PadN(H);
@@ -1491,6 +1492,27 @@ struct Engine {
     }
   }
 
+  // Lossless speculation: a step may carry draft rows; Commit keeps the accepted prefix (KV past it is overwritten later).
+  static constexpr bool kSpec = true;
+  std::uint32_t step_start{0};
+  void Commit(std::uint32_t k) {
+    pos = step_start + k;
+    for (auto& L : layers)
+      for (auto& np : L.napps) np = std::min(np, pos);
+  }
+  void ArgmaxRows(const float* hid, std::uint32_t rows, std::uint32_t* out) {
+    if (npu_argmax && rows <= 16) {
+      rt.Argmax(p_argmax, w_argmax, hid, rows, out, &tim);
+      bool ok = true;
+      for (std::uint32_t r = 0; r < rows; ++r) ok = ok && out[r] < c.vocab;
+      if (ok) return;
+    }
+    for (std::uint32_t r = 0; r < rows; ++r) out[r] = Argmax(hid + std::size_t{r} * c.hidden);
+  }
+  bool LoadHeads(const std::string&) { return false; }
+  std::uint32_t HeadCount() const { return 0; }
+  void Draft(const float*, std::uint32_t*) {}
+
   std::uint32_t Argmax(const float* h) {
     std::uint32_t id = 0;
     if (npu_argmax) {
@@ -1608,6 +1630,7 @@ struct HybridEngine : Engine {
   std::vector<LmState> lm;
   std::vector<std::uint16_t> head_bf;  // output projection, bf16 (vocab x hidden)
   bool lm_mode{false};
+  static constexpr bool kSpec = false;  // delta-net state cannot be rolled back cheaply
   bool moe{false};
   std::uint32_t n_exp{0}, n_used{0};
   bool dec_ok{false};   // int5 stream-bound decode path available (language-model mode)
@@ -2872,10 +2895,24 @@ struct Lfm3Engine {
       std::fprintf(stderr, "lfm3 engine: step failed\n");
       std::exit(3);
     }
-    e->Commit(n);
     c.hidden = static_cast<std::uint32_t>(hidden->size() / n);
   }
   std::uint32_t Argmax(const float* hid) { return e->Argmax(hid); }
+  // Lossless speculation: a step may carry draft rows; Commit keeps the accepted prefix (conv history and position).
+  static constexpr bool kSpec = true;
+  void Commit(std::uint32_t k) { e->Commit(k); }
+  void ArgmaxRows(const float* hid, std::uint32_t rows, std::uint32_t* out) { e->ArgmaxRows(hid, rows, out); }
+  bool LoadHeads(const std::string& path) {
+    std::string err;
+    if (!e->LoadHeads(path, &err)) {
+      std::fprintf(stderr, "%s\n", err.c_str());
+      return false;
+    }
+    e->LimitHeads(2);
+    return true;
+  }
+  std::uint32_t HeadCount() const { return e->HeadCount(); }
+  void Draft(const float* hid, std::uint32_t* out) { e->Draft(hid, out); }
 };
 
 // What chat needs from a tokenizer, whatever the model family.
@@ -2923,6 +2960,12 @@ bool MakeChatTok(const gufo::core::GgufReader& reader, const std::string& arch, 
 }
 
 template <class E>
+constexpr bool kSpecEngine = [] {
+  if constexpr (requires { E::kSpec; }) return E::kSpec;
+  else return false;
+}();
+
+template <class E>
 int ChatT(const char* model, const char* programs, const std::string& prompt, std::uint32_t max_new, bool bench_synth, std::uint32_t bench_prompt) {
   std::string e;
   auto reader = gufo::core::GgufReader::OpenFile(model, &e);
@@ -2948,13 +2991,81 @@ int ChatT(const char* model, const char* programs, const std::string& prompt, st
   for (std::uint32_t o = 0, m = 0; o < ids.size(); o += m) {
     m = g.Chunk(static_cast<std::uint32_t>(ids.size()) - o);
     g.Step(&ids[o], m, &hd);
+    if constexpr (kSpecEngine<E>) g.Commit(m);
   }
   std::uint32_t next = g.Argmax(&hd[hd.size() - g.c.hidden]);
   const double pf = Ms(t0);
   const auto t1 = Clock::now();
   std::uint32_t produced = 0;
   std::string out;
-  for (std::uint32_t i = 0; i < max_new; ++i) {
+  const bool use_spec = kSpecEngine<E> && !std::getenv("GEN_NO_SPEC");
+  if constexpr (kSpecEngine<E>) {
+   if (use_spec) {
+    // Prompt-lookup drafts (longest recent n-gram match, then the tokens that followed it) plus the engine's draft heads, verified in one pass.
+    if (const char* hp = std::getenv("GEN_HEADS")) g.LoadHeads(hp);
+    const std::size_t max_fed = std::getenv("GEN_MAXFED") ? std::stoul(std::getenv("GEN_MAXFED")) : 16;
+    std::vector<std::uint32_t> hist = ids, head_draft, pred;
+    bool done = false;
+    const std::uint32_t hidden = g.c.hidden;
+    while (!done && produced < max_new) {
+      if (!bench_synth && ct.stop(next)) break;
+      ++produced;
+      hist.push_back(next);
+      if (!bench_synth) {
+        std::fputs(ct.piece(next).c_str(), stdout);
+        std::fflush(stdout);
+      }
+      std::vector<std::uint32_t> fed = {next};
+      const std::size_t hn = hist.size();
+      for (std::size_t m = std::min<std::size_t>(5, hn - 1); m >= 2 && fed.size() == 1; --m)
+        for (std::size_t p = hn - 1; p-- > m;) {
+          bool same = true;
+          for (std::size_t q = 0; q < m && same; ++q) same = hist[p - q] == hist[hn - 1 - q];
+          if (same) {
+            for (std::size_t q = p + 1; q < hn && fed.size() < max_fed; ++q) fed.push_back(hist[q]);
+            break;
+          }
+        }
+      if (fed.size() == 1)
+        for (auto t : head_draft)
+          if (fed.size() < max_fed) fed.push_back(t);
+      g.Step(fed.data(), static_cast<std::uint32_t>(fed.size()), &hd);
+      pred.assign(fed.size(), 0);
+      std::size_t have = 0, j = 0;
+      for (;;) {  // greedy rows are produced lazily: the first few, then the rest only while drafts keep matching
+        const std::size_t want = std::min<std::size_t>(fed.size(), have == 0 ? 4 : fed.size());
+        if (want > have) {
+          g.ArgmaxRows(hd.data() + have * hidden, static_cast<std::uint32_t>(want - have), pred.data() + have);
+          have = want;
+        }
+        while (j + 1 < fed.size() && j < have && pred[j] == fed[j + 1]) ++j;
+        if (j >= have && have < fed.size()) continue;
+        break;
+      }
+      for (std::size_t q = 1; q <= j && !done && produced < max_new; ++q) {
+        if (!bench_synth && ct.stop(fed[q])) {
+          done = true;
+          break;
+        }
+        ++produced;
+        hist.push_back(fed[q]);
+        if (!bench_synth) {
+          std::fputs(ct.piece(fed[q]).c_str(), stdout);
+          std::fflush(stdout);
+        }
+      }
+      g.Commit(static_cast<std::uint32_t>(j + 1));
+      if (j >= have) pred[j] = 0;
+      next = pred[j];
+      head_draft.clear();
+      if (g.HeadCount() && !done) {
+        head_draft.resize(g.HeadCount());
+        g.Draft(hd.data() + j * hidden, head_draft.data());
+      }
+    }
+   }
+  }
+  for (std::uint32_t i = 0; !use_spec && i < max_new; ++i) {
     if (std::getenv("GEN_TRACE")) std::fprintf(stderr, "[tok %u]", next);
     if (!bench_synth && ct.stop(next)) break;
     ++produced;
@@ -2964,6 +3075,7 @@ int ChatT(const char* model, const char* programs, const std::string& prompt, st
       std::fflush(stdout);
     }
     g.Step(&next, 1, &hd);
+    if constexpr (kSpecEngine<E>) g.Commit(1);
     next = g.Argmax(hd.data());
   }
   const double dc = Ms(t1);
