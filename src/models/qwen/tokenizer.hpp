@@ -144,6 +144,7 @@ private:
   TokenId endoftext_token_id_{kInvalidTokenId};
   TokenId pad_token_id_{kInvalidTokenId};
   PreTokenizer pre_tokenizer_{PreTokenizer::kNone};
+  std::size_t digit_group_{1};
 };
 
 }  // namespace gufo::tokenization
