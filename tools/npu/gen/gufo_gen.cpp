@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <iterator>
 #include <memory>
 #include <string>
@@ -948,7 +949,90 @@ int Chat(const char* model, const char* programs, const std::string& prompt, std
   return 0;
 }
 
+int Interactive(const char* model, const char* programs) {
+  std::string e;
+  auto reader = gufo::core::GgufReader::OpenFile(model, &e);
+  if (!reader) {
+    std::fprintf(stderr, "gguf: %s\n", e.c_str());
+    return 1;
+  }
+  auto tok = gufo::tokenization::QwenTokenizer::CreateFromGguf(*reader, &e);
+  if (!tok) {
+    std::fprintf(stderr, "tokenizer: %s\n", e.c_str());
+    return 1;
+  }
+  const std::uint32_t ctx = std::getenv("GEN_CTX") ? static_cast<std::uint32_t>(std::atoi(std::getenv("GEN_CTX"))) : 8192;
+  const std::uint32_t max_new = std::getenv("GEN_MAXNEW") ? static_cast<std::uint32_t>(std::atoi(std::getenv("GEN_MAXNEW"))) : 512;
+  std::vector<std::uint32_t> stop;
+  if (auto eo = reader->GetMetadataUint32("tokenizer.ggml.eos_token_id")) stop.push_back(*eo);
+  for (const char* sp : {"<|im_end|>", "<|endoftext|>"}) {
+    const auto v = tok->Encode(sp);
+    if (v.size() == 1) stop.push_back(v[0]);
+  }
+  const bool nothink = std::getenv("GEN_THINK") == nullptr && tok->Encode("<think>").size() == 1;
+  bool bos = false;
+  if (const auto tmpl = reader->GetMetadataString("tokenizer.chat_template"))
+    bos = tmpl->rfind("{{- bos_token", 0) == 0 || tmpl->rfind("{{ bos_token", 0) == 0;
+  Engine g;
+  if (!g.Init(model, programs, ctx)) return 1;
+  std::vector<float> hd;
+  auto feed = [&](const std::vector<std::uint32_t>& ids) {
+    for (std::uint32_t o = 0, m = 0; o < ids.size(); o += m) {
+      m = g.Chunk(static_cast<std::uint32_t>(ids.size()) - o);
+      g.Step(&ids[o], m, &hd);
+    }
+  };
+  std::fprintf(stderr, "ready. type a message and press Enter; empty line or Ctrl-D quits. /reset starts a new conversation. (the NPU stays locked while this runs)\n");
+  bool first = true;
+  std::string line;
+  for (;;) {
+    std::fprintf(stderr, "\n> ");
+    if (!std::getline(std::cin, line) || line.empty()) break;
+    if (line == "/reset") {
+      g.Reset();
+      first = true;
+      std::fprintf(stderr, "(conversation reset)\n");
+      continue;
+    }
+    std::vector<std::uint32_t> ids;
+    if (first && bos)
+      if (auto b = reader->GetMetadataUint32("tokenizer.ggml.bos_token_id")) ids.push_back(*b);
+    std::string text = "<|im_start|>user\n" + line + "<|im_end|>\n<|im_start|>assistant\n";
+    if (nothink) text += "<think>\n\n</think>\n\n";
+    for (auto t : tok->Encode(text)) ids.push_back(t);
+    first = false;
+    if (g.pos + ids.size() + max_new + 8 > ctx) {
+      std::fprintf(stderr, "(context full, resetting conversation)\n");
+      g.Reset();
+      ids.clear();
+      if (bos)
+        if (auto b = reader->GetMetadataUint32("tokenizer.ggml.bos_token_id")) ids.push_back(*b);
+      for (auto t : tok->Encode(text)) ids.push_back(t);
+    }
+    const auto t0 = Clock::now();
+    feed(ids);
+    std::uint32_t next = g.Argmax(&hd[hd.size() - g.c.hidden]);
+    const double pf = Ms(t0);
+    const auto t1 = Clock::now();
+    std::uint32_t produced = 0;
+    for (std::uint32_t i = 0; i < max_new && g.pos + 2 < ctx; ++i) {
+      if (std::find(stop.begin(), stop.end(), next) != stop.end()) break;
+      ++produced;
+      std::fputs(tok->DecodeTokenCopy(next).c_str(), stdout);
+      std::fflush(stdout);
+      g.Step(&next, 1, &hd);
+      next = g.Argmax(hd.data());
+    }
+    const double dc = Ms(t1);
+    std::printf("\n");
+    feed(tok->Encode("<|im_end|>\n"));
+    std::fprintf(stderr, "[prefill %zu tok %.0f ms (%.0f tok/s) | decode %u tok %.2f tok/s | context %u]\n", ids.size(), pf, ids.size() / pf * 1000, produced, produced / dc * 1000, g.pos);
+  }
+  return 0;
+}
+
 int main(int argc, char** argv) {
+  if (argc >= 4 && std::string(argv[1]) == "interactive") return Interactive(argv[2], argv[3]);
   if (argc >= 5 && std::string(argv[1]) == "chat") return Chat(argv[2], argv[3], argv[4], argc > 5 ? std::atoi(argv[5]) : 256, false, 0);
   if (argc >= 5 && std::string(argv[1]) == "bench") return Chat(argv[2], argv[3], "", static_cast<std::uint32_t>(std::atoi(argv[5 < argc ? 5 : 4])), true, static_cast<std::uint32_t>(std::atoi(argv[4])));
   if (argc == 6 && std::string(argv[1]) == "gemmtest") return GemmTest(argv[2], argv[3], std::atoi(argv[4]), std::atoi(argv[5]));

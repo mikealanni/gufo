@@ -1,5 +1,6 @@
 #!/bin/bash
-# usage: run_gen.sh chat MODEL.gguf "prompt" [max_new]
+# usage: run_gen.sh interactive MODEL.gguf            (type messages, multi-turn)
+#        run_gen.sh chat MODEL.gguf "prompt" [max_new]
 #        run_gen.sh bench MODEL.gguf PROMPT_TOKENS NEW_TOKENS
 # Prefill uses the 1024-row path by default (GEN_KD=1 GUFO_ATB=1); set GEN_KD= to disable.
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
