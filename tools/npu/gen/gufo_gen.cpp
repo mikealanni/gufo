@@ -25,6 +25,8 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
 #include "src/models/lfm3/weights.hpp"
+#include "src/models/lfm3/npu/engine.hpp"
+#include "src/models/lfm3/tokenizer.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 #include "src/npu/runtime/runtime.hpp"
 
@@ -2686,6 +2688,89 @@ int GemmTest(const char* prog_dir, const char* inst, std::uint32_t K, std::uint3
   return 0;
 }
 
+// LFM3 (conv + attention hybrid) runs on the specialised NPU engine behind the same Init/Step/Argmax surface as the other engines.
+struct Lfm3Engine {
+  std::unique_ptr<gufo::models::lfm3::npu::Engine> e;
+  struct Cfg {
+    std::uint32_t hidden{0};
+  } c;
+  double ph[24]{};
+  NpuRuntime::Timings tim{};
+  std::uint64_t bad_head_rows{0};
+  int dec_threads{std::getenv("GEN_DEC_THREADS") ? std::atoi(std::getenv("GEN_DEC_THREADS")) : 2};
+  int pre_threads{std::getenv("GEN_PRE_THREADS") ? std::atoi(std::getenv("GEN_PRE_THREADS")) : 12};
+
+  bool Init(const std::string& model, const std::string& programs, std::uint32_t context) {
+    // The 1024-row prefill path of the engine is selected by environment; default it on like the other engines do.
+    setenv("GUFO_ATB", "1", 0);
+    setenv("GUFO_ATB_KDYN", "1", 0);
+    gufo::models::lfm3::npu::Options opt;
+    opt.gguf = model;
+    opt.programs = programs;
+    opt.context = context;
+    std::string err;
+    e = gufo::models::lfm3::npu::Engine::Create(opt, &err);
+    if (!e) std::fprintf(stderr, "lfm3 engine: %s\n", err.c_str());
+    return static_cast<bool>(e);
+  }
+  std::uint32_t Chunk(std::uint32_t remaining) const { return std::min(remaining, e->PrefillRows()); }
+  void Reset() { e->Reset(); }
+  void Step(const std::uint32_t* tok, std::uint32_t n, std::vector<float>* hidden) {
+    omp_set_num_threads(n <= 2 ? dec_threads : pre_threads);
+    if (!e->Step(std::span<const std::uint32_t>(tok, n), hidden)) {
+      std::fprintf(stderr, "lfm3 engine: step failed\n");
+      std::exit(3);
+    }
+    e->Commit(n);
+    c.hidden = static_cast<std::uint32_t>(hidden->size() / n);
+  }
+  std::uint32_t Argmax(const float* hid) { return e->Argmax(hid); }
+};
+
+// What chat needs from a tokenizer, whatever the model family.
+struct ChatTok {
+  std::function<std::vector<std::uint32_t>(const std::string&, bool)> prompt;  // user message -> prompt ids (with the assistant turn open)
+  std::function<std::string(std::uint32_t)> piece;
+  std::function<bool(std::uint32_t)> stop;
+};
+
+bool MakeChatTok(const gufo::core::GgufReader& reader, const std::string& arch, ChatTok* out, std::string* err) {
+  if (arch == "lfm3" || arch == "lfm2") {
+    auto tk = std::shared_ptr<gufo::models::lfm3::Tokenizer>(gufo::models::lfm3::Tokenizer::Load(reader, err).release());
+    if (!tk) return false;
+    const std::uint32_t eos = reader.GetMetadataUint32("tokenizer.ggml.eos_token_id").value_or(7);
+    out->prompt = [tk](const std::string& user, bool think) {
+      const std::vector<std::pair<std::string, std::string>> msgs{{"user", user}};
+      return tk->Encode(gufo::models::lfm3::Tokenizer::Render(msgs, think));
+    };
+    out->piece = [tk](std::uint32_t t) { return tk->Decode(std::span<const std::uint32_t>(&t, 1)); };
+    out->stop = [tk, eos](std::uint32_t t) { return t == eos || tk->IsStop(t); };
+    return true;
+  }
+  auto tk = std::shared_ptr<gufo::tokenization::QwenTokenizer>(gufo::tokenization::QwenTokenizer::CreateFromGguf(reader, err).release());
+  if (!tk) return false;
+  std::vector<std::uint32_t> stop_ids;
+  if (auto eo = reader.GetMetadataUint32("tokenizer.ggml.eos_token_id")) stop_ids.push_back(*eo);
+  for (const char* sp : {"<|im_end|>", "<|endoftext|>"}) {
+    const auto v = tk->Encode(sp);
+    if (v.size() == 1) stop_ids.push_back(v[0]);
+  }
+  std::vector<std::uint32_t> bos;
+  if (const auto tmpl = reader.GetMetadataString("tokenizer.chat_template"))
+    if (tmpl->rfind("{{- bos_token", 0) == 0 || tmpl->rfind("{{ bos_token", 0) == 0)
+      if (auto b = reader.GetMetadataUint32("tokenizer.ggml.bos_token_id")) bos.push_back(*b);
+  out->prompt = [tk, bos](const std::string& user, bool think) {
+    std::string text = "<|im_start|>user\n" + user + "<|im_end|>\n<|im_start|>assistant\n";
+    if (!think && tk->Encode("<think>").size() == 1) text += "<think>\n\n</think>\n\n";
+    std::vector<std::uint32_t> ids = bos;
+    for (auto t : tk->Encode(text)) ids.push_back(t);
+    return ids;
+  };
+  out->piece = [tk](std::uint32_t t) { return tk->DecodeTokenCopy(t); };
+  out->stop = [stop_ids](std::uint32_t t) { return std::find(stop_ids.begin(), stop_ids.end(), t) != stop_ids.end(); };
+  return true;
+}
+
 template <class E>
 int ChatT(const char* model, const char* programs, const std::string& prompt, std::uint32_t max_new, bool bench_synth, std::uint32_t bench_prompt) {
   std::string e;
@@ -2694,8 +2779,8 @@ int ChatT(const char* model, const char* programs, const std::string& prompt, st
     std::fprintf(stderr, "gguf: %s\n", e.c_str());
     return 1;
   }
-  auto tok = gufo::tokenization::QwenTokenizer::CreateFromGguf(*reader, &e);
-  if (!tok) {
+  ChatTok ct;
+  if (!MakeChatTok(*reader, std::string(reader->GetMetadataString("general.architecture").value_or("llama")), &ct, &e)) {
     std::fprintf(stderr, "tokenizer: %s\n", e.c_str());
     return 1;
   }
@@ -2703,19 +2788,7 @@ int ChatT(const char* model, const char* programs, const std::string& prompt, st
   if (bench_synth) {
     for (std::uint32_t i = 0; i < bench_prompt; ++i) ids.push_back(1000 + (i * 7919) % 5000);
   } else {
-    std::string text = "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
-    if (std::getenv("GEN_THINK") == nullptr && tok->Encode("<think>").size() == 1) text += "<think>\n\n</think>\n\n";
-    const auto tmpl = reader->GetMetadataString("tokenizer.chat_template");
-    if (tmpl && (tmpl->rfind("{{- bos_token", 0) == 0 || tmpl->rfind("{{ bos_token", 0) == 0)) {
-      if (auto b = reader->GetMetadataUint32("tokenizer.ggml.bos_token_id")) ids.push_back(*b);
-    }
-    for (auto t : tok->Encode(text)) ids.push_back(t);
-  }
-  std::vector<std::uint32_t> stop;
-  if (auto eo = reader->GetMetadataUint32("tokenizer.ggml.eos_token_id")) stop.push_back(*eo);
-  for (const char* sp : {"<|im_end|>", "<|endoftext|>"}) {
-    const auto v = tok->Encode(sp);
-    if (v.size() == 1) stop.push_back(v[0]);
+    ids = ct.prompt(prompt, std::getenv("GEN_THINK") != nullptr);
   }
   E g;
   if (!g.Init(model, programs, static_cast<std::uint32_t>(ids.size()) + max_new + 1024)) return 1;
@@ -2732,10 +2805,10 @@ int ChatT(const char* model, const char* programs, const std::string& prompt, st
   std::string out;
   for (std::uint32_t i = 0; i < max_new; ++i) {
     if (std::getenv("GEN_TRACE")) std::fprintf(stderr, "[tok %u]", next);
-    if (!bench_synth && std::find(stop.begin(), stop.end(), next) != stop.end()) break;
+    if (!bench_synth && ct.stop(next)) break;
     ++produced;
     if (!bench_synth) {
-      const std::string piece = tok->DecodeTokenCopy(next);
+      const std::string piece = ct.piece(next);
       std::fputs(piece.c_str(), stdout);
       std::fflush(stdout);
     }
@@ -2764,6 +2837,7 @@ int Chat(const char* model, const char* programs, const std::string& prompt, std
   }
   const auto arch = reader->GetMetadataString("general.architecture");
   if (arch && (*arch == "qwen35" || *arch == "qwen35moe")) return ChatT<HybridEngine>(model, programs, prompt, max_new, bench_synth, bench_prompt);
+  if (arch && (*arch == "lfm3" || *arch == "lfm2")) return ChatT<Lfm3Engine>(model, programs, prompt, max_new, bench_synth, bench_prompt);
   return ChatT<Engine>(model, programs, prompt, max_new, bench_synth, bench_prompt);
 }
 
