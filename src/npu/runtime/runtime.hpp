@@ -244,6 +244,8 @@ class NpuRuntime {
   // Model weight tensors are [N rows][K cols] (same as PackWeight), so W is the
   // model layout and the B stream is built as B[k][n] = W[n][k]. C comes back as
   // ATB bfp16 and is decoded to M x N row-major float.
+  /// Host-only pack of an N x K model-layout matrix into the ATB B stream (K * N / 8 * 9 bytes at dst).
+  static void PackAtbHost(const float* W, std::uint32_t N, std::uint32_t K, std::uint8_t* dst);
   WeightBuffer PackWeightAtb(const float* W, std::uint32_t N, std::uint32_t K,
                              int b_group = 3);
 

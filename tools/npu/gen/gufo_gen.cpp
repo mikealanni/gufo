@@ -18,6 +18,7 @@
 #include <iostream>
 #include <iterator>
 #include <memory>
+#include <numeric>
 #include <string>
 #include <vector>
 
@@ -305,6 +306,18 @@ struct MlpSlice {
   xrt::bo swc, swc2;
 };
 
+// Packed weights of every routed expert of one layer, concatenated; mapped from the weight cache (or held in memory when it is off).
+struct ExpertBlob {
+  std::vector<std::uint8_t> mem;
+  const std::uint8_t* mapped{nullptr};
+  std::size_t len{0};
+  ExpertBlob() = default;
+  ExpertBlob(const ExpertBlob&) = delete;
+  ExpertBlob& operator=(const ExpertBlob&) = delete;
+  ~ExpertBlob() { gufo::npu::runtime::WeightCache::Unmap(mapped, len); }
+  [[nodiscard]] const std::uint8_t* data() const { return mapped ? mapped : mem.data(); }
+};
+
 struct Layer {
   std::vector<float> attn_norm, ffn_norm;
   WeightBuffer qkv, out, ffn, ffn_dn;
@@ -321,6 +334,9 @@ struct Layer {
   // int5 decode path (language-model mode): stream-bound m16 programs on the decode xclbin
   WeightBuffer dq_in, dq_o, dq_gu, dq_dn;
   Program dp_in, dp_o, dp_gu, dp_dn;
+  // mixture of experts: router (experts x hidden), shared-expert gate (hidden), packed routed experts (1024-row path and int5 decode path)
+  std::vector<float> router, sh_gate;
+  std::shared_ptr<ExpertBlob> exp_kd, exp_q5;
   std::vector<std::vector<std::uint16_t>> khs, vhs;
 };
 
@@ -422,7 +438,8 @@ struct Engine {
       need(nm.kqkv + ".txt", gk + nm.kqkv + " " + n(I) + " " + base + "-K " + n(H) + " -N " + n(qkv_p));
       need(nm.ko + ".txt", gk + nm.ko + " " + n(I) + " " + base + "-K " + n(qd) + " -N " + n(h_p));
       need(nm.swa + ".txt", gk + nm.swa + " " + n(slice_i) + " " + base + "-K " + n(H) + " -N " + n(2 * half_a) + " --mode swigu --noff 0");
-      need(nm.swb + ".txt", gk + nm.swb + " " + n(slice_i) + " " + base + "-K " + n(H) + " -N " + n(2 * (slice_i - half_a)) + " --mode swigu --noff " + n(half_a / 64));
+      if (slice_i > half_a)
+        need(nm.swb + ".txt", gk + nm.swb + " " + n(slice_i) + " " + base + "-K " + n(H) + " -N " + n(2 * (slice_i - half_a)) + " --mode swigu --noff " + n(half_a / 64));
       need(nm.dn2 + ".txt", gk + nm.dn2 + " " + n(slice_i) + " " + base + "-K " + n(slice_i) + " -N " + n(h_p) + " --a2 1");
     }
   }
@@ -434,7 +451,7 @@ struct Engine {
     mlp_slices = (I + kMaxSliceInter - 1) / kMaxSliceInter;
     while (I % (mlp_slices * 512) != 0) ++mlp_slices;
     slice_i = I / mlp_slices;
-    half_a = (slice_i / 2) / 512 * 512;
+    half_a = slice_i < 1024 ? slice_i : (slice_i / 2) / 512 * 512;  // narrow MLPs (MoE experts) fit one fused program
   }
 
   bool Init(const std::string& model_dir, const std::string& programs, std::uint32_t context) {
@@ -912,7 +929,7 @@ struct Engine {
         });
       };
       m.kw_a = pack("a", 0, half_a);
-      m.kw_b = pack("b", half_a, half_b);
+      if (half_b) m.kw_b = pack("b", half_a, half_b);
       for (int set = 0; set < 2; ++set) {
         xrt::bo& sw = set ? m.swc2 : m.swc;
         sw = rk.MakeBo(2 * abytes, 3);
@@ -922,11 +939,13 @@ struct Engine {
         Program& pb = set ? m.kq_b2 : m.kq_b;
         Program& pd = set ? m.kq_d2 : m.kq_d;
         pa = rk.MakeProgram(H, 2 * half_a, programs + "/" + nm.swa + ".txt", 64, err, 0, 64, 3, 5);
-        pb = rk.MakeProgram(H, 2 * half_b, programs + "/" + nm.swb + ".txt", 64, err, 0, 64, 3, 5);
         pa.c = sw;
         pa.ch = sw.map<std::uint8_t*>();
-        pb.c = sw;
-        pb.ch = pa.ch;
+        if (half_b) {
+          pb = rk.MakeProgram(H, 2 * half_b, programs + "/" + nm.swb + ".txt", 64, err, 0, 64, 3, 5);
+          pb.c = sw;
+          pb.ch = pa.ch;
+        }
         pd = rk.MakeProgram(SI, h_p, programs + "/" + nm.dn2 + ".txt", std::size_t{1024} * h_p / 8 * 9, err, 0, 64, 3, 5);
         rk.RebindA(pd, sw);
         if (set == 0)
@@ -940,23 +959,25 @@ struct Engine {
       }
       if (small_ok) {
         m.ks_a = rk.MakeProgram(H, 2 * half_a, programs + "/" + nm.swa + "_m512.txt", 64, err, 0, 32, 3, 5);
-        m.ks_b = rk.MakeProgram(H, 2 * half_b, programs + "/" + nm.swb + "_m512.txt", 64, err, 0, 32, 3, 5);
         m.ks_a.c = m.swc;
         m.ks_a.ch = m.swc.map<std::uint8_t*>();
-        m.ks_b.c = m.swc;
-        m.ks_b.ch = m.ks_a.ch;
+        if (half_b) {
+          m.ks_b = rk.MakeProgram(H, 2 * half_b, programs + "/" + nm.swb + "_m512.txt", 64, err, 0, 32, 3, 5);
+          m.ks_b.c = m.swc;
+          m.ks_b.ch = m.ks_a.ch;
+        }
         m.ks_d = rk.MakeProgram(SI, h_p, programs + "/" + nm.dn2s + ".txt", std::size_t{512} * h_p / 8 * 9, err, 0, 32, 3, 5);
         rk.RebindA(m.ks_d, m.swc);
         rk.WeightSlot(m.kw_d, m.ks_d);
       }
       for (int set = 0; set < 2; ++set) {
         KDispatch(m.kw_a, set ? m.kq_a2 : m.kq_a);
-        KDispatch(m.kw_b, set ? m.kq_b2 : m.kq_b);
+        if (half_b) KDispatch(m.kw_b, set ? m.kq_b2 : m.kq_b);
         KDispatch(m.kw_d, set ? m.kq_d2 : m.kq_d);
       }
       if (small_ok) {
         KDispatch(m.kw_a, m.ks_a);
-        KDispatch(m.kw_b, m.ks_b);
+        if (half_b) KDispatch(m.kw_b, m.ks_b);
         KDispatch(m.kw_d, m.ks_d);
       }
     }
@@ -1092,9 +1113,11 @@ struct Engine {
       const std::size_t bytes = std::size_t{up} * H / 8 * 9;
       for (MlpSlice& m : L.mlp) {
         if (pa(m, i & 1).ah != first) std::memcpy(pa(m, i & 1).ah, first, bytes);
-        std::memcpy(pb(m, i & 1).ah, first, bytes);
         pa(m, i & 1).a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-        pb(m, i & 1).a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        if (slice_i > half_a) {
+          std::memcpy(pb(m, i & 1).ah, first, bytes);
+          pb(m, i & 1).a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        }
       }
     };
     auto decode = [&](std::uint32_t i) {
@@ -1122,7 +1145,7 @@ struct Engine {
       if (i + 1 < nch) enc = std::async(std::launch::async, [&, i] { encode(i + 1); });
       for (MlpSlice& m : L.mlp) {
         KDispatch(m.kw_a, pa(m, i & 1));
-        KDispatch(m.kw_b, pb(m, i & 1));
+        if (slice_i > half_a) KDispatch(m.kw_b, pb(m, i & 1));
         KDispatch(m.kw_d, pd(m, i & 1));
       }
       if (enc.valid()) enc.get();
@@ -1471,6 +1494,8 @@ struct HybridEngine : Engine {
   std::vector<LmState> lm;
   std::vector<std::uint16_t> head_bf;  // output projection, bf16 (vocab x hidden)
   bool lm_mode{false};
+  bool moe{false};
+  std::uint32_t n_exp{0}, n_used{0};
   bool dec_ok{false};   // int5 stream-bound decode path available (language-model mode)
   bool use_dec{false};  // the current Step runs on it (few rows)
   std::vector<float> s_gu, s_act, s_dn;
@@ -1511,21 +1536,33 @@ struct HybridEngine : Engine {
     if (!st.Open(model)) return false;
     wcache.Open(model);
     const auto& r = *st.r;
-    c.layers = *r.GetMetadataUint32("qwen35.block_count");
-    if (const auto mtp = r.GetMetadataUint32("qwen35.nextn_predict_layers")) c.layers -= *mtp;
-    c.hidden = *r.GetMetadataUint32("qwen35.embedding_length");
-    c.inter = *r.GetMetadataUint32("qwen35.feed_forward_length");
-    c.heads = *r.GetMetadataUint32("qwen35.attention.head_count");
-    c.kv_heads = *r.GetMetadataUint32("qwen35.attention.head_count_kv");
-    c.head_dim = *r.GetMetadataUint32("qwen35.attention.key_length");
-    c.theta = *r.GetMetadataFloat32("qwen35.rope.freq_base");
-    c.eps = *r.GetMetadataFloat32("qwen35.attention.layer_norm_rms_epsilon");
-    const std::uint32_t interval = *r.GetMetadataUint32("qwen35.full_attention_interval");
-    kVH = *r.GetMetadataUint32("qwen35.ssm.time_step_rank");
-    kKH = *r.GetMetadataUint32("qwen35.ssm.group_count");
-    kKD = kVD = *r.GetMetadataUint32("qwen35.ssm.state_size");
-    kConvK = *r.GetMetadataUint32("qwen35.ssm.conv_kernel");
-    kRotDim = *r.GetMetadataUint32("qwen35.rope.dimension_count");
+    const std::string ap = st.arch + ".";
+    c.layers = *r.GetMetadataUint32(ap + "block_count");
+    if (const auto mtp = r.GetMetadataUint32(ap + "nextn_predict_layers")) c.layers -= *mtp;
+    c.hidden = *r.GetMetadataUint32(ap + "embedding_length");
+    moe = st.arch == "qwen35moe";
+    if (moe) {
+      n_exp = *r.GetMetadataUint32(ap + "expert_count");
+      n_used = *r.GetMetadataUint32(ap + "expert_used_count");
+      c.inter = *r.GetMetadataUint32(ap + "expert_shared_feed_forward_length");
+      if (*r.GetMetadataUint32(ap + "expert_feed_forward_length") != c.inter) {
+        std::fprintf(stderr, "hybrid: experts and the shared expert must have the same width\n");
+        return false;
+      }
+    } else {
+      c.inter = *r.GetMetadataUint32(ap + "feed_forward_length");
+    }
+    c.heads = *r.GetMetadataUint32(ap + "attention.head_count");
+    c.kv_heads = *r.GetMetadataUint32(ap + "attention.head_count_kv");
+    c.head_dim = *r.GetMetadataUint32(ap + "attention.key_length");
+    c.theta = *r.GetMetadataFloat32(ap + "rope.freq_base");
+    c.eps = *r.GetMetadataFloat32(ap + "attention.layer_norm_rms_epsilon");
+    const std::uint32_t interval = *r.GetMetadataUint32(ap + "full_attention_interval");
+    kVH = *r.GetMetadataUint32(ap + "ssm.time_step_rank");
+    kKH = *r.GetMetadataUint32(ap + "ssm.group_count");
+    kKD = kVD = *r.GetMetadataUint32(ap + "ssm.state_size");
+    kConvK = *r.GetMetadataUint32(ap + "ssm.conv_kernel");
+    kRotDim = *r.GetMetadataUint32(ap + "rope.dimension_count");
     kKeyDim = kKH * kKD;
     kValDim = kVH * kVD;
     kConvDim = 2 * kKeyDim + kValDim;
@@ -1582,7 +1619,8 @@ struct HybridEngine : Engine {
       need(nm.kqkv + ".txt", gk + nm.kqkv + " " + n(I) + " " + base + "-K " + n(H) + " -N " + n(attn_n));
       need(nm.ko + ".txt", gk + nm.ko + " " + n(I) + " " + base + "-K " + n(kValDim) + " -N " + n(h_p));
       need(nm.swa + ".txt", gk + nm.swa + " " + n(slice_i) + " " + base + "-K " + n(H) + " -N " + n(2 * half_a) + " --mode swigu --noff 0");
-      need(nm.swb + ".txt", gk + nm.swb + " " + n(slice_i) + " " + base + "-K " + n(H) + " -N " + n(2 * (slice_i - half_a)) + " --mode swigu --noff " + n(half_a / 64));
+      if (slice_i > half_a)
+        need(nm.swb + ".txt", gk + nm.swb + " " + n(slice_i) + " " + base + "-K " + n(H) + " -N " + n(2 * (slice_i - half_a)) + " --mode swigu --noff " + n(half_a / 64));
       need(nm.dn2 + ".txt", gk + nm.dn2 + " " + n(slice_i) + " " + base + "-K " + n(slice_i) + " -N " + n(h_p) + " --a2 1");
       if (small_ok) {
         const std::string sm = "-M 512 ";
@@ -1590,7 +1628,8 @@ struct HybridEngine : Engine {
         need(s_kqkv + ".txt", gk + s_kqkv + " " + n(I) + " " + sm + "-K " + n(H) + " -N " + n(attn_n));
         need(s_ko + ".txt", gk + s_ko + " " + n(I) + " " + sm + "-K " + n(kValDim) + " -N " + n(h_p));
         need(nm.swa + "_m512.txt", gk + nm.swa + "_m512 " + n(slice_i) + " " + sm + "-K " + n(H) + " -N " + n(2 * half_a) + " --mode swigu --noff 0");
-        need(nm.swb + "_m512.txt", gk + nm.swb + "_m512 " + n(slice_i) + " " + sm + "-K " + n(H) + " -N " + n(2 * (slice_i - half_a)) + " --mode swigu --noff " + n(half_a / 64));
+        if (slice_i > half_a)
+          need(nm.swb + "_m512.txt", gk + nm.swb + "_m512 " + n(slice_i) + " " + sm + "-K " + n(H) + " -N " + n(2 * (slice_i - half_a)) + " --mode swigu --noff " + n(half_a / 64));
         need(s_dn2 + ".txt", gk + s_dn2 + " " + n(slice_i) + " " + sm + "-K " + n(slice_i) + " -N " + n(h_p) + " --a2 1");
       }
       for (std::uint32_t t : {64u, 128u, 256u, 512u, 1024u, 2048u})
@@ -1659,6 +1698,7 @@ struct HybridEngine : Engine {
       });
       npu_argmax = true;
     }
+    if (moe) InitExpertPrograms(programs, &err, H, 2 * slice_i);
     layers.resize(c.layers);
     hl.resize(c.layers);
     if (lm_mode) lm.resize(c.layers);
@@ -1784,11 +1824,18 @@ struct HybridEngine : Engine {
           gate.resize(std::size_t{I} * H);
           up.resize(std::size_t{I} * H);
           down.resize(std::size_t{H} * I);
-          st.LoadG(b + "ffn_gate.weight", gate.data(), gate.size());
-          st.LoadG(b + "ffn_up.weight", up.data(), up.size());
-          st.LoadG(b + "ffn_down.weight", down.data(), down.size());
+          st.LoadG(b + (moe ? "ffn_gate_shexp.weight" : "ffn_gate.weight"), gate.data(), gate.size());
+          st.LoadG(b + (moe ? "ffn_up_shexp.weight" : "ffn_up.weight"), up.data(), up.size());
+          st.LoadG(b + (moe ? "ffn_down_shexp.weight" : "ffn_down.weight"), down.data(), down.size());
         };
+        if (moe) {
+          L.router.resize(std::size_t{n_exp} * H);
+          st.LoadG(b + "ffn_gate_inp.weight", L.router.data(), L.router.size());
+          L.sh_gate.resize(H);
+          st.LoadG(b + "ffn_gate_inp_shexp.weight", L.sh_gate.data(), H);
+        }
         PackMlp(L, b + "kd.", programs, &err, ensure, gate, up, down);
+        if (moe) PackExperts(L, st, b);
         if (dec_ok) {
           // int5 decode copy of the layer: m16 programs on the decode xclbin, streamed once per token
           std::vector<float> gu_buf, dn_buf;
@@ -2133,6 +2180,218 @@ struct HybridEngine : Engine {
 
   // Layer-major forward over a batch of sequences (rows of all sequences share the GEMM chunks). Returns the final-norm hidden
   // state at each sequence's marker.
+  // ---- mixture of experts (qwen35moe) ----
+  // One program set serves every expert of every layer: expert weights are copied into pinned scratch buffers (WeightSlot).
+  Program ep_a, ep_d, ed_a, ed_d;
+  xrt::bo ep_swc;
+  WeightBuffer ep_slot_a, ep_slot_d, ed_slot_a, ed_slot_d;
+  std::size_t ex_a{0}, ex_d{0}, ex_qa{0}, ex_qd{0};  // packed bytes of one expert: gate/up and down, bfp16 and int5
+
+  void PackExperts(Layer& L, const Safetensors& st, const std::string& b) {
+    const std::uint32_t H = c.hidden, SI = slice_i, h_p = PadN(H);
+    const std::string tag_kd = b + "kd.experts", tag_q5 = b + "q5.experts";
+    const std::size_t per_kd = ex_a + ex_d, per_q5 = ex_qa + ex_qd;
+    L.exp_kd = std::make_shared<ExpertBlob>();
+    L.exp_kd->len = per_kd * n_exp;
+    L.exp_kd->mapped = wcache.Map(tag_kd, L.exp_kd->len);
+    if (dec_ok) {
+      L.exp_q5 = std::make_shared<ExpertBlob>();
+      L.exp_q5->len = per_q5 * n_exp;
+      L.exp_q5->mapped = wcache.Map(tag_q5, L.exp_q5->len);
+    }
+    const bool need_kd = !L.exp_kd->mapped, need_q5 = dec_ok && !L.exp_q5->mapped;
+    if (!need_kd && !need_q5) return;
+    if (need_kd) L.exp_kd->mem.resize(L.exp_kd->len);
+    if (need_q5) L.exp_q5->mem.resize(L.exp_q5->len);
+    const auto* tg = st.r->FindTensor(b + "ffn_gate_exps.weight");
+    const auto* tu = st.r->FindTensor(b + "ffn_up_exps.weight");
+    const auto* td = st.r->FindTensor(b + "ffn_down_exps.weight");
+    if (!tg || !tu || !td || !TypeOk(tg->type) || !TypeOk(tu->type) || !TypeOk(td->type)) {
+      std::fprintf(stderr, "moe: expert tensors of %s are missing or use an unsupported type\n", b.c_str());
+      std::exit(1);
+    }
+    const gufo::models::lfm3::Tensor eg{tg->data, tg->type, H, static_cast<std::uint32_t>(tg->dimensions[1] * tg->dimensions[2]), tg->size_bytes};
+    const gufo::models::lfm3::Tensor eu{tu->data, tu->type, H, static_cast<std::uint32_t>(tu->dimensions[1] * tu->dimensions[2]), tu->size_bytes};
+    const gufo::models::lfm3::Tensor ed{td->data, td->type, SI, static_cast<std::uint32_t>(td->dimensions[1] * td->dimensions[2]), td->size_bytes};
+    std::vector<float> g(std::size_t{SI} * H), u(std::size_t{SI} * H), ws(std::size_t{2 * SI} * H), dn(std::size_t{h_p} * SI);
+    for (std::uint32_t e = 0; e < n_exp; ++e) {
+#pragma omp parallel for
+      for (std::int64_t r = 0; r < SI; ++r) {
+        DecodeRowAny(eg, e * SI + static_cast<std::uint32_t>(r), std::span<float>(&g[std::size_t(r) * H], H));
+        DecodeRowAny(eu, e * SI + static_cast<std::uint32_t>(r), std::span<float>(&u[std::size_t(r) * H], H));
+      }
+      for (std::size_t f = 0; f < SI / 8; ++f)
+        for (std::size_t i = 0; i < 8; ++i) {
+          std::memcpy(&ws[(f * 16 + i) * H], &g[(f * 8 + i) * H], std::size_t{H} * 4);
+          std::memcpy(&ws[(f * 16 + 8 + i) * H], &u[(f * 8 + i) * H], std::size_t{H} * 4);
+        }
+      std::fill(dn.begin(), dn.end(), 0.f);
+#pragma omp parallel for
+      for (std::int64_t r = 0; r < H; ++r) DecodeRowAny(ed, e * H + static_cast<std::uint32_t>(r), std::span<float>(&dn[std::size_t(r) * SI], SI));
+      if (need_kd) {
+        std::uint8_t* dst = L.exp_kd->mem.data() + e * per_kd;
+        NpuRuntime::PackAtbHost(ws.data(), 2 * SI, H, dst);
+        NpuRuntime::PackAtbHost(dn.data(), h_p, SI, dst + ex_a);
+      }
+      if (need_q5) {
+        std::uint8_t* dst = L.exp_q5->mem.data() + e * per_q5;
+        PackMatInt5(ws.data(), 2 * SI, H, dst);
+        PackMatInt5(dn.data(), h_p, SI, dst + ex_qa);
+      }
+    }
+    const auto publish = [&](ExpertBlob& blob, const std::string& tag) {
+      wcache.Store(tag, blob.mem.data(), blob.len);
+      if (const std::uint8_t* m = wcache.Map(tag, blob.len)) {
+        blob.mapped = m;
+        std::vector<std::uint8_t>().swap(blob.mem);
+      }
+    };
+    if (need_kd) publish(*L.exp_kd, tag_kd);
+    if (need_q5) publish(*L.exp_q5, tag_q5);
+  }
+
+  void InitExpertPrograms(const std::string& programs, std::string* err, std::uint32_t plain_a_k, std::uint32_t plain_a_n) {
+    const std::uint32_t H = c.hidden, SI = slice_i, h_p = PadN(H);
+    ex_a = std::size_t{H} * (2 * SI) / 8 * 9;
+    ex_d = std::size_t{SI} * h_p / 8 * 9;
+    ex_qa = std::size_t{(2 * SI) / kStrip} * (H / kTileK) * 4 * kQuarterBytes;
+    ex_qd = std::size_t{h_p / kStripRows} * (SI / kTileK) * 4 * kQuarterBytes;
+    const std::size_t abytes = std::size_t{1024} * SI / 8 * 9;
+    ep_swc = rk.MakeBo(2 * abytes, 3);
+    std::memset(ep_swc.map<void*>(), 0, 2 * abytes);
+    ep_swc.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    ep_a = rk.MakeProgram(H, 2 * half_a, programs + "/" + nm.swa + "_m512.txt", 64, err, 0, 32, 3, 5);
+    ep_a.c = ep_swc;
+    ep_a.ch = ep_swc.map<std::uint8_t*>();
+    ep_d = rk.MakeProgram(SI, h_p, programs + "/" + nm.dn2s + ".txt", std::size_t{512} * h_p / 8 * 9, err, 0, 32, 3, 5);
+    rk.RebindA(ep_d, ep_swc);
+    ep_slot_a = rk.AllocWeightBo(ex_a, 4);
+    ep_slot_d = rk.AllocWeightBo(ex_d, 4);
+    rk.WeightSlot(ep_slot_a, ep_a);
+    rk.WeightSlot(ep_slot_d, ep_d);
+    if (dec_ok) {
+      ed_a = rt.MakeProgram(plain_a_k, plain_a_n, programs + "/" + std::string("insts_plain_") + std::to_string(H) + "x" + std::to_string(2 * SI) + ".txt", 0, err);
+      ed_d = rt.MakeProgram(SI, h_p, programs + "/" + std::string("insts_plain_") + std::to_string(SI) + "x" + std::to_string(h_p) + ".txt", 0, err);
+      ed_slot_a = rt.AllocWeightBo(ex_qa, 3);
+      ed_slot_d = rt.AllocWeightBo(ex_qd, 3);
+      rt.WeightSlot(ed_slot_a, ed_a);
+      rt.WeightSlot(ed_slot_d, ed_d);
+    }
+  }
+
+  // One expert over n <= 512 gathered rows (x: n x H) -> y (n x H).
+  void ExpertRun(Layer& L, std::uint32_t e, const float* x, std::uint32_t n, float* y) {
+    const std::uint32_t H = c.hidden, h_p = PadN(H);
+    const std::size_t per = ex_a + ex_d;
+    WeightBuffer wa, wd;
+    wa.host = const_cast<std::uint8_t*>(L.exp_kd->data()) + e * per;
+    wa.bytes = ex_a;
+    wd.host = wa.host + ex_a;
+    wd.bytes = ex_d;
+    const std::uint32_t up = std::min(512u, (n + 127) / 128 * 128);
+    if (kxs[0].size() < std::size_t{1024} * kxn) {
+      kxs[0].assign(std::size_t{1024} * kxn, 0.f);
+      kxs[1].assign(std::size_t{1024} * kxn, 0.f);
+    }
+    std::memcpy(kxs[0].data(), x, std::size_t{n} * H * 4);
+    std::memset(kxs[0].data() + std::size_t{n} * H, 0, std::size_t{up - n} * H * 4);
+    rk.EncodeAAtbRaw(kxs[0].data(), 512, H, ep_a.ah, n);
+    ep_a.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    KDispatch(wa, ep_a);
+    KDispatch(wd, ep_d);
+    ep_d.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    if (ky.size() < std::size_t{512} * h_p) ky.assign(std::size_t{1024} * kyn, 0.f);
+    rk.DecodeCAtbRaw(ep_d.ch, ky.data(), 512, h_p, n);
+    for (std::uint32_t r = 0; r < n; ++r) std::memcpy(y + std::size_t{r} * H, &ky[std::size_t{r} * h_p], std::size_t{H} * 4);
+  }
+
+  // The same expert for few rows on the int5 decode programs.
+  void ExpertRunDec(Layer& L, std::uint32_t e, const float* x, std::uint32_t n, float* y) {
+    const std::uint32_t H = c.hidden, SI = slice_i, h_p = PadN(H);
+    const std::size_t per = ex_qa + ex_qd;
+    WeightBuffer wa, wd;
+    wa.host = const_cast<std::uint8_t*>(L.exp_q5->data()) + e * per;
+    wa.bytes = ex_qa;
+    wd.host = wa.host + ex_qa;
+    wd.bytes = ex_qd;
+    s_gu.resize(std::size_t{n} * 2 * SI);
+    rt.Gemm(ed_a, wa, x, n, s_gu.data(), &tim);
+    s_act.resize(std::size_t{n} * SI);
+    for (std::uint32_t r = 0; r < n; ++r) {
+      const float* gu = &s_gu[std::size_t{r} * 2 * SI];
+      float* a = &s_act[std::size_t{r} * SI];
+      for (std::uint32_t f = 0; f < SI / 8; ++f)
+        for (std::uint32_t i = 0; i < 8; ++i) a[f * 8 + i] = SiluF(gu[f * 16 + i]) * gu[f * 16 + 8 + i];
+    }
+    s_dn.resize(std::size_t{n} * h_p);
+    rt.Gemm(ed_d, wd, s_act.data(), n, s_dn.data(), &tim);
+    for (std::uint32_t r = 0; r < n; ++r) std::memcpy(y + std::size_t{r} * H, &s_dn[std::size_t{r} * h_p], std::size_t{H} * 4);
+  }
+
+  // Routed experts (softmax over all experts, top-k, renormalised) plus the shared expert scaled by sigmoid(gate . x).
+  void MoeLayer(Layer& L, const float* z, std::uint32_t T, float* out) {
+    const std::uint32_t H = c.hidden;
+    std::vector<float> sh(std::size_t{T} * H);
+    if (use_dec) DecMlp(L, z, T, sh.data());
+    else KMlp(L, z, T, sh.data(), small_ok && T <= 512);
+    std::vector<std::uint32_t> top(std::size_t{T} * n_used);
+    std::vector<float> wgt(std::size_t{T} * n_used);
+#pragma omp parallel
+    {
+      std::vector<float> lg(n_exp);
+      std::vector<std::uint32_t> order(n_exp);
+#pragma omp for
+      for (std::int64_t t = 0; t < T; ++t) {
+        const float* zt = z + std::size_t(t) * H;
+        float mx = -INFINITY;
+        for (std::uint32_t e = 0; e < n_exp; ++e) {
+          const float* w = &L.router[std::size_t{e} * H];
+          float sacc = 0;
+          for (std::uint32_t i = 0; i < H; ++i) sacc += w[i] * zt[i];
+          lg[e] = sacc;
+          mx = std::max(mx, sacc);
+        }
+        float den = 0;
+        for (std::uint32_t e = 0; e < n_exp; ++e) {
+          lg[e] = std::exp(lg[e] - mx);
+          den += lg[e];
+        }
+        std::iota(order.begin(), order.end(), 0u);
+        std::partial_sort(order.begin(), order.begin() + n_used, order.end(), [&](std::uint32_t a, std::uint32_t b2) { return lg[a] > lg[b2]; });
+        float sel = 0;
+        for (std::uint32_t k = 0; k < n_used; ++k) sel += lg[order[k]];
+        for (std::uint32_t k = 0; k < n_used; ++k) {
+          top[std::size_t(t) * n_used + k] = order[k];
+          wgt[std::size_t(t) * n_used + k] = lg[order[k]] / sel;
+        }
+        float gs = 0;
+        for (std::uint32_t i = 0; i < H; ++i) gs += L.sh_gate[i] * zt[i];
+        const float sg = 1.0f / (1.0f + std::exp(-gs));
+        float* o = out + std::size_t(t) * H;
+        for (std::uint32_t i = 0; i < H; ++i) o[i] = sg * sh[std::size_t(t) * H + i];
+      }
+    }
+    std::vector<std::vector<std::pair<std::uint32_t, float>>> by_expert(n_exp);
+    for (std::uint32_t t = 0; t < T; ++t)
+      for (std::uint32_t k = 0; k < n_used; ++k) by_expert[top[std::size_t{t} * n_used + k]].emplace_back(t, wgt[std::size_t{t} * n_used + k]);
+    const std::uint32_t chunk = use_dec ? 16u : 512u;
+    std::vector<float> xe(std::size_t{chunk} * H), ye(std::size_t{chunk} * H);
+    for (std::uint32_t e = 0; e < n_exp; ++e) {
+      const auto& list = by_expert[e];
+      for (std::size_t o0 = 0; o0 < list.size(); o0 += chunk) {
+        const std::uint32_t n = static_cast<std::uint32_t>(std::min<std::size_t>(chunk, list.size() - o0));
+        for (std::uint32_t r = 0; r < n; ++r) std::memcpy(&xe[std::size_t{r} * H], z + std::size_t{list[o0 + r].first} * H, std::size_t{H} * 4);
+        if (use_dec) ExpertRunDec(L, e, xe.data(), n, ye.data());
+        else ExpertRun(L, e, xe.data(), n, ye.data());
+        for (std::uint32_t r = 0; r < n; ++r) {
+          float* o = out + std::size_t{list[o0 + r].first} * H;
+          const float w = list[o0 + r].second;
+          for (std::uint32_t i = 0; i < H; ++i) o[i] += w * ye[std::size_t{r} * H + i];
+        }
+      }
+    }
+  }
+
   // Decode-path MLP: fused gate/up GEMM (interleaved 8-row blocks), host swiglu, down GEMM.
   void DecMlp(Layer& L, const float* z, std::uint32_t n, float* out) {
     const std::uint32_t H = c.hidden, I = c.inter, h_p = PadN(H);
@@ -2173,7 +2432,8 @@ struct HybridEngine : Engine {
       norm_rows(L.ffn_norm.data());
       ph[11] += Ms(tl);
       tl = Clock::now();
-      if (use_dec) DecMlp(L, z.data(), T, br.data());
+      if (moe) MoeLayer(L, z.data(), T, br.data());
+      else if (use_dec) DecMlp(L, z.data(), T, br.data());
       else KMlp(L, z.data(), T, br.data(), small_ok && T <= 512);
       ph[10] += Ms(tl);
       tl = Clock::now();
@@ -2460,7 +2720,7 @@ int Chat(const char* model, const char* programs, const std::string& prompt, std
     return 1;
   }
   const auto arch = reader->GetMetadataString("general.architecture");
-  if (arch && *arch == "qwen35") return ChatT<HybridEngine>(model, programs, prompt, max_new, bench_synth, bench_prompt);
+  if (arch && (*arch == "qwen35" || *arch == "qwen35moe")) return ChatT<HybridEngine>(model, programs, prompt, max_new, bench_synth, bench_prompt);
   return ChatT<Engine>(model, programs, prompt, max_new, bench_synth, bench_prompt);
 }
 

@@ -455,13 +455,19 @@ WeightBuffer NpuRuntime::PackWeightAtb(const float* W, std::uint32_t N,
   wb.bytes = std::size_t{K} * N / 8 * 9;
   wb.bo = xrt::bo(dev_, wb.bytes, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(b_group));
   wb.host = wb.bo.map<std::uint8_t*>();
+  PackAtbHost(W, N, K, wb.host);
+  wb.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  return wb;
+}
+
+void NpuRuntime::PackAtbHost(const float* W, std::uint32_t N, std::uint32_t K, std::uint8_t* dst) {
   const std::uint32_t l1_rows = K / kAtbTileK;
   const std::uint32_t l1_cols = N / kAtbTileN;
 #pragma omp parallel for collapse(2)
   for (std::uint32_t l1_col = 0; l1_col < l1_cols; ++l1_col) {
     for (std::uint32_t l1_row = 0; l1_row < l1_rows; ++l1_row) {
       std::uint8_t* tile =
-          wb.host + (std::size_t{l1_col} * l1_rows + l1_row) * kAtbTileBytes;
+          dst + (std::size_t{l1_col} * l1_rows + l1_row) * kAtbTileBytes;
       for (std::uint32_t sbc_i = 0; sbc_i < 8; ++sbc_i) {
         for (std::uint32_t sbr = 0; sbr < 8; ++sbr) {
           for (std::uint32_t bis = 0; bis < 2; ++bis) {
@@ -481,8 +487,6 @@ WeightBuffer NpuRuntime::PackWeightAtb(const float* W, std::uint32_t N,
       }
     }
   }
-  wb.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-  return wb;
 }
 
 WeightBuffer NpuRuntime::PackFfnGuAtb(const float* gate, const float* up,

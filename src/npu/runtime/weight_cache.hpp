@@ -2,8 +2,11 @@
 #ifndef GUFO_NPU_RUNTIME_WEIGHT_CACHE_HPP_
 #define GUFO_NPU_RUNTIME_WEIGHT_CACHE_HPP_
 
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#include <fcntl.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -54,6 +57,21 @@ class WeightCache {
     f.seekg(0);
     f.read(reinterpret_cast<char*>(dst), static_cast<std::streamsize>(bytes));
     return static_cast<bool>(f);
+  }
+
+  /// Read-only mapping of the entry for `tag` when it exists with exactly `bytes` bytes; nullptr otherwise. Release with Unmap.
+  const std::uint8_t* Map(const std::string& tag, std::size_t bytes) const {
+    if (dir_.empty()) return nullptr;
+    const int fd = ::open((dir_ + "/" + tag + ".bin").c_str(), O_RDONLY);
+    if (fd < 0) return nullptr;
+    struct stat st {};
+    void* p = MAP_FAILED;
+    if (::fstat(fd, &st) == 0 && static_cast<std::size_t>(st.st_size) == bytes) p = ::mmap(nullptr, bytes, PROT_READ, MAP_SHARED, fd, 0);
+    ::close(fd);
+    return p == MAP_FAILED ? nullptr : static_cast<const std::uint8_t*>(p);
+  }
+  static void Unmap(const std::uint8_t* p, std::size_t bytes) {
+    if (p) ::munmap(const_cast<std::uint8_t*>(p), bytes);
   }
 
   /// Atomic write (temp file, then rename) so a killed run never leaves a truncated entry.
