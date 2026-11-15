@@ -179,24 +179,19 @@ float Silu(float x) { return x / (1.0f + std::exp(-x)); }
 
 struct GdnDev {
   xrt::device dev;
-  xrt::hw_context ctx;
   xrt::kernel kern;
   std::vector<std::pair<std::uint32_t, xrt::bo>> insts;
   std::vector<std::uint32_t> inst_words;
-  xrt::bo bin, bx, bout;
-  std::uint8_t* in_h{nullptr};
-  const float* out_h{nullptr};
-  static constexpr std::uint32_t kMaxNe = 512;
-  static constexpr std::uint32_t kMaxTok = 4 * kMaxNe;
-  bool Init(const std::string& programs) {
+  xrt::bo bin[2], bx, bout[2];
+  std::uint8_t* in_h[2]{nullptr, nullptr};
+  const std::uint8_t* out_h[2]{nullptr, nullptr};
+  static constexpr std::uint32_t kMaxTok = 2048;
+  bool Init(NpuRuntime& rk, const std::string& programs) {
     try {
-      dev = xrt::device(0u);
-      const xrt::xclbin xb{programs + "/final_gdn.xclbin"};
-      dev.register_xclbin(xb);
-      ctx = xrt::hw_context(dev, xb.get_uuid());
-      kern = xrt::kernel(ctx, xb.get_kernels().at(0).get_name());
-      for (std::uint32_t ne : {16u, 32u, 64u, 128u, 256u, 512u}) {
-        std::ifstream f(programs + "/insts_gdn_" + std::to_string(ne) + ".txt", std::ios::binary | std::ios::ate);
+      dev = rk.device();
+      kern = rk.kernel();
+      for (std::uint32_t t : {64u, 128u, 256u, 512u, 1024u, 2048u}) {
+        std::ifstream f(programs + "/insts_kdh_gdn_" + std::to_string(t) + ".txt", std::ios::binary | std::ios::ate);
         if (!f) return false;
         const std::size_t n = static_cast<std::size_t>(f.tellg());
         f.seekg(0);
@@ -205,16 +200,18 @@ struct GdnDev {
         xrt::bo b(dev, n, XCL_BO_FLAGS_CACHEABLE, kern.group_id(1));
         std::memcpy(b.map<void*>(), v.data(), n);
         b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-        insts.emplace_back(ne, b);
+        insts.emplace_back(t, b);
         inst_words.push_back(static_cast<std::uint32_t>(n / 4));
       }
-      bin = xrt::bo(dev, std::size_t{8} * kMaxNe * 4 * 4096, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(3));
-      bx = xrt::bo(dev, 4, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(4));
-      bout = xrt::bo(dev, std::size_t{8} * kMaxNe * 4 * 2048, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(5));
-      in_h = bin.map<std::uint8_t*>();
-      out_h = bout.map<float*>();
-      std::memset(in_h, 0, std::size_t{8} * kMaxNe * 4 * 4096);
-      std::memset(bout.map<void*>(), 0, std::size_t{8} * kMaxNe * 4 * 2048);
+      bx = xrt::bo(dev, 4, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(3));
+      for (int i = 0; i < 2; ++i) {
+        bin[i] = xrt::bo(dev, std::size_t{8} * (kMaxTok / 4) * 9216, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(4));
+        bout[i] = xrt::bo(dev, std::size_t{8} * (kMaxTok / 64) * 73728, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(5));
+        in_h[i] = bin[i].map<std::uint8_t*>();
+        out_h[i] = bout[i].map<std::uint8_t*>();
+        std::memset(in_h[i], 0, std::size_t{8} * (kMaxTok / 4) * 9216);
+        std::memset(bout[i].map<void*>(), 0, std::size_t{8} * (kMaxTok / 64) * 73728);
+      }
       return true;
     } catch (const std::exception& e) {
       std::fprintf(stderr, "gdn device: %s\n", e.what());
@@ -222,18 +219,18 @@ struct GdnDev {
     }
   }
   static std::uint32_t Bucket(std::uint32_t tokens) {
-    for (std::uint32_t ne : {16u, 32u, 64u, 128u, 256u, 512u})
-      if (tokens <= 4 * ne) return ne;
+    for (std::uint32_t t : {64u, 128u, 256u, 512u, 1024u, 2048u})
+      if (tokens <= t) return t;
     return 0;
   }
-  void Run(std::uint32_t ne) {
+  void Run(int set, std::uint32_t bucket) {
     std::size_t idx = 0;
     for (; idx < insts.size(); ++idx)
-      if (insts[idx].first == ne) break;
-    bin.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    auto run = kern(3, insts[idx].second, inst_words[idx], bin, bx, bout);
+      if (insts[idx].first == bucket) break;
+    bin[set].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    auto run = kern(3, insts[idx].second, inst_words[idx], bx, bin[set], bout[set]);
     run.wait();
-    bout.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    bout[set].sync(XCL_BO_SYNC_BO_FROM_DEVICE);
   }
 };
 
@@ -257,6 +254,8 @@ struct Layer {
 struct Engine {
   NpuRuntime rt, rk;
   GdnDev gd;
+  const bool kdh{std::getenv("Q35_KDH") != nullptr};
+  const std::string kdp{std::getenv("Q35_KDH") ? "/insts_kdh_" : "/insts_kd_"};
   bool gdn_dev{std::getenv("Q35_GDN_DEV") != nullptr};
   NpuRuntime::Timings tim{};
   bool kd{std::getenv("Q35_KD") != nullptr};
@@ -282,13 +281,13 @@ struct Engine {
     readout.resize(cnt);
     for (std::size_t i = 0; i < cnt; ++i) readout[i] = Bf(rp[i]);
     std::string err;
-    if (!(kd ? rk.Init(programs + "/final_kd.xclbin", &err) : rt.Init(programs + "/final_16x64x128_ffn.xclbin", &err))) {
+    if (!(kd ? rk.Init(programs + (kdh ? "/final_kdh.xclbin" : "/final_kd.xclbin"), &err) : rt.Init(programs + "/final_16x64x128_ffn.xclbin", &err))) {
       std::fprintf(stderr, "npu init: %s\n", err.c_str());
       return false;
     }
     embed = w.Raw("language_model.embed_tokens.weight", 0 + std::size_t{248320} * kH);
     norm_w = w.Vec("language_model.norm.weight", kH, 1.0f);
-    if (gdn_dev && !gd.Init(programs)) gdn_dev = false;
+    if (gdn_dev && (!kdh || !gd.Init(rk, programs))) gdn_dev = false;
     layers.resize(kLayers);
     const auto t0 = Clock::now();
     std::vector<float> buf;
@@ -419,13 +418,13 @@ struct Engine {
 
   void PackKdIn(Layer& L, const std::string& a, const std::string& programs, bool gdn, std::vector<float>& buf, std::string* err) {
     if (gdn) {
-      L.kp_in = rk.MakeProgram(kH, kGdnInN, programs + "/insts_kd_1024x2560x12288.txt", std::size_t{1024} * kGdnInN / 8 * 9, err, 0, 64, 3, 5);
+      L.kp_in = rk.MakeProgram(kH, kGdnInN, programs + kdp + "1024x2560x12288.txt", std::size_t{1024} * kGdnInN / 8 * 9, err, 0, 64, 3, 5);
       buf.resize(std::size_t{kGdnInN} * kH);
       w.Load(a + "in_proj_qkv.weight", buf.data(), std::size_t{kConvDim} * kH);
       w.Load(a + "in_proj_z.weight", buf.data() + std::size_t{kConvDim} * kH, std::size_t{kValDim} * kH);
       L.kw_in = rk.PackWeightAtb(buf.data(), kGdnInN, kH, 4);
     } else {
-      L.kp_in = rk.MakeProgram(kH, kAttnInN, programs + "/insts_kd_1024x2560x10240.txt", std::size_t{1024} * kAttnInN / 8 * 9, err, 0, 64, 3, 5);
+      L.kp_in = rk.MakeProgram(kH, kAttnInN, programs + kdp + "1024x2560x10240.txt", std::size_t{1024} * kAttnInN / 8 * 9, err, 0, 64, 3, 5);
       buf.resize(std::size_t{kAttnInN} * kH);
       w.Load(a + "q_proj.weight", buf.data(), std::size_t{2 * kQDim} * kH);
       w.Load(a + "k_proj.weight", buf.data() + std::size_t{2 * kQDim} * kH, std::size_t{kKvDim} * kH);
@@ -435,7 +434,7 @@ struct Engine {
   }
 
   void PackKdOut(Layer& L, const std::string& name, std::uint32_t K, const std::string& programs, std::vector<float>& buf, std::string* err) {
-    L.kp_out = rk.MakeProgram(K, kOutN, programs + "/insts_kd_1024x4096x3072.txt", std::size_t{1024} * kOutN / 8 * 9, err, 0, 64, 3, 5);
+    L.kp_out = rk.MakeProgram(K, kOutN, programs + kdp + "1024x4096x3072.txt", std::size_t{1024} * kOutN / 8 * 9, err, 0, 64, 3, 5);
     buf.assign(std::size_t{kOutN} * K, 0.f);
     w.Load(name, buf.data(), std::size_t{kH} * K);
     L.kw_out = rk.PackWeightAtb(buf.data(), kOutN, K, 4);
@@ -461,13 +460,13 @@ struct Engine {
       L.swc = rk.MakeBo(2 * abytes, 3);
       std::memset(L.swc.map<void*>(), 0, 2 * abytes);
       L.swc.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-      L.kq_a = rk.MakeProgram(kH, 2 * kHalf, programs + "/insts_kd_swi_a_1024x2560x9216.txt", 64, err, 0, 64, 3, 5);
-      L.kq_b = rk.MakeProgram(kH, 2 * kHalf, programs + "/insts_kd_swi_b_1024x2560x9216.txt", 64, err, 0, 64, 3, 5);
+      L.kq_a = rk.MakeProgram(kH, 2 * kHalf, programs + kdp + "swi_a_1024x2560x9216.txt", 64, err, 0, 64, 3, 5);
+      L.kq_b = rk.MakeProgram(kH, 2 * kHalf, programs + kdp + "swi_b_1024x2560x9216.txt", 64, err, 0, 64, 3, 5);
       L.kq_a.c = L.swc;
       L.kq_a.ch = L.swc.map<std::uint8_t*>();
       L.kq_b.c = L.swc;
       L.kq_b.ch = L.kq_a.ch;
-      L.kq_d = rk.MakeProgram(kI, kOutN, programs + "/insts_kd_dn2_1024x9216x3072.txt", std::size_t{1024} * kOutN / 8 * 9, err, 0, 64, 3, 5);
+      L.kq_d = rk.MakeProgram(kI, kOutN, programs + kdp + "dn2_1024x9216x3072.txt", std::size_t{1024} * kOutN / 8 * 9, err, 0, 64, 3, 5);
       rk.RebindA(L.kq_d, L.swc);
       buf.assign(std::size_t{kOutN} * kI, 0.f);
       w.Load(pre + "mlp.down_proj.weight", buf.data(), std::size_t{kH} * kI);
@@ -476,9 +475,9 @@ struct Engine {
       L.fused = true;
       return;
     }
-    L.kp_g = rk.MakeProgram(kH, kI, programs + "/insts_kd_1024x2560x9216.txt", std::size_t{1024} * kI / 8 * 9, err, 0, 64, 3, 5);
-    L.kp_u = rk.MakeProgram(kH, kI, programs + "/insts_kd_1024x2560x9216.txt", std::size_t{1024} * kI / 8 * 9, err, 0, 64, 3, 5);
-    L.kp_d = rk.MakeProgram(kI, kOutN, programs + "/insts_kd_1024x9216x3072.txt", std::size_t{1024} * kOutN / 8 * 9, err, 0, 64, 3, 5);
+    L.kp_g = rk.MakeProgram(kH, kI, programs + kdp + "1024x2560x9216.txt", std::size_t{1024} * kI / 8 * 9, err, 0, 64, 3, 5);
+    L.kp_u = rk.MakeProgram(kH, kI, programs + kdp + "1024x2560x9216.txt", std::size_t{1024} * kI / 8 * 9, err, 0, 64, 3, 5);
+    L.kp_d = rk.MakeProgram(kI, kOutN, programs + kdp + "1024x9216x3072.txt", std::size_t{1024} * kOutN / 8 * 9, err, 0, 64, 3, 5);
     buf.resize(std::size_t{kI} * kH);
     w.Load(pre + "mlp.gate_proj.weight", buf.data(), buf.size());
     L.kw_g = rk.PackWeightAtb(buf.data(), kI, kH, 4);
@@ -532,9 +531,10 @@ struct Engine {
     const std::uint32_t ne = GdnDev::Bucket(Tt);
     if (gdn_dev && ne) {
       for (const auto& sg : segs) GdnPrepDev(L, proj.data() + std::size_t{sg.first} * kGdnInN, z + std::size_t{sg.first} * kH, sg.second, sg.first, ne);
-      GdnPadDev(Tt, 4 * ne, ne);
+      GdnPadDev(Tt, ne, ne);
       const auto td = Clock::now();
-      gd.Run(ne);
+      gd.Run(0, ne);
+      gd.Run(1, ne);
       mx[7] += Ms(td);
       for (const auto& sg : segs) GdnPostDev(L, proj.data() + std::size_t{sg.first} * kGdnInN, sg.second, sg.first, ne, gated.data() + std::size_t{sg.first} * kValDim);
     } else {
@@ -594,8 +594,8 @@ struct Engine {
           kn += row[kKeyDim + kh * kKD + i] * row[kKeyDim + kh * kKD + i];
         }
         const float qs = 1.0f / std::sqrt(qn + 1e-6f) / std::sqrt(static_cast<float>(kKD)), ks = 1.0f / std::sqrt(kn + 1e-6f);
-        const std::uint32_t g = tok_off + static_cast<std::uint32_t>(t), col = h / 4, rw = h % 4, e = g / 4, tt = g % 4;
-        std::uint8_t* rec = gd.in_h + ((((std::size_t{col} * ne + e) * 4 + rw) * 4) + tt) * 1024;
+        const std::uint32_t g = tok_off + static_cast<std::uint32_t>(t), set = h / 16, hh = h % 16, col = hh / 2, hs = hh % 2;
+        std::uint8_t* rec = gd.in_h[set] + (std::size_t{col} * (ne / 4) + g / 4) * 9216 + ((g % 4) * 2 + hs) * 1024;
         auto* b = reinterpret_cast<std::uint16_t*>(rec);
         for (std::uint32_t i = 0; i < kKD; ++i) {
           b[i] = Bf16Bits(row[kh * kKD + i] * qs);
@@ -615,8 +615,8 @@ struct Engine {
   void GdnPadDev(std::uint32_t from, std::uint32_t to, std::uint32_t ne) {
     for (std::uint32_t g = from; g < to; ++g)
       for (std::uint32_t h = 0; h < kVH; ++h) {
-        const std::uint32_t col = h / 4, rw = h % 4, e = g / 4, tt = g % 4;
-        std::uint8_t* rec = gd.in_h + ((((std::size_t{col} * ne + e) * 4 + rw) * 4) + tt) * 1024;
+        const std::uint32_t set = h / 16, hh = h % 16, col = hh / 2, hs = hh % 2;
+        std::uint8_t* rec = gd.in_h[set] + (std::size_t{col} * (ne / 4) + g / 4) * 9216 + ((g % 4) * 2 + hs) * 1024;
         std::memset(rec, 0, 1024);
         const float sc[2] = {1.0f, 0.0f};
         std::memcpy(rec + 768, sc, 8);
@@ -627,8 +627,13 @@ struct Engine {
 #pragma omp parallel for collapse(2)
     for (std::int64_t t = 0; t < T; ++t)
       for (std::uint32_t h = 0; h < kVH; ++h) {
-        const std::uint32_t g = tok_off + static_cast<std::uint32_t>(t), col = h / 4, rw = h % 4, e = g / 4, tt = g % 4;
-        const float* o = gd.out_h + (((std::size_t{col} * ne + e) * 4 + rw) * 4 + tt) * 128;
+        const std::uint32_t g = tok_off + static_cast<std::uint32_t>(t), set = h / 16, hh = h % 16, col = hh / 2, hs = hh % 2;
+        float o[kVD];
+        for (std::uint32_t half = 0; half < 2; ++half) {
+          const std::uint32_t row = hs * 2 + half;
+          const std::uint8_t* src = gd.out_h[set] + (std::size_t{col} * (ne / 64) + g / 64) * 73728 + std::size_t{row} * 18432 + std::size_t{g % 64} * 256;
+          std::memcpy(o + half * 64, src, 256);
+        }
         float ss = 0;
         for (std::uint32_t j = 0; j < kVD; ++j) ss += o[j] * o[j];
         const float rs = 1.0f / std::sqrt(ss / kVD + kEps);
