@@ -273,11 +273,12 @@ class NpuRuntime {
   // move the stream with one linear copy.
   std::vector<std::uint8_t> atb_a_scratch_, atb_c_scratch_;
  public:
-  void EncodeAAtb(const float* x, std::uint32_t M, std::uint32_t K, Program& p);
-  void DecodeCAtb(float* y, std::uint32_t M, std::uint32_t N, Program& p);
+  /// valid_rows: only the 128-row tiles holding rows below it are encoded/decoded (the rest of the program's rows are padding).
+  void EncodeAAtb(const float* x, std::uint32_t M, std::uint32_t K, Program& p, std::uint32_t valid_rows = ~0u);
+  void DecodeCAtb(float* y, std::uint32_t M, std::uint32_t N, Program& p, std::uint32_t valid_rows = ~0u);
   /// Scratch-free variants (thread-safe): A stream into dst, C stream from src.
-  void EncodeAAtbRaw(const float* x, std::uint32_t M, std::uint32_t K, std::uint8_t* dst) const;
-  void DecodeCAtbRaw(const std::uint8_t* src, float* y, std::uint32_t M, std::uint32_t N) const;
+  void EncodeAAtbRaw(const float* x, std::uint32_t M, std::uint32_t K, std::uint8_t* dst, std::uint32_t valid_rows = ~0u) const;
+  void DecodeCAtbRaw(const std::uint8_t* src, float* y, std::uint32_t M, std::uint32_t N, std::uint32_t valid_rows = ~0u) const;
   /// One output row (N floats) straight from the C wire.
   void DecodeCRowAtb(const Program& p, std::uint32_t N, std::uint32_t row, float* out) const;
   /// Inverse of EncodeAAtb (reads p.ah).
