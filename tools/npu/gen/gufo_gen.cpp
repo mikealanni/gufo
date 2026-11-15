@@ -1674,7 +1674,7 @@ struct HybridEngine : Engine {
   bool lm_mode{false};
   static constexpr bool kSpec = true;
   bool moe{false};
-  double moe_dec[3]{0, 0, 0};  // decode expert loop: wall ms, experts, layers
+  double moe_dec[6]{0, 0, 0, 0, 0, 0};  // decode expert loop: wall ms, experts, layers
   // Multi-token prediction (the model's own next-token head) as the drafter for lossless speculation.
   bool mtp{false};
   std::vector<float> mtp_enorm, mtp_hnorm, mtp_out_norm, last_raw;  // last_raw: final residual rows of the last Step (before the output norm)
@@ -2642,6 +2642,7 @@ struct HybridEngine : Engine {
   // Routed experts (softmax over all experts, top-k, renormalised) plus the shared expert scaled by sigmoid(gate . x).
   void MoeLayer(Layer& L, const float* z, std::uint32_t T, float* out) {
     const std::uint32_t H = c.hidden;
+    const auto t_ml0 = Clock::now();
     std::vector<float> sh(std::size_t{T} * H);
     // decode: the shared expert runs on the device while the host routes
     if (use_dec) rt.FfnStart(L.dp_ffn, L.dq_ffn, z, T, &tim);
@@ -2683,7 +2684,10 @@ struct HybridEngine : Engine {
         sgate[t] = sg;
       }
     }
+    const auto t_rt1 = Clock::now();
     if (use_dec) rt.FfnFinish(L.dp_ffn, L.dq_ffn, sh.data(), T, &tim, gu_strips, H);
+    moe_dec[3] += std::chrono::duration<double, std::milli>(t_rt1 - t_ml0).count();
+    moe_dec[4] += Ms(t_rt1);
     for (std::uint32_t t = 0; t < T; ++t) {  // shared expert, scaled by its sigmoid gate
       float* o = out + std::size_t{t} * H;
       for (std::uint32_t i = 0; i < H; ++i) o[i] = sgate[t] * sh[std::size_t{t} * H + i];
@@ -3531,7 +3535,7 @@ int ChatT(const char* model, const char* programs, const std::string& prompt, st
   std::fprintf(stderr, "\nhost norm+resid %.0f ms | ffn %.0f ms | attention+rope %.0f ms | gemm enc %.0f dec %.0f sync+wait %.0f ms\n", g.ph[0], g.ph[1], g.ph[2], g.tim.enc, g.tim.dec, g.tim.wait + g.tim.syncA + g.tim.syncC);
   if (g.bad_head_rows) std::fprintf(stderr, "attention rows recomputed on the host: %llu\n", static_cast<unsigned long long>(g.bad_head_rows));
   if constexpr (std::is_same_v<E, HybridEngine>)
-    if (g.moe_dec[2] > 0 && std::getenv("GEN_MOE_PROF")) std::fprintf(stderr, "moe decode: %.0f layer-steps, %.3f ms per layer in the expert loop, %.1f experts per layer\n", g.moe_dec[2], g.moe_dec[0] / g.moe_dec[2], g.moe_dec[1] / g.moe_dec[2]);
+    if (g.moe_dec[2] > 0 && std::getenv("GEN_MOE_PROF")) std::fprintf(stderr, "moe decode: %.0f layer-steps, %.3f ms per layer in the expert loop, %.1f experts per layer | start+route %.3f ms | shared finish %.3f ms\n", g.moe_dec[2], g.moe_dec[0] / g.moe_dec[2], g.moe_dec[1] / g.moe_dec[2], g.moe_dec[3] / g.moe_dec[2], g.moe_dec[4] / g.moe_dec[2]);
     if (g.ph[23] > 0) std::fprintf(stderr, "moe runs %.0f: host prepare %.0f ms | device %.0f ms | host finish %.0f ms (sums over threads)\n", g.ph[23], g.ph[20], g.ph[21], g.ph[22]);
     std::fprintf(stderr, "stages (prefill+decode): delta-net %.0f ms (in-gemm %.0f | host prep %.0f | device %.0f | host post %.0f | out-gemm %.0f) | attention %.0f ms | mlp %.0f ms | norm+resid %.0f ms | host delta-net: gates %.0f conv %.0f recurrence %.0f\n", g.ph[8], g.ph[12], g.ph[13], g.ph[14], g.ph[15], g.ph[16], g.ph[9], g.ph[10], g.ph[11], g.ph[17], g.ph[18], g.ph[19]);
   std::fprintf(stderr, "\nprefill %zu tok %.1f ms (%.0f tok/s); decode %u tok %.1f ms (%.2f tok/s)\n", ids.size(), pf, ids.size() / pf * 1000, produced, dc, produced / dc * 1000);
