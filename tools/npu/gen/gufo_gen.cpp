@@ -170,14 +170,22 @@ struct Safetensors {
     *cols = static_cast<std::uint32_t>(t->dimensions[0]);
     *rows = t->dimensions.size() > 1 ? static_cast<std::uint32_t>(t->dimensions[1]) : 1;
   }
-  void Load(const std::string& name, float* dst, std::size_t expect) const {
-    const auto* t = r->FindTensor(Map(name));
+  bool HasG(const std::string& g) const { return r->FindTensor(g) != nullptr; }
+  void DimsG(const std::string& g, std::uint32_t* cols, std::uint32_t* rows) const {
+    const auto* t = r->FindTensor(g);
+    *cols = static_cast<std::uint32_t>(t->dimensions[0]);
+    *rows = t->dimensions.size() > 1 ? static_cast<std::uint32_t>(t->dimensions[1]) : 1;
+  }
+  void Load(const std::string& name, float* dst, std::size_t expect) const { LoadG(Map(name), dst, expect); }
+  void LoadG(const std::string& gname, float* dst, std::size_t expect) const {
+    const std::string name = gname;
+    const auto* t = r->FindTensor(gname);
     if (!t) {
       std::fprintf(stderr, "tensor %s missing\n", name.c_str());
       std::exit(1);
     }
     std::uint32_t cols, rows;
-    Dims(name, &cols, &rows);
+    DimsG(gname, &cols, &rows);
     if (std::size_t{cols} * rows != expect) {
       std::fprintf(stderr, "tensor %s size %zu expected %zu\n", name.c_str(), std::size_t{cols} * rows, expect);
       std::exit(1);
@@ -695,20 +703,10 @@ struct Engine {
     }
   }
 
-  void PackKd(Layer& L, const Safetensors& st, const std::string& pre, const std::string& programs, std::string* err) {
-    const std::uint32_t H = c.hidden, I = c.inter, qd = c.heads * c.head_dim, kvd = c.kv_heads * c.head_dim;
-    const std::uint32_t qkv_n = qd + 2 * kvd, qkv_p = PadN(qkv_n), h_p = PadN(H);
+  void PackKdMlp(Layer& L, const Safetensors& st, const std::string& pre, const std::string& programs, std::string* err) {
+    const std::uint32_t H = c.hidden, I = c.inter, h_p = PadN(H);
     const std::uint32_t half_b = I - half_a;
-    std::vector<float> buf(std::size_t{qkv_p} * H, 0.f);
-    st.Load(pre + "self_attn.q_proj.weight", buf.data(), std::size_t{qd} * H);
-    st.Load(pre + "self_attn.k_proj.weight", buf.data() + std::size_t{qd} * H, std::size_t{kvd} * H);
-    st.Load(pre + "self_attn.v_proj.weight", buf.data() + std::size_t{qd + kvd} * H, std::size_t{kvd} * H);
-    L.kp_qkv = rk.MakeProgram(H, qkv_p, programs + "/" + nm.kqkv + ".txt", std::size_t{1024} * qkv_p / 8 * 9, err, 0, 64, 3, 5);
-    L.kw_qkv = rk.PackWeightAtb(buf.data(), qkv_p, H, 4);
-    buf.assign(std::size_t{h_p} * qd, 0.f);
-    st.Load(pre + "self_attn.o_proj.weight", buf.data(), std::size_t{H} * qd);
-    L.kp_o = rk.MakeProgram(qd, h_p, programs + "/" + nm.ko + ".txt", std::size_t{1024} * h_p / 8 * 9, err, 0, 64, 3, 5);
-    L.kw_o = rk.PackWeightAtb(buf.data(), h_p, qd, 4);
+    std::vector<float> buf;
     std::vector<float> gate(std::size_t{I} * H), up(std::size_t{I} * H), ws;
     st.Load(pre + "mlp.gate_proj.weight", gate.data(), gate.size());
     st.Load(pre + "mlp.up_proj.weight", up.data(), up.size());
@@ -739,8 +737,6 @@ struct Engine {
     st.Load(pre + "mlp.down_proj.weight", buf.data(), std::size_t{H} * I);
     L.kw_d = rk.PackWeightAtb(buf.data(), h_p, I, 4);
     rk.WeightSlot(L.kw_d, L.kq_d);
-    L.kp_qkv2 = rk.MakeProgram(H, qkv_p, programs + "/" + nm.kqkv + ".txt", std::size_t{1024} * qkv_p / 8 * 9, err, 0, 64, 3, 5);
-    L.kp_o2 = rk.MakeProgram(qd, h_p, programs + "/" + nm.ko + ".txt", std::size_t{1024} * h_p / 8 * 9, err, 0, 64, 3, 5);
     L.swc2 = rk.MakeBo(2 * abytes, 3);
     std::memset(L.swc2.map<void*>(), 0, 2 * abytes);
     L.swc2.sync(XCL_BO_SYNC_BO_TO_DEVICE);
@@ -753,15 +749,34 @@ struct Engine {
     L.kq_d2 = rk.MakeProgram(I, h_p, programs + "/" + nm.dn2 + ".txt", std::size_t{1024} * h_p / 8 * 9, err, 0, 64, 3, 5);
     rk.RebindA(L.kq_d2, L.swc2);
     rk.WeightSlot(L.kw_d, L.kq_d2);
-    KDispatch(L.kw_qkv, L.kp_qkv);
-    KDispatch(L.kw_qkv, L.kp_qkv2);
-    KDispatch(L.kw_o, L.kp_o);
-    KDispatch(L.kw_o, L.kp_o2);
     for (int set = 0; set < 2; ++set) {
       KDispatch(L.kw_a, set ? L.kq_a2 : L.kq_a);
       KDispatch(L.kw_b, set ? L.kq_b2 : L.kq_b);
       KDispatch(L.kw_d, set ? L.kq_d2 : L.kq_d);
     }
+  }
+
+  void PackKd(Layer& L, const Safetensors& st, const std::string& pre, const std::string& programs, std::string* err) {
+    const std::uint32_t H = c.hidden, I = c.inter, qd = c.heads * c.head_dim, kvd = c.kv_heads * c.head_dim;
+    const std::uint32_t qkv_n = qd + 2 * kvd, qkv_p = PadN(qkv_n), h_p = PadN(H);
+    const std::uint32_t half_b = I - half_a;
+    std::vector<float> buf(std::size_t{qkv_p} * H, 0.f);
+    st.Load(pre + "self_attn.q_proj.weight", buf.data(), std::size_t{qd} * H);
+    st.Load(pre + "self_attn.k_proj.weight", buf.data() + std::size_t{qd} * H, std::size_t{kvd} * H);
+    st.Load(pre + "self_attn.v_proj.weight", buf.data() + std::size_t{qd + kvd} * H, std::size_t{kvd} * H);
+    L.kp_qkv = rk.MakeProgram(H, qkv_p, programs + "/" + nm.kqkv + ".txt", std::size_t{1024} * qkv_p / 8 * 9, err, 0, 64, 3, 5);
+    L.kw_qkv = rk.PackWeightAtb(buf.data(), qkv_p, H, 4);
+    buf.assign(std::size_t{h_p} * qd, 0.f);
+    st.Load(pre + "self_attn.o_proj.weight", buf.data(), std::size_t{H} * qd);
+    L.kp_o = rk.MakeProgram(qd, h_p, programs + "/" + nm.ko + ".txt", std::size_t{1024} * h_p / 8 * 9, err, 0, 64, 3, 5);
+    L.kw_o = rk.PackWeightAtb(buf.data(), h_p, qd, 4);
+    PackKdMlp(L, st, pre, programs, err);
+    L.kp_qkv2 = rk.MakeProgram(H, qkv_p, programs + "/" + nm.kqkv + ".txt", std::size_t{1024} * qkv_p / 8 * 9, err, 0, 64, 3, 5);
+    L.kp_o2 = rk.MakeProgram(qd, h_p, programs + "/" + nm.ko + ".txt", std::size_t{1024} * h_p / 8 * 9, err, 0, 64, 3, 5);
+    KDispatch(L.kw_qkv, L.kp_qkv);
+    KDispatch(L.kw_qkv, L.kp_qkv2);
+    KDispatch(L.kw_o, L.kp_o);
+    KDispatch(L.kw_o, L.kp_o2);
   }
 
   // Chunk pipeline: while the device runs chunk i the host encodes chunk i+1 (second program, own A buffer) and decodes chunk i-1.
@@ -1073,6 +1088,712 @@ std::vector<std::int32_t> ReadTokens(const std::string& path) {
   return t;
 }
 
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Hybrid models (qwen35 architecture: gated delta-net layers + non-causal gated attention, one forward pass per sequence).
+// Same engine core as the dense path (pipelined 1024-row GEMM and fused MLP chunks, scratch reuse); only the layer kinds and
+// the layer-major loop over a batch of sequences differ.
+// ---------------------------------------------------------------------------------------------------------------------
+constexpr std::uint32_t kKH = 16, kVH = 32, kKD = 128, kVD = 128, kConvK = 4, kRotDim = 64;
+constexpr std::uint32_t kKeyDim = kKH * kKD, kValDim = kVH * kVD, kConvDim = 2 * kKeyDim + kValDim;
+constexpr std::uint32_t kGdnInN = kConvDim + kValDim;
+
+float SiluF(float x) { return x / (1.0f + std::exp(-x)); }
+
+struct GdnDev {
+  xrt::device dev;
+  xrt::kernel kern;
+  std::vector<std::pair<std::uint32_t, xrt::bo>> insts;
+  std::vector<std::uint32_t> inst_words;
+  xrt::bo bin[2], bx, bout[2];
+  std::uint8_t* in_h[2]{nullptr, nullptr};
+  const std::uint8_t* out_h[2]{nullptr, nullptr};
+  static constexpr std::uint32_t kMaxTok = 2048;
+  bool Init(NpuRuntime& rk, const std::string& programs) {
+    try {
+      dev = rk.device();
+      kern = rk.kernel();
+      for (std::uint32_t t : {64u, 128u, 256u, 512u, 1024u, 2048u}) {
+        std::ifstream f(programs + "/insts_kdh_gdn_" + std::to_string(t) + ".txt", std::ios::binary | std::ios::ate);
+        if (!f) return false;
+        const std::size_t n = static_cast<std::size_t>(f.tellg());
+        f.seekg(0);
+        std::vector<char> v(n);
+        f.read(v.data(), static_cast<std::streamsize>(n));
+        xrt::bo b(dev, n, XCL_BO_FLAGS_CACHEABLE, kern.group_id(1));
+        std::memcpy(b.map<void*>(), v.data(), n);
+        b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        insts.emplace_back(t, b);
+        inst_words.push_back(static_cast<std::uint32_t>(n / 4));
+      }
+      bx = xrt::bo(dev, 4, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(3));
+      for (int i = 0; i < 2; ++i) {
+        bin[i] = xrt::bo(dev, std::size_t{8} * (kMaxTok / 4 + 1) * 9216, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(4));
+        bout[i] = xrt::bo(dev, std::size_t{8} * (kMaxTok / 64) * 73728, XRT_BO_FLAGS_HOST_ONLY, kern.group_id(5));
+        in_h[i] = bin[i].map<std::uint8_t*>();
+        out_h[i] = bout[i].map<std::uint8_t*>();
+        std::memset(in_h[i], 0, std::size_t{8} * (kMaxTok / 4 + 1) * 9216);
+        std::memset(bout[i].map<void*>(), 0, std::size_t{8} * (kMaxTok / 64) * 73728);
+      }
+      return true;
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "gdn device: %s\n", e.what());
+      return false;
+    }
+  }
+  static std::uint32_t Bucket(std::uint32_t tokens) {
+    for (std::uint32_t t : {64u, 128u, 256u, 512u, 1024u, 2048u})
+      if (tokens <= t) return t;
+    return 0;
+  }
+  void Run(int set, std::uint32_t bucket) {
+    std::size_t idx = 0;
+    for (; idx < insts.size(); ++idx)
+      if (insts[idx].first == bucket) break;
+    bin[set].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    auto run = kern(3, insts[idx].second, inst_words[idx], bx, bin[set], bout[set]);
+    run.wait();
+    bout[set].sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+  }
+};
+
+struct HybridEngine : Engine {
+  struct HL {
+    bool linear{false};
+    std::vector<float> conv, convT, a_neg, dt_bias, gnorm, w_a, w_b;
+  };
+  std::vector<HL> hl;
+  GdnDev gd;
+  bool gdn_dev{std::getenv("GEN_GDN_HOST") == nullptr};
+  std::vector<float> readout;
+  std::uint32_t n_codes{0};
+  std::vector<float> s_proj, s_gated, s_outp, s_att, s_qkv;
+  double mx[8]{0, 0, 0, 0, 0, 0, 0, 0};
+
+  static std::uint32_t HfHead(std::uint32_t j) { return j < 16 ? 2 * j : 2 * (j - 16) + 1; }
+
+  // GGUF stores the 32 value heads grouped even-first; rebuild the reference (repeat-interleave) order.
+  static void PermBlocks(std::vector<float>& data, std::size_t first_row, std::uint32_t block_rows, std::size_t cols) {
+    std::vector<float> tmp(std::size_t{kVH} * block_rows * cols);
+    std::memcpy(tmp.data(), &data[first_row * cols], tmp.size() * 4);
+    for (std::uint32_t j = 0; j < kVH; ++j)
+      std::memcpy(&data[(first_row + std::size_t{HfHead(j)} * block_rows) * cols], &tmp[std::size_t{j} * block_rows * cols], std::size_t{block_rows} * cols * 4);
+  }
+  static void PermCols(std::vector<float>& data, std::size_t rows, std::size_t cols, std::uint32_t block_cols) {
+    std::vector<float> tmp(cols);
+    for (std::size_t r = 0; r < rows; ++r) {
+      float* row = &data[r * cols];
+      std::memcpy(tmp.data(), row, cols * 4);
+      for (std::uint32_t j = 0; j < kVH; ++j) std::memcpy(row + std::size_t{HfHead(j)} * block_cols, &tmp[std::size_t{j} * block_cols], std::size_t{block_cols} * 4);
+    }
+  }
+
+  // MLP weights from the GGUF names (ffn_gate/up/down), same packing as the dense path.
+  void PackKdMlpG(Layer& L, const Safetensors& st, const std::string& b, const std::string& programs, std::string* err) {
+    const std::uint32_t H = c.hidden, I = c.inter, h_p = PadN(H);
+    const std::uint32_t half_b = I - half_a;
+    std::vector<float> gate(std::size_t{I} * H), up(std::size_t{I} * H), ws, buf;
+    st.LoadG(b + "ffn_gate.weight", gate.data(), gate.size());
+    st.LoadG(b + "ffn_up.weight", up.data(), up.size());
+    auto pack = [&](std::uint32_t c0, std::uint32_t n) {
+      ws.resize(std::size_t{2} * n * H);
+      for (std::uint32_t r = 0; r < 2 * n; ++r) {
+        const std::uint32_t q = r >> 4, rr = r & 15;
+        const float* src = (rr < 8 ? gate.data() : up.data()) + std::size_t{c0 + q * 8 + (rr & 7)} * H;
+        std::memcpy(ws.data() + std::size_t{r} * H, src, H * 4);
+      }
+      return rk.PackWeightAtb(ws.data(), 2 * n, H, 4);
+    };
+    L.kw_a = pack(0, half_a);
+    L.kw_b = pack(half_a, half_b);
+    const std::size_t abytes = std::size_t{1024} * I / 8 * 9;
+    for (int set = 0; set < 2; ++set) {
+      xrt::bo& sw = set ? L.swc2 : L.swc;
+      sw = rk.MakeBo(2 * abytes, 3);
+      std::memset(sw.map<void*>(), 0, 2 * abytes);
+      sw.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      Program& pa = set ? L.kq_a2 : L.kq_a;
+      Program& pb = set ? L.kq_b2 : L.kq_b;
+      Program& pd = set ? L.kq_d2 : L.kq_d;
+      pa = rk.MakeProgram(H, 2 * half_a, programs + "/" + nm.swa + ".txt", 64, err, 0, 64, 3, 5);
+      pb = rk.MakeProgram(H, 2 * half_b, programs + "/" + nm.swb + ".txt", 64, err, 0, 64, 3, 5);
+      pa.c = sw;
+      pa.ch = sw.map<std::uint8_t*>();
+      pb.c = sw;
+      pb.ch = pa.ch;
+      pd = rk.MakeProgram(I, h_p, programs + "/" + nm.dn2 + ".txt", std::size_t{1024} * h_p / 8 * 9, err, 0, 64, 3, 5);
+      rk.RebindA(pd, sw);
+      if (set == 0) {
+        buf.assign(std::size_t{h_p} * I, 0.f);
+        st.LoadG(b + "ffn_down.weight", buf.data(), std::size_t{H} * I);
+        L.kw_d = rk.PackWeightAtb(buf.data(), h_p, I, 4);
+      }
+      rk.WeightSlot(L.kw_d, pd);
+    }
+    for (int set = 0; set < 2; ++set) {
+      KDispatch(L.kw_a, set ? L.kq_a2 : L.kq_a);
+      KDispatch(L.kw_b, set ? L.kq_b2 : L.kq_b);
+      KDispatch(L.kw_d, set ? L.kq_d2 : L.kq_d);
+    }
+  }
+
+  bool InitH(const std::string& model, const std::string& programs, std::uint32_t context, const std::vector<std::uint32_t>& code_ids) {
+    ctx = context;
+    programs_dir = programs;
+    Safetensors st;
+    if (!st.Open(model)) return false;
+    const auto& r = *st.r;
+    c.layers = *r.GetMetadataUint32("qwen35.block_count");
+    c.hidden = *r.GetMetadataUint32("qwen35.embedding_length");
+    c.inter = *r.GetMetadataUint32("qwen35.feed_forward_length");
+    c.heads = *r.GetMetadataUint32("qwen35.attention.head_count");
+    c.kv_heads = *r.GetMetadataUint32("qwen35.attention.head_count_kv");
+    c.head_dim = *r.GetMetadataUint32("qwen35.attention.key_length");
+    c.theta = *r.GetMetadataFloat32("qwen35.rope.freq_base");
+    c.eps = *r.GetMetadataFloat32("qwen35.attention.layer_norm_rms_epsilon");
+    const std::uint32_t interval = *r.GetMetadataUint32("qwen35.full_attention_interval");
+    if (c.head_dim != 256 || c.heads != 16 || c.kv_heads != 4 || *r.GetMetadataUint32("qwen35.ssm.time_step_rank") != kVH ||
+        *r.GetMetadataUint32("qwen35.ssm.group_count") != kKH || *r.GetMetadataUint32("qwen35.ssm.state_size") != kKD ||
+        *r.GetMetadataUint32("qwen35.rope.dimension_count") != kRotDim || c.hidden % 64 || c.inter % 512) {
+      std::fprintf(stderr, "hybrid: unsupported qwen35 shape\n");
+      return false;
+    }
+    std::string err;
+    if (!rk.Init(programs + "/final_kdh.xclbin", &err)) {
+      std::fprintf(stderr, "npu init: %s\n", err.c_str());
+      return false;
+    }
+    kd = true;
+    const std::uint32_t H = c.hidden, I = c.inter, qd = c.heads * c.head_dim, kvd = c.kv_heads * c.head_dim;
+    const std::uint32_t attn_n = 2 * qd + 2 * kvd, h_p = PadN(H);
+    half_a = (I / 2) / 512 * 512;
+    const std::string mk = std::to_string(H) + "x" + std::to_string(I);
+    nm.kqkv = "insts_kdh_1024x" + std::to_string(H) + "x" + std::to_string(attn_n);
+    nm.ko = "insts_kdh_1024x" + std::to_string(kValDim) + "x" + std::to_string(h_p);
+    nm.swa = "insts_kdh_swi_a_" + mk + "_" + std::to_string(half_a);
+    nm.swb = "insts_kdh_swi_b_" + mk + "_" + std::to_string(half_a);
+    nm.dn2 = "insts_kdh_dn2_1024x" + std::to_string(I) + "x" + std::to_string(h_p);
+    const std::string gdn_in = "insts_kdh_1024x" + std::to_string(H) + "x" + std::to_string(kGdnInN);
+    {
+      const std::string env = "source " + programs + "/../../gen/env.sh; ";
+      const std::string gk = "bash " + programs + "/../kdh/gen_kdh.sh ";
+      const auto need = [&](const std::string& file, const std::string& cmd) {
+        std::ifstream f(programs + "/" + file);
+        if (f.good()) return;
+        std::fprintf(stderr, "gen: generating %s\n", file.c_str());
+        if (std::system(("bash -c '" + env + cmd + "' >/dev/null").c_str()) != 0) {
+          std::fprintf(stderr, "gen: failed to generate %s\n", file.c_str());
+          std::exit(1);
+        }
+      };
+      const auto n = [](std::uint32_t v) { return std::to_string(v); };
+      const std::string base = "-M 1024 ";
+      need(gdn_in + ".txt", gk + gdn_in + " " + n(I) + " " + base + "-K " + n(H) + " -N " + n(kGdnInN));
+      need(nm.kqkv + ".txt", gk + nm.kqkv + " " + n(I) + " " + base + "-K " + n(H) + " -N " + n(attn_n));
+      need(nm.ko + ".txt", gk + nm.ko + " " + n(I) + " " + base + "-K " + n(kValDim) + " -N " + n(h_p));
+      need(nm.swa + ".txt", gk + nm.swa + " " + n(I) + " " + base + "-K " + n(H) + " -N " + n(2 * half_a) + " --mode swigu --noff 0");
+      need(nm.swb + ".txt", gk + nm.swb + " " + n(I) + " " + base + "-K " + n(H) + " -N " + n(2 * (I - half_a)) + " --mode swigu --noff " + n(half_a / 64));
+      need(nm.dn2 + ".txt", gk + nm.dn2 + " " + n(I) + " " + base + "-K " + n(I) + " -N " + n(h_p) + " --a2 1");
+      for (std::uint32_t t : {64u, 128u, 256u, 512u, 1024u, 2048u})
+        need("insts_kdh_gdn_" + n(t) + ".txt", gk + "insts_kdh_gdn_" + n(t) + " 7680 -M " + n(t) + " -K 64 -N 128 --mode gdn");
+    }
+    if (gdn_dev && !gd.Init(rk, programs)) gdn_dev = false;
+    {
+      std::uint32_t cc, rr;
+      st.DimsG("token_embd.weight", &cc, &rr);
+      c.vocab = rr;
+      const auto* t = r.FindTensor("token_embd.weight");
+      embed.resize(std::size_t{cc} * rr);
+      const gufo::models::lfm3::Tensor tn{t->data, t->type, cc, rr, t->size_bytes};
+#pragma omp parallel
+      {
+        std::vector<float> tmp(cc);
+#pragma omp for
+        for (std::int64_t row = 0; row < rr; ++row) {
+          DecodeRowAny(tn, static_cast<std::uint32_t>(row), std::span<float>(tmp.data(), cc));
+          for (std::uint32_t i = 0; i < cc; ++i) embed[std::size_t(row) * cc + i] = Bf16Bits(tmp[i]);
+        }
+      }
+    }
+    norm_w.resize(H);
+    st.LoadG("output_norm.weight", norm_w.data(), H);
+    {
+      std::uint32_t cc, rr;
+      st.DimsG("output.weight", &cc, &rr);
+      const auto* t = r.FindTensor("output.weight");
+      const gufo::models::lfm3::Tensor tn{t->data, t->type, cc, rr, t->size_bytes};
+      n_codes = static_cast<std::uint32_t>(code_ids.size());
+      readout.resize(std::size_t{n_codes} * H);
+      for (std::uint32_t k = 0; k < n_codes; ++k) DecodeRowAny(tn, code_ids[k], std::span<float>(&readout[std::size_t{k} * H], H));
+    }
+    kxn = std::max({H, qd, I, kValDim});
+    kyn = std::max<std::size_t>(kGdnInN, h_p);
+    layers.resize(c.layers);
+    hl.resize(c.layers);
+    std::vector<float> buf;
+    const auto t0 = Clock::now();
+    for (std::uint32_t l = 0; l < c.layers; ++l) {
+      Layer& L = layers[l];
+      HL& h = hl[l];
+      const std::string b = "blk." + std::to_string(l) + ".";
+      h.linear = (l % interval) != interval - 1;
+      L.attn_norm.resize(H);
+      L.ffn_norm.resize(H);
+      st.LoadG(b + "attn_norm.weight", L.attn_norm.data(), H);
+      st.LoadG(b + "post_attention_norm.weight", L.ffn_norm.data(), H);
+      if (h.linear) {
+        h.conv.resize(std::size_t{kConvDim} * kConvK);
+        st.LoadG(b + "ssm_conv1d.weight", h.conv.data(), h.conv.size());
+        PermBlocks(h.conv, 2 * kKeyDim, kVD, kConvK);
+        h.a_neg.resize(kVH);
+        h.dt_bias.resize(kVH);
+        {
+          std::vector<float> ta(kVH), td(kVH);
+          st.LoadG(b + "ssm_a", ta.data(), kVH);
+          st.LoadG(b + "ssm_dt.bias", td.data(), kVH);
+          for (std::uint32_t j = 0; j < kVH; ++j) {
+            h.a_neg[HfHead(j)] = ta[j];
+            h.dt_bias[HfHead(j)] = td[j];
+          }
+        }
+        h.gnorm.resize(kVD);
+        st.LoadG(b + "ssm_norm.weight", h.gnorm.data(), kVD);
+        h.w_a.resize(std::size_t{kVH} * H);
+        h.w_b.resize(std::size_t{kVH} * H);
+        if (st.HasG(b + "ssm_beta_alpha.weight")) {
+          std::vector<float> ba(std::size_t{2 * kVH} * H);
+          st.LoadG(b + "ssm_beta_alpha.weight", ba.data(), ba.size());
+          std::memcpy(h.w_b.data(), ba.data(), std::size_t{kVH} * H * 4);
+          std::memcpy(h.w_a.data(), ba.data() + std::size_t{kVH} * H, std::size_t{kVH} * H * 4);
+        } else {
+          st.LoadG(b + "ssm_alpha.weight", h.w_a.data(), h.w_a.size());
+          st.LoadG(b + "ssm_beta.weight", h.w_b.data(), h.w_b.size());
+        }
+        PermBlocks(h.w_a, 0, 1, H);
+        PermBlocks(h.w_b, 0, 1, H);
+        buf.resize(std::size_t{kGdnInN} * H);
+        if (st.HasG(b + "attn_qkv_gate.weight")) {
+          st.LoadG(b + "attn_qkv_gate.weight", buf.data(), buf.size());
+        } else {
+          st.LoadG(b + "attn_qkv.weight", buf.data(), std::size_t{kConvDim} * H);
+          st.LoadG(b + "attn_gate.weight", buf.data() + std::size_t{kConvDim} * H, std::size_t{kValDim} * H);
+        }
+        {
+          std::vector<float> vb(buf.begin() + std::size_t{2 * kKeyDim} * H, buf.begin() + std::size_t{kConvDim} * H);
+          PermBlocks(vb, 0, kVD, H);
+          std::memcpy(&buf[std::size_t{2 * kKeyDim} * H], vb.data(), vb.size() * 4);
+          std::vector<float> zb(buf.begin() + std::size_t{kConvDim} * H, buf.end());
+          PermBlocks(zb, 0, kVD, H);
+          std::memcpy(&buf[std::size_t{kConvDim} * H], zb.data(), zb.size() * 4);
+        }
+        L.kp_qkv = rk.MakeProgram(H, kGdnInN, programs + "/" + gdn_in + ".txt", std::size_t{1024} * kGdnInN / 8 * 9, &err, 0, 64, 3, 5);
+        L.kp_qkv2 = rk.MakeProgram(H, kGdnInN, programs + "/" + gdn_in + ".txt", std::size_t{1024} * kGdnInN / 8 * 9, &err, 0, 64, 3, 5);
+        L.kw_qkv = rk.PackWeightAtb(buf.data(), kGdnInN, H, 4);
+        buf.assign(std::size_t{h_p} * kValDim, 0.f);
+        {
+          std::vector<float> ow(std::size_t{H} * kValDim);
+          st.LoadG(b + "ssm_out.weight", ow.data(), ow.size());
+          PermCols(ow, H, kValDim, kVD);
+          std::memcpy(buf.data(), ow.data(), ow.size() * 4);
+        }
+      } else {
+        L.qn.resize(c.head_dim);
+        L.kn.resize(c.head_dim);
+        st.LoadG(b + "attn_q_norm.weight", L.qn.data(), c.head_dim);
+        st.LoadG(b + "attn_k_norm.weight", L.kn.data(), c.head_dim);
+        buf.resize(std::size_t{attn_n} * H);
+        st.LoadG(b + "attn_q.weight", buf.data(), std::size_t{2 * qd} * H);
+        st.LoadG(b + "attn_k.weight", buf.data() + std::size_t{2 * qd} * H, std::size_t{kvd} * H);
+        st.LoadG(b + "attn_v.weight", buf.data() + std::size_t{2 * qd + kvd} * H, std::size_t{kvd} * H);
+        L.kp_qkv = rk.MakeProgram(H, attn_n, programs + "/" + nm.kqkv + ".txt", std::size_t{1024} * attn_n / 8 * 9, &err, 0, 64, 3, 5);
+        L.kp_qkv2 = rk.MakeProgram(H, attn_n, programs + "/" + nm.kqkv + ".txt", std::size_t{1024} * attn_n / 8 * 9, &err, 0, 64, 3, 5);
+        L.kw_qkv = rk.PackWeightAtb(buf.data(), attn_n, H, 4);
+        buf.assign(std::size_t{h_p} * qd, 0.f);
+        st.LoadG(b + "attn_output.weight", buf.data(), std::size_t{H} * qd);
+      }
+      L.kp_o = rk.MakeProgram(kValDim, h_p, programs + "/" + nm.ko + ".txt", std::size_t{1024} * h_p / 8 * 9, &err, 0, 64, 3, 5);
+      L.kp_o2 = rk.MakeProgram(kValDim, h_p, programs + "/" + nm.ko + ".txt", std::size_t{1024} * h_p / 8 * 9, &err, 0, 64, 3, 5);
+      L.kw_o = rk.PackWeightAtb(buf.data(), h_p, kValDim, 4);
+      KDispatch(L.kw_qkv, L.kp_qkv);
+      KDispatch(L.kw_qkv, L.kp_qkv2);
+      KDispatch(L.kw_o, L.kp_o);
+      KDispatch(L.kw_o, L.kp_o2);
+      PackKdMlpG(L, st, b, programs, &err);
+      if (l % 8 == 0) std::fprintf(stderr, "hybrid: packed layer %u (%.1f s)\n", l, Ms(t0) / 1000.0);
+    }
+    return true;
+  }
+
+  // ---- delta-net layer ----
+  void GdnHdrDev(const HL& h, std::uint32_t ne) {
+    for (std::uint32_t set = 0; set < 2; ++set)
+      for (std::uint32_t col = 0; col < 8; ++col) {
+        auto* w = reinterpret_cast<std::uint16_t*>(gd.in_h[set] + std::size_t{col} * (ne / 4 + 1) * 9216);
+        const std::uint32_t kh = 8 * set + col;
+        for (std::uint32_t j = 0; j < kConvK; ++j)
+          for (std::uint32_t i = 0; i < 128; ++i) {
+            w[j * 128 + i] = Bf16Bits(h.conv[std::size_t{kh * 128 + i} * kConvK + j]);
+            w[512 + j * 128 + i] = Bf16Bits(h.conv[std::size_t{kKeyDim + kh * 128 + i} * kConvK + j]);
+            for (std::uint32_t hs = 0; hs < 2; ++hs)
+              w[1024 + hs * 512 + j * 128 + i] = Bf16Bits(h.conv[std::size_t{2 * kKeyDim + (16 * set + 2 * col + hs) * 128 + i} * kConvK + j]);
+          }
+      }
+  }
+
+  void Gates(const HL& h, const float* z, std::uint32_t T, std::vector<float>* ab) {
+    const std::uint32_t H = c.hidden;
+    ab->resize(std::size_t{T} * 2 * kVH);
+#pragma omp parallel for collapse(2)
+    for (std::int64_t t = 0; t < T; ++t)
+      for (std::uint32_t j = 0; j < 2 * kVH; ++j) {
+        const float* wrow = (j < kVH ? h.w_a.data() : h.w_b.data()) + std::size_t{j % kVH} * H;
+        const float* zr = z + std::size_t(t) * H;
+        float s = 0;
+        for (std::uint32_t i = 0; i < H; ++i) s += wrow[i] * zr[i];
+        (*ab)[std::size_t(t) * 2 * kVH + j] = s;
+      }
+  }
+
+  void GdnPrepDev(const HL& h, const float* proj, const float* z, std::uint32_t T, std::uint32_t tok_off, std::uint32_t ne) {
+    std::vector<float> ab;
+    Gates(h, z, T, &ab);
+#pragma omp parallel for collapse(2)
+    for (std::int64_t t = 0; t < T; ++t)
+      for (std::uint32_t v = 0; v < kVH; ++v) {
+        const std::uint32_t kh = v / (kVH / kKH);
+        const float* row = proj + std::size_t(t) * kGdnInN;
+        const std::uint32_t g = tok_off + static_cast<std::uint32_t>(t), set = v / 16, hh = v % 16, col = hh / 2, hs = hh % 2;
+        std::uint8_t* rec = gd.in_h[set] + (std::size_t{col} * (ne / 4 + 1) + 1 + g / 4) * 9216 + ((g % 4) * 2 + hs) * 1024;
+        auto* b = reinterpret_cast<std::uint16_t*>(rec);
+        for (std::uint32_t i = 0; i < kKD; ++i) {
+          b[i] = Bf16Bits(row[kh * kKD + i]);
+          b[128 + i] = Bf16Bits(row[kKeyDim + kh * kKD + i]);
+          b[256 + i] = Bf16Bits(row[2 * kKeyDim + v * kVD + i]);
+        }
+        const float av = ab[std::size_t(t) * 2 * kVH + v], bv = ab[std::size_t(t) * 2 * kVH + kVH + v];
+        const float x = av + h.dt_bias[v];
+        const float sp = x > 20.f ? x : std::log1p(std::exp(x));
+        const float sc[2] = {std::exp(h.a_neg[v] * sp), 1.0f / (1.0f + std::exp(-bv))};
+        std::memcpy(rec + 768, sc, 8);
+        const std::int32_t reset = t == 0 ? 1 : 0;
+        std::memcpy(rec + 776, &reset, 4);
+      }
+  }
+
+  void GdnPadDev(std::uint32_t from, std::uint32_t to, std::uint32_t ne) {
+    for (std::uint32_t g = from; g < to; ++g)
+      for (std::uint32_t v = 0; v < kVH; ++v) {
+        const std::uint32_t set = v / 16, hh = v % 16, col = hh / 2, hs = hh % 2;
+        std::uint8_t* rec = gd.in_h[set] + (std::size_t{col} * (ne / 4 + 1) + 1 + g / 4) * 9216 + ((g % 4) * 2 + hs) * 1024;
+        std::memset(rec, 0, 1024);
+        const float sc[2] = {1.0f, 0.0f};
+        std::memcpy(rec + 768, sc, 8);
+      }
+  }
+
+  void GdnPostDev(const HL& h, const float* proj, std::uint32_t T, std::uint32_t tok_off, std::uint32_t ne, float* gated) {
+#pragma omp parallel for collapse(2)
+    for (std::int64_t t = 0; t < T; ++t)
+      for (std::uint32_t v = 0; v < kVH; ++v) {
+        const std::uint32_t g = tok_off + static_cast<std::uint32_t>(t), set = v / 16, hh = v % 16, col = hh / 2, hs = hh % 2;
+        float o[kVD];
+        for (std::uint32_t half = 0; half < 2; ++half) {
+          const std::uint32_t row = hs * 2 + half;
+          const std::uint8_t* src = gd.out_h[set] + (std::size_t{col} * (ne / 64) + g / 64) * 73728 + std::size_t{row} * 18432 + std::size_t{g % 64} * 256;
+          std::memcpy(o + half * 64, src, 256);
+        }
+        float ss = 0;
+        for (std::uint32_t j = 0; j < kVD; ++j) ss += o[j] * o[j];
+        const float rs = 1.0f / std::sqrt(ss / kVD + c.eps);
+        const float* zz = &proj[std::size_t(t) * kGdnInN + kConvDim + v * kVD];
+        float* gt = &gated[std::size_t(t) * kValDim + v * kVD];
+        for (std::uint32_t j = 0; j < kVD; ++j) gt[j] = h.gnorm[j] * (o[j] * rs) * SiluF(zz[j]);
+      }
+  }
+
+  // Host reference of the whole delta-net stage (conv, norms, recurrence, gated norm), fp32 state.
+  void GdnHost(const HL& h, const float* proj, const float* z, std::uint32_t T, float* gated) {
+    std::vector<float> ab;
+    Gates(h, z, T, &ab);
+    std::vector<float> qkv(std::size_t{T} * kConvDim);
+#pragma omp parallel for
+    for (std::int64_t t = 0; t < T; ++t) {
+      float* o = &qkv[std::size_t(t) * kConvDim];
+      for (std::uint32_t ch = 0; ch < kConvDim; ++ch) {
+        float s = 0;
+        for (std::uint32_t j = 0; j < kConvK; ++j) {
+          const std::int64_t src = t - (kConvK - 1) + j;
+          if (src >= 0) s += h.conv[std::size_t{ch} * kConvK + j] * proj[std::size_t(src) * kGdnInN + ch];
+        }
+        o[ch] = SiluF(s);
+      }
+    }
+#pragma omp parallel for
+    for (std::int64_t v = 0; v < kVH; ++v) {
+      const std::uint32_t kh = static_cast<std::uint32_t>(v) / (kVH / kKH);
+      std::vector<float> S(std::size_t{kKD} * kVD, 0.f), q(kKD), k(kKD), kv(kVD), o(kVD);
+      for (std::uint32_t t = 0; t < T; ++t) {
+        const float* row = &qkv[std::size_t{t} * kConvDim];
+        std::memcpy(q.data(), row + kh * kKD, kKD * 4);
+        std::memcpy(k.data(), row + kKeyDim + kh * kKD, kKD * 4);
+        const float* vv = row + 2 * kKeyDim + v * kVD;
+        float qn = 0, kn = 0;
+        for (std::uint32_t i = 0; i < kKD; ++i) {
+          qn += q[i] * q[i];
+          kn += k[i] * k[i];
+        }
+        const float qs = 1.0f / std::sqrt(qn + 1e-6f) / std::sqrt(static_cast<float>(kKD)), ks = 1.0f / std::sqrt(kn + 1e-6f);
+        for (std::uint32_t i = 0; i < kKD; ++i) {
+          q[i] *= qs;
+          k[i] *= ks;
+        }
+        const float x = ab[std::size_t{t} * 2 * kVH + v] + h.dt_bias[v];
+        const float sp = x > 20.f ? x : std::log1p(std::exp(x));
+        const float decay = std::exp(h.a_neg[v] * sp);
+        const float beta = 1.0f / (1.0f + std::exp(-ab[std::size_t{t} * 2 * kVH + kVH + v]));
+        std::fill(kv.begin(), kv.end(), 0.f);
+        for (std::uint32_t i = 0; i < kKD; ++i) {
+          float* Si = &S[std::size_t{i} * kVD];
+          for (std::uint32_t j = 0; j < kVD; ++j) {
+            Si[j] *= decay;
+            kv[j] += Si[j] * k[i];
+          }
+        }
+        for (std::uint32_t j = 0; j < kVD; ++j) kv[j] = (vv[j] - kv[j]) * beta;
+        std::fill(o.begin(), o.end(), 0.f);
+        for (std::uint32_t i = 0; i < kKD; ++i) {
+          float* Si = &S[std::size_t{i} * kVD];
+          for (std::uint32_t j = 0; j < kVD; ++j) {
+            Si[j] += k[i] * kv[j];
+            o[j] += Si[j] * q[i];
+          }
+        }
+        float ss = 0;
+        for (std::uint32_t j = 0; j < kVD; ++j) ss += o[j] * o[j];
+        const float rs = 1.0f / std::sqrt(ss / kVD + c.eps);
+        const float* zz = &proj[std::size_t{t} * kGdnInN + kConvDim + v * kVD];
+        float* gt = &gated[std::size_t{t} * kValDim + v * kVD];
+        for (std::uint32_t j = 0; j < kVD; ++j) gt[j] = h.gnorm[j] * (o[j] * rs) * SiluF(zz[j]);
+      }
+    }
+  }
+
+  using Seg = std::pair<std::uint32_t, std::uint32_t>;
+
+  void GdnLayer(Layer& L, const HL& h, const float* z, std::uint32_t Tt, const std::vector<Seg>& segs, float* out_h) {
+    const std::uint32_t H = c.hidden, h_p = PadN(H);
+    s_proj.resize(std::size_t{Tt} * kGdnInN);
+    s_gated.resize(std::size_t{Tt} * kValDim);
+    KGemm(L.kp_qkv, L.kp_qkv2, L.kw_qkv, z, Tt, H, s_proj.data());
+    const std::uint32_t ne = GdnDev::Bucket(Tt);
+    if (gdn_dev && ne) {
+      GdnHdrDev(h, ne);
+      for (const auto& sg : segs) GdnPrepDev(h, s_proj.data() + std::size_t{sg.first} * kGdnInN, z + std::size_t{sg.first} * H, sg.second, sg.first, ne);
+      GdnPadDev(Tt, ne, ne);
+      gd.Run(0, ne);
+      gd.Run(1, ne);
+      for (const auto& sg : segs) GdnPostDev(h, s_proj.data() + std::size_t{sg.first} * kGdnInN, sg.second, sg.first, ne, s_gated.data() + std::size_t{sg.first} * kValDim);
+    } else {
+      for (const auto& sg : segs) GdnHost(h, s_proj.data() + std::size_t{sg.first} * kGdnInN, z + std::size_t{sg.first} * H, sg.second, s_gated.data() + std::size_t{sg.first} * kValDim);
+    }
+    s_outp.resize(std::size_t{Tt} * h_p);
+    KGemm(L.kp_o, L.kp_o2, L.kw_o, s_gated.data(), Tt, kValDim, s_outp.data());
+    for (std::uint32_t t = 0; t < Tt; ++t) std::memcpy(out_h + std::size_t{t} * H, &s_outp[std::size_t{t} * h_p], std::size_t{H} * 4);
+  }
+
+  // ---- gated, non-causal full attention (head_dim 256, partial rope) on the host ----
+  void AttnHost(const Layer& L, const float* proj, std::uint32_t T, float* att) {
+    const std::uint32_t qd = c.heads * c.head_dim, kvd = c.kv_heads * c.head_dim, hd = c.head_dim, attn_n = 2 * qd + 2 * kvd;
+    std::vector<float> q(std::size_t{T} * qd), gate(std::size_t{T} * qd), k(std::size_t{T} * kvd), v(std::size_t{T} * kvd);
+    std::vector<float> cs(std::size_t{T} * (kRotDim / 2)), sn(std::size_t{T} * (kRotDim / 2));
+    for (std::uint32_t t = 0; t < T; ++t)
+      for (std::uint32_t i = 0; i < kRotDim / 2; ++i) {
+        const double ang = static_cast<double>(t) * std::pow(static_cast<double>(c.theta), -2.0 * i / kRotDim);
+        cs[std::size_t{t} * (kRotDim / 2) + i] = static_cast<float>(std::cos(ang));
+        sn[std::size_t{t} * (kRotDim / 2) + i] = static_cast<float>(std::sin(ang));
+      }
+    auto norm_rope = [&](float* x, const float* nw, std::uint32_t t) {
+      float ss = 0;
+      for (std::uint32_t i = 0; i < hd; ++i) ss += x[i] * x[i];
+      const float rs = 1.0f / std::sqrt(ss / hd + c.eps);
+      for (std::uint32_t i = 0; i < hd; ++i) x[i] *= rs * nw[i];
+      for (std::uint32_t i = 0; i < kRotDim / 2; ++i) {
+        const float cc = cs[std::size_t{t} * (kRotDim / 2) + i], ss2 = sn[std::size_t{t} * (kRotDim / 2) + i];
+        const float a = x[i], b = x[i + kRotDim / 2];
+        x[i] = a * cc - b * ss2;
+        x[i + kRotDim / 2] = b * cc + a * ss2;
+      }
+    };
+#pragma omp parallel for
+    for (std::int64_t t = 0; t < T; ++t) {
+      const float* row = &proj[std::size_t(t) * attn_n];
+      for (std::uint32_t h = 0; h < c.heads; ++h) {
+        float* qh = &q[std::size_t(t) * qd + h * hd];
+        std::memcpy(qh, row + h * 2 * hd, hd * 4);
+        std::memcpy(&gate[std::size_t(t) * qd + h * hd], row + h * 2 * hd + hd, hd * 4);
+        norm_rope(qh, L.qn.data(), static_cast<std::uint32_t>(t));
+      }
+      for (std::uint32_t h = 0; h < c.kv_heads; ++h) {
+        float* kh = &k[std::size_t(t) * kvd + h * hd];
+        std::memcpy(kh, row + 2 * qd + h * hd, hd * 4);
+        norm_rope(kh, L.kn.data(), static_cast<std::uint32_t>(t));
+        std::memcpy(&v[std::size_t(t) * kvd + h * hd], row + 2 * qd + kvd + h * hd, hd * 4);
+      }
+    }
+    const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+    const std::uint32_t grp = c.heads / c.kv_heads;
+#pragma omp parallel
+    {
+      std::vector<float> sc(T);
+#pragma omp for collapse(2) schedule(dynamic, 4)
+      for (std::int64_t t = 0; t < T; ++t)
+        for (std::uint32_t h = 0; h < c.heads; ++h) {
+          const float* qh = &q[std::size_t(t) * qd + h * hd];
+          const std::uint32_t kh = h / grp;
+          float mx2 = -INFINITY;
+          for (std::uint32_t u = 0; u < T; ++u) {
+            const float* kk = &k[std::size_t{u} * kvd + kh * hd];
+            float s = 0;
+            for (std::uint32_t i = 0; i < hd; ++i) s += qh[i] * kk[i];
+            s *= scale;
+            sc[u] = s;
+            mx2 = std::max(mx2, s);
+          }
+          float den = 0;
+          for (std::uint32_t u = 0; u < T; ++u) {
+            sc[u] = std::exp(sc[u] - mx2);
+            den += sc[u];
+          }
+          float* o = &att[std::size_t(t) * qd + h * hd];
+          std::fill(o, o + hd, 0.f);
+          for (std::uint32_t u = 0; u < T; ++u) {
+            const float wgt = sc[u] / den;
+            const float* vv = &v[std::size_t{u} * kvd + kh * hd];
+            for (std::uint32_t i = 0; i < hd; ++i) o[i] += wgt * vv[i];
+          }
+          const float* gg = &gate[std::size_t(t) * qd + h * hd];
+          for (std::uint32_t i = 0; i < hd; ++i) o[i] *= 1.0f / (1.0f + std::exp(-gg[i]));
+        }
+    }
+  }
+
+  void AttnLayer(Layer& L, const float* z, std::uint32_t Tt, const std::vector<Seg>& segs, float* out_h) {
+    const std::uint32_t H = c.hidden, h_p = PadN(H), qd = c.heads * c.head_dim, attn_n = 2 * qd + 2 * c.kv_heads * c.head_dim;
+    s_proj.resize(std::size_t{Tt} * attn_n);
+    s_att.resize(std::size_t{Tt} * qd);
+    KGemm(L.kp_qkv, L.kp_qkv2, L.kw_qkv, z, Tt, H, s_proj.data());
+    for (const auto& sg : segs) AttnHost(L, s_proj.data() + std::size_t{sg.first} * attn_n, sg.second, s_att.data() + std::size_t{sg.first} * qd);
+    s_outp.resize(std::size_t{Tt} * h_p);
+    KGemm(L.kp_o, L.kp_o2, L.kw_o, s_att.data(), Tt, qd, s_outp.data());
+    for (std::uint32_t t = 0; t < Tt; ++t) std::memcpy(out_h + std::size_t{t} * H, &s_outp[std::size_t{t} * h_p], std::size_t{H} * 4);
+  }
+
+  struct Seq {
+    const std::int32_t* tok;
+    std::uint32_t len, marker;
+  };
+
+  // Layer-major forward over a batch of sequences (rows of all sequences share the GEMM chunks). Returns the final-norm hidden
+  // state at each sequence's marker.
+  void ForwardBatch(const std::vector<Seq>& seqs, std::vector<float>* hidden) {
+    const std::uint32_t H = c.hidden;
+    std::vector<Seg> segs;
+    std::uint32_t T = 0;
+    for (const auto& q : seqs) {
+      segs.push_back({T, q.len});
+      T += q.len;
+    }
+    std::vector<float> x(std::size_t{T} * H), z(std::size_t{T} * H), br(std::size_t{T} * H);
+    for (std::size_t i = 0; i < seqs.size(); ++i)
+#pragma omp parallel for
+      for (std::int64_t t = 0; t < seqs[i].len; ++t)
+        for (std::uint32_t k = 0; k < H; ++k) x[std::size_t(segs[i].first + t) * H + k] = Bf(embed[std::size_t(seqs[i].tok[t]) * H + k]);
+    auto norm_rows = [&](const float* w) {
+#pragma omp parallel for
+      for (std::int64_t r = 0; r < T; ++r) RmsNorm(&x[std::size_t(r) * H], w, &z[std::size_t(r) * H], H, c.eps);
+    };
+    for (std::uint32_t l = 0; l < c.layers; ++l) {
+      Layer& L = layers[l];
+      norm_rows(L.attn_norm.data());
+      if (hl[l].linear) GdnLayer(L, hl[l], z.data(), T, segs, br.data());
+      else AttnLayer(L, z.data(), T, segs, br.data());
+#pragma omp parallel for
+      for (std::int64_t i = 0; i < static_cast<std::int64_t>(x.size()); ++i) x[i] += br[i];
+      norm_rows(L.ffn_norm.data());
+      KMlp(L, z.data(), T, br.data());
+#pragma omp parallel for
+      for (std::int64_t i = 0; i < static_cast<std::int64_t>(x.size()); ++i) x[i] += br[i];
+    }
+    hidden->resize(seqs.size() * H);
+    for (std::size_t i = 0; i < seqs.size(); ++i)
+      RmsNorm(&x[std::size_t{segs[i].first + seqs[i].marker} * H], norm_w.data(), &(*hidden)[i * H], H, c.eps);
+  }
+
+  void Logits(const float* hid, std::uint32_t count, float* out) const {
+    const std::uint32_t H = c.hidden;
+    for (std::uint32_t k = 0; k < count && k < n_codes; ++k) {
+      float s = 0;
+      for (std::uint32_t i = 0; i < H; ++i) s += readout[std::size_t{k} * H + i] * hid[i];
+      out[k] = s;
+    }
+  }
+};
+
+// Batched decision forward: `decide-eval MODEL.gguf PROGRAMS EVAL.bin CODE_IDS.txt` (EVAL.bin: count, then len marker n_options tokens...).
+int DecideEval(const char* model, const char* programs, const char* path, const char* ids_path) {
+  std::vector<std::uint32_t> ids;
+  {
+    std::ifstream f(ids_path);
+    std::uint32_t v;
+    while (f >> v) ids.push_back(v);
+  }
+  std::ifstream f(path, std::ios::binary);
+  std::vector<char> b((std::istreambuf_iterator<char>(f)), {});
+  std::vector<std::int32_t> d(b.size() / 4);
+  std::memcpy(d.data(), b.data(), d.size() * 4);
+  HybridEngine e;
+  if (!e.InitH(model, programs, 4096, ids)) return 1;
+  struct Item { const std::int32_t* tok; std::uint32_t len, marker, cnt; };
+  std::vector<Item> items;
+  std::size_t at = 0;
+  const std::int32_t cases = d[at++];
+  for (std::int32_t k = 0; k < cases; ++k) {
+    Item it{nullptr, static_cast<std::uint32_t>(d[at]), static_cast<std::uint32_t>(d[at + 1]), static_cast<std::uint32_t>(d[at + 2])};
+    at += 3;
+    it.tok = &d[at];
+    at += it.len;
+    items.push_back(it);
+  }
+  const std::uint32_t group = std::getenv("GEN_GROUP") ? static_cast<std::uint32_t>(std::atoi(std::getenv("GEN_GROUP"))) : 12;
+  const int reps = std::getenv("GEN_REPEAT") ? std::atoi(std::getenv("GEN_REPEAT")) : 1;
+  std::uint64_t total = 0;
+  Clock::time_point t0;
+  for (int rep = 0; rep < reps; ++rep) {
+    if (rep == reps - 1) {
+      t0 = Clock::now();
+      total = 0;
+    }
+    for (std::size_t g = 0; g < items.size(); g += group) {
+      std::vector<HybridEngine::Seq> sq;
+      for (std::size_t i = g; i < std::min(items.size(), g + group); ++i) {
+        sq.push_back({items[i].tok, items[i].len, items[i].marker});
+        total += items[i].len;
+      }
+      std::vector<float> hid;
+      e.ForwardBatch(sq, &hid);
+      if (rep == reps - 1)
+        for (std::size_t i = 0; i < sq.size(); ++i) {
+          std::vector<float> lg(items[g + i].cnt);
+          e.Logits(&hid[i * e.c.hidden], items[g + i].cnt, lg.data());
+          for (float v : lg) std::printf("%.5f ", v);
+          std::printf("\n");
+        }
+    }
+  }
+  std::fprintf(stderr, "decide: %zu cases %llu tokens %.1f ms (%.1f ms/case, %.0f tok/s) group %u\n", items.size(), static_cast<unsigned long long>(total), Ms(t0), Ms(t0) / items.size(), total / Ms(t0) * 1000, group);
+  return 0;
+}
+
 }  // namespace
 
 int GemmTest(const char* prog_dir, const char* inst, std::uint32_t K, std::uint32_t N) {
@@ -1319,6 +2040,7 @@ int JudgeStdio(const char* model, const char* programs) {
 }
 
 int main(int argc, char** argv) {
+  if (argc >= 6 && std::string(argv[1]) == "decide-eval") return DecideEval(argv[2], argv[3], argv[4], argv[5]);
   if (argc >= 4 && std::string(argv[1]) == "judge-stdio") return JudgeStdio(argv[2], argv[3]);
   if (argc >= 4 && std::string(argv[1]) == "interactive") return Interactive(argv[2], argv[3]);
   if (argc >= 5 && std::string(argv[1]) == "chat") return Chat(argv[2], argv[3], argv[4], argc > 5 ? std::atoi(argv[5]) : 256, false, 0);

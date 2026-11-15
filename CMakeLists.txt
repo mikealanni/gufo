@@ -283,20 +283,6 @@ if (GUFO_BUILD_NPU_ENGINE)
   target_compile_options(gufo-npu PRIVATE -O3 -march=native -ffast-math -fno-finite-math-only)
   target_link_libraries(gufo-npu PRIVATE gufo_lfm3 OpenMP::OpenMP_CXX
     ${GUFO_XRT_LIB_DIR}/libxrt_coreutil.so.2 ${GUFO_XRT_LIB_DIR}/libxrt_core.so.2)
-  add_executable(gufo-mc5
-    src/npu/runtime/runtime.cpp
-    tools/npu/mc5/gufo_mc5.cpp)
-  target_include_directories(gufo-mc5 PRIVATE ${PROJECT_SOURCE_DIR} ${GUFO_XRT_INCLUDE_DIR})
-  target_compile_options(gufo-mc5 PRIVATE -O3 -march=native -ffast-math -fno-finite-math-only)
-  target_link_libraries(gufo-mc5 PRIVATE OpenMP::OpenMP_CXX
-    ${GUFO_XRT_LIB_DIR}/libxrt_coreutil.so.2 ${GUFO_XRT_LIB_DIR}/libxrt_core.so.2)
-  add_executable(gufo-q35
-    src/npu/runtime/runtime.cpp
-    tools/npu/q35/gufo_q35.cpp)
-  target_include_directories(gufo-q35 PRIVATE ${PROJECT_SOURCE_DIR} ${GUFO_XRT_INCLUDE_DIR})
-  target_compile_options(gufo-q35 PRIVATE -O3 -march=native -ffast-math -fno-finite-math-only)
-  target_link_libraries(gufo-q35 PRIVATE OpenMP::OpenMP_CXX
-    ${GUFO_XRT_LIB_DIR}/libxrt_coreutil.so.2 ${GUFO_XRT_LIB_DIR}/libxrt_core.so.2)
   add_executable(gufo-gen
     src/npu/runtime/runtime.cpp
     tools/npu/gen/gufo_gen.cpp)
