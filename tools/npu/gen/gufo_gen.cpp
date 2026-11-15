@@ -988,7 +988,7 @@ struct Engine {
       return;
     }
     const std::uint32_t nqb = (T + kBq - 1) / kBq;
-#pragma omp parallel for collapse(2) schedule(dynamic, 1) num_threads(attn_threads)
+#pragma omp parallel for collapse(2) schedule(dynamic, 1) num_threads(prefill_attn_threads)
     for (std::int64_t qb = 0; qb < nqb; ++qb)
       for (std::int64_t h = 0; h < c.heads; ++h) {
         float rowtmp[kMaxHeadDim];
@@ -1042,6 +1042,7 @@ struct Engine {
       }
   }
 
+  int prefill_attn_threads{std::getenv("GEN_ATTN_THREADS") ? std::atoi(std::getenv("GEN_ATTN_THREADS")) : 32};  // prefill is compute-bound: both hardware threads of every core help
   int attn_threads{std::getenv("GEN_ATTN_THREADS") ? std::atoi(std::getenv("GEN_ATTN_THREADS")) : 16};
 
   void Attend(Layer& L, const float* q, std::uint32_t p, float* out) {
