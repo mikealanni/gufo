@@ -597,11 +597,19 @@ __attribute__((noinline)) static void gdn_token(const uint8_t *rec, int half, ui
     for (int i = 0; i < 128; ++i) aie::store_v(S + i * 64, z);
   }
   aie::accum<accfloat, 64> kv = aie::zeros<accfloat, 64>(), sq = aie::zeros<accfloat, 64>();
-  for (int i = 0; i < 128; ++i) {
+  aie::accum<accfloat, 64> kv2 = aie::zeros<accfloat, 64>(), sq2 = aie::zeros<accfloat, 64>();
+  AIE_PREPARE_FOR_PIPELINING
+  AIE_LOOP_MIN_ITERATION_COUNT(64)
+  for (int i = 0; i < 128; i += 2) {
     const aie::vector<bfloat16, 64> s = aie::load_v<64>(S + i * 64);
+    const aie::vector<bfloat16, 64> s2 = aie::load_v<64>(S + i * 64 + 64);
     kv = aie::mac(kv, s, aie::broadcast<bfloat16, 64>(kk[i]));
     sq = aie::mac(sq, s, aie::broadcast<bfloat16, 64>(q[i]));
+    kv2 = aie::mac(kv2, s2, aie::broadcast<bfloat16, 64>(kk[i + 1]));
+    sq2 = aie::mac(sq2, s2, aie::broadcast<bfloat16, 64>(q[i + 1]));
   }
+  kv = aie::add(kv.template to_vector<float>(), kv2.template to_vector<float>());
+  sq = aie::add(sq.template to_vector<float>(), sq2.template to_vector<float>());
   aie::accum<accfloat, 64> dq = aie::zeros<accfloat, 64>();
   dq = aie::mac(dq, aie::load_v<64>(kk), aie::load_v<64>(q));
   dq = aie::mac(dq, aie::load_v<64>(kk + 64), aie::load_v<64>(q + 64));
@@ -620,14 +628,37 @@ __attribute__((noinline)) static void gdn_token(const uint8_t *rec, int half, ui
   const bfloat16 dhi = (bfloat16)decay;
   const aie::vector<bfloat16, 64> vdh = aie::broadcast<bfloat16, 64>(dhi);
   const aie::vector<bfloat16, 64> vdl = aie::broadcast<bfloat16, 64>((bfloat16)(decay - (float)dhi));
-  for (int i = 0; i < 128; ++i) {
-    const aie::vector<bfloat16, 64> s = aie::load_v<64>(S + i * 64);
-    const aie::vector<bfloat16, 64> vk = aie::broadcast<bfloat16, 64>(kk[i]);
-    aie::accum<accfloat, 64> a = aie::mul(s, vdh);
-    a = aie::mac(a, s, vdl);
-    a = aie::mac(a, vk, dh);
-    a = aie::mac(a, vk, dl);
-    aie::store_v(S + i * 64, a.template to_vector<bfloat16>());
+  AIE_PREPARE_FOR_PIPELINING
+  AIE_LOOP_MIN_ITERATION_COUNT(32)
+  for (int i = 0; i < 128; i += 4) {
+    const aie::vector<bfloat16, 64> s0 = aie::load_v<64>(S + i * 64);
+    const aie::vector<bfloat16, 64> s1 = aie::load_v<64>(S + i * 64 + 64);
+    const aie::vector<bfloat16, 64> s2 = aie::load_v<64>(S + i * 64 + 128);
+    const aie::vector<bfloat16, 64> s3 = aie::load_v<64>(S + i * 64 + 192);
+    const aie::vector<bfloat16, 64> k0 = aie::broadcast<bfloat16, 64>(kk[i]);
+    const aie::vector<bfloat16, 64> k1 = aie::broadcast<bfloat16, 64>(kk[i + 1]);
+    const aie::vector<bfloat16, 64> k2 = aie::broadcast<bfloat16, 64>(kk[i + 2]);
+    const aie::vector<bfloat16, 64> k3 = aie::broadcast<bfloat16, 64>(kk[i + 3]);
+    aie::accum<accfloat, 64> a0 = aie::mul(s0, vdh);
+    aie::accum<accfloat, 64> a1 = aie::mul(s1, vdh);
+    aie::accum<accfloat, 64> a2 = aie::mul(s2, vdh);
+    aie::accum<accfloat, 64> a3 = aie::mul(s3, vdh);
+    a0 = aie::mac(a0, s0, vdl);
+    a1 = aie::mac(a1, s1, vdl);
+    a2 = aie::mac(a2, s2, vdl);
+    a3 = aie::mac(a3, s3, vdl);
+    a0 = aie::mac(a0, k0, dh);
+    a1 = aie::mac(a1, k1, dh);
+    a2 = aie::mac(a2, k2, dh);
+    a3 = aie::mac(a3, k3, dh);
+    a0 = aie::mac(a0, k0, dl);
+    a1 = aie::mac(a1, k1, dl);
+    a2 = aie::mac(a2, k2, dl);
+    a3 = aie::mac(a3, k3, dl);
+    aie::store_v(S + i * 64, a0.template to_vector<bfloat16>());
+    aie::store_v(S + i * 64 + 64, a1.template to_vector<bfloat16>());
+    aie::store_v(S + i * 64 + 128, a2.template to_vector<bfloat16>());
+    aie::store_v(S + i * 64 + 192, a3.template to_vector<bfloat16>());
   }
 }
 
