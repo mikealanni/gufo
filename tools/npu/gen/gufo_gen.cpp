@@ -3866,6 +3866,11 @@ int JudgeStdio(const char* model, const char* programs) {
 }
 
 int main(int argc, char** argv) {
+  // 512-row device-resident prefill programs on by default (10x dense prefill); an explicit environment value wins
+  setenv("GEN_KD", "1", 0);
+  setenv("GUFO_ATB", "1", 0);
+  setenv("GEN_HOST_CTX", "512", 0);
+  setenv("GEN_KD_MIN", "512", 0);
   if (argc >= 6 && std::string(argv[1]) == "decide-eval") return DecideEval(argv[2], argv[3], argv[4], argv[5]);
   if (argc >= 4 && std::string(argv[1]) == "judge-stdio") return JudgeStdio(argv[2], argv[3]);
   if (argc >= 4 && std::string(argv[1]) == "interactive") return Interactive(argv[2], argv[3]);
