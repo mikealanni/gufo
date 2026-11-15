@@ -14,7 +14,8 @@ COLS, ROWS = 8, 4
 BQ = 1536
 CB = 1024
 CHUNK = 3 * ROWS * BQ
-PREFIX_UNITS = 16
+NT = int(os.environ.get("ATTNP_NT", "3"))
+PREFIX_UNITS = 7 + 3 * NT
 PREFIX_COL = PREFIX_UNITS * ROWS * BQ
 OUT_ELEMS = 34
 MAX_BD = 1023
@@ -101,7 +102,7 @@ def design(m, k, n, mc):
                             e = B_l2l1[row][col].acquire(ObjectFifoPort.Consume, 1)
                             attn_q(e, arith.index_cast(T.i32(), qi))
                             B_l2l1[row][col].release(ObjectFifoPort.Consume, 1)
-                        for ti in range_(9):
+                        for ti in range_(3 * NT):
                             e = B_l2l1[row][col].acquire(ObjectFifoPort.Consume, 1)
                             attn_tail(e, arith.index_cast(T.i32(), ti))
                             B_l2l1[row][col].release(ObjectFifoPort.Consume, 1)

@@ -1325,26 +1325,30 @@ bool NpuRuntime::AttnRun(AttnLayer& al, std::uint32_t pos, std::uint32_t n, cons
   return ok;
 }
 
-bool AttnPrefill::Init(const std::string& dir, std::string* error) {
+bool AttnPrefill::Init(const std::string& dir, std::string* error, bool packed) {
   try {
     dir_ = dir;
+    packed_ = packed;
+    nt_ = packed ? 5 : 3;
+    pcol_ = std::size_t{7 + 3 * nt_} * 4 * 1536;
+    tag_ = packed ? "2" : "";
     dev_ = xrt::device(0u);
-    const xrt::xclbin xb{dir + "/final_attnp.xclbin"};
+    const xrt::xclbin xb{dir + "/final_attnp" + tag_ + ".xclbin"};
     dev_.register_xclbin(xb);
     ctx_ = xrt::hw_context(dev_, xb.get_uuid());
     kern_ = xrt::kernel(ctx_, xb.get_kernels().at(0).get_name());
-    const xrt::xclbin xe{dir + "/final_attnp_exact.xclbin"};
+    const xrt::xclbin xe{dir + "/final_attnp" + tag_ + "_exact.xclbin"};
     dev_.register_xclbin(xe);
     ctx_x_ = xrt::hw_context(dev_, xe.get_uuid());
     kern_x_ = xrt::kernel(ctx_x_, xe.get_kernels().at(0).get_name());
     have_exact_ = true;
     exact_ = std::getenv("GUFO_ATTN_EXACT") != nullptr;
     for (int s = 0; s < 2; ++s) {
-      a_[s] = xrt::bo(dev_, kAttnPrefixCol * 8, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(3));
+      a_[s] = xrt::bo(dev_, pcol_ * 8, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(3));
       c_[s] = xrt::bo(dev_, std::size_t{8} * kAttnOutElems * 4 * kRowBytes, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(3));
       ah_[s] = a_[s].map<std::uint8_t*>();
       ch_[s] = c_[s].map<std::uint8_t*>();
-      std::memset(ah_[s], 0, kAttnPrefixCol * 8);
+      std::memset(ah_[s], 0, pcol_ * 8);
       a_[s].sync(XCL_BO_SYNC_BO_TO_DEVICE);
       c_[s].sync(XCL_BO_SYNC_BO_TO_DEVICE);
     }
@@ -1359,7 +1363,8 @@ bool AttnPrefill::Init(const std::string& dir, std::string* error) {
 bool AttnPrefill::Prep(int slot, AttnLayer& al, std::uint32_t pos0, std::uint32_t n, const float* q,
                        const std::uint16_t* k_hist, const std::uint16_t* v_hist, std::uint32_t* mc_out) {
   const std::uint32_t ring = al.ring_tokens;
-  if (!ready_ || (!ring && al.kpre.empty()) || n == 0 || n > 128) return false;
+  if (!ready_ || (!ring && al.kpre.empty()) || n == 0 || n > PassTokens()) return false;
+  const std::uint32_t tpc = 16u << sg_, hmask = (1u << (2 - sg_)) - 1;
   const std::uint32_t kvd = kAttnKvh * kAttnHd, qd = 16 * kAttnHd;
   const float qscale = 1.4426950408889634f / std::sqrt(static_cast<float>(kAttnHd));
   const std::uint32_t total = pos0 + n;
@@ -1374,19 +1379,20 @@ bool AttnPrefill::Prep(int slot, AttnLayer& al, std::uint32_t pos0, std::uint32_
     if (mc == 0 || mc > al.capacity_chunks) return false;
   }
   auto hist_slot = [&](std::uint32_t tok) { return ring ? tok % ring : tok; };
-  std::memset(ah_[slot], 0, kAttnPrefixCol * 8);
+  std::memset(ah_[slot], 0, pcol_ * 8);
 #pragma omp parallel for schedule(static, 1)
   for (std::int32_t cr = 0; cr < 32; ++cr) {
     const std::uint32_t c = static_cast<std::uint32_t>(cr) / 4, r = static_cast<std::uint32_t>(cr) % 4;
-    const std::uint32_t pos = pos0 + 16 * c;
-    const std::uint32_t nc = 16 * c >= n ? 0 : std::min(16u, n - 16 * c);
-    std::uint8_t* core = ah_[slot] + std::size_t{c} * kAttnPrefixCol;
+    const std::uint32_t pos = pos0 + tpc * c;
+    const std::uint32_t nc = tpc * c >= n ? 0 : std::min(tpc, n - tpc * c);
+    std::uint8_t* core = ah_[slot] + std::size_t{c} * pcol_;
     auto unit = [&](std::uint32_t u) { return core + std::size_t{u} * 4 * 1536 + std::size_t{r} * 1536; };
     const std::uint32_t tot_c = pos + nc;
     std::int32_t ih[4] = {static_cast<std::int32_t>(pos), static_cast<std::int32_t>(nc),
                          static_cast<std::int32_t>(tot_c ? (tot_c - 1) / 16 : 0),
                          static_cast<std::int32_t>(al.window)};
     std::memcpy(unit(0), ih, 16);
+    *reinterpret_cast<std::int32_t*>(unit(0) + 112) = static_cast<std::int32_t>(sg_);
     if (nc == 0) continue;
     if (ring) {
       auto* tab = reinterpret_cast<std::int32_t*>(unit(0) + 16);
@@ -1399,9 +1405,9 @@ bool AttnPrefill::Prep(int slot, AttnLayer& al, std::uint32_t pos0, std::uint32_
     std::vector<float> qs(std::size_t{64} * kAttnHd, 0.f);
     const float kbound = std::sqrt(ring ? al.kmax2[r] : al.kpre[std::size_t{tot_c - 1} * kAttnKvh + r]);
     for (std::uint32_t i = 0; i < 64; ++i) {
-      const std::uint32_t hq = i / 16, t = i % 16;
+      const std::uint32_t hq = i / 16, t = (i % 16) + 16 * (hq >> (2 - sg_));
       if (t >= nc) continue;
-      const float* src = q + std::size_t{16 * c + t} * qd + (r * 4 + hq) * kAttnHd;
+      const float* src = q + std::size_t{tpc * c + t} * qd + (r * 4 + (hq & hmask)) * kAttnHd;
       for (std::uint32_t d = 0; d < kAttnHd; ++d) qs[std::size_t{i} * kAttnHd + d] = src[d] * qscale;
     }
     std::uint8_t qb[9216];
@@ -1411,7 +1417,7 @@ bool AttnPrefill::Prep(int slot, AttnLayer& al, std::uint32_t pos0, std::uint32_
           EncGroup(&qs[std::size_t{rb * 8 + rib} * kAttnHd + ks * 8], qb + (std::size_t{rb * 16 + ks} * 8 + rib) * 9);
     for (std::uint32_t u = 0; u < 6; ++u) std::memcpy(unit(1 + u), qb + u * 1536, 1536);
     for (std::uint32_t i = 0; i < 64; ++i) {
-      const std::uint32_t t = i % 16;
+      const std::uint32_t t = (i % 16) + 16 * ((i / 16) >> (2 - sg_));
       float qn = 0;
       for (std::uint32_t d = 0; d < kAttnHd; ++d) qn += qs[std::size_t{i} * kAttnHd + d] * qs[std::size_t{i} * kAttnHd + d];
       const float bound = std::sqrt(qn) * kbound;
@@ -1434,7 +1440,7 @@ bool AttnPrefill::Prep(int slot, AttnLayer& al, std::uint32_t pos0, std::uint32_
     }
     const std::uint32_t t0 = pos & ~7u;
     alignas(64) std::uint8_t chunk[4608];
-    for (std::uint32_t tb = 0; tb < 3; ++tb) {
+    for (std::uint32_t tb = 0; tb < nt_; ++tb) {
       alignas(64) std::uint8_t tl[4608] = {0};
       const std::uint32_t tokbase = t0 + tb * 8;
       if (tokbase < tot_c) {
@@ -1460,7 +1466,7 @@ bool AttnPrefill::Prep(int slot, AttnLayer& al, std::uint32_t pos0, std::uint32_
 bool AttnPrefill::Launch(int slot, AttnLayer& al, std::uint32_t mc, xrt::run** run_out) {
   auto it = insts_.find(mc);
   if (it == insts_.end()) {
-    const std::string path = dir_ + "/insts_attnp_" + std::to_string(mc) + ".txt";
+    const std::string path = dir_ + "/insts_attnp" + tag_ + "_" + std::to_string(mc) + ".txt";
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) return false;
     const std::size_t sz = static_cast<std::size_t>(f.tellg());
@@ -1493,7 +1499,8 @@ bool AttnPrefill::Merge(int slot, std::uint32_t n, float* out, std::uint32_t pos
 #pragma omp parallel for collapse(2) reduction(+ : bad)
   for (std::int32_t c = 0; c < 8; ++c) {
     for (std::int32_t r = 0; r < static_cast<std::int32_t>(kAttnKvh); ++r) {
-      const std::uint32_t nc = 16 * c >= n ? 0 : std::min(16u, n - 16 * c);
+      const std::uint32_t tpc = 16u << sg_, hmask = (1u << (2 - sg_)) - 1;
+      const std::uint32_t nc = tpc * c >= n ? 0 : std::min(tpc, n - tpc * c);
       if (nc == 0) continue;
       float tot[34 * 256];
       for (std::uint32_t i = 0; i < kAttnOutElems; ++i)
@@ -1501,7 +1508,7 @@ bool AttnPrefill::Merge(int slot, std::uint32_t n, float* out, std::uint32_t pos
       const float* o = tot;
       const float* lt = tot + std::size_t{32} * 256;
       for (std::uint32_t i = 0; i < 64; ++i) {
-        const std::uint32_t hq = i / 16, t = i % 16;
+        const std::uint32_t hq = i / 16, t = (i % 16) + 16 * (hq >> (2 - sg_));
         if (t >= nc) continue;
         const std::uint32_t rb = i / 8, rib = i % 8;
         float l = 0;
@@ -1509,7 +1516,7 @@ bool AttnPrefill::Merge(int slot, std::uint32_t n, float* out, std::uint32_t pos
         if (!(l > 1e-30f) || !(l < 1e30f)) {
           if (collect_bad) {
 #pragma omp critical(attn_bad)
-            bad_rows.emplace_back(pos0 + 16 * c + t, static_cast<std::uint32_t>(r) * 4 + hq);
+            bad_rows.emplace_back(pos0 + tpc * c + t, static_cast<std::uint32_t>(r) * 4 + (hq & hmask));
           } else {
             ++bad;
           }
@@ -1518,7 +1525,7 @@ bool AttnPrefill::Merge(int slot, std::uint32_t n, float* out, std::uint32_t pos
         const float inv = 1.0f / l;
         for (std::uint32_t db = 0; db < 16; ++db)
           for (int cc = 0; cc < 8; ++cc)
-            out[std::size_t{16 * c + t} * qd + (r * 4 + hq) * kAttnHd + db * 8 + cc] =
+            out[std::size_t{tpc * c + t} * qd + (r * 4 + (hq & hmask)) * kAttnHd + db * 8 + cc] =
                 o[(std::size_t{rb} * 16 + db) * 64 + rib * 8 + cc] * inv;
       }
     }
@@ -1894,7 +1901,7 @@ void AttnDevPrep::ReadHist(const AttnLayer& al, std::uint32_t t0, std::uint32_t 
 bool AttnPrefill::DebugPrep(AttnLayer& al, std::uint32_t pos0, std::uint32_t n, const float* q, const std::uint16_t* k_hist, const std::uint16_t* v_hist, std::vector<std::uint8_t>* out) {
   std::uint32_t mc = 0;
   if (!Prep(0, al, pos0, n, q, k_hist, v_hist, &mc)) return false;
-  out->assign(ah_[0], ah_[0] + kAttnPrefixCol * 8);
+  out->assign(ah_[0], ah_[0] + pcol_ * 8);
   return true;
 }
 
@@ -1902,7 +1909,7 @@ bool AttnPrefill::LaunchDev(int slot, AttnLayer& al, AttnDevPrep& dp, std::uint3
                             xrt::run** run_out) {
   auto it = insts_.find(mc);
   if (it == insts_.end()) {
-    const std::string path = dir_ + "/insts_attnp_" + std::to_string(mc) + ".txt";
+    const std::string path = dir_ + "/insts_attnp" + tag_ + "_" + std::to_string(mc) + ".txt";
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) return false;
     const std::size_t sz = static_cast<std::size_t>(f.tellg());

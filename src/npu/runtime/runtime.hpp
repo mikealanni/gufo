@@ -366,8 +366,12 @@ class NpuRuntime {
 /// streams the causal prefix of its own rows, so nothing is merged across columns.
 class AttnPrefill {
  public:
-  bool Init(const std::string& dir, std::string* error);
+  /// packed: the v2 programs, where one core covers 16 << sg tokens (sg set by SetPack) and a pass up to 8 x that.
+  bool Init(const std::string& dir, std::string* error, bool packed = false);
   bool ready() const { return ready_; }
+  /// Query heads per kv head g (1, 2 or 4): g = 2 packs two token blocks into the rows the missing heads would pad.
+  void SetPack(std::uint32_t g) { sg_ = packed_ && g == 2 ? 1u : 0u; }
+  std::uint32_t PassTokens() const { return 128u << sg_; }
   /// Picks the exact-exp2 kernel (short contexts, no speed cost) or the hardware-exp2 kernel for later passes.
   void SetExact(bool exact) { exact_ = exact && have_exact_; }
   /// q: n x 2048 rows [pos0, pos0+n), n <= 128. Writes normalized attention (n x 2048, before the gate).
@@ -415,7 +419,10 @@ class AttnPrefill {
   xrt::hw_context ctx_x_;
   xrt::kernel kern_x_;
   bool exact_{false}, have_exact_{false};
-  bool ready_{false};
+  bool ready_{false}, packed_{false};
+  std::uint32_t sg_{0}, nt_{3};
+  std::size_t pcol_{std::size_t{16} * 4 * 1536};
+  std::string tag_;
   xrt::bo a_[2], c_[2];
   std::uint8_t* ah_[2]{};
   std::uint8_t* ch_[2]{};

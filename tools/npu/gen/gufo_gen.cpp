@@ -401,8 +401,9 @@ struct Engine {
     if (npu_attn && !std::getenv("GEN_NO_ATTNP")) {
       auto ap = std::make_unique<AttnPrefill>();
       std::string aerr;
-      if (ap->Init(programs, &aerr)) apre = std::move(ap);
-      else std::fprintf(stderr, "prefill attention unavailable: %s\n", aerr.c_str());
+      if (ap->Init(programs, &aerr)) {
+        apre = std::move(ap);
+      } else std::fprintf(stderr, "prefill attention unavailable: %s\n", aerr.c_str());
     }
     Safetensors st;
     if (!st.Open(model_dir)) return false;
@@ -451,6 +452,16 @@ struct Engine {
           apre.reset();
         }
         kvp = c.kv_heads >= 4 ? c.kv_heads / 4 : 1;
+        if (apre && c.kv_heads >= 4 && c.heads / c.kv_heads == 2 && !std::getenv("GEN_NO_PACK")) {
+          auto pk = std::make_unique<AttnPrefill>();
+          std::string perr;
+          if (pk->Init(programs, &perr, true)) {
+            pk->SetPack(2);
+            apre = std::move(pk);
+          } else {
+            std::fprintf(stderr, "gen: packed attention unavailable: %s\n", perr.c_str());
+          }
+        }
       }
       std::fprintf(stderr, "gen: %s layers %u hidden %u ffn %u heads %u/%u hd %u vocab %u rope %s qknorm %d tied %d\n", st.arch.c_str(), c.layers, c.hidden, c.inter, c.heads, c.kv_heads, c.head_dim, c.vocab, c.rope_neox ? "neox" : "interleaved", c.qk_norm, c.tied);
     }
@@ -1020,8 +1031,9 @@ struct Engine {
               }
               ph[5] += Ms(tap);
               std::vector<AttnPrefill::Pass> passes;
-              for (std::uint32_t o = 0; o < n; o += 128)
-                passes.push_back({pos + o, std::min(128u, n - o), &qa[std::size_t{o} * 2048], &s_ap[std::size_t{o} * 2048]});
+              const std::uint32_t pt = apre->PassTokens();
+              for (std::uint32_t o = 0; o < n; o += pt)
+                passes.push_back({pos + o, std::min(pt, n - o), &qa[std::size_t{o} * 2048], &s_ap[std::size_t{o} * 2048]});
               const auto tr = Clock::now();
               apre->collect_bad = true;
               apre->bad_rows.clear();
@@ -1975,6 +1987,7 @@ int Chat(const char* model, const char* programs, const std::string& prompt, std
   const double dc = Ms(t1);
   std::fprintf(stderr, "\nmlp host enc+dec %.0f ms | mlp device %.0f ms\n", g.ph[6], g.ph[7]);
   std::fprintf(stderr, "\nattention parts: rope+dup+convert %.0f ms | AttnAppend %.0f ms | prefill-attention run %.0f ms\n", g.ph[3], g.ph[5], g.ph[4]);
+  std::fprintf(stderr, "attention run split: prep %.0f ms | wait %.0f ms | merge %.0f ms\n", g.tim.attn_prep, g.tim.attn_wait, g.tim.attn_merge);
   std::fprintf(stderr, "\nhost norm+resid %.0f ms | ffn %.0f ms | attention+rope %.0f ms | gemm enc %.0f dec %.0f sync+wait %.0f ms\n", g.ph[0], g.ph[1], g.ph[2], g.tim.enc, g.tim.dec, g.tim.wait + g.tim.syncA + g.tim.syncC);
   if (g.bad_head_rows) std::fprintf(stderr, "attention rows recomputed on the host: %llu\n", static_cast<unsigned long long>(g.bad_head_rows));
   std::fprintf(stderr, "\nprefill %zu tok %.1f ms (%.0f tok/s); decode %u tok %.1f ms (%.2f tok/s)\n", ids.size(), pf, ids.size() / pf * 1000, produced, dc, produced / dc * 1000);

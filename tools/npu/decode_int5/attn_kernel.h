@@ -35,7 +35,7 @@ static int32_t *const a_pp = (int32_t *)(arena + 512);  // row position (last to
 static int32_t *const a_lo = (int32_t *)(arena + 768);  // row window floor: first key valid for the row
 static float *const a_l = (float *)(arena + 1024);
 static int a_pos = 0, a_n = 0, a_feed = 0, a_chunk_idx = 0, a_hi0 = -1;
-static int a_qhi = 0, a_win = 0;      // ring: absolute chunk of newest tokens; sliding window size (0 = full ctx)
+static int a_qhi = 0, a_win = 0, a_sg = 0;      // ring: absolute chunk of newest tokens; sliding window size (0 = full ctx)
 static int a_tab[32];                 // ring: slot chunk -> qhi - absolute chunk (-1 = stale slot)
 
 template <typename T>
@@ -70,6 +70,7 @@ __attribute__((noinline)) static void AttnBegin(const uint8_t *hdr, int row_id) 
   a_n = ih[1];
   a_qhi = ih[2];
   a_win = ih[3];
+  a_sg = 2 - ih[28];  // ih[28]: token blocks packed per core (0 = one block of 16 tokens x 4 heads, 1 = two blocks x 2 heads)
   a_feed = 0;
   a_chunk_idx = 0;
   a_hi0 = (a_pos & ~7) - 1;  // last key visible to every row of the pass
@@ -77,7 +78,7 @@ __attribute__((noinline)) static void AttnBegin(const uint8_t *hdr, int row_id) 
   for (int s = 0; s < 24; s++) a_tab[s] = tab[s];
   const float *mrow = (const float *)(hdr + 128 + row_id * 256);
   for (int i = 0; i < 64; i++) {
-    const int t = i & 15;
+    const int t = (i & 15) + (((i >> 4) >> a_sg) << 4);
     a_m[i] = mrow[i];
     a_pp[i] = t < a_n ? a_pos + t : -1;
     a_hi[i] = t < a_n ? ((a_pos + t) & ~7) - 1 : -1;
