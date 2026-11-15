@@ -2742,6 +2742,8 @@ int ChatT(const char* model, const char* programs, const std::string& prompt, st
   std::fprintf(stderr, "attention run split: prep %.0f ms | wait %.0f ms | merge %.0f ms\n", g.tim.attn_prep, g.tim.attn_wait, g.tim.attn_merge);
   std::fprintf(stderr, "\nhost norm+resid %.0f ms | ffn %.0f ms | attention+rope %.0f ms | gemm enc %.0f dec %.0f sync+wait %.0f ms\n", g.ph[0], g.ph[1], g.ph[2], g.tim.enc, g.tim.dec, g.tim.wait + g.tim.syncA + g.tim.syncC);
   if (g.bad_head_rows) std::fprintf(stderr, "attention rows recomputed on the host: %llu\n", static_cast<unsigned long long>(g.bad_head_rows));
+  if constexpr (std::is_same_v<E, HybridEngine>)
+    std::fprintf(stderr, "stages (prefill+decode): delta-net %.0f ms (in-gemm %.0f | host prep %.0f | device %.0f | host post %.0f | out-gemm %.0f) | attention %.0f ms | mlp %.0f ms | norm+resid %.0f ms\n", g.ph[8], g.ph[12], g.ph[13], g.ph[14], g.ph[15], g.ph[16], g.ph[9], g.ph[10], g.ph[11]);
   std::fprintf(stderr, "\nprefill %zu tok %.1f ms (%.0f tok/s); decode %u tok %.1f ms (%.2f tok/s)\n", ids.size(), pf, ids.size() / pf * 1000, produced, dc, produced / dc * 1000);
   return 0;
 }
