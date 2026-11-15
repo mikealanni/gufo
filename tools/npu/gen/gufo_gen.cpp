@@ -401,7 +401,7 @@ struct Engine {
   std::uint32_t half_a{0};                        // half of one slice's intermediate width, multiple of 512
   std::uint32_t mlp_slices{1}, slice_i{0};        // the fused gate/up program bakes the intermediate width into a DMA stride (limit 4 MB)
   int dec_threads{std::getenv("GEN_DEC_THREADS") ? std::atoi(std::getenv("GEN_DEC_THREADS")) : 2};
-  int pre_threads{std::getenv("GEN_PRE_THREADS") ? std::atoi(std::getenv("GEN_PRE_THREADS")) : 8};
+  int pre_threads{std::getenv("GEN_PRE_THREADS") ? std::atoi(std::getenv("GEN_PRE_THREADS")) : 16};
 
   // Generates a missing instruction stream with the shared toolchain scripts (gen_insts.sh / kdyn/gen_kd.sh / kdh/gen_kdh.sh).
   static void NeedInsts(const std::string& programs, const std::string& file, const std::string& cmd) {
@@ -1846,6 +1846,9 @@ struct HybridEngine : Engine {
         h.conv.resize(std::size_t{kConvDim} * kConvK);
         st.LoadG(b + "ssm_conv1d.weight", h.conv.data(), h.conv.size());
         PermBlocks(h.conv, 2 * kKeyDim, kVD, kConvK);
+        h.convT.resize(h.conv.size());  // tap-major copy: one contiguous channel vector per tap
+        for (std::uint32_t ch = 0; ch < kConvDim; ++ch)
+          for (std::uint32_t j = 0; j < kConvK; ++j) h.convT[std::size_t{j} * kConvDim + ch] = h.conv[std::size_t{ch} * kConvK + j];
         h.a_neg.resize(kVH);
         h.dt_bias.resize(kVH);
         {
@@ -2080,22 +2083,27 @@ struct HybridEngine : Engine {
   // Host reference of the whole delta-net stage (conv, norms, recurrence, gated norm), fp32 state.
   // Sall (kVH x kKD x kVD) and hist ((kConvK-1) x kConvDim) carry the recurrence and the conv window across calls (language-model mode).
   void GdnHost(const HL& h, const float* proj, const float* z, std::uint32_t T, float* gated, float* Sall = nullptr, float* hist = nullptr) {
+    const auto tg0 = Clock::now();
     std::vector<float> ab;
     Gates(h, z, T, &ab);
+    ph[17] += Ms(tg0);
+    const auto tc0 = Clock::now();
     std::vector<float> qkv(std::size_t{T} * kConvDim);
 #pragma omp parallel for
     for (std::int64_t t = 0; t < T; ++t) {
       float* o = &qkv[std::size_t(t) * kConvDim];
-      for (std::uint32_t ch = 0; ch < kConvDim; ++ch) {
-        float s = 0;
-        for (std::uint32_t j = 0; j < kConvK; ++j) {
-          const std::int64_t src = t - (kConvK - 1) + j;
-          if (src >= 0) s += h.conv[std::size_t{ch} * kConvK + j] * proj[std::size_t(src) * kGdnInN + ch];
-          else if (hist) s += h.conv[std::size_t{ch} * kConvK + j] * hist[std::size_t(src + kConvK - 1) * kConvDim + ch];
-        }
-        o[ch] = SiluF(s);
+      std::fill(o, o + kConvDim, 0.f);
+      for (std::uint32_t j = 0; j < kConvK; ++j) {
+        const std::int64_t src = t - (kConvK - 1) + j;
+        const float* in = src >= 0 ? &proj[std::size_t(src) * kGdnInN] : (hist ? &hist[std::size_t(src + kConvK - 1) * kConvDim] : nullptr);
+        if (!in) continue;
+        const float* w = &h.convT[std::size_t{j} * kConvDim];
+        for (std::uint32_t ch = 0; ch < kConvDim; ++ch) o[ch] += w[ch] * in[ch];
       }
+      for (std::uint32_t ch = 0; ch < kConvDim; ++ch) o[ch] = o[ch] / (1.0f + std::exp(-o[ch]));  // silu, vectorised
     }
+    ph[18] += Ms(tc0);
+    const auto tr0 = Clock::now();
     if (hist) {
       std::vector<float> next(std::size_t{kConvK - 1} * kConvDim);
       for (std::uint32_t i = 0; i + 1 < kConvK; ++i) {
@@ -2129,22 +2137,27 @@ struct HybridEngine : Engine {
         const float sp = x > 20.f ? x : std::log1p(std::exp(x));
         const float decay = std::exp(h.a_neg[v] * sp);
         const float beta = 1.0f / (1.0f + std::exp(-ab[std::size_t{t} * 2 * kVH + kVH + v]));
+        // One read pass over the state for S^T k and S^T q, one update pass:  S <- decay S + k d^T, o = decay S^T q + (k.q) d
         std::fill(kv.begin(), kv.end(), 0.f);
+        std::fill(o.begin(), o.end(), 0.f);
+        float kq = 0;
         for (std::uint32_t i = 0; i < kKD; ++i) {
-          float* Si = &S[std::size_t{i} * kVD];
+          const float* Si = &S[std::size_t{i} * kVD];
+          const float ki = k[i], qi = q[i];
+          kq += ki * qi;
           for (std::uint32_t j = 0; j < kVD; ++j) {
-            Si[j] *= decay;
-            kv[j] += Si[j] * k[i];
+            kv[j] += Si[j] * ki;
+            o[j] += Si[j] * qi;
           }
         }
-        for (std::uint32_t j = 0; j < kVD; ++j) kv[j] = (vv[j] - kv[j]) * beta;
-        std::fill(o.begin(), o.end(), 0.f);
+        for (std::uint32_t j = 0; j < kVD; ++j) {
+          kv[j] = (vv[j] - decay * kv[j]) * beta;  // d
+          o[j] = decay * o[j] + kq * kv[j];
+        }
         for (std::uint32_t i = 0; i < kKD; ++i) {
           float* Si = &S[std::size_t{i} * kVD];
-          for (std::uint32_t j = 0; j < kVD; ++j) {
-            Si[j] += k[i] * kv[j];
-            o[j] += Si[j] * q[i];
-          }
+          const float ki = k[i];
+          for (std::uint32_t j = 0; j < kVD; ++j) Si[j] = decay * Si[j] + ki * kv[j];
         }
         float ss = 0;
         for (std::uint32_t j = 0; j < kVD; ++j) ss += o[j] * o[j];
@@ -2155,6 +2168,7 @@ struct HybridEngine : Engine {
       }
       if (Sall) std::memcpy(Sall + std::size_t(v) * kKD * kVD, S.data(), S.size() * 4);
     }
+    ph[19] += Ms(tr0);
   }
 
   using Seg = std::pair<std::uint32_t, std::uint32_t>;
@@ -2960,7 +2974,7 @@ int ChatT(const char* model, const char* programs, const std::string& prompt, st
   if (g.bad_head_rows) std::fprintf(stderr, "attention rows recomputed on the host: %llu\n", static_cast<unsigned long long>(g.bad_head_rows));
   if constexpr (std::is_same_v<E, HybridEngine>)
     if (g.ph[23] > 0) std::fprintf(stderr, "moe runs %.0f: host prepare %.0f ms | device %.0f ms | host finish %.0f ms (sums over threads)\n", g.ph[23], g.ph[20], g.ph[21], g.ph[22]);
-    std::fprintf(stderr, "stages (prefill+decode): delta-net %.0f ms (in-gemm %.0f | host prep %.0f | device %.0f | host post %.0f | out-gemm %.0f) | attention %.0f ms | mlp %.0f ms | norm+resid %.0f ms\n", g.ph[8], g.ph[12], g.ph[13], g.ph[14], g.ph[15], g.ph[16], g.ph[9], g.ph[10], g.ph[11]);
+    std::fprintf(stderr, "stages (prefill+decode): delta-net %.0f ms (in-gemm %.0f | host prep %.0f | device %.0f | host post %.0f | out-gemm %.0f) | attention %.0f ms | mlp %.0f ms | norm+resid %.0f ms | host delta-net: gates %.0f conv %.0f recurrence %.0f\n", g.ph[8], g.ph[12], g.ph[13], g.ph[14], g.ph[15], g.ph[16], g.ph[9], g.ph[10], g.ph[11], g.ph[17], g.ph[18], g.ph[19]);
   std::fprintf(stderr, "\nprefill %zu tok %.1f ms (%.0f tok/s); decode %u tok %.1f ms (%.2f tok/s)\n", ids.size(), pf, ids.size() / pf * 1000, produced, dc, produced / dc * 1000);
   return 0;
 }
