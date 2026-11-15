@@ -395,6 +395,11 @@ struct Engine {
   std::string cpu_ops{std::getenv("GEN_CPU") ? "qkv,out,ffn" : (std::getenv("GEN_CPU_OP") ? std::getenv("GEN_CPU_OP") : "")};
   bool Cpu(const char* op) const { return cpu_ops.find(op) != std::string::npos; }
 
+  // 4-bit decode weights (programs/q4): the decode xclbin and its instruction streams are chosen by the weight format
+  bool dec_int4{false};
+  std::string dec_pre;       // "q4/" when dec_int4
+  std::string qtag{"q5."};   // weight cache prefix of the decode copies (format dependent)
+
   struct Names {
     std::string qkv16, out16, qkv64, out64, dn64, gu64, ffn16, argmax, kqkv, ko, swa, swb, dn2, dn2s;
   } nm;
@@ -419,11 +424,13 @@ struct Engine {
     const std::string env = "source " + repo + "/../gen/env.sh; ";
     const std::string gi = "bash " + repo + "/gen_insts.sh ";
     const std::string gk = "bash " + repo + "/kdyn/gen_kd.sh ";
+    const std::string genv = dec_int4 ? "QBYTES=1152 INSTS_DIR=" + programs + "/q4 " : "";
+    const auto base = [](const std::string& f) { return f.substr(f.rfind('/') + 1); };
     const auto need = [&](const std::string& file, const std::string& cmd) {
       std::ifstream f(programs + "/" + file);
       if (f.good()) return;
       std::fprintf(stderr, "gen: generating %s\n", file.c_str());
-      const std::string full = "bash -c '" + env + cmd + "' >/dev/null";
+      const std::string full = "bash -c '" + env + genv + cmd + "' >/dev/null";
       if (std::system(full.c_str()) != 0) {
         std::fprintf(stderr, "gen: failed to generate %s (toolchain env: tools/npu/gen/env.sh)\n", file.c_str());
         std::exit(1);
@@ -432,8 +439,8 @@ struct Engine {
     const auto n = [](std::uint32_t v) { return std::to_string(v); };
     need(nm.qkv16, gi + "plain " + n(H) + " " + n(qkv_p));
     need(nm.out16, gi + "plain " + n(qd) + " " + n(h_p));
-    need(nm.ffn16, gi + "ffn " + n(H) + " " + n(2 * I) + " " + n(I) + " " + n(h_p) + " 1 " + nm.ffn16);
-    need(nm.argmax, gi + "argmax " + n(H) + " " + n(vp) + " " + nm.argmax);
+    need(nm.ffn16, gi + "ffn " + n(H) + " " + n(2 * I) + " " + n(I) + " " + n(h_p) + " 1 " + base(nm.ffn16));
+    need(nm.argmax, gi + "argmax " + n(H) + " " + n(vp) + " " + base(nm.argmax));
     if (m64) {
       need(nm.qkv64, gi + "plain " + n(H) + " " + n(qkv_p) + " 4");
       need(nm.out64, gi + "plain " + n(qd) + " " + n(h_p) + " 4");
@@ -549,7 +556,15 @@ struct Engine {
       std::fprintf(stderr, "gen: %s layers %u hidden %u ffn %u heads %u/%u hd %u vocab %u rope %s qknorm %d tied %d\n", st.arch.c_str(), c.layers, c.hidden, c.inter, c.heads, c.kv_heads, c.head_dim, c.vocab, c.rope_neox ? "neox" : "interleaved", c.qk_norm, c.tied);
     }
     std::string err;
-    if (!rt.Init(programs + "/final_16x64x128_ffn.xclbin", &err)) {
+    // 4-bit decode keeps attention on the host (the 4-bit xclbin has no attention programs), which only pays up to about 4k keys
+    dec_int4 = !qdir && !cpu_ref && !std::getenv("GEN_INT5") && context <= 4096 && std::ifstream(programs + "/q4/final_16x64x128_ffn.xclbin").good();
+    if (dec_int4) {
+      dec_pre = "q4/";
+      qtag = "q4.";
+      m64 = false;  // the 4-bit decode xclbin carries the 16-row programs only; longer steps use the 1024-row path or 16-row loops
+      host_ctx_dec = ~0u;  // and no attention programs: decode attention stays on the host
+    }
+    if (!rt.Init(programs + "/" + dec_pre + "final_16x64x128_ffn.xclbin", &err, dec_int4)) {
       std::fprintf(stderr, "npu init: %s\n", err.c_str());
       return false;
     }
@@ -562,15 +577,15 @@ struct Engine {
     const std::uint32_t vp_n = PadN(c.vocab);
     const auto t0 = Clock::now();
     const std::string mk = std::to_string(H) + "x" + std::to_string(I);
-    const auto plain = [&](std::uint32_t K, std::uint32_t N, bool m64n) { return "insts_plain_" + std::to_string(K) + "x" + std::to_string(N) + (m64n ? "_m64.txt" : ".txt"); };
+    const auto plain = [&](std::uint32_t K, std::uint32_t N, bool m64n) { return dec_pre + "insts_plain_" + std::to_string(K) + "x" + std::to_string(N) + (m64n ? "_m64.txt" : ".txt"); };
     nm.qkv16 = plain(H, qkv_p, false);
     nm.out16 = plain(qd, h_p, false);
     nm.qkv64 = plain(H, qkv_p, true);
     nm.out64 = plain(qd, h_p, true);
     nm.dn64 = plain(I, h_p, true);
     nm.gu64 = "insts_ffngu64_" + mk + ".txt";
-    nm.ffn16 = "insts_ffn_" + mk + ".txt";
-    nm.argmax = "insts_argmax_" + std::to_string(H) + "x" + std::to_string(vp_n) + ".txt";
+    nm.ffn16 = dec_pre + "insts_ffn_" + mk + ".txt";
+    nm.argmax = dec_pre + "insts_argmax_" + std::to_string(H) + "x" + std::to_string(vp_n) + ".txt";
     SetupMlpSlices();
     const std::string mks = std::to_string(H) + "x" + std::to_string(slice_i);
     nm.kqkv = "insts_kd_1024x" + std::to_string(H) + "x" + std::to_string(qkv_p);
@@ -615,7 +630,7 @@ struct Engine {
       L.p_ffn = rt.MakeProgram(H, H, programs + "/" + nm.ffn16,
                                std::size_t{gu_strips + h_p / kStripRows} * kStripBytes, &err);
       const bool wc = wcache.enabled() && !qdir && !cpu_ref;
-      const std::string wtag = "l" + std::to_string(l) + ".";
+      const std::string wtag = (dec_int4 ? "q4.l" : "l") + std::to_string(l) + ".";
       const auto load_qkv = [&]() -> const float* {
         buf.assign(std::size_t{qkv_p} * H, 0.f);
         st.Load(pre + "self_attn.q_proj.weight", buf.data(), std::size_t{qd} * H);
@@ -625,6 +640,21 @@ struct Engine {
       };
       if (wc) {
         L.qkv = rt.PackWeightCached(wcache, wtag + "qkv", qkv_p, H, load_qkv);
+        if (std::getenv("GEN_DBG_PACK") && l == 0) {  // layer-0 QKV GEMM against the host on a synthetic row
+          if (buf.size() != std::size_t{qkv_p} * H) load_qkv();
+          std::vector<float> xs(H), y(qkv_p), ref(qkv_p);
+          for (std::uint32_t i = 0; i < H; ++i) xs[i] = 0.5f * std::sin(0.3f * i);
+          rt.Gemm(L.p_qkv, L.qkv, xs.data(), 1, y.data(), nullptr);
+          MatVec(buf.data(), qkv_p, H, xs.data(), 1, ref.data());
+          double num = 0, den = 0;
+          std::size_t nans = 0;
+          for (std::uint32_t i = 0; i < qkv_p; ++i) {
+            if (!std::isfinite(y[i])) ++nans;
+            else num += (y[i] - ref[i]) * (y[i] - ref[i]);
+            den += ref[i] * ref[i];
+          }
+          std::fprintf(stderr, "[dbg-pack] layer 0 qkv: rel_err %.4f nonfinite %zu of %u, y[0..2] %.4f %.4f %.4f ref %.4f %.4f %.4f\n", std::sqrt(num / den), nans, qkv_p, y[0], y[1], y[2], ref[0], ref[1], ref[2]);
+        }
       } else {
         load_qkv();
         if (cpu_ref) L.wqkv = buf;
@@ -752,7 +782,7 @@ struct Engine {
     if (!std::getenv("GEN_CPU_ARGMAX")) {
       const std::uint32_t vp = PadN(c.vocab);
       p_argmax = rt.MakeProgram(H, vp, programs + "/" + nm.argmax, 0, &err);
-      w_argmax = rt.PackWeightCached(wcache, "argmax", vp, H, [&]() -> const float* {
+      w_argmax = rt.PackWeightCached(wcache, dec_int4 ? "q4.argmax" : "argmax", vp, H, [&]() -> const float* {
         buf.assign(std::size_t{vp} * H, 0.f);
 #pragma omp parallel for
         for (std::int64_t i = 0; i < static_cast<std::int64_t>(std::size_t{c.vocab} * H); ++i) buf[i] = Bf(head[i]);
@@ -1323,7 +1353,7 @@ struct Engine {
           }
         }
         ph[3] += Ms(tprep);
-        if (pos + n <= (n <= 2 ? std::max(host_ctx, host_ctx_dec) : host_ctx)) {
+        if (pos + n <= (n <= (dec_int4 ? kRows : 2u) ? std::max(host_ctx, host_ctx_dec) : host_ctx)) {
           for (std::uint32_t r = 0; r < n; ++r) {
             const float* row = &qkv[std::size_t{r} * stride];
             std::memcpy(&L.k[std::size_t{pos + r} * kvd], row + qd, kvd * 4);
@@ -1484,6 +1514,17 @@ struct Engine {
 #pragma omp parallel for
       for (std::int64_t i = 0; i < static_cast<std::int64_t>(std::size_t{n} * H); ++i) x[i] += brh[i];
       ph[0] += Ms(tp);
+      if (std::getenv("GEN_DBG_LAYERS")) {
+        double rx = 0, rb = 0, rq = 0, ra = 0, ro = 0;
+        for (std::uint32_t i = 0; i < H; ++i) {
+          rx += x[i] * x[i];
+          rb += brh[i] * brh[i];
+          rq += qkv[i] * qkv[i];
+          ro += br[i] * br[i];
+        }
+        for (std::uint32_t i = 0; i < qd; ++i) ra += att[i] * att[i];
+        std::fprintf(stderr, "[dbg] layer %u row0 rms: qkv %.4f att %.4f oproj %.4f ffn %.4f x %.4f\n", l, std::sqrt(rq / H), std::sqrt(ra / qd), std::sqrt(ro / H), std::sqrt(rb / H), std::sqrt(rx / H));
+      }
     }
     pos += n;
     if (hidden) {
@@ -1644,9 +1685,6 @@ struct HybridEngine : Engine {
   std::vector<LmState> row0, row1;  // delta-net state after the first / second row of a 2-3 row step (a draft may be rejected there)
   std::uint32_t n_exp{0}, n_used{0};
   bool dec_ok{false};   // int5 stream-bound decode path available (language-model mode)
-  bool dec_int4{false};  // the decode programs stream 4-bit weights (programs/q4)
-  std::string dec_pre;   // "q4/" when dec_int4: where the decode xclbin and instruction streams live below `programs`
-  std::string qtag{"q5."};  // weight cache prefix of the decode copies (format dependent)
   bool use_dec{false};  // the current Step runs on it (few rows)
   std::vector<float> s_gu, s_act, s_dn;
   int moe_threads{std::getenv("GEN_MOE_THREADS") ? std::atoi(std::getenv("GEN_MOE_THREADS")) : 8};  // per host stage of the expert pipeline
@@ -3076,7 +3114,8 @@ int DecideEval(const char* model, const char* programs, const char* path, const 
 // Timing probe of one int5 m64 program: gemmbench64 PROGRAMS INSTS K N
 // Teacher-forced negative log-likelihood of a text on a hybrid model: `kd` runs the exact bfp16 prefill path in one pass,
 // `dec` feeds the same tokens one at a time through the decode path (int5 or int4 weights). The gap between the two is the decode quantisation cost.
-int HybridQuality(const char* model, const char* programs, const char* text_path, std::uint32_t ntok, const std::string& mode) {
+template <class E>
+int QualityT(const char* model, const char* programs, const char* text_path, std::uint32_t ntok, const std::string& mode) {
   std::string e;
   auto reader = gufo::core::GgufReader::OpenFile(model, &e);
   if (!reader) return 1;
@@ -3086,7 +3125,7 @@ int HybridQuality(const char* model, const char* programs, const char* text_path
   const std::string text((std::istreambuf_iterator<char>(f)), {});
   std::vector<std::uint32_t> ids = tok->Encode(text);
   if (ids.size() > ntok) ids.resize(ntok);
-  HybridEngine g;
+  E g;
   if (!g.Init(model, programs, static_cast<std::uint32_t>(ids.size()) + 64)) return 1;
   const std::uint32_t H = g.c.hidden;
   std::vector<float> hd, lg(g.c.vocab);
@@ -3102,9 +3141,14 @@ int HybridQuality(const char* model, const char* programs, const char* text_path
     nll += std::log(den) + mx - lg[target];
     ++counted;
   };
-  if (mode == "kd") {
-    g.Step(ids.data(), static_cast<std::uint32_t>(ids.size()), &hd);
-    for (std::uint32_t t = 0; t + 1 < ids.size(); ++t) score(&hd[std::size_t{t} * H], ids[t + 1]);
+  if (mode == "kd") {  // prefill path, chunk by chunk
+    std::vector<float> rows;
+    for (std::uint32_t o = 0, m = 0; o < ids.size(); o += m) {
+      m = g.Chunk(static_cast<std::uint32_t>(ids.size()) - o);
+      g.Step(&ids[o], m, &hd);
+      rows.insert(rows.end(), hd.begin(), hd.end());
+    }
+    for (std::uint32_t t = 0; t + 1 < ids.size(); ++t) score(&rows[std::size_t{t} * H], ids[t + 1]);
   } else {
     for (std::uint32_t t = 0; t + 1 < ids.size(); ++t) {
       g.Step(&ids[t], 1, &hd);
@@ -3113,6 +3157,15 @@ int HybridQuality(const char* model, const char* programs, const char* text_path
   }
   std::printf("%s: %u tokens, NLL %.4f (ppl %.2f)\n", mode.c_str(), counted, nll / counted, std::exp(nll / counted));
   return 0;
+}
+
+int HybridQuality(const char* model, const char* programs, const char* text_path, std::uint32_t ntok, const std::string& mode) {
+  std::string e;
+  auto reader = gufo::core::GgufReader::OpenFile(model, &e);
+  if (!reader) return 1;
+  const auto arch = reader->GetMetadataString("general.architecture");
+  if (arch && (*arch == "qwen35" || *arch == "qwen35moe")) return QualityT<HybridEngine>(model, programs, text_path, ntok, mode);
+  return QualityT<Engine>(model, programs, text_path, ntok, mode);
 }
 
 // Timing probe of the fused FFN decode program: ffnbench PROGRAMS_DIR H I [int4]; synchronous vs 4 in flight.
@@ -3155,8 +3208,34 @@ int FfnBench(const char* prog_dir, std::uint32_t H, std::uint32_t I, bool int4) 
     PackMatInt5(dn.data(), h_p, I, w[i].host + gu_b);
     w[i].bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
   }
-  std::vector<float> x(H, 0.1f), y(H);
+  std::vector<float> x(H), y(H);
+  for (std::uint32_t i = 0; i < H; ++i) x[i] = 0.3f * std::sin(0.37f * i) + 0.1f;
   for (int i = 0; i < kProg; ++i) rt.Ffn(p[i], w[i], x.data(), 1, y.data(), nullptr, gu_strips, H);
+  {  // numerical check of program 3 against the host (weights regenerated with the same seed)
+    std::vector<float> gu(std::size_t{2 * I} * H), dn(std::size_t{h_p} * I);
+    std::srand(7 + 3);
+    for (auto& v : gu) v = (std::rand() / static_cast<float>(RAND_MAX) - 0.5f) * 0.1f;
+    for (auto& v : dn) v = (std::rand() / static_cast<float>(RAND_MAX) - 0.5f) * 0.1f;
+    std::vector<float> act(I), ref(H, 0.f);
+    for (std::uint32_t f = 0; f < I / 8; ++f)
+      for (std::uint32_t k = 0; k < 8; ++k) {
+        float g1 = 0, u1 = 0;
+        for (std::uint32_t j = 0; j < H; ++j) {
+          g1 += gu[(std::size_t{f} * 16 + k) * H + j] * x[j];
+          u1 += gu[(std::size_t{f} * 16 + 8 + k) * H + j] * x[j];
+        }
+        act[f * 8 + k] = SiluF(g1) * u1;
+      }
+    for (std::uint32_t r = 0; r < H; ++r)
+      for (std::uint32_t j = 0; j < I; ++j) ref[r] += dn[std::size_t{r} * I + j] * act[j];
+    rt.Ffn(p[3], w[3], x.data(), 1, y.data(), nullptr, gu_strips, H);
+    double num = 0, den = 0;
+    for (std::uint32_t r = 0; r < H; ++r) {
+      num += (y[r] - ref[r]) * (y[r] - ref[r]);
+      den += ref[r] * ref[r];
+    }
+    std::printf("ffn numeric check: rel_err %.4f (y[0..2] %.4f %.4f %.4f, ref %.4f %.4f %.4f)\n", std::sqrt(num / den), y[0], y[1], y[2], ref[0], ref[1], ref[2]);
+  }
   const int reps = 400;
   NpuRuntime::Timings tm{};
   auto t0 = Clock::now();
@@ -3200,7 +3279,9 @@ int GemmBench64(const char* prog_dir, const char* inst, std::uint32_t K, std::ui
 int GemmTest(const char* prog_dir, const char* inst, std::uint32_t K, std::uint32_t N) {
   NpuRuntime rt;
   std::string err;
-  if (!rt.Init(std::string(prog_dir) + "/final_16x64x128_ffn.xclbin", &err)) return 1;
+  const std::string dir = prog_dir;
+  const bool i4 = dir.size() >= 2 && dir.compare(dir.size() - 2, 2, "q4") == 0;  // a programs/q4 directory streams 4-bit weights
+  if (!rt.Init(dir + "/final_16x64x128_ffn.xclbin", &err, i4)) return 1;
   std::vector<float> W(std::size_t{N} * K), x(std::size_t{kRows} * K), y(std::size_t{kRows} * N), ref(y.size());
   std::srand(1);
   for (auto& v : W) v = (std::rand() / static_cast<float>(RAND_MAX) - 0.5f) * 0.1f;

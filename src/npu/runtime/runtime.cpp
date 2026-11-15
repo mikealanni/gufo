@@ -40,7 +40,8 @@ void PackMatInt5(const float* W, std::uint32_t N, std::uint32_t K,
       const float qmax = g_decode_int4 ? 7.0f : 15.0f, qmin = g_decode_int4 ? -8.0f : -15.0f;
       std::uint16_t sb = Bf16Bits(amax / qmax);
       float s = Bf16Float(sb);
-      if (g_decode_int4 && amax > 0) {
+      static const bool no_clip = std::getenv("GUFO_NO_CLIP") != nullptr;
+      if (g_decode_int4 && amax > 0 && !no_clip) {
         // 4 bits leave little room: pick the group scale (a few clipping levels) that minimises the squared error
         float best = INFINITY;
         for (const float mult : {1.0f, 0.93f, 0.86f, 0.8f, 0.74f}) {
@@ -110,7 +111,7 @@ void PackMatInt5Q(const std::int8_t* q, const std::uint16_t* sc, std::uint32_t N
 }
 
 bool NpuRuntime::Init(const std::string& xclbin_path, std::string* error, bool int4) {
-  g_decode_int4 = int4;
+  if (int4) g_decode_int4 = true;  // process-wide and sticky: other runtimes (the prefill kernels) initialised later must not reset it
   try {
     dev_ = xrt::device(0u);
     const xrt::xclbin xb{xclbin_path};
