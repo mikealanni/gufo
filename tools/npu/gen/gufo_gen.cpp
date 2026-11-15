@@ -318,15 +318,16 @@ struct Engine {
   NpuRuntime rk;
   bool kd{false};
   std::uint32_t kd_min{std::getenv("GEN_KD_MIN") ? static_cast<std::uint32_t>(std::atoi(std::getenv("GEN_KD_MIN"))) : 256u};
-  std::vector<float> kx, ky;
+  std::vector<float> kx, ky, rcos, rsin, s_qa, s_kd;
   std::size_t kxn{0}, kyn{0};
+  std::uint32_t super_rows{std::getenv("GEN_SUPER") ? static_cast<std::uint32_t>(std::atoi(std::getenv("GEN_SUPER"))) : 4096u};
   bool npu_attn{std::getenv("GEN_HOST_ATTN") == nullptr};
   std::string programs_dir;
   std::vector<float> ogain;
   std::uint32_t host_ctx{std::getenv("GEN_HOST_CTX") ? static_cast<std::uint32_t>(std::atoi(std::getenv("GEN_HOST_CTX"))) : 256u};
   std::unique_ptr<AttnPrefill> apre;
   const char* qdir{std::getenv("GEN_QDIR")};
-  double t_npu{0}, t_cpu{0}, ph[4]{0, 0, 0, 0};
+  double t_npu{0}, t_cpu{0}, ph[8]{0, 0, 0, 0, 0, 0, 0, 0};
   bool cpu_ref{std::getenv("GEN_CPU") != nullptr || std::getenv("GEN_CPU_OP") != nullptr};
   std::string cpu_ops{std::getenv("GEN_CPU") ? "qkv,out,ffn" : (std::getenv("GEN_CPU_OP") ? std::getenv("GEN_CPU_OP") : "")};
   bool Cpu(const char* op) const { return cpu_ops.find(op) != std::string::npos; }
@@ -377,6 +378,7 @@ struct Engine {
   bool Init(const std::string& model_dir, const std::string& programs, std::uint32_t context) {
     ctx = context;
     programs_dir = programs;
+    ctx = context;
     if (const char* gp = std::getenv("GEN_OGAIN")) {
       std::ifstream gf(gp);
       float gv;
@@ -440,6 +442,7 @@ struct Engine {
     }
     const std::uint32_t H = c.hidden, I = c.inter, qd = c.heads * c.head_dim, kvd = c.kv_heads * c.head_dim;
     const std::uint32_t qkv_n = qd + 2 * kvd, qkv_p = PadN(qkv_n), h_p = PadN(H);
+    BuildRope();
     gu_strips = 2 * I / kStripRows;
     kxn = std::max({H, qd, I});
     kyn = std::max(qkv_p, h_p);
@@ -596,7 +599,7 @@ struct Engine {
   }
 
   std::uint32_t Chunk(std::uint32_t remaining) const {
-    if (kd && remaining >= kd_min) return std::min(remaining, 1024u);
+    if (kd && remaining >= kd_min) return std::min(remaining, super_rows);
     return std::min(remaining, kPrefillRows);
   }
 
@@ -623,12 +626,23 @@ struct Engine {
     }
   }
 
+  void BuildRope() {
+    const std::uint32_t hd = c.head_dim, half = hd / 2;
+    rcos.resize(std::size_t{ctx + 64} * half);
+    rsin.resize(std::size_t{ctx + 64} * half);
+#pragma omp parallel for
+    for (std::int64_t p = 0; p < ctx + 64; ++p)
+      for (std::uint32_t i = 0; i < half; ++i) {
+        const double a = static_cast<double>(p) * std::pow(static_cast<double>(c.theta), -2.0 * i / hd);
+        rcos[std::size_t(p) * half + i] = static_cast<float>(std::cos(a));
+        rsin[std::size_t(p) * half + i] = static_cast<float>(std::sin(a));
+      }
+  }
+
   void Rope(float* x, std::uint32_t nh, std::uint32_t p) const {
     const std::uint32_t hd = c.head_dim, half = hd / 2;
     for (std::uint32_t i = 0; i < half; ++i) {
-      const double f = std::pow(static_cast<double>(c.theta), -2.0 * i / hd);
-      const double a = static_cast<double>(p) * f;
-      const float cs = static_cast<float>(std::cos(a)), sn = static_cast<float>(std::sin(a));
+      const float cs = rcos[std::size_t{p} * half + i], sn = rsin[std::size_t{p} * half + i];
       for (std::uint32_t h = 0; h < nh; ++h) {
         float* v = x + std::size_t{h} * hd;
         const std::uint32_t i0 = c.rope_neox ? i : 2 * i, i1 = c.rope_neox ? i + half : 2 * i + 1;
@@ -723,17 +737,22 @@ struct Engine {
     rk.WeightSlot(L.kw_d, L.kq_d);
   }
 
-  void KGemm(Program& p, WeightBuffer& wb, const float* z, std::uint32_t n, std::uint32_t K, float* out) {
+  void KGemm(Program& p, WeightBuffer& wb, const float* z, std::uint32_t n_all, std::uint32_t K, float* out) {
     if (kx.size() < std::size_t{1024} * kxn) kx.assign(std::size_t{1024} * kxn, 0.f);
     if (ky.size() < std::size_t{1024} * kyn) ky.assign(std::size_t{1024} * kyn, 0.f);
-    if (n == 1024) {
-      rk.GemmAtb(p, wb, z, 1024, out, &tim);
-      return;
+    for (std::uint32_t o = 0; o < n_all; o += 1024) {
+      const std::uint32_t n = std::min(1024u, n_all - o);
+      const float* src = z + std::size_t{o} * K;
+      float* dst = out + std::size_t{o} * p.N;
+      if (n == 1024) {
+        rk.GemmAtb(p, wb, src, 1024, dst, &tim);
+        continue;
+      }
+      std::memcpy(kx.data(), src, std::size_t{n} * K * 4);
+      std::memset(kx.data() + std::size_t{n} * K, 0, std::size_t{1024 - n} * K * 4);
+      rk.GemmAtb(p, wb, kx.data(), 1024, ky.data(), &tim);
+      std::memcpy(dst, ky.data(), std::size_t{n} * p.N * 4);
     }
-    std::memcpy(kx.data(), z, std::size_t{n} * K * 4);
-    std::memset(kx.data() + std::size_t{n} * K, 0, std::size_t{1024 - n} * K * 4);
-    rk.GemmAtb(p, wb, kx.data(), 1024, ky.data(), &tim);
-    std::memcpy(out, ky.data(), std::size_t{n} * p.N * 4);
   }
 
   void KDispatch(WeightBuffer& wb, Program& p) {
@@ -747,26 +766,31 @@ struct Engine {
     }
   }
 
-  void KMlp(Layer& L, const float* z, std::uint32_t n, float* out_h) {
+  void KMlp(Layer& L, const float* z_all, std::uint32_t n_all, float* out_all) {
     const std::uint32_t H = c.hidden, h_p = PadN(H);
     if (kx.size() < std::size_t{1024} * kxn) kx.assign(std::size_t{1024} * kxn, 0.f);
     if (ky.size() < std::size_t{1024} * kyn) ky.assign(std::size_t{1024} * kyn, 0.f);
-    const float* src = z;
-    if (n < 1024) {
-      std::memcpy(kx.data(), z, std::size_t{n} * H * 4);
-      std::memset(kx.data() + std::size_t{n} * H, 0, std::size_t{1024 - n} * H * 4);
-      src = kx.data();
+    for (std::uint32_t o = 0; o < n_all; o += 1024) {
+      const std::uint32_t n = std::min(1024u, n_all - o);
+      const float* z = z_all + std::size_t{o} * H;
+      float* out_h = out_all + std::size_t{o} * H;
+      const float* src = z;
+      if (n < 1024) {
+        std::memcpy(kx.data(), z, std::size_t{n} * H * 4);
+        std::memset(kx.data() + std::size_t{n} * H, 0, std::size_t{1024 - n} * H * 4);
+        src = kx.data();
+      }
+      rk.EncodeAAtbRaw(src, 1024, H, L.kq_a.ah);
+      std::memcpy(L.kq_b.ah, L.kq_a.ah, std::size_t{1024} * H / 8 * 9);
+      L.kq_a.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      L.kq_b.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      KDispatch(L.kw_a, L.kq_a);
+      KDispatch(L.kw_b, L.kq_b);
+      KDispatch(L.kw_d, L.kq_d);
+      L.kq_d.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+      rk.DecodeCAtbRaw(L.kq_d.ch, ky.data(), 1024, h_p);
+      for (std::uint32_t r = 0; r < n; ++r) std::memcpy(out_h + std::size_t{r} * H, &ky[std::size_t{r} * h_p], H * 4);
     }
-    rk.EncodeAAtbRaw(src, 1024, H, L.kq_a.ah);
-    std::memcpy(L.kq_b.ah, L.kq_a.ah, std::size_t{1024} * H / 8 * 9);
-    L.kq_a.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    L.kq_b.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    KDispatch(L.kw_a, L.kq_a);
-    KDispatch(L.kw_b, L.kq_b);
-    KDispatch(L.kw_d, L.kq_d);
-    L.kq_d.c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-    rk.DecodeCAtbRaw(L.kq_d.ch, ky.data(), 1024, h_p);
-    for (std::uint32_t r = 0; r < n; ++r) std::memcpy(out_h + std::size_t{r} * H, &ky[std::size_t{r} * h_p], H * 4);
   }
 
   void Step(const std::uint32_t* tok, std::uint32_t n, std::vector<float>* hidden) {
@@ -785,30 +809,36 @@ struct Engine {
       ph[0] += Ms(tp);
       auto t0 = Clock::now();
       const bool u64 = m64 && n > kRows;
-      const bool ukd = kd && n >= kd_min && n <= 1024;
+      const bool ukd = kd && n >= kd_min && n <= super_rows;
       if (ukd) KGemm(L.kp_qkv, L.kw_qkv, z.data(), n, H, qkv.data());
       else if (Cpu("qkv")) MatVec(L.wqkv.data(), qkv_n, H, z.data(), n, qkv.data());
       else rt.Gemm(u64 ? L.p_qkv64 : L.p_qkv, L.qkv, z.data(), n, qkv.data(), &tim);
       t_npu += Ms(t0);
       t0 = Clock::now();
       if (npu_attn) {
-        std::vector<float> qa(std::size_t{n} * qd), kd(std::size_t{n} * kAttnKv);
+        s_qa.resize(std::size_t{n} * qd);
+        s_kd.resize(std::size_t{n} * kAttnKv);
+        std::vector<float>& qa = s_qa;
+        std::vector<float>& kd = s_kd;
         const std::uint32_t hd = c.head_dim, rep = kAttnKv / kvd;
-        for (std::uint32_t r = 0; r < n; ++r) {
-          float* row = &qkv[std::size_t{r} * (Cpu("qkv") ? qkv_n : qkv_p)];
+        auto tprep = Clock::now();
+#pragma omp parallel for
+        for (std::int64_t r = 0; r < n; ++r) {
+          float* row = &qkv[std::size_t(r) * (Cpu("qkv") ? qkv_n : qkv_p)];
           QkNorm(L, row, qd);
-          Rope(row, c.heads, pos + r);
-          Rope(row + qd, c.kv_heads, pos + r);
-          std::memcpy(&qa[std::size_t{r} * qd], row, qd * 4);
+          Rope(row, c.heads, pos + static_cast<std::uint32_t>(r));
+          Rope(row + qd, c.kv_heads, pos + static_cast<std::uint32_t>(r));
+          std::memcpy(&qa[std::size_t(r) * qd], row, qd * 4);
           for (std::uint32_t h = 0; h < 4; ++h) {
             const std::uint32_t src = h / rep;
-            std::memcpy(&kd[std::size_t{r} * kAttnKv + h * hd], row + qd + src * hd, hd * 4);
+            std::memcpy(&kd[std::size_t(r) * kAttnKv + h * hd], row + qd + src * hd, hd * 4);
             for (std::uint32_t i = 0; i < hd; ++i) {
-              L.kh[std::size_t{pos + r} * kAttnKv + h * hd + i] = Bf16Bits(row[qd + src * hd + i]);
-              L.vh[std::size_t{pos + r} * kAttnKv + h * hd + i] = Bf16Bits(row[qd + kvd + src * hd + i]);
+              L.kh[std::size_t(pos + r) * kAttnKv + h * hd + i] = Bf16Bits(row[qd + src * hd + i]);
+              L.vh[std::size_t(pos + r) * kAttnKv + h * hd + i] = Bf16Bits(row[qd + kvd + src * hd + i]);
             }
           }
         }
+        ph[3] += Ms(tprep);
         if (pos + n <= host_ctx) {
           for (std::uint32_t r = 0; r < n; ++r) {
             const float* row = &qkv[std::size_t{r} * (Cpu("qkv") ? qkv_n : qkv_p)];
@@ -821,15 +851,19 @@ struct Engine {
           EnsureAppended(L, pos);
           L.napp = pos + n;
           apre->SetExact(pos + n <= kExactCtx);
+          const auto tap = Clock::now();
           for (std::uint32_t o = 0; o < n; o += 16)
             rt.AttnAppend(L.al, pos + o, std::min(16u, n - o), &kd[std::size_t{o} * kAttnKv], L.vh.data(), &tim);
-          for (std::uint32_t o = 0; o < n; o += 128) {
-            const std::uint32_t n2 = std::min(128u, n - o);
-            if (!apre->Run(L.al, pos + o, n2, &qa[std::size_t{o} * qd], L.kh.data(), L.vh.data(), &att[std::size_t{o} * qd], &tim)) {
-              std::fprintf(stderr, "prefill attention failed (layer %u pos %u)\n", l, pos + o);
-              std::exit(3);
-            }
+          ph[5] += Ms(tap);
+          std::vector<AttnPrefill::Pass> passes;
+          for (std::uint32_t o = 0; o < n; o += 128)
+            passes.push_back({pos + o, std::min(128u, n - o), &qa[std::size_t{o} * qd], &att[std::size_t{o} * qd]});
+          const auto tr = Clock::now();
+          if (!apre->RunMany(L.al, passes.data(), passes.size(), L.kh.data(), L.vh.data(), &tim)) {
+            std::fprintf(stderr, "prefill attention failed (layer %u pos %u)\n", l, pos);
+            std::exit(3);
           }
+          ph[4] += Ms(tr);
         } else {
         EnsureAppended(L, pos);
         L.napp = pos + n;
@@ -1043,6 +1077,7 @@ int Chat(const char* model, const char* programs, const std::string& prompt, std
     next = g.Argmax(hd.data());
   }
   const double dc = Ms(t1);
+  std::fprintf(stderr, "\nattention parts: rope+dup+convert %.0f ms | AttnAppend %.0f ms | prefill-attention run %.0f ms\n", g.ph[3], g.ph[5], g.ph[4]);
   std::fprintf(stderr, "\nhost norm+resid %.0f ms | ffn %.0f ms | attention+rope %.0f ms | gemm enc %.0f dec %.0f sync+wait %.0f ms\n", g.ph[0], g.ph[1], g.ph[2], g.tim.enc, g.tim.dec, g.tim.wait + g.tim.syncA + g.tim.syncC);
   std::fprintf(stderr, "\nprefill %zu tok %.1f ms (%.0f tok/s); decode %u tok %.1f ms (%.2f tok/s)\n", ids.size(), pf, ids.size() / pf * 1000, produced, dc, produced / dc * 1000);
   return 0;
@@ -1130,7 +1165,83 @@ int Interactive(const char* model, const char* programs) {
   return 0;
 }
 
+std::string UnescapeJev(std::string_view text) {
+  std::string out;
+  for (std::size_t i = 0; i < text.size(); ++i) {
+    if (text[i] != '\\' || i + 1 == text.size()) {
+      out.push_back(text[i]);
+      continue;
+    }
+    const char next = text[++i];
+    out.push_back(next == 'n' ? '\n' : next == 't' ? '\t' : next);
+  }
+  return out;
+}
+
+// jev judge protocol: prints READY, then one verdict line per request line "question<TAB>context" (backslash escapes).
+int JudgeStdio(const char* model, const char* programs) {
+  std::string e;
+  auto reader = gufo::core::GgufReader::OpenFile(model, &e);
+  if (!reader) {
+    std::fprintf(stderr, "gguf: %s\n", e.c_str());
+    return 1;
+  }
+  auto tok = gufo::tokenization::QwenTokenizer::CreateFromGguf(*reader, &e);
+  if (!tok) {
+    std::fprintf(stderr, "tokenizer: %s\n", e.c_str());
+    return 1;
+  }
+  const auto yes_ids = tok->Encode("Yes"), no_ids = tok->Encode("No");
+  if (yes_ids.empty() || no_ids.empty()) return 1;
+  std::string sys = "Judge whether the statement or question is true or correct. Answer with exactly one word: Yes or No.";
+  if (const char* env = std::getenv("GUFO_JEV_SYS")) sys = env;
+  std::vector<std::uint32_t> bos;
+  if (const auto tmpl = reader->GetMetadataString("tokenizer.chat_template"))
+    if (tmpl->rfind("{{- bos_token", 0) == 0 || tmpl->rfind("{{ bos_token", 0) == 0)
+      if (auto b = reader->GetMetadataUint32("tokenizer.ggml.bos_token_id")) bos.push_back(*b);
+  const std::uint32_t ctx = 4096;
+  Engine g;
+  if (!g.Init(model, programs, ctx)) return 1;
+  std::vector<std::uint32_t> prefix = bos;
+  for (auto t : tok->Encode("<|im_start|>system\n" + sys + "<|im_end|>\n<|im_start|>user\n")) prefix.push_back(t);
+  std::vector<float> hd;
+  auto feed = [&](const std::uint32_t* ids, std::uint32_t n) {
+    for (std::uint32_t o = 0, m = 0; o < n; o += m) {
+      m = g.Chunk(n - o);
+      g.Step(ids + o, m, &hd);
+    }
+  };
+  const std::uint32_t p0 = static_cast<std::uint32_t>(prefix.size());
+  g.Reset();
+  feed(prefix.data(), p0);
+  std::printf("READY\n");
+  std::fflush(stdout);
+  std::string line;
+  while (std::getline(std::cin, line)) {
+    const auto tab = line.find('\t');
+    const std::string question = UnescapeJev(std::string_view(line).substr(0, tab));
+    const std::string context = tab == std::string::npos ? std::string() : UnescapeJev(std::string_view(line).substr(tab + 1));
+    const auto t0 = Clock::now();
+    std::string body;
+    if (!context.empty()) body += context + "\n\n";
+    body += "Question: " + question + "\nAnswer with Yes or No.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+    auto ids = tok->Encode(body);
+    if (ids.size() + p0 + 8 > ctx) ids.erase(ids.begin(), ids.end() - (ctx - p0 - 8));
+    g.pos = p0;
+    for (auto& L : g.layers) L.napp = std::min(L.napp, p0);
+    feed(ids.data(), static_cast<std::uint32_t>(ids.size()));
+    const float* last = &hd[hd.size() - g.c.hidden];
+    const float ly = g.LogitAt(last, yes_ids[0]), ln = g.LogitAt(last, no_ids[0]);
+    const double m = std::max(ly, ln);
+    const double ey = std::exp(ly - m), en = std::exp(ln - m);
+    std::printf("%s %.3f %.3f %.1f\n", ly >= ln ? "Yes" : "No", ey / (ey + en), en / (ey + en), Ms(t0));
+    std::fflush(stdout);
+  }
+  return 0;
+}
+
 int main(int argc, char** argv) {
+  if (argc >= 4 && std::string(argv[1]) == "judge-stdio") return JudgeStdio(argv[2], argv[3]);
   if (argc >= 4 && std::string(argv[1]) == "interactive") return Interactive(argv[2], argv[3]);
   if (argc >= 5 && std::string(argv[1]) == "chat") return Chat(argv[2], argv[3], argv[4], argc > 5 ? std::atoi(argv[5]) : 256, false, 0);
   if (argc >= 5 && std::string(argv[1]) == "bench") return Chat(argv[2], argv[3], "", static_cast<std::uint32_t>(std::atoi(argv[5 < argc ? 5 : 4])), true, static_cast<std::uint32_t>(std::atoi(argv[4])));
