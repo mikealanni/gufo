@@ -134,7 +134,8 @@ inline std::string GenerationLogDetails(
   out << std::fixed << std::setprecision(1)
       << "prompt_tokens=" << result.prompt_tokens
       << " prefill_tokens=" << result.prefill_tokens
-      << " generated_tokens=" << result.completion_tokens << " finish="
+      << " generated_tokens=" << result.completion_tokens
+      << " reasoning_tokens=" << result.reasoning_tokens << " finish="
       << (result.cancelled ? "cancelled"
           : result.finish_reason == TextGenerationBackend::FinishReason::kLength
               ? "length"
