@@ -43,6 +43,31 @@ as the old name.
 Guard endpoints: `GET /jev-guard/status`, `POST /jev-guard/prepare`,
 `/jev-guard/classify`, `/jev-guard/switch`.
 
+## Judge
+
+Commands the rules cannot classify go to one resident NPU decision model, owned
+by the guard (`gufo judge --model <gguf> --stdio`, one `READY` line, then one
+question per line, answer `Yes|No <p_yes> <p_no> ...`). The plugin never starts a
+second NPU process. A command is treated as heavy when `p_yes` reaches
+`--judge-cutoff`.
+
+- **Model.** The launcher `~/run-jev-guard.sh` runs the pplx decider
+  (Qwen3.5-4B, Q8_0) on the general NPU engine (`gufo-judge`, built from
+  `tools/npu/gen`). About 370 ms per request, 4.5 GB real RAM (measured as the
+  drop in `MemAvailable`; NPU buffers do not show in RSS).
+- **Cutoff.** Probabilities are not comparable between judges. The old 0.85
+  cutoff flagged none of the 239 unknown commands in a replay of real sessions.
+  pplx uses `0.05` (flags 18% of unknown commands, 3 of 4 labeled heavy ones);
+  the d1 decision model uses about `0.3`. Each false stop costs a gufo reload
+  (about 70 s), so tune it from `~/.gufo/jev-log/jev.sqlite3` before relying on it.
+- **Roll back.** `run-jev-guard.sh.bak-pre-pplx` restores the d1 launcher.
+
+## Start-up check
+
+`~/run-gufo.sh` checks free RAM before it starts the guard and exits when the
+model does not fit. `FORCE=1` skips the check. The guard cannot free memory; it
+only stops a running gufo.
+
 ## opencode plugin
 
 Install the server plugin and the TUI plugin from the opencode config

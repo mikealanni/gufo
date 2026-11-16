@@ -1,5 +1,7 @@
 # JEV as an opencode plugin: design history
 
+Current behaviour (judge, cutoff, start-up check) is in [JEV.md](JEV.md); this file keeps the history.
+
 > **Status: shipped and in use.** This file is the original port plan
 > (2026-11-08, Phase 0 = log only). The plugin has since gone past Phase 0: it
 > stops and restarts gufo around heavy commands, controls reasoning effort,
