@@ -18,8 +18,13 @@ namespace gufo::npu::runtime {
 
 class FfnAtbChain {
 public:
-  static constexpr std::uint32_t kM = 1024, kHid = 2048, kInt = 7680,
-                                 kNa = 4096, kNb = 3584;
+  static constexpr std::uint32_t kHid = 2048, kInt = 7680, kNa = 4096,
+                                 kNb = 3584;
+  /// Rows per pass: 1024 for chat/prefill, 512 for decision passes (every
+  /// program takes its instruction stream for this row count).
+  std::uint32_t kM = 1024;
+  std::uint32_t M() const { return kM; }
+  void SetRows(std::uint32_t rows) { kM = rows; }
 
   bool Init(const std::string& dir, std::string* err) {
     dir_ = dir;
@@ -51,9 +56,14 @@ public:
       }
       return ws;
     };
-    const std::vector<float> wsa = pack_swi(0, kNa), wsb = pack_swi(kNa, kNb);
+    // The fused swiglu program needs an even number of 1024-column groups: at
+    // 512 rows the 7680 intermediate splits as 4096 + 4096 with a 512-column
+    // overlap (the overlap is recomputed identically).
+    const std::uint32_t nb = kM == 512 ? 4096 : kNb;
+    const std::uint32_t c0b = kM == 512 ? 3584 : kNa;
+    const std::vector<float> wsa = pack_swi(0, kNa), wsb = pack_swi(c0b, nb);
     l->wqa = gu_.PackWeightAtb(wsa.data(), 2 * kNa, kHid, 4);
-    l->wqb = gu_.PackWeightAtb(wsb.data(), 2 * kNb, kHid, 4);
+    l->wqb = gu_.PackWeightAtb(wsb.data(), 2 * nb, kHid, 4);
     l->wd = dnp_->PackWeightAtb(down, kHid, kInt, 4);
     if (kd_ && !std::getenv("GUFO_NO_SWIFUSE") && swifuse_ok_) {
       l->fused = true;
@@ -61,42 +71,48 @@ public:
       l->swc = gu_.MakeBo(2 * abytes, 3);
       std::memset(l->swc.map<void*>(), 0, 2 * abytes);
       l->swc.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-      l->qa = gu_.MakeProgram(kHid, 2 * kNa,
-                              dir_ + "/" + ip_ + "swi_a_1024x2048x8192.txt", 64,
-                              err, 0, mrows, 3, 5);
-      l->qb = gu_.MakeProgram(kHid, 2 * kNb,
-                              dir_ + "/" + ip_ + "swi_b_1024x2048x7168.txt", 64,
-                              err, 0, mrows, 3, 5);
+      l->qa = gu_.MakeProgram(
+          kHid, 2 * kNa,
+          dir_ + "/" + ip_ + "swi_a_" + std::to_string(kM) + "x2048x8192.txt",
+          64, err, 0, mrows, 3, 5);
+      l->qb = gu_.MakeProgram(kHid, 2 * nb,
+                              dir_ + "/" + ip_ + "swi_b_" + std::to_string(kM) +
+                                  "x2048x" + std::to_string(2 * nb) + ".txt",
+                              64, err, 0, mrows, 3, 5);
       l->qa.c = l->swc;
       l->qa.ch = l->swc.map<std::uint8_t*>();
       l->qb.c = l->swc;
       l->qb.ch = l->qa.ch;
       l->dn = dnp_->MakeProgram(
-          kInt, kHid, dir_ + "/" + ip_ + "dn2_1024x7680x2048.txt",
+          kInt, kHid,
+          dir_ + "/" + ip_ + "dn2_" + std::to_string(kM) + "x7680x2048.txt",
           std::size_t{kM} * kHid / 8 * 9, err, 0, mrows, 3, 5);
       dnp_->RebindA(l->dn, l->swc);
       dnp_->WeightSlot(l->wd, l->dn);
       layers_.push_back(std::move(l));
       return err == nullptr || err->empty();
     }
-    l->qa =
-        gu_.MakeProgram(kHid, 2 * kNa, dir_ + "/" + ip_ + "1024x2048x8192.txt",
-                        std::size_t{kM} * 2 * kNa / 8 * 9, err, 0, mrows, 3, 5);
-    l->qb =
-        gu_.MakeProgram(kHid, 2 * kNb, dir_ + "/" + ip_ + "1024x2048x7168.txt",
-                        std::size_t{kM} * 2 * kNb / 8 * 9, err, 0, mrows, 3, 5);
-    l->sw =
-        swp_->MakeProgram(kInt, kHid,
-                          dir_ + (kd_ ? "/insts_kd_resh_1024x7680x2048.txt"
-                                      : "/insts_swresh_1024x7680x2048.txt"),
-                          std::size_t{kM} * kInt / 8 * 9, err, 0, mrows, 3, 5);
+    l->qa = gu_.MakeProgram(
+        kHid, 2 * kNa,
+        dir_ + "/" + ip_ + "" + std::to_string(kM) + "x2048x8192.txt",
+        std::size_t{kM} * 2 * kNa / 8 * 9, err, 0, mrows, 3, 5);
+    l->qb = gu_.MakeProgram(
+        kHid, 2 * kNb,
+        dir_ + "/" + ip_ + "" + std::to_string(kM) + "x2048x7168.txt",
+        std::size_t{kM} * 2 * kNb / 8 * 9, err, 0, mrows, 3, 5);
+    l->sw = swp_->MakeProgram(
+        kInt, kHid,
+        dir_ + (kd_ ? "/insts_kd_resh_" + std::to_string(kM) + "x7680x2048.txt"
+                    : "/insts_swresh_" + std::to_string(kM) + "x7680x2048.txt"),
+        std::size_t{kM} * kInt / 8 * 9, err, 0, mrows, 3, 5);
     l->sw.a = l->qa.c;
     l->fake.bo = l->qb.c;
     l->fake.bytes = std::size_t{kM} * 2 * kNb / 8 * 9;
     swp_->WeightSlot(l->fake, l->sw);
-    l->dn =
-        dnp_->MakeProgram(kInt, kHid, dir_ + "/" + ip_ + "1024x7680x2048.txt",
-                          std::size_t{kM} * kHid / 8 * 9, err, 0, mrows, 3, 5);
+    l->dn = dnp_->MakeProgram(
+        kInt, kHid,
+        dir_ + "/" + ip_ + "" + std::to_string(kM) + "x7680x2048.txt",
+        std::size_t{kM} * kHid / 8 * 9, err, 0, mrows, 3, 5);
     dnp_->RebindA(l->dn, l->sw.c);
     dnp_->WeightSlot(l->wd, l->dn);
     layers_.push_back(std::move(l));
@@ -111,12 +127,14 @@ public:
     const std::uint32_t mrows = kM / 16;
     a->wq = gu_.PackWeightAtb(qkv, 3072, kHid, 4);
     a->wo = gu_.PackWeightAtb(o, kHid, kHid, 4);
-    a->pq =
-        gu_.MakeProgram(kHid, 3072, dir_ + "/" + ip_ + "1024x2048x3072.txt",
-                        std::size_t{kM} * 3072 / 8 * 9, err, 0, mrows, 3, 5);
-    a->po =
-        gu_.MakeProgram(kHid, kHid, dir_ + "/" + ip_ + "1024x2048x2048.txt",
-                        std::size_t{kM} * kHid / 8 * 9, err, 0, mrows, 3, 5);
+    a->pq = gu_.MakeProgram(
+        kHid, 3072,
+        dir_ + "/" + ip_ + "" + std::to_string(kM) + "x2048x3072.txt",
+        std::size_t{kM} * 3072 / 8 * 9, err, 0, mrows, 3, 5);
+    a->po = gu_.MakeProgram(
+        kHid, kHid,
+        dir_ + "/" + ip_ + "" + std::to_string(kM) + "x2048x2048.txt",
+        std::size_t{kM} * kHid / 8 * 9, err, 0, mrows, 3, 5);
     attn_[layer] = std::move(a);
     return err == nullptr || err->empty();
   }
@@ -124,21 +142,33 @@ public:
   /// Run every program once so the throwaway first dispatch ("first C write is
   /// lost") happens at load time.
   void Warm() {
+    const bool dbg = std::getenv("GUFO_ATB_DEBUG") != nullptr;
+    const auto say = [&](const char* w) {
+      if (dbg)
+        std::fprintf(stderr, "[atb warm] %s\n", w);
+    };
     for (auto& lp : layers_) {
       Layer& l = *lp;
+      say("qa");
       Dispatch(gu_, l.wqa, l.qa);
+      say("qb");
       Dispatch(gu_, l.wqb, l.qb);
       if (!l.fused)
         Dispatch(*swp_, l.fake, l.sw);
+      say("dn");
       Dispatch(*dnp_, l.wd, l.dn);
     }
     for (auto& cp : conv_) {
       if (!cp)
         continue;
+      say("conv-in");
       Dispatch(gu_, cp->wi, cp->pi);
+      say("conv-out");
       Dispatch(gu_, cp->wo, cp->po);
-      if (cp->dev)
+      if (cp->dev) {
+        say("conv-mode");
         Dispatch(gu_, cp->wx, cp->pc);
+      }
     }
     for (auto& ap : attn_) {
       if (!ap)
@@ -153,18 +183,26 @@ public:
     auto c = std::make_unique<Conv>();
     if (conv_.size() <= layer)
       conv_.resize(layer + 1);
-    const std::uint32_t mrows = kM / 16;
+    // The conv mode's core program always consumes two 512-row groups, so its
+    // wires are sized for 1024 rows; a 512-row in_proj fills the first group.
+    constexpr std::uint32_t kConvRows = 1024;
+    const std::uint32_t mrows = std::max(kM, kConvRows) / 16;
     c->wi = gu_.PackWeightAtb(w_in, 3 * kHid, kHid, 4);
     c->wo = gu_.PackWeightAtb(w_out, kHid, kHid, 4);
-    c->pi =
-        gu_.MakeProgram(kHid, 3 * kHid, dir_ + "/" + ip_ + "1024x2048x6144.txt",
-                        std::size_t{448} * 18432, err, 0, mrows, 3, 5);
-    c->po =
-        gu_.MakeProgram(kHid, kHid, dir_ + "/" + ip_ + "1024x2048x2048.txt",
-                        std::size_t{kM} * kHid / 8 * 9, err, 0, mrows, 3, 5);
+    c->pi = gu_.MakeProgram(
+        kHid, 3 * kHid,
+        dir_ + "/" + ip_ + "" + std::to_string(kM) + "x2048x6144.txt",
+        std::size_t{448} * 18432, err, 0, mrows, 3, 5);
+    c->po = gu_.MakeProgram(
+        kHid, kHid,
+        dir_ + "/" + ip_ + "" + std::to_string(kM) + "x2048x2048.txt",
+        std::size_t{kConvRows} * kHid / 8 * 9, err, 0, mrows, 3, 5);
     try {
-      c->pc = gu_.MakeProgram(kHid, kHid, dir_ + "/" + ip_ + "conv_1024.txt", 1,
-                              err, 0, mrows, 3, 5);
+      c->pc =
+          gu_.MakeProgram(kHid, kHid,
+                          dir_ + "/" + ip_ + "conv_" +
+                              std::to_string(std::max(kM, kConvRows)) + ".txt",
+                          1, err, 0, mrows, 3, 5);
       c->pc.a = c->pi.c;
       c->pc.ah = c->pi.ch;
       c->pc.c = c->po.a;
@@ -175,7 +213,7 @@ public:
       std::memset(c->wx.host, 0, c->wx.bytes);
       c->wx.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
       gu_.WeightSlot(c->wx, c->pc);
-      c->dev = kd_;
+      c->dev = kd_ && !std::getenv("GUFO_NO_CONVDEV");
     } catch (const std::exception&) {
       c->dev = false;
     }
@@ -209,22 +247,29 @@ public:
     bool staged{false};
   };
   void EncodeJob(const float* z, std::uint32_t n, std::uint32_t k, Job& j) {
+    // Only the 128-row tiles that hold real rows are encoded; the device
+    // computes the rest from whatever the A buffer held, and their outputs are
+    // never read.
+    constexpr std::uint32_t kTile = 128;
+    const std::uint32_t rows = std::min(kM, (n + kTile - 1) / kTile * kTile);
     std::vector<float> pad;
     const float* src = z;
-    if (n < kM) {
-      pad.assign(std::size_t{kM} * k, 0.f);
+    if (n < rows) {
+      pad.assign(std::size_t{rows} * k, 0.f);
       std::memcpy(pad.data(), z, std::size_t{n} * k * 4);
       src = pad.data();
     }
     j.a.resize(std::size_t{kM} * k / 8 * 9);
-    gu_.EncodeAAtbRaw(src, kM, k, j.a.data());
+    gu_.EncodeAAtbRaw(src, kM, k, j.a.data(), n);
   }
   void DecodeJob(const Job& j, std::uint32_t n, std::uint32_t nout, float* y) {
-    if (n == kM) {
-      gu_.DecodeCAtbRaw(j.c.data(), y, kM, nout);
+    constexpr std::uint32_t kTile = 128;
+    const std::uint32_t rows = std::min(kM, (n + kTile - 1) / kTile * kTile);
+    if (n == rows) {
+      gu_.DecodeCAtbRaw(j.c.data(), y, kM, nout, n);
     } else {
-      std::vector<float> tmp(std::size_t{kM} * nout);
-      gu_.DecodeCAtbRaw(j.c.data(), tmp.data(), kM, nout);
+      std::vector<float> tmp(std::size_t{rows} * nout);
+      gu_.DecodeCAtbRaw(j.c.data(), tmp.data(), kM, nout, n);
       std::memcpy(y, tmp.data(), std::size_t{n} * nout * 4);
     }
   }
@@ -271,7 +316,7 @@ public:
 
   // ---- device-resident residual stream: x, branch and the normalized A wire
   // never leave the device ----
-  static constexpr std::size_t kRegionBytes = std::size_t{kM} * kHid / 8 * 9;
+  std::size_t RegionBytes() const { return std::size_t{kM} * kHid / 8 * 9; }
   bool DevRes() const { return devres_; }
   bool SetupDevRes(const std::vector<const float*>& g_a,
                    const std::vector<const float*>& g_f, const float* g_final,
@@ -282,18 +327,18 @@ public:
       const std::size_t nl = layers_.size();
       if (g_a.size() != nl || g_f.size() != nl)
         throw std::runtime_error("norm weight count");
-      resc_ = gu_.MakeBo(3 * kRegionBytes, 3);
-      resa_ = gu_.MakeBo(kRegionBytes, 3);
+      resc_ = gu_.MakeBo(3 * RegionBytes(), 3);
+      resa_ = gu_.MakeBo(RegionBytes(), 3);
       resc_h_ = resc_.map<std::uint8_t*>();
       resa_h_ = resa_.map<std::uint8_t*>();
-      std::memset(resc_h_, 0, 3 * kRegionBytes);
-      std::memset(resa_h_, 0, kRegionBytes);
+      std::memset(resc_h_, 0, 3 * RegionBytes());
+      std::memset(resa_h_, 0, RegionBytes());
       resc_.sync(XCL_BO_SYNC_BO_TO_DEVICE);
       resa_.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-      br_ = xrt::bo(resc_, kRegionBytes, kRegionBytes);
+      br_ = xrt::bo(resc_, RegionBytes(), RegionBytes());
       const auto bind_c = [&](Program& p) {
         p.c = br_;
-        p.ch = resc_h_ + kRegionBytes;
+        p.ch = resc_h_ + RegionBytes();
       };
       for (auto& lp : layers_) {
         gu_.RebindA(lp->qa, resa_);
@@ -321,7 +366,8 @@ public:
       const auto mk = [&](const float* g, const float* gp, int variant) {
         auto np = std::make_unique<NormP>();
         np->p = gu_.MakeBareProgram(dir_ + "/insts_kd_norm" +
-                                    std::to_string(variant) + "_1024.txt");
+                                    std::to_string(variant) + "_" +
+                                    std::to_string(kM) + ".txt");
         np->p.a = resc_;
         np->p.c = resa_;
         np->w.bytes = std::size_t{16} * 9216;
@@ -362,8 +408,8 @@ public:
       std::memcpy(pad.data(), x, std::size_t{n} * kHid * 4);
       src = pad.data();
     }
-    gu_.EncodeCAtbRaw(src, kM, kHid, resc_h_ + 2 * kRegionBytes);
-    std::memset(resc_h_ + kRegionBytes, 0, kRegionBytes);
+    gu_.EncodeCAtbRaw(src, kM, kHid, resc_h_ + 2 * RegionBytes());
+    std::memset(resc_h_ + RegionBytes(), 0, RegionBytes());
     resc_.sync(XCL_BO_SYNC_BO_TO_DEVICE);
   }
   /// site 0: before the attention/conv block, 1: before the FFN, l == layers:

@@ -32,6 +32,7 @@
 #include "src/models/qwen/tokenizer.hpp"
 #include "src/npu/runtime/runtime.hpp"
 
+static double UnevictableGb();
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -1097,9 +1098,7 @@ struct Engine {
       if (half_b) m.kw_b = pack("b", half_a, half_b);
       for (int set = 0; set < 2; ++set) {
         xrt::bo& sw = set ? m.swc2 : m.swc;
-        sw = rk.MakeBo(2 * abytes, 3);
-        std::memset(sw.map<void*>(), 0, 2 * abytes);
-        sw.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        sw = rk.MakeScratchBo(2 * abytes, 3, set);
         Program& pa = set ? m.kq_a2 : m.kq_a;
         Program& pb = set ? m.kq_b2 : m.kq_b;
         Program& pd = set ? m.kq_d2 : m.kq_d;
@@ -1713,6 +1712,19 @@ struct HybridEngine : Engine {
   std::vector<LmState> row0, row1;  // delta-net state after the first / second row of a 2-3 row step (a draft may be rejected there)
   std::uint32_t n_exp{0}, n_used{0};
   bool dec_ok{false};   // int5 stream-bound decode path available (language-model mode)
+  // Decision-only engines read embedding rows straight from the mapped GGUF instead of holding a bf16 copy of the table.
+  gufo::models::lfm3::Tensor embed_tn{};
+  std::unique_ptr<gufo::core::GgufReader> embed_reader;  // keeps the GGUF mapped for lazy embedding rows
+  bool embed_lazy{false};
+  void EmbedRow(std::uint32_t tok, float* out) const {
+    const std::uint32_t H = c.hidden;
+    if (embed_lazy) {
+      DecodeRowAny(embed_tn, tok, std::span<float>(out, H));
+      for (std::uint32_t i = 0; i < H; ++i) out[i] = Bf(Bf16Bits(out[i]));
+    } else {
+      for (std::uint32_t i = 0; i < H; ++i) out[i] = Bf(embed[std::size_t{tok} * H + i]);
+    }
+  }
   bool use_dec{false};  // the current Step runs on it (few rows)
   std::vector<float> s_gu, s_act, s_dn;
   int moe_threads{std::getenv("GEN_MOE_THREADS") ? std::atoi(std::getenv("GEN_MOE_THREADS")) : 8};  // per host stage of the expert pipeline
@@ -1796,6 +1808,7 @@ struct HybridEngine : Engine {
       std::fprintf(stderr, "npu init: %s\n", err.c_str());
       return false;
     }
+    rk.SetSharedScratch(!std::getenv("GEN_NO_SHARED_SCRATCH"));  // decision engine: layers run in order, one staging pair serves all of them
     kd = true;
     dec_ok = lm_mode && !std::getenv("GEN_NO_INT5_DECODE");
     dec_int4 = dec_ok && !std::getenv("GEN_INT5") && std::ifstream(programs + "/q4/final_16x64x128_ffn.xclbin").good();
@@ -1861,15 +1874,26 @@ struct HybridEngine : Engine {
       st.DimsG("token_embd.weight", &cc, &rr);
       c.vocab = rr;
       const auto* t = r.FindTensor("token_embd.weight");
-      embed.resize(std::size_t{cc} * rr);
-      const gufo::models::lfm3::Tensor tn{t->data, t->type, cc, rr, t->size_bytes};
+      gufo::models::lfm3::Tensor tn{t->data, t->type, cc, rr, t->size_bytes};
+      embed_lazy = !lm_mode && !std::getenv("GEN_EAGER_EMBED");
+      if (embed_lazy) {
+        std::string rerr;
+        embed_reader = gufo::core::GgufReader::OpenFile(model, &rerr);
+        const auto* t2 = embed_reader ? embed_reader->FindTensor("token_embd.weight") : nullptr;
+        if (t2 == nullptr) embed_lazy = false;
+        else tn = gufo::models::lfm3::Tensor{t2->data, t2->type, cc, rr, t2->size_bytes};
+      }
+      embed_tn = tn;
+      if (!embed_lazy) {
+        embed.resize(std::size_t{cc} * rr);
 #pragma omp parallel
-      {
-        std::vector<float> tmp(cc);
+        {
+          std::vector<float> tmp(cc);
 #pragma omp for
-        for (std::int64_t row = 0; row < rr; ++row) {
-          DecodeRowAny(tn, static_cast<std::uint32_t>(row), std::span<float>(tmp.data(), cc));
-          for (std::uint32_t i = 0; i < cc; ++i) embed[std::size_t(row) * cc + i] = Bf16Bits(tmp[i]);
+          for (std::int64_t row = 0; row < rr; ++row) {
+            DecodeRowAny(tn, static_cast<std::uint32_t>(row), std::span<float>(tmp.data(), cc));
+            for (std::uint32_t i = 0; i < cc; ++i) embed[std::size_t(row) * cc + i] = Bf16Bits(tmp[i]);
+          }
         }
       }
     }
@@ -2010,7 +2034,9 @@ struct HybridEngine : Engine {
         };
         in_rows = kGdnInN;
         L.kp_qkv = rk.MakeProgram(H, kGdnInN, programs + "/" + gdn_in + ".txt", std::size_t{1024} * kGdnInN / 8 * 9, &err, 0, 64, 3, 5);
+        rk.SetScratchSlot(1);
         L.kp_qkv2 = rk.MakeProgram(H, kGdnInN, programs + "/" + gdn_in + ".txt", std::size_t{1024} * kGdnInN / 8 * 9, &err, 0, 64, 3, 5);
+        rk.SetScratchSlot(0);
         load_o = [&]() -> const float* {
           buf.assign(std::size_t{h_p} * kValDim, 0.f);
           std::vector<float> ow(std::size_t{H} * kValDim);
@@ -2033,7 +2059,9 @@ struct HybridEngine : Engine {
         };
         in_rows = attn_n;
         L.kp_qkv = rk.MakeProgram(H, attn_n, programs + "/" + nm.kqkv + ".txt", std::size_t{1024} * attn_n / 8 * 9, &err, 0, 64, 3, 5);
+        rk.SetScratchSlot(1);
         L.kp_qkv2 = rk.MakeProgram(H, attn_n, programs + "/" + nm.kqkv + ".txt", std::size_t{1024} * attn_n / 8 * 9, &err, 0, 64, 3, 5);
+        rk.SetScratchSlot(0);
         load_o = [&]() -> const float* {
           buf.assign(std::size_t{h_p} * qd, 0.f);
           st.LoadG(b + "attn_output.weight", buf.data(), std::size_t{H} * qd);
@@ -2041,9 +2069,12 @@ struct HybridEngine : Engine {
         };
       }
       L.kp_o = rk.MakeProgram(kValDim, h_p, programs + "/" + nm.ko + ".txt", std::size_t{1024} * h_p / 8 * 9, &err, 0, 64, 3, 5);
-      L.kp_o2 = rk.MakeProgram(kValDim, h_p, programs + "/" + nm.ko + ".txt", std::size_t{1024} * h_p / 8 * 9, &err, 0, 64, 3, 5);
+      rk.SetScratchSlot(1);
+        L.kp_o2 = rk.MakeProgram(kValDim, h_p, programs + "/" + nm.ko + ".txt", std::size_t{1024} * h_p / 8 * 9, &err, 0, 64, 3, 5);
+        rk.SetScratchSlot(0);
       L.kw_qkv = rk.PackWeightAtbCached(wcache, b + "kd.in", in_rows, H, 4, load_in);
       L.kw_o = rk.PackWeightAtbCached(wcache, b + "kd.o", h_p, kValDim, 4, load_o);
+      if (std::getenv("GEN_MEMLOG") && l < 2) std::fprintf(stderr, "[mem] L%u after qkv/o weights: unevictable %.2f GB\n", l, UnevictableGb());
       KDispatch(L.kw_qkv, L.kp_qkv);
       KDispatch(L.kw_qkv, L.kp_qkv2);
       KDispatch(L.kw_o, L.kp_o);
@@ -2072,7 +2103,9 @@ struct HybridEngine : Engine {
           L.sh_gate.resize(H);
           st.LoadG(b + "ffn_gate_inp_shexp.weight", L.sh_gate.data(), H);
         }
+        if (std::getenv("GEN_MEMLOG") && l < 2) std::fprintf(stderr, "[mem] L%u before PackMlp: unevictable %.2f GB\n", l, UnevictableGb());
         PackMlp(L, b + "kd.", programs, &err, ensure, gate, up, down);
+        if (std::getenv("GEN_MEMLOG") && l < 2) std::fprintf(stderr, "[mem] L%u after PackMlp: unevictable %.2f GB\n", l, UnevictableGb());
         if (moe) {
           PackExperts(L, st, b);
           if (zero_copy) ZeroCopyLayer(l, programs, &err);
@@ -2147,7 +2180,7 @@ struct HybridEngine : Engine {
     cat->assign(std::size_t{rows} * 2 * H, 0.f);
     std::vector<float> e(H);
     for (std::uint32_t r = 0; r < rows; ++r) {
-      for (std::uint32_t i = 0; i < H; ++i) e[i] = Bf(embed[std::size_t{next_tok[r]} * H + i]);
+      EmbedRow(next_tok[r], e.data());
       RmsNorm(e.data(), mtp_enorm.data(), &(*cat)[std::size_t{r} * 2 * H], H, c.eps);
       RmsNorm(raw + std::size_t{r} * H, mtp_hnorm.data(), &(*cat)[std::size_t{r} * 2 * H + H], H, c.eps);
     }
@@ -3003,7 +3036,7 @@ struct HybridEngine : Engine {
     const std::uint32_t H = c.hidden;
     std::vector<float> x(std::size_t{n} * H);
     for (std::uint32_t r = 0; r < n; ++r)
-      for (std::uint32_t i = 0; i < H; ++i) x[std::size_t{r} * H + i] = Bf(embed[std::size_t{tok[r]} * H + i]);
+      EmbedRow(tok[r], &x[std::size_t{r} * H]);
     use_dec = dec_ok && n <= 16;
     step_start = pos;
     step_rows = n;
@@ -3065,7 +3098,7 @@ struct HybridEngine : Engine {
     for (std::size_t i = 0; i < seqs.size(); ++i)
 #pragma omp parallel for
       for (std::int64_t t = 0; t < seqs[i].len; ++t)
-        for (std::uint32_t k = 0; k < H; ++k) x[std::size_t(segs[i].first + t) * H + k] = Bf(embed[std::size_t(seqs[i].tok[t]) * H + k]);
+        EmbedRow(seqs[i].tok[t], &x[std::size_t(segs[i].first + t) * H]);
     Layers(x, T, segs);
     hidden->resize(seqs.size() * H);
     for (std::size_t i = 0; i < seqs.size(); ++i)
@@ -3728,7 +3761,17 @@ int DeciderStdio(const char* model, const char* programs, gufo::tokenization::Qw
     }
     std::vector<HybridEngine::Seq> sq{{ids.data(), static_cast<std::uint32_t>(ids.size()), static_cast<std::uint32_t>(ids.size() - 1)}};
     std::vector<float> hid;
+    double ph0[24];
+    std::copy(e.ph, e.ph + 24, ph0);
+    const auto tim0 = e.tim;
     e.ForwardBatch(sq, &hid);
+    if (std::getenv("GUFO_JUDGE_PROF")) {
+      const auto d = [&](int i) { return e.ph[i] - ph0[i]; };
+      std::fprintf(stderr,
+                   "prof %zu tok: total %.1f | gdn %.1f (in-gemm %.1f dev %.1f out-gemm %.1f host-conv %.1f rec %.1f) | attn %.1f | mlp %.1f | norm %.1f | gemm enc %.1f dec %.1f wait %.1f syncA %.1f syncC %.1f submit %.1f\n",
+                   ids.size(), Ms(t0), d(8), d(12), d(14), d(16), d(18), d(19), d(9), d(10), d(11), e.tim.enc - tim0.enc, e.tim.dec - tim0.dec, e.tim.wait - tim0.wait,
+                   e.tim.syncA - tim0.syncA, e.tim.syncC - tim0.syncC, e.tim.submit - tim0.submit);
+    }
     float lg[2];
     e.Logits(hid.data(), 2, lg);
     const double m = std::max(lg[0], lg[1]);
@@ -3811,6 +3854,8 @@ int D1Stdio(const char* model, const char* programs, gufo::core::GgufReader& rea
   opt.gguf = model;
   opt.programs = programs;
   opt.context = 4096;
+  opt.rows = 512;  // decision passes: one 512-row program per layer
+  opt.decision = true;
   std::string err;
   auto engine = gufo::models::lfm3::npu::Engine::Create(opt, &err);
   if (!engine) {
@@ -3834,7 +3879,7 @@ int D1Stdio(const char* model, const char* programs, gufo::core::GgufReader& rea
     }
     return true;
   };
-  constexpr std::uint32_t kMaxD1Tokens = 1024;
+  constexpr std::uint32_t kMaxD1Tokens = 512;
   auto judge = gufo::models::d1::Judge::Create(reader, forward, kMaxD1Tokens, &err);
   if (!judge) {
     std::fprintf(stderr, "d1 judge: %s\n", err.c_str());
@@ -3888,6 +3933,16 @@ int JudgeStdio(const char* model, const char* programs) {
   }
   if (arch == "qwen35" || arch == "qwen35moe") return JudgeLoop<HybridEngine>(model, programs, *reader, *tok);
   return JudgeLoop<Engine>(model, programs, *reader, *tok);
+}
+
+static double UnevictableGb() {
+  std::ifstream f("/proc/meminfo");
+  std::string k;
+  long v = 0;
+  std::string unit;
+  while (f >> k >> v >> unit)
+    if (k == "Unevictable:") return static_cast<double>(v) / 1048576.0;
+  return 0.0;
 }
 
 int main(int argc, char** argv) {

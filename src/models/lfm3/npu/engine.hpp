@@ -14,6 +14,12 @@ struct Options {
   std::string programs;  // directory with xclbin + insts
   std::string spec;  // optional: JSON model spec (defaults to built-in LFM3)
   std::uint32_t context{8192};
+  /// Rows per device-resident pass: 1024 for chat/prefill, 512 for decision
+  /// passes.
+  std::uint32_t rows{1024};
+  /// Decision-model process: host attention, no attention xclbin, rows-sized KV
+  /// rings.
+  bool decision{false};
 };
 
 /// LFM3 engine with every dense projection on the NPU (16-row int5 split-B

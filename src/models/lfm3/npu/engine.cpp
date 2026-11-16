@@ -242,6 +242,8 @@ struct Engine::Impl {
   Options opt;
   bool devres_ok{false};
   bool dec_on{false};
+  bool decision{false};  // decision-only process: only the 512-row chain
+                         // weights are packed
   const std::int32_t* dec_groups{nullptr};
   std::unique_ptr<gufo::npu::runtime::AttnDevPrep> dprep;
   std::vector<bool> dprep_layer;
@@ -405,11 +407,12 @@ std::unique_ptr<Engine> Engine::Create(const Options& options_in,
 
     if (std::getenv("GUFO_ATB") != nullptr && s.m64) {
       s.atb = std::make_unique<gufo::npu::runtime::FfnAtbChain>();
+      s.atb->SetRows(options.rows);
       std::string aerr;
       if (!s.atb->Init(options.programs, &aerr)) {
         std::fprintf(stderr, "GUFO_ATB init failed: %s\n", aerr.c_str());
         s.atb.reset();
-      } else if (!std::getenv("GUFO_NO_ATTNP")) {
+      } else if (!std::getenv("GUFO_NO_ATTNP") && !options.decision) {
         auto ap = std::make_unique<gufo::npu::runtime::AttnPrefill>();
         std::string perr;
         if (ap->Init(options.programs, &perr))
@@ -427,7 +430,8 @@ std::unique_ptr<Engine> Engine::Create(const Options& options_in,
     s.m_out.resize(L);
     s.programs_dir = options.programs;
     s.int4 = int4;
-    s.npu_attn = (!int4 || std::getenv("GUFO_ATB")) &&
+    s.decision = options.decision;
+    s.npu_attn = !options.decision && (!int4 || std::getenv("GUFO_ATB")) &&
                  !std::getenv("GUFO_CPU_ATTN") && options.context >= 1;
     s.m_qkv.resize(L);
     s.m_ffn.resize(L);
@@ -471,10 +475,11 @@ std::unique_ptr<Engine> Engine::Create(const Options& options_in,
         std::vector<float> wout(std::size_t{2048} * 2048);
         s.LoadRows(pre + "conv.out_proj.weight", lw.out_proj, wout.data(), 2048,
                    2048);
-        s.m_conv[l] =
-            s.rt.PackConv(buf.data(), static_cast<const float*>(lw.conv.data),
-                          s.taps, wout.data(), 2048, s.p_conv);
-        if (have_conv64)
+        if (!options.decision)
+          s.m_conv[l] =
+              s.rt.PackConv(buf.data(), static_cast<const float*>(lw.conv.data),
+                            s.taps, wout.data(), 2048, s.p_conv);
+        if (have_conv64 && !options.decision)
           s.m_conv64[l] =
               s.rt.PackConv(buf.data(), static_cast<const float*>(lw.conv.data),
                             s.taps, wout.data(), 2048, s.p_conv64);
@@ -494,12 +499,12 @@ std::unique_ptr<Engine> Engine::Create(const Options& options_in,
                    buf.data() + std::size_t{2048} * 2048, 512, 2048);
         s.LoadRows(pre + "self_attn.v_proj.weight", lw.v,
                    buf.data() + std::size_t{2560} * 2048, 512, 2048);
-        s.m_qkv[l] = s.rt.PackWeight(buf.data(), 3072, 2048);
-        ;
+        if (!options.decision)
+          s.m_qkv[l] = s.rt.PackWeight(buf.data(), 3072, 2048);
         s.LoadRows(pre + "self_attn.o_proj.weight", lw.attn_out, buf.data(),
                    2048, 2048);
-        s.m_out[l] = s.rt.PackWeight(buf.data(), 2048, 2048);
-        ;
+        if (!options.decision)
+          s.m_out[l] = s.rt.PackWeight(buf.data(), 2048, 2048);
         if (s.atb) {
           std::string aerr;
           std::vector<float> wqkv(std::size_t{3072} * 2048);
@@ -524,8 +529,9 @@ std::unique_ptr<Engine> Engine::Create(const Options& options_in,
         // Sliding layers run on the NPU with a 1.5x-window ring cache (384
         // tokens for window 256).
         const std::uint32_t l_ring = l_swa ? s.window + s.window / 2 : 0;
-        s.capacity[l] =
-            l_swa ? std::max(s.window + kRows, l_ring) : options.context;
+        s.capacity[l] = l_swa ? std::max({s.window + kRows, l_ring,
+                                          options.decision ? options.rows : 0u})
+                              : options.context;
         if (s.npu_attn && s.kvh == 4 && s.hd == 128 && s.heads == 16 &&
             (c.layers[l] == LayerType::kFullAttention ||
              (l_ring && l_ring % 16 == 0 && options.context >= l_ring)))
@@ -554,19 +560,23 @@ std::unique_ptr<Engine> Engine::Create(const Options& options_in,
         const std::size_t dn_bytes =
             std::size_t{16} * 120 * 4 * gufo::npu::runtime::QuarterBytesW();
         gufo::npu::runtime::WeightBuffer m;
-        m.bytes = gu_bytes + dn_bytes;
-        m.bo = xrt::bo(s.rt.device(), m.bytes, XRT_BO_FLAGS_HOST_ONLY,
-                       s.rt.kernel().group_id(3));
-        m.host = m.bo.map<std::uint8_t*>();
-        std::memset(m.host, 0, m.bytes);
-        gufo::npu::runtime::PackMatInt5(buf.data(), 15360, 2048, m.host);
+        if (!options.decision) {
+          m.bytes = gu_bytes + dn_bytes;
+          m.bo = xrt::bo(s.rt.device(), m.bytes, XRT_BO_FLAGS_HOST_ONLY,
+                         s.rt.kernel().group_id(3));
+          m.host = m.bo.map<std::uint8_t*>();
+          std::memset(m.host, 0, m.bytes);
+          gufo::npu::runtime::PackMatInt5(buf.data(), 15360, 2048, m.host);
+        }
         buf.resize(std::size_t{2048} * 7680);
         s.LoadRows(pre + "feed_forward.w2.weight", lw.down, buf.data(), 2048,
                    7680);
-        gufo::npu::runtime::PackMatInt5(buf.data(), 2048, 7680,
-                                        m.host + gu_bytes);
-        if (s.m64)
-          s.m_ffn_dn[l] = s.rt.PackWeight(buf.data(), 2048, 7680);
+        if (!options.decision) {
+          gufo::npu::runtime::PackMatInt5(buf.data(), 2048, 7680,
+                                          m.host + gu_bytes);
+          if (s.m64)
+            s.m_ffn_dn[l] = s.rt.PackWeight(buf.data(), 2048, 7680);
+        }
         if (s.atb) {
           std::string aerr;
           if (!s.atb->AddLayer(gate.data(), up.data(), buf.data(), &aerr)) {
@@ -574,8 +584,9 @@ std::unique_ptr<Engine> Engine::Create(const Options& options_in,
             s.atb.reset();
           }
         }
-        m.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-        if (s.m64) {
+        if (!options.decision)
+          m.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        if (s.m64 && !options.decision) {
           s.pGu64[l] = s.rt.MakeProgram(
               2048, 15360, pdir + "/insts_ffngu64.txt", 0, error, 0, 4);
           s.pDn64[l] = s.rt.MakeProgram(7680, 2048,
@@ -651,7 +662,7 @@ std::unique_ptr<Engine> Engine::Create(const Options& options_in,
       s.atb->Warm();
     // WP4: pack tied embedding as int5 head for NPU argmax, if program exists.
     s.npu_argmax = false;
-    if (std::getenv("GUFO_CPU_ARGMAX") == nullptr) {
+    if (std::getenv("GUFO_CPU_ARGMAX") == nullptr && !options.decision) {
       const std::string ainst = pdir + "/insts_argmax_2048x128000.txt";
       std::ifstream af(ainst, std::ios::binary);
       if (af.good()) {
@@ -761,7 +772,7 @@ std::uint32_t Engine::Position() const {
   return impl_->pos;
 }
 std::uint32_t Engine::PrefillRows() const {
-  return impl_->atb ? gufo::npu::runtime::FfnAtbChain::kM * SuperChunks()
+  return impl_->atb ? impl_->atb->M() * SuperChunks()
                     : (impl_->m64 ? kMaxRows : 16);
 }
 
@@ -815,8 +826,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens,
   // and DecodeC skips rows >= n, so n need not be a multiple of 16.
   if (nTot == 0 || s.pos + nTot > s.opt.context)
     return false;
-  const std::uint32_t max_rows =
-      s.atb ? gufo::npu::runtime::FfnAtbChain::kM * SuperChunks() : 64;
+  const std::uint32_t max_rows = s.atb ? s.atb->M() * SuperChunks() : 64;
   if (nTot > max_rows || (nTot > 16 && !s.m64))
     return false;
   const std::uint32_t pos0 = s.pos;
@@ -827,7 +837,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens,
   const std::uint32_t H = s.H, I = s.I, hd = s.hd, heads = s.heads, kvh = s.kvh,
                       kvd = s.kvd, qd = s.qd;
   const bool devres = !s.dec_on && s.devres_ok && nTot > 64;
-  std::uint32_t kChunk = 1024;
+  std::uint32_t kChunk = s.atb ? s.atb->M() : 1024;
   const std::uint32_t nChunks = (nTot + kChunk - 1) / kChunk;
   if (devres)
     kChunk = (nTot + nChunks - 1) / nChunks;
@@ -906,10 +916,12 @@ bool Engine::Step(std::span<const std::uint32_t> tokens,
     static const bool no_bigconv = std::getenv("GUFO_NO_BIGCONV") != nullptr;
     const bool big_conv = s.atb && !no_bigconv && nTot > 64 &&
                           c.layers[l] == LayerType::kConvolution &&
-                          s.atb->HasConv(l) && s.m_conv64[l].hidden;
-    const bool defer_any = big_attn && s.apre && s.m_attn[l].host;
+                          s.atb->HasConv(l) &&
+                          (s.m_conv64[l].hidden || s.decision);
+    const bool defer_any =
+        big_attn && ((s.apre && s.m_attn[l].host) || s.dec_on);
     const bool defer_sw = defer_any && s.m_attn[l].ring_tokens;
-    const bool defer = defer_any && !defer_sw;
+    const bool defer = defer_any && !defer_sw && !s.dec_on;
     if (defer_any) {
       QALL.resize(std::size_t{nTot} * qd);
       GATE.resize(std::size_t{nTot} * heads);
@@ -1117,7 +1129,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens,
             s.rt.ConvGetHistory(s.m_conv64[l], h0.data());
             s.atb->RunConvDev(l, static_cast<const float*>(lw.conv.data),
                               h0.data());
-            devA.resize(std::size_t{1024} * H);
+            devA.resize(std::size_t{s.atb ? s.atb->M() : 1024} * H);
             s.atb->ConvDevA(l, devA.data());
           }
           // Temporary host middle: Bx = bf16(B*x), 7-tap causal conv over
@@ -1724,9 +1736,11 @@ bool Engine::Step(std::span<const std::uint32_t> tokens,
         const auto ta1 = Clock::now();
         bool many_ok = cs.attn_done;
         cs.attn_done = false;
-        if (s.dec_on && c.layers[l] == LayerType::kFullAttention) {
-          // d1 decision pass: bidirectional global attention on the host (the
-          // NPU kernel is causal).
+        if (s.dec_on) {
+          // d1 decision pass on the host: global layers see every token
+          // (bidirectional, masked by question group); sliding layers stay
+          // causal inside their window. No attention xclbin is needed.
+          const bool swa_layer = c.layers[l] == LayerType::kSlidingAttention;
           const float inv_sqrt = 1.0f / std::sqrt(static_cast<float>(hd));
           const std::uint32_t cap = s.capacity[l];
 #pragma omp parallel for schedule(dynamic, 1)
@@ -1737,11 +1751,16 @@ bool Engine::Step(std::span<const std::uint32_t> tokens,
             const std::uint32_t kh = h / (heads / kvh);
             const float* qh = &QALL[std::size_t{t} * qd + h * hd];
             const std::int32_t own = s.dec_groups ? s.dec_groups[t] : -1;
-            std::vector<float> sc(nTot);
+            std::vector<float> sc(nTot, -1e30f);
             float mx = -1e30f;
-            for (std::uint32_t u = 0; u < nTot; ++u) {
-              if (s.dec_groups && own >= 0 && s.dec_groups[u] >= 0 &&
-                  s.dec_groups[u] != own) {
+            const std::uint32_t u_first =
+                swa_layer && t + 1 > s.window ? t + 1 - s.window : 0;
+            const std::uint32_t u_last = swa_layer ? t : nTot - 1;
+            for (std::uint32_t u = u_first; u <= u_last; ++u) {
+              if (!swa_layer && s.dec_groups &&
+                  (((own == INT32_MIN) != (s.dec_groups[u] == INT32_MIN)) ||
+                   (own >= 0 && s.dec_groups[u] >= 0 &&
+                    s.dec_groups[u] != own))) {
                 sc[u] = -1e30f;
                 continue;
               }
@@ -1760,12 +1779,12 @@ bool Engine::Step(std::span<const std::uint32_t> tokens,
               mx = std::max(mx, sc[u]);
             }
             float sum = 0.0f;
-            for (std::uint32_t u = 0; u < nTot; ++u) {
+            for (std::uint32_t u = u_first; u <= u_last; ++u) {
               sc[u] = sc[u] <= -1e29f ? 0.0f : std::exp(sc[u] - mx);
               sum += sc[u];
             }
             alignas(64) float acco[128] = {0};
-            for (std::uint32_t u = 0; u < nTot; ++u) {
+            for (std::uint32_t u = u_first; u <= u_last; ++u) {
               if (sc[u] == 0.0f)
                 continue;
               const __m512 wv = _mm512_set1_ps(sc[u] / sum);
@@ -2303,7 +2322,7 @@ bool Engine::Decide(std::span<const std::uint32_t> tokens,
                     std::span<const std::uint32_t> vocabulary,
                     std::span<float> logits) {
   Impl& s = *impl_;
-  if (!s.atb || !s.apre)
+  if (!s.atb)
     return false;
   const std::uint32_t H = s.H, n = static_cast<std::uint32_t>(tokens.size());
   const std::size_t cols =
@@ -2320,8 +2339,26 @@ bool Engine::Decide(std::span<const std::uint32_t> tokens,
     const std::uint32_t a = starts[q], b = starts[q + 1];
     Reset();
     s.dec_on = true;
-    s.dec_groups = groups.empty() ? nullptr : groups.data() + a;
-    ok = Step(tokens.subspan(a, b - a), &hidden);
+    // A decision-only engine has no 64-row path: short sequences get masked
+    // padding tokens at the end (causal layers never look forward, and global
+    // attention blocks them) so every request takes the 512-row chain.
+    constexpr std::uint32_t kMinRows = 65;
+    std::vector<std::uint32_t> padded_tokens;
+    std::vector<std::int32_t> padded_groups;
+    std::span<const std::uint32_t> seq_tokens = tokens.subspan(a, b - a);
+    if (s.decision && b - a < kMinRows) {
+      padded_tokens.assign(seq_tokens.begin(), seq_tokens.end());
+      padded_tokens.resize(kMinRows,
+                           seq_tokens.empty() ? 0u : seq_tokens.back());
+      padded_groups.assign(kMinRows, INT32_MIN);
+      for (std::uint32_t i = 0; i < b - a; ++i)
+        padded_groups[i] = groups.empty() ? 0 : groups[a + i];
+      seq_tokens = padded_tokens;
+      s.dec_groups = padded_groups.data();
+    } else {
+      s.dec_groups = groups.empty() ? nullptr : groups.data() + a;
+    }
+    ok = Step(seq_tokens, &hidden);
     s.dec_on = false;
     s.dec_groups = nullptr;
     if (!ok)
