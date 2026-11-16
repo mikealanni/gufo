@@ -242,6 +242,8 @@ struct Engine::Impl {
   Options opt;
   bool devres_ok{false};
   bool dec_on{false};
+  bool decision{false};  // decision-only process: only the 512-row chain
+                         // weights are packed
   const std::int32_t* dec_groups{nullptr};
   std::unique_ptr<gufo::npu::runtime::AttnDevPrep> dprep;
   std::vector<bool> dprep_layer;
@@ -428,6 +430,7 @@ std::unique_ptr<Engine> Engine::Create(const Options& options_in,
     s.m_out.resize(L);
     s.programs_dir = options.programs;
     s.int4 = int4;
+    s.decision = options.decision;
     s.npu_attn = !options.decision && (!int4 || std::getenv("GUFO_ATB")) &&
                  !std::getenv("GUFO_CPU_ATTN") && options.context >= 1;
     s.m_qkv.resize(L);
@@ -472,10 +475,11 @@ std::unique_ptr<Engine> Engine::Create(const Options& options_in,
         std::vector<float> wout(std::size_t{2048} * 2048);
         s.LoadRows(pre + "conv.out_proj.weight", lw.out_proj, wout.data(), 2048,
                    2048);
-        s.m_conv[l] =
-            s.rt.PackConv(buf.data(), static_cast<const float*>(lw.conv.data),
-                          s.taps, wout.data(), 2048, s.p_conv);
-        if (have_conv64)
+        if (!options.decision)
+          s.m_conv[l] =
+              s.rt.PackConv(buf.data(), static_cast<const float*>(lw.conv.data),
+                            s.taps, wout.data(), 2048, s.p_conv);
+        if (have_conv64 && !options.decision)
           s.m_conv64[l] =
               s.rt.PackConv(buf.data(), static_cast<const float*>(lw.conv.data),
                             s.taps, wout.data(), 2048, s.p_conv64);
@@ -495,12 +499,12 @@ std::unique_ptr<Engine> Engine::Create(const Options& options_in,
                    buf.data() + std::size_t{2048} * 2048, 512, 2048);
         s.LoadRows(pre + "self_attn.v_proj.weight", lw.v,
                    buf.data() + std::size_t{2560} * 2048, 512, 2048);
-        s.m_qkv[l] = s.rt.PackWeight(buf.data(), 3072, 2048);
-        ;
+        if (!options.decision)
+          s.m_qkv[l] = s.rt.PackWeight(buf.data(), 3072, 2048);
         s.LoadRows(pre + "self_attn.o_proj.weight", lw.attn_out, buf.data(),
                    2048, 2048);
-        s.m_out[l] = s.rt.PackWeight(buf.data(), 2048, 2048);
-        ;
+        if (!options.decision)
+          s.m_out[l] = s.rt.PackWeight(buf.data(), 2048, 2048);
         if (s.atb) {
           std::string aerr;
           std::vector<float> wqkv(std::size_t{3072} * 2048);
@@ -556,19 +560,23 @@ std::unique_ptr<Engine> Engine::Create(const Options& options_in,
         const std::size_t dn_bytes =
             std::size_t{16} * 120 * 4 * gufo::npu::runtime::QuarterBytesW();
         gufo::npu::runtime::WeightBuffer m;
-        m.bytes = gu_bytes + dn_bytes;
-        m.bo = xrt::bo(s.rt.device(), m.bytes, XRT_BO_FLAGS_HOST_ONLY,
-                       s.rt.kernel().group_id(3));
-        m.host = m.bo.map<std::uint8_t*>();
-        std::memset(m.host, 0, m.bytes);
-        gufo::npu::runtime::PackMatInt5(buf.data(), 15360, 2048, m.host);
+        if (!options.decision) {
+          m.bytes = gu_bytes + dn_bytes;
+          m.bo = xrt::bo(s.rt.device(), m.bytes, XRT_BO_FLAGS_HOST_ONLY,
+                         s.rt.kernel().group_id(3));
+          m.host = m.bo.map<std::uint8_t*>();
+          std::memset(m.host, 0, m.bytes);
+          gufo::npu::runtime::PackMatInt5(buf.data(), 15360, 2048, m.host);
+        }
         buf.resize(std::size_t{2048} * 7680);
         s.LoadRows(pre + "feed_forward.w2.weight", lw.down, buf.data(), 2048,
                    7680);
-        gufo::npu::runtime::PackMatInt5(buf.data(), 2048, 7680,
-                                        m.host + gu_bytes);
-        if (s.m64)
-          s.m_ffn_dn[l] = s.rt.PackWeight(buf.data(), 2048, 7680);
+        if (!options.decision) {
+          gufo::npu::runtime::PackMatInt5(buf.data(), 2048, 7680,
+                                          m.host + gu_bytes);
+          if (s.m64)
+            s.m_ffn_dn[l] = s.rt.PackWeight(buf.data(), 2048, 7680);
+        }
         if (s.atb) {
           std::string aerr;
           if (!s.atb->AddLayer(gate.data(), up.data(), buf.data(), &aerr)) {
@@ -576,8 +584,9 @@ std::unique_ptr<Engine> Engine::Create(const Options& options_in,
             s.atb.reset();
           }
         }
-        m.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-        if (s.m64) {
+        if (!options.decision)
+          m.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        if (s.m64 && !options.decision) {
           s.pGu64[l] = s.rt.MakeProgram(
               2048, 15360, pdir + "/insts_ffngu64.txt", 0, error, 0, 4);
           s.pDn64[l] = s.rt.MakeProgram(7680, 2048,
@@ -653,7 +662,7 @@ std::unique_ptr<Engine> Engine::Create(const Options& options_in,
       s.atb->Warm();
     // WP4: pack tied embedding as int5 head for NPU argmax, if program exists.
     s.npu_argmax = false;
-    if (std::getenv("GUFO_CPU_ARGMAX") == nullptr) {
+    if (std::getenv("GUFO_CPU_ARGMAX") == nullptr && !options.decision) {
       const std::string ainst = pdir + "/insts_argmax_2048x128000.txt";
       std::ifstream af(ainst, std::ios::binary);
       if (af.good()) {
@@ -907,7 +916,8 @@ bool Engine::Step(std::span<const std::uint32_t> tokens,
     static const bool no_bigconv = std::getenv("GUFO_NO_BIGCONV") != nullptr;
     const bool big_conv = s.atb && !no_bigconv && nTot > 64 &&
                           c.layers[l] == LayerType::kConvolution &&
-                          s.atb->HasConv(l) && s.m_conv64[l].hidden;
+                          s.atb->HasConv(l) &&
+                          (s.m_conv64[l].hidden || s.decision);
     const bool defer_any =
         big_attn && ((s.apre && s.m_attn[l].host) || s.dec_on);
     const bool defer_sw = defer_any && s.m_attn[l].ring_tokens;
@@ -1747,8 +1757,10 @@ bool Engine::Step(std::span<const std::uint32_t> tokens,
                 swa_layer && t + 1 > s.window ? t + 1 - s.window : 0;
             const std::uint32_t u_last = swa_layer ? t : nTot - 1;
             for (std::uint32_t u = u_first; u <= u_last; ++u) {
-              if (!swa_layer && s.dec_groups && own >= 0 &&
-                  s.dec_groups[u] >= 0 && s.dec_groups[u] != own) {
+              if (!swa_layer && s.dec_groups &&
+                  (((own == INT32_MIN) != (s.dec_groups[u] == INT32_MIN)) ||
+                   (own >= 0 && s.dec_groups[u] >= 0 &&
+                    s.dec_groups[u] != own))) {
                 sc[u] = -1e30f;
                 continue;
               }
@@ -2327,8 +2339,26 @@ bool Engine::Decide(std::span<const std::uint32_t> tokens,
     const std::uint32_t a = starts[q], b = starts[q + 1];
     Reset();
     s.dec_on = true;
-    s.dec_groups = groups.empty() ? nullptr : groups.data() + a;
-    ok = Step(tokens.subspan(a, b - a), &hidden);
+    // A decision-only engine has no 64-row path: short sequences get masked
+    // padding tokens at the end (causal layers never look forward, and global
+    // attention blocks them) so every request takes the 512-row chain.
+    constexpr std::uint32_t kMinRows = 65;
+    std::vector<std::uint32_t> padded_tokens;
+    std::vector<std::int32_t> padded_groups;
+    std::span<const std::uint32_t> seq_tokens = tokens.subspan(a, b - a);
+    if (s.decision && b - a < kMinRows) {
+      padded_tokens.assign(seq_tokens.begin(), seq_tokens.end());
+      padded_tokens.resize(kMinRows,
+                           seq_tokens.empty() ? 0u : seq_tokens.back());
+      padded_groups.assign(kMinRows, INT32_MIN);
+      for (std::uint32_t i = 0; i < b - a; ++i)
+        padded_groups[i] = groups.empty() ? 0 : groups[a + i];
+      seq_tokens = padded_tokens;
+      s.dec_groups = padded_groups.data();
+    } else {
+      s.dec_groups = groups.empty() ? nullptr : groups.data() + a;
+    }
+    ok = Step(seq_tokens, &hidden);
     s.dec_on = false;
     s.dec_groups = nullptr;
     if (!ok)

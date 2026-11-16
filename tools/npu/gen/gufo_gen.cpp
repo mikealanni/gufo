@@ -3728,7 +3728,17 @@ int DeciderStdio(const char* model, const char* programs, gufo::tokenization::Qw
     }
     std::vector<HybridEngine::Seq> sq{{ids.data(), static_cast<std::uint32_t>(ids.size()), static_cast<std::uint32_t>(ids.size() - 1)}};
     std::vector<float> hid;
+    double ph0[24];
+    std::copy(e.ph, e.ph + 24, ph0);
+    const auto tim0 = e.tim;
     e.ForwardBatch(sq, &hid);
+    if (std::getenv("GUFO_JUDGE_PROF")) {
+      const auto d = [&](int i) { return e.ph[i] - ph0[i]; };
+      std::fprintf(stderr,
+                   "prof %zu tok: total %.1f | gdn %.1f (in-gemm %.1f dev %.1f out-gemm %.1f host-conv %.1f rec %.1f) | attn %.1f | mlp %.1f | norm %.1f | gemm enc %.1f dec %.1f wait %.1f syncA %.1f syncC %.1f submit %.1f\n",
+                   ids.size(), Ms(t0), d(8), d(12), d(14), d(16), d(18), d(19), d(9), d(10), d(11), e.tim.enc - tim0.enc, e.tim.dec - tim0.dec, e.tim.wait - tim0.wait,
+                   e.tim.syncA - tim0.syncA, e.tim.syncC - tim0.syncC, e.tim.submit - tim0.submit);
+    }
     float lg[2];
     e.Logits(hid.data(), 2, lg);
     const double m = std::max(lg[0], lg[1]);
