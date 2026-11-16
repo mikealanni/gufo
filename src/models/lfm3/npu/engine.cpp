@@ -405,11 +405,12 @@ std::unique_ptr<Engine> Engine::Create(const Options& options_in,
 
     if (std::getenv("GUFO_ATB") != nullptr && s.m64) {
       s.atb = std::make_unique<gufo::npu::runtime::FfnAtbChain>();
+      s.atb->SetRows(options.rows);
       std::string aerr;
       if (!s.atb->Init(options.programs, &aerr)) {
         std::fprintf(stderr, "GUFO_ATB init failed: %s\n", aerr.c_str());
         s.atb.reset();
-      } else if (!std::getenv("GUFO_NO_ATTNP")) {
+      } else if (!std::getenv("GUFO_NO_ATTNP") && !options.decision) {
         auto ap = std::make_unique<gufo::npu::runtime::AttnPrefill>();
         std::string perr;
         if (ap->Init(options.programs, &perr))
@@ -427,7 +428,7 @@ std::unique_ptr<Engine> Engine::Create(const Options& options_in,
     s.m_out.resize(L);
     s.programs_dir = options.programs;
     s.int4 = int4;
-    s.npu_attn = (!int4 || std::getenv("GUFO_ATB")) &&
+    s.npu_attn = !options.decision && (!int4 || std::getenv("GUFO_ATB")) &&
                  !std::getenv("GUFO_CPU_ATTN") && options.context >= 1;
     s.m_qkv.resize(L);
     s.m_ffn.resize(L);
@@ -524,8 +525,9 @@ std::unique_ptr<Engine> Engine::Create(const Options& options_in,
         // Sliding layers run on the NPU with a 1.5x-window ring cache (384
         // tokens for window 256).
         const std::uint32_t l_ring = l_swa ? s.window + s.window / 2 : 0;
-        s.capacity[l] =
-            l_swa ? std::max(s.window + kRows, l_ring) : options.context;
+        s.capacity[l] = l_swa ? std::max({s.window + kRows, l_ring,
+                                          options.decision ? options.rows : 0u})
+                              : options.context;
         if (s.npu_attn && s.kvh == 4 && s.hd == 128 && s.heads == 16 &&
             (c.layers[l] == LayerType::kFullAttention ||
              (l_ring && l_ring % 16 == 0 && options.context >= l_ring)))
@@ -761,7 +763,7 @@ std::uint32_t Engine::Position() const {
   return impl_->pos;
 }
 std::uint32_t Engine::PrefillRows() const {
-  return impl_->atb ? gufo::npu::runtime::FfnAtbChain::kM * SuperChunks()
+  return impl_->atb ? impl_->atb->M() * SuperChunks()
                     : (impl_->m64 ? kMaxRows : 16);
 }
 
@@ -815,8 +817,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens,
   // and DecodeC skips rows >= n, so n need not be a multiple of 16.
   if (nTot == 0 || s.pos + nTot > s.opt.context)
     return false;
-  const std::uint32_t max_rows =
-      s.atb ? gufo::npu::runtime::FfnAtbChain::kM * SuperChunks() : 64;
+  const std::uint32_t max_rows = s.atb ? s.atb->M() * SuperChunks() : 64;
   if (nTot > max_rows || (nTot > 16 && !s.m64))
     return false;
   const std::uint32_t pos0 = s.pos;
@@ -827,7 +828,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens,
   const std::uint32_t H = s.H, I = s.I, hd = s.hd, heads = s.heads, kvh = s.kvh,
                       kvd = s.kvd, qd = s.qd;
   const bool devres = !s.dec_on && s.devres_ok && nTot > 64;
-  std::uint32_t kChunk = 1024;
+  std::uint32_t kChunk = s.atb ? s.atb->M() : 1024;
   const std::uint32_t nChunks = (nTot + kChunk - 1) / kChunk;
   if (devres)
     kChunk = (nTot + nChunks - 1) / nChunks;
@@ -907,9 +908,10 @@ bool Engine::Step(std::span<const std::uint32_t> tokens,
     const bool big_conv = s.atb && !no_bigconv && nTot > 64 &&
                           c.layers[l] == LayerType::kConvolution &&
                           s.atb->HasConv(l) && s.m_conv64[l].hidden;
-    const bool defer_any = big_attn && s.apre && s.m_attn[l].host;
+    const bool defer_any =
+        big_attn && ((s.apre && s.m_attn[l].host) || s.dec_on);
     const bool defer_sw = defer_any && s.m_attn[l].ring_tokens;
-    const bool defer = defer_any && !defer_sw;
+    const bool defer = defer_any && !defer_sw && !s.dec_on;
     if (defer_any) {
       QALL.resize(std::size_t{nTot} * qd);
       GATE.resize(std::size_t{nTot} * heads);
@@ -1117,7 +1119,7 @@ bool Engine::Step(std::span<const std::uint32_t> tokens,
             s.rt.ConvGetHistory(s.m_conv64[l], h0.data());
             s.atb->RunConvDev(l, static_cast<const float*>(lw.conv.data),
                               h0.data());
-            devA.resize(std::size_t{1024} * H);
+            devA.resize(std::size_t{s.atb ? s.atb->M() : 1024} * H);
             s.atb->ConvDevA(l, devA.data());
           }
           // Temporary host middle: Bx = bf16(B*x), 7-tap causal conv over
@@ -1724,9 +1726,11 @@ bool Engine::Step(std::span<const std::uint32_t> tokens,
         const auto ta1 = Clock::now();
         bool many_ok = cs.attn_done;
         cs.attn_done = false;
-        if (s.dec_on && c.layers[l] == LayerType::kFullAttention) {
-          // d1 decision pass: bidirectional global attention on the host (the
-          // NPU kernel is causal).
+        if (s.dec_on) {
+          // d1 decision pass on the host: global layers see every token
+          // (bidirectional, masked by question group); sliding layers stay
+          // causal inside their window. No attention xclbin is needed.
+          const bool swa_layer = c.layers[l] == LayerType::kSlidingAttention;
           const float inv_sqrt = 1.0f / std::sqrt(static_cast<float>(hd));
           const std::uint32_t cap = s.capacity[l];
 #pragma omp parallel for schedule(dynamic, 1)
@@ -1737,11 +1741,14 @@ bool Engine::Step(std::span<const std::uint32_t> tokens,
             const std::uint32_t kh = h / (heads / kvh);
             const float* qh = &QALL[std::size_t{t} * qd + h * hd];
             const std::int32_t own = s.dec_groups ? s.dec_groups[t] : -1;
-            std::vector<float> sc(nTot);
+            std::vector<float> sc(nTot, -1e30f);
             float mx = -1e30f;
-            for (std::uint32_t u = 0; u < nTot; ++u) {
-              if (s.dec_groups && own >= 0 && s.dec_groups[u] >= 0 &&
-                  s.dec_groups[u] != own) {
+            const std::uint32_t u_first =
+                swa_layer && t + 1 > s.window ? t + 1 - s.window : 0;
+            const std::uint32_t u_last = swa_layer ? t : nTot - 1;
+            for (std::uint32_t u = u_first; u <= u_last; ++u) {
+              if (!swa_layer && s.dec_groups && own >= 0 &&
+                  s.dec_groups[u] >= 0 && s.dec_groups[u] != own) {
                 sc[u] = -1e30f;
                 continue;
               }
@@ -1760,12 +1767,12 @@ bool Engine::Step(std::span<const std::uint32_t> tokens,
               mx = std::max(mx, sc[u]);
             }
             float sum = 0.0f;
-            for (std::uint32_t u = 0; u < nTot; ++u) {
+            for (std::uint32_t u = u_first; u <= u_last; ++u) {
               sc[u] = sc[u] <= -1e29f ? 0.0f : std::exp(sc[u] - mx);
               sum += sc[u];
             }
             alignas(64) float acco[128] = {0};
-            for (std::uint32_t u = 0; u < nTot; ++u) {
+            for (std::uint32_t u = u_first; u <= u_last; ++u) {
               if (sc[u] == 0.0f)
                 continue;
               const __m512 wv = _mm512_set1_ps(sc[u] / sum);
@@ -2303,7 +2310,7 @@ bool Engine::Decide(std::span<const std::uint32_t> tokens,
                     std::span<const std::uint32_t> vocabulary,
                     std::span<float> logits) {
   Impl& s = *impl_;
-  if (!s.atb || !s.apre)
+  if (!s.atb)
     return false;
   const std::uint32_t H = s.H, n = static_cast<std::uint32_t>(tokens.size());
   const std::size_t cols =

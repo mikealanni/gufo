@@ -3811,6 +3811,8 @@ int D1Stdio(const char* model, const char* programs, gufo::core::GgufReader& rea
   opt.gguf = model;
   opt.programs = programs;
   opt.context = 4096;
+  opt.rows = 512;  // decision passes: one 512-row program per layer
+  opt.decision = true;
   std::string err;
   auto engine = gufo::models::lfm3::npu::Engine::Create(opt, &err);
   if (!engine) {
@@ -3834,7 +3836,7 @@ int D1Stdio(const char* model, const char* programs, gufo::core::GgufReader& rea
     }
     return true;
   };
-  constexpr std::uint32_t kMaxD1Tokens = 1024;
+  constexpr std::uint32_t kMaxD1Tokens = 512;
   auto judge = gufo::models::d1::Judge::Create(reader, forward, kMaxD1Tokens, &err);
   if (!judge) {
     std::fprintf(stderr, "d1 judge: %s\n", err.c_str());
