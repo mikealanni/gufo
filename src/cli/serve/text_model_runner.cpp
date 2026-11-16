@@ -329,13 +329,17 @@ void ReconcileStateBytes(const TextRunnerResourceClaim& resources,
       resources.per_request_state_bytes.has_value() &&
       *measured.per_request_state_bytes > *resources.per_request_state_bytes) {
     throw std::runtime_error(
-        "text runner measured state exceeds its resource claim");
+        "text runner measured state exceeds its resource claim (measured " +
+        std::to_string(*measured.per_request_state_bytes) + " bytes, claim " +
+        std::to_string(*resources.per_request_state_bytes) + " bytes)");
   }
   if (measured.temporary_scratch_bytes.has_value() &&
       resources.temporary_scratch_bytes.has_value() &&
       *measured.temporary_scratch_bytes > *resources.temporary_scratch_bytes) {
     throw std::runtime_error(
-        "text runner measured scratch exceeds its resource claim");
+        "text runner measured scratch exceeds its resource claim (measured " +
+        std::to_string(*measured.temporary_scratch_bytes) + " bytes, claim " +
+        std::to_string(*resources.temporary_scratch_bytes) + " bytes)");
   }
 }
 

@@ -1964,8 +1964,9 @@ std::size_t Executor::SessionBytes(
          attention * (kv + index) + sizeof(Session::Control) +
          (mode == core::SessionMode::kSpeculative
               ? kv + index +
-                    std::size_t{std::max(options_.max_speculative + 1,
-                                         max_copy_rows())} *
+                    std::size_t{
+                        std::max(options_.max_speculative, max_copy_rows()) +
+                        1} *
                         c.HcDim() * sizeof(float)
               : 0);
 }
