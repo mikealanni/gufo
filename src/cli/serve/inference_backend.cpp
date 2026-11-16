@@ -1,5 +1,8 @@
 #include "src/cli/serve/inference_backend.hpp"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -4588,6 +4591,58 @@ struct InferenceBackend::Impl {
 
   JevAnswerFn EnsureJevAnswer() {
     std::lock_guard<std::mutex> lock(jev_mutex);
+    // One judge per machine: when the guard serves it (GUFO_JEV_PORT), ask the
+    // guard instead of loading a second model.
+    if (const char* port_env = std::getenv("GUFO_JEV_PORT")) {
+      const int port = std::atoi(port_env);
+      return [port](const std::string& q, const std::string& c) {
+        models::qwen38_flash_next::JevBinaryVerdict verdict;
+        const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0)
+          return verdict;
+        timeval tv{.tv_sec = 5, .tv_usec = 0};
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(static_cast<std::uint16_t>(port));
+        ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+        if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) !=
+            0) {
+          ::close(fd);
+          return verdict;
+        }
+        json::Value body = json::Value::object();
+        body["question"] = q;
+        body["context"] = c;
+        const std::string payload = body.dump();
+        const std::string request =
+            "POST /jev-guard/judge HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            "Content-Type: application/json\r\nConnection: close\r\n"
+            "Content-Length: " +
+            std::to_string(payload.size()) + "\r\n\r\n" + payload;
+        if (::send(fd, request.data(), request.size(), MSG_NOSIGNAL) !=
+            static_cast<ssize_t>(request.size())) {
+          ::close(fd);
+          return verdict;
+        }
+        std::string reply;
+        std::array<char, 2048> buf{};
+        for (ssize_t n; (n = ::recv(fd, buf.data(), buf.size(), 0)) > 0;)
+          reply.append(buf.data(), static_cast<std::size_t>(n));
+        ::close(fd);
+        const auto number = [&reply](const char* key) {
+          const auto pos = reply.find(key);
+          return pos == std::string::npos
+                     ? 0.0F
+                     : std::strtof(reply.c_str() + pos + std::strlen(key),
+                                   nullptr);
+        };
+        verdict.yes = number("\"yes\":");
+        verdict.no = number("\"no\":");
+        return verdict;
+      };
+    }
     const char* npu_env = std::getenv("GUFO_JEV_NPU");
     const bool want_npu = !npu_env || std::string(npu_env) != "0";
     if (want_npu) {
