@@ -697,7 +697,7 @@ def inspect_scripts(command, depth=SCRIPT_DEPTH, seen=None):
     return None, excerpt
 
 
-MEM_RELEASE_QUIET = 30
+MEM_RELEASE_QUIET = 5
 MULTI_PASS_QUIET = 30
 
 
@@ -1350,6 +1350,22 @@ class Guard:
             return False
         return not os.path.exists(os.path.expanduser("~/.gufo/jev-log/feature-off.command"))
 
+    async def judge_question(self, request):
+        try:
+            data = await request.json()
+            text = str(data.get("question", ""))[:2000]
+        except ValueError:
+            return web.json_response({"error": "bad json"}, status=400)
+        p = None
+        if self.judge is not None and text:
+            try:
+                p = await self.judge.yes_probability(text)
+            except (asyncio.TimeoutError, RuntimeError, OSError):
+                p = None
+        if p is None:
+            return web.json_response({"error": "judge unavailable"}, status=503)
+        return web.json_response({"yes": p, "no": 1.0 - p})
+
     async def classify_command(self, request):
         try:
             data = await request.json()
@@ -1438,6 +1454,7 @@ class Guard:
         app.router.add_post("/jev-guard/prepare", self.prepare)
         app.router.add_post("/jev-guard/switch", self.switch)
         app.router.add_post("/jev-guard/classify", self.classify_command)
+        app.router.add_post("/jev-guard/judge", self.judge_question)
         app.router.add_route("*", "/{tail:.*}", self.proxy)
         runner = web.AppRunner(app)
         await runner.setup()
@@ -1450,6 +1467,7 @@ class Guard:
         await stop.wait()
         self.want_up = False
         await self.stop_gufo("guard exiting")
+        self.want_up = False
         await runner.cleanup()
 
 

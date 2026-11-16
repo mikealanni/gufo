@@ -17,6 +17,7 @@ import { classifyJevAgentTurn, classifyJevRequest, K_ROUTINE_BUDGET_TOKENS, type
 import { applyPlan, baselineEffort, effortRank, pinnedEffort, setPlan, takePlan, type Plan } from "./effort.ts";
 
 const PLUGIN_VERSION = "0.1.0";
+const K_ROUTINE_LOW_CAP_TOKENS = 2048;
 const LOG_DIR = process.env.JEV_LOG_DIR ?? join(homedir(), ".gufo", "jev-log");
 const RETAIN_DAYS = 14;
 const MAX_DAY_BYTES = 64 * 1024 * 1024;
@@ -332,7 +333,11 @@ export default {
           else if (featureOn("effort")) {
             if (lastRole === "tool") {
               const base = await baselineEffort();
-              if (decision.lower && effortRank(base) > effortRank("low")) plan = { budget: K_ROUTINE_BUDGET_TOKENS, reason: decision.reason };
+              if (decision.lower) {
+                // Routine tool turns think 30-70 tokens; one took 6208. At a low baseline the cap only stops runaways.
+                const budget = effortRank(base) > effortRank("low") ? K_ROUTINE_BUDGET_TOKENS : K_ROUTINE_LOW_CAP_TOKENS;
+                plan = { budget, reason: decision.reason };
+              }
             } else {
               const lastUser = [...msgs].reverse().find((m: any) => roleOf(m) === "user");
               const text = messageText(lastUser);
