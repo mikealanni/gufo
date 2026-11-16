@@ -228,6 +228,28 @@ public:
   /// int4: the xclbin streams 4-bit weights (see g_decode_int4).
   bool Init(const std::string& xclbin_path, std::string* error,
             bool int4 = false);
+  /// Programs of equal size share their A/C staging buffers (decision engines
+  /// run layers strictly in order). `slot` keeps double-buffered pairs apart.
+  void SetSharedScratch(bool on) { share_scratch_ = on; }
+  void SetScratchSlot(int slot) { scratch_slot_ = slot; }
+  /// A zeroed staging buffer; shared by every caller with the same size, group
+  /// and slot while shared scratch is on.
+  xrt::bo MakeScratchBo(std::size_t bytes, int group, int slot) {
+    if (share_scratch_) {
+      const auto key = std::make_tuple(bytes, std::size_t{0}, group, -1, slot);
+      if (const auto it = scratch_pool_.find(key); it != scratch_pool_.end())
+        return it->second.first;
+      xrt::bo bo = MakeBo(bytes, group);
+      std::memset(bo.map<void*>(), 0, bytes);
+      bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      scratch_pool_[key] = {bo, bo};
+      return bo;
+    }
+    xrt::bo bo = MakeBo(bytes, group);
+    std::memset(bo.map<void*>(), 0, bytes);
+    bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    return bo;
+  }
 
   xrt::device& device() { return dev_; }
   xrt::kernel& kernel() { return kern_; }
@@ -323,6 +345,11 @@ public:
                             std::uint32_t INT, int b_group = 3);
 
 private:
+  bool share_scratch_{false};
+  int scratch_slot_{0};
+  std::map<std::tuple<std::size_t, std::size_t, int, int, int>,
+           std::pair<xrt::bo, xrt::bo>>
+      scratch_pool_;
   // Staging for the ATB A/C streams: the xrt BO mapping is write-combined, so
   // 9-byte block stores to it run at ~1 GB/s. Encode/decode in cached memory
   // and move the stream with one linear copy.

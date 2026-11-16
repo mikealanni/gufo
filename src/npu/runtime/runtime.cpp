@@ -168,6 +168,19 @@ Program NpuRuntime::MakeProgram(std::uint32_t K, std::uint32_t N,
   const std::size_t ab = std::size_t{16 * mrows} * (K + a_extra_k) / 8 * 9;
   const std::size_t cb =
       c_override ? c_override : std::size_t{N / kStrip} * mrows * kStripBytes;
+  const auto pool_key =
+      std::make_tuple(ab, cb, a_group, c_group, scratch_slot_);
+  if (share_scratch_) {
+    if (const auto it = scratch_pool_.find(pool_key);
+        it != scratch_pool_.end()) {
+      p.a = it->second.first;
+      p.c = it->second.second;
+      p.ah = p.a.map<std::uint8_t*>();
+      p.ch = p.c.map<std::uint8_t*>();
+      (void)error;
+      return p;
+    }
+  }
   p.a = xrt::bo(dev_, ab, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(a_group));
   p.c = xrt::bo(dev_, cb, XRT_BO_FLAGS_HOST_ONLY, kern_.group_id(c_group));
   p.ah = p.a.map<std::uint8_t*>();
@@ -177,6 +190,8 @@ Program NpuRuntime::MakeProgram(std::uint32_t K, std::uint32_t N,
   p.a.sync(XCL_BO_SYNC_BO_TO_DEVICE);  // flush dirty zero lines: evicted later
                                        // they overwrite device writes
   p.c.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  if (share_scratch_)
+    scratch_pool_[pool_key] = {p.a, p.c};
   (void)error;
   return p;
 }
