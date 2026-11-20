@@ -10,7 +10,7 @@ speculative decoding on top, for Qwen, Flint and GLM-5.3 Flash models. Fork of [
 | Qwen3.8-27B | UD-Q4_K_XL | FFN, attention and linear-attention projections | DFlash2, MTP, auto |
 | Qwen3.8 Flash-Next | UD-IQ4_XS | whole projections, two-bank lock-step | DFlash2 (default), MTP |
 | Flint | UD-Q4_K_XL | shared expert and QKV, two-bank pipeline | prompt lookup (no draft model) |
-| GLM-5.3 Flash | AJ-IQ2_XXS | KDA q/k/v and shared expert, two-bank lock-step | DFlash2 with prompt-lookup drafts |
+| GLM-5.3 Flash | AJ-IQ2_XXS / RCO-152E Q3_K_M | KDA q/k/v and shared expert, two-bank lock-step | DFlash2 with prompt-lookup drafts |
 | Laguna S 2.1 | UD-Q4_K_M | shared expert, two-bank pipeline | DFlash v1 (block-diffusion) |
 
 ## Speed
@@ -122,16 +122,28 @@ are in [docs/models/flint](docs/models/flint/README.md).
 ### GLM-5.3 Flash
 
 A 321B-parameter mixture-of-experts model (about 14B active per token; 45 layers,
-34 KDA and 11 DSA, 288 experts with 8 routed) in the 81 GiB AJ-IQ2_XXS quantization.
+34 KDA and 11 DSA, 288 experts with 8 routed) in the 81 GiB AJ-IQ2_XXS quantization,
+and its coder variant RCO-152E (152 experts with 8 routed, 69.9 GiB Q3_K_M, served
+by native Q3_K WMMA expert GEMMs).
 
-| Prefill, tok/s | GPU only | GPU + NPU (two-bank) |
+| Prefill, tok/s (RCO-152E) | GPU only | GPU + NPU (two-bank) |
 | --- | --- | --- |
-| `-p 2048` | 634 | 626 (-1.3%) |
-| `-p 4096` | 635 | 631 (-0.6%) |
-| `-p 8192` | 630 | **740** (+17.5%) |
+| `-p 2048` | 632 | 636 (GPU path) |
+| `-p 4096` | 623 | **714** (+14.6%) |
+| `-p 8192` | 617 | **706** (+14.4%) |
+| `-p 16384` | 610 | **699** (+14.6%) |
+| `-p 4096 -d 32768` | 584 | **665** (+13.9%) |
+| `-p 4096 -d 65536` | 560 | **633** (+13.0%) |
+| `-p 4096 -d 131072` | 511 | **571** (+11.8%) |
 
-The NPU pair path needs two full 4096-token banks, so prompts under 8192 tokens run
-the GPU path and match GPU-only speed; 16384 tokens measure 735 tok/s with the NPU.
+Every prompt of 4096 tokens or more runs a two-bank pair of 2048-token banks
+through the runtime-M/K program, at any context depth; smaller prompts and
+decode stay on the GPU at full speed. `GUFO_GLM53_NPU_M=4096` selects wide
+banks (same speed at 8192, no gain elsewhere). Moving the shared-expert down
+projection to the NPU as well (`GUFO_NPU_WHOLE=1`, implemented) measures zero
+net gain: the NPU queue is already balanced at 28 slices per bank. AJ-IQ2_XXS
+with the same path: pp4096 616 on GPU vs **689** with the NPU, pp8192 613 vs
+**690**.
 
 | Decode, tok/s | plain | DFlash2 |
 | --- | --- | --- |
@@ -192,7 +204,7 @@ without the NPU.
 | Flash-Next decode copies, `balanced` (default) | perplexity +1.3% against llama.cpp, decode +19% (plain) and +21% (MTP) |
 | Flash-Next decode copies, `off` | exact Q8_0 weights; plain 30.5 tok/s, MTP 44.9 tok/s |
 | Flash-Next F16 residual (on with the two-bank NPU mode, `GUFO_F16_RESIDUAL=0/1` overrides) | perplexity +0.5%, prefill +1.5% with the NPU, no gain on GPU-only |
-| GLM-5.3 Flash, NPU two-bank prefill | logits cosine 0.994 against the GPU-only chunked path, same top-1; GPU-only prefill matches sequential decode at cosine 0.989 |
+| GLM-5.3 Flash, NPU two-bank prefill | logits cosine 0.994 against the GPU-only chunked path, same top-1; GPU-only prefill matches sequential decode at cosine 0.989; RCO-152E two-bank output is byte-identical to the GPU-only path over 64 greedy tokens on real prose |
 | GLM-5.3 Flash, IQ2_XXS weights | HumanEval 157 of 164 (reasoning off); 50 of 75 on the DS4 capability set with reasoning (GPQA 13/24, SuperGPQA 18/25, AIME 18/25); not yet compared with llama.cpp |
 | Speculative decoding | the target verifies every draft; greedy text can differ from plain decode only at near-tie tokens |
 
@@ -219,8 +231,9 @@ reads the NPU result directly. One runtime-K program serves every reduction leng
   passes of 1,024 to 4,095 tokens run in groups of their own size through the
   runtime-M program in `tools/npu/runtime_mk`.
 - **GLM-5.3 Flash:** the KDA q/k/v projections and the shared expert gate/up, in
-  two 4096-token banks that run layer by layer in lock-step; the runtime-K program
-  in `tools/npu/runtime_k` serves them.
+  two 2048-token banks that run layer by layer in lock-step; the runtime-M/K
+  program in `tools/npu/runtime_mk` serves them, so every prompt of 4096 tokens
+  or more pairs at any depth.
 - **Flint:** the shared expert and QKV projections, in two banks of up to 8192
   tokens; the runtime-M/K kernel in `tools/npu/runtime_mk` serves any chunk size
   without rebuilding the xclbin.

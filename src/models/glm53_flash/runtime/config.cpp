@@ -163,6 +163,10 @@ std::optional<Config> ParseConfig(const core::GgufReader& reader,
   c.expert_shared = r.U32(key("expert_shared_count"));
   c.expert_ff = r.U32(key("expert_feed_forward_length"));
   c.shared_ff = r.U32(key("expert_shared_feed_forward_length"));
+  if (!r.ok) {
+    r.ok = true;
+    c.shared_ff = c.expert_ff;
+  }
   c.dense_ff = r.U32(key("feed_forward_length"));
   c.leading_dense = r.U32(key("leading_dense_block_count"));
   c.hc_count = r.U32(key("hyper_connection.count"));
@@ -172,6 +176,10 @@ std::optional<Config> ParseConfig(const core::GgufReader& reader,
   c.vocab_size = r.U32(key("vocab_size"));
   c.context_length = r.U32(key("context_length"));
   c.nextn_layers = r.U32(key("nextn_predict_layers"));
+  if (!r.ok) {
+    r.ok = true;
+    c.nextn_layers = 0;
+  }
   c.rms_eps = r.F32(key("attention.layer_norm_rms_epsilon"));
   c.layer_norm_eps = r.F32(key("attention.layer_norm_epsilon"));
   c.hc_eps = r.F32(key("hyper_connection.epsilon"));
@@ -208,7 +216,8 @@ std::optional<Config> ParseConfig(const core::GgufReader& reader,
   Expect(r, "attention.indexer.key_length", c.indexer_key_dim, 128);
   Expect(r, "attention.indexer.top_k", c.indexer_top_k, 2048);
   Expect(r, "attention.indexer.kpool", c.indexer_kpool, 4);
-  Expect(r, "expert_count", c.expert_count, 288);
+  if (c.expert_count != 288 && c.expert_count != 152)
+    r.Fail("GLM-5.3-Flash: expert_count is " + std::to_string(c.expert_count));
   Expect(r, "expert_used_count", c.expert_used, 8);
   Expect(r, "expert_shared_count", c.expert_shared, 1);
   Expect(r, "expert_feed_forward_length", c.expert_ff, 2048);

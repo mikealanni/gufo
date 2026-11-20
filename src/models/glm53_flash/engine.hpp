@@ -40,6 +40,8 @@ struct ModelOptions {
   std::uint32_t max_context = 4096;
   /// Optional DFlash-2 drafter bound to this trunk's embedding and head.
   std::string dflash_model_path;
+  /// Optional MTP (NEXTN) draft-block sidecar (`mtp-GLM-5.3-*.gguf`).
+  std::string mtp_model_path;
   std::uint32_t max_draft_tokens = kMaxDraftTokens;
 };
 
@@ -80,6 +82,9 @@ public:
   }
   [[nodiscard]] bool HasDflash() const noexcept {
     return dflash_model_ != nullptr;
+  }
+  [[nodiscard]] bool HasMtp() const noexcept {
+    return executor_ && executor_->HasMtp();
   }
   [[nodiscard]] std::string ModelName() const;
   [[nodiscard]] const tokenization::QwenTokenizer& tokenizer() const noexcept {

@@ -21,6 +21,10 @@ namespace gufo::models::qwen38_flash_next::rocm {
 class NpuGemm;
 }
 
+namespace gufo::hip {
+class WeightUpload;
+}
+
 namespace gufo::models::glm53_flash::rocm {
 
 struct ExecutorOptions {
@@ -39,6 +43,10 @@ struct ExecutorOptions {
   std::uint32_t dflash_rows{0};
   // Largest number of trailing rows whose logits one forward can return.
   std::uint32_t logit_rows{1};
+  // Optional MTP (NEXTN) draft sidecar: one extra plain-residual DSA block
+  // (blk.45.*) plus its nextn norms and `eh_proj`, and its own embedding and
+  // output head. Empty leaves the block out.
+  std::string mtp_model_path;
 };
 
 struct DeviceTensor {
@@ -71,9 +79,20 @@ public:
   struct Session {
     std::uint64_t id{0};
     std::uint32_t position{0};
+    // MTP draft-cache write frontier: entries 1 .. mtp_position - 1 of the
+    // block-45 cache hold (embedding of token p, trunk hidden of p - 1), and
+    // appending the entry at `mtp_position` predicts the next token. Equal to
+    // the committed token count at every speculative-cycle boundary.
+    std::uint32_t mtp_position{0};
     std::vector<LayerState> layers;
+    // MTP per-session carry: the trunk hidden (F32 rows) of the last
+    // committed position, and the draft block's own hidden from the previous
+    // draft step. Allocated only when the executor loaded a draft block.
+    float* mtp_carry{nullptr};
+    float* mtp_mcarry{nullptr};
     std::vector<float*> saved_conv;  // SaveState snapshots
     std::vector<float*> saved_state;
+    float* saved_slab{nullptr};
     std::uint32_t saved_position{0};
     // KDA operands of the last recorded forward, per layer, for Rollback.
     struct KdaLog {
@@ -125,6 +144,24 @@ public:
   [[nodiscard]] const DeviceTensor* TokenEmbedding() const;
   [[nodiscard]] const DeviceTensor* Output() const;
   [[nodiscard]] const Config& config() const { return config_; }
+
+  // ---- MTP (NEXTN) draft block ------------------------------------------
+  // Loaded from ExecutorOptions::mtp_model_path; DraftStep runs the block for
+  // one token: `first` drafts read the trunk hidden kept by the last forward
+  // (or prefill priming), later drafts the block's own carried hidden. The
+  // entry for cache position `session.mtp_position` is appended and the head
+  // leaves one logits row (read it with ArgmaxRows(1) / ReadLogitRows).
+  [[nodiscard]] bool HasMtp() const noexcept { return mtp_.active; }
+  bool MtpDraftStep(Session& session, std::int32_t token, bool first,
+                    std::string* error);
+  // After a verification commits `keep` chain tokens: overwrite the accepted
+  // drafts' cache entries with the true trunk hidden (all captured rows
+  // [0, keep) belong to the chain forward) and reset the write frontier.
+  bool MtpRefine(Session& session, std::span<const std::int32_t> chain,
+                 std::uint32_t keep, std::string* error);
+  // After a single-token forward: append that position's draft-cache entry
+  // from the previous carry and adopt the new hidden as carry.
+  bool MtpAdvance(Session& session, std::int32_t token, std::string* error);
 
   // One batched forward of `tokens` (at most prefill_chunk) that keeps the
   // logits of the last `logit_rows` of them and the drafter taps.
@@ -202,11 +239,31 @@ private:
   bool CopyToDevice(void* dst, const core::GgufTensorInfo& t,
                     std::string* error);
   bool Upload(const std::string& name, std::string* error);
+  // Upload one MTP sidecar tensor, optionally under a different map key.
+  bool UploadFromMtp(const std::string& name, const char* key,
+                     std::string* error);
+  bool UploadImpl(const std::string& name, const std::string& key,
+                  const core::GgufReader& reader, std::string* error);
   const DeviceTensor* Find(const std::string& name) const;
   bool Resolve(std::string* error);
+  bool LoadMtp(std::string* error);
   bool SetupNpu(std::string* error);
   bool SetupRouter(std::string* error);
   bool AllocScratch(std::string* error);
+
+  // Appends `rows` draft-cache entries starting at cache position `pos0`;
+  // `emb_tokens` (host) is the token embedding of each entry, and the hidden
+  // rows come from the last trunk capture: row r of the output takes capture
+  // row r, or the session carry when `use_carry` and r == 0.
+  bool MtpPrimeEntries(Session& session, const std::int32_t* emb_tokens,
+                       int rows, std::uint32_t pos0, bool use_carry,
+                       std::size_t cap_base, std::string* error);
+  // After one prefill forward of `n` tokens: append every draft-cache entry
+  // the chunk made possible and adopt the chunk's last hidden as carry.
+  // `cap_base` is the row of the trunk capture where this chunk's hidden
+  // rows start (0; ForwardPair priming splits the halves).
+  bool MtpPrimeChunk(Session& session, const std::int32_t* tokens, int n,
+                     std::size_t cap_base, std::string* error);
 
   bool Forward(Session& session, const std::int32_t* tokens, int count,
                int logit_rows, std::string* error);
@@ -215,7 +272,15 @@ private:
   struct Act {
     const float* f{nullptr};
     const void* q{nullptr};
+    // MMQ-layout copies keyed by the weight's activation layout (DS4 for
+    // Q4_K, D4 for Q6_K), quantized on first use and shared by every
+    // projection of the same input.
+    mutable const void* mmq[2]{nullptr, nullptr};
+    mutable std::size_t mmq_bytes[2]{0, 0};
   };
+  /// Live expert count from the artifact (152 for RCO, 288 for the older
+  /// exports); scratch and router spans are sized from it.
+  int experts() const { return static_cast<int>(config_.expert_count); }
   Act Prep(const float* x, int tokens, int k) const;
   void Proj(const DeviceTensor& w, const Act& x, float* out, int tokens) const;
   void KdaBlock(std::uint32_t layer, Session& s, int tokens) const;
@@ -223,6 +288,7 @@ private:
   void HeadGemm(const DeviceTensor& w, void* out, bool half_out, int tokens,
                 int k, int rows) const;
   void RoutedExpertsF16(const LayerWeights& w, int tokens) const;
+  void RoutedExpertsMatvec(const LayerWeights& w, int tokens) const;
   void FfnBlock(std::uint32_t layer, int tokens) const;
   void RunLayer(std::uint32_t layer, Session& session, int tokens, int& cur,
                 bool attn_prepared, int ffn_rows);
@@ -231,11 +297,15 @@ private:
   void FinishHead(float* residual, int tokens, int logit_rows);
   bool EmbedRows(const std::int32_t* tokens, int count, float* dst,
                  std::string* error);
+  bool EmbedRowsFrom(const DeviceTensor& embd, const std::int32_t* tokens,
+                     int count, float* dst, std::string* error);
   void NpuQkvQueue(int bank, int tokens);
   void NpuQkvFinish(int bank) const;
   void SwapBank();
   void NpuShexpQueue(std::uint32_t layer) const;
   void NpuShexpFinish() const;
+  void NpuShDownQueue(std::uint32_t layer, int T) const;
+  void NpuShDownFinish(int T) const;
   bool ForwardPair(Session& session, const std::int32_t* tokens, int count,
                    int logit_rows, std::string* error);
   void HcPreStep(const void* x, const DeviceTensor& fn, const float* scale,
@@ -245,6 +315,30 @@ private:
   void* ResidualAt(float* base, std::size_t rows_offset) const;
 
   std::unique_ptr<core::GgufReader> reader_;
+  // MTP draft block: sidecar reader, the extra LayerWeights index and the
+  // two head tensors uploaded under their own keys.
+  struct MtpState {
+    bool active{false};
+    std::uint32_t layer{0};
+    DeviceTensor token_embd{};
+    DeviceTensor output{};
+  };
+  MtpState mtp_;
+  std::unique_ptr<core::GgufReader> mtp_reader_;
+  // Row offset within the mtp_hidden capture the next FinishHead fills
+  // (0; ForwardPair fills the second half).
+  std::size_t mtp_capture_row0_{0};
+  int mtp_capture_rows_{0};
+  // Cache rows covered by a snapshot for layer `l`: the draft block tracks
+  // its own write frontier, every other DSA layer the session position.
+  [[nodiscard]] std::uint64_t mtp_rows(std::uint32_t l,
+                                       const Session& session) const {
+    return mtp_.active && l == mtp_.layer ? session.mtp_position
+                                          : session.position;
+  }
+  // Parallel O_DIRECT shard reader used to upload weights (see
+  // core::hip::WeightUpload); null falls back to the per-tensor pread path.
+  std::unique_ptr<gufo::hip::WeightUpload> uploader_;
   Config config_;
   ExecutorOptions options_;
   std::uint32_t layers_{0};
@@ -288,6 +382,16 @@ private:
   const std::uint8_t** npu_sh_tab_[2]{};
   mutable std::uint64_t npu_sh_ticket_[2]{};
   const std::uint8_t** npu_tab_[2]{};
+  // GUFO_NPU_WHOLE: the shared expert's down projection also runs on the NPU
+  // (K = kExpertFf program), submitted after the SwiGLU stage and hidden
+  // behind the routed experts already queued on the stream.
+  bool npu_whole_{false};
+  int npu_sd_prog_{-1};
+  int npu_sd_a_[2]{{-1}, {-1}};
+  std::vector<int> npu_sd_c_[2];
+  const std::uint8_t** npu_sd_tab_[2]{};
+  std::vector<std::vector<int>> npu_sd_;
+  mutable std::uint64_t npu_sd_ticket_[2]{};
   std::uint32_t current_layer_{0};
   hipStream_t stream_{nullptr};
   void* staging_{nullptr};
@@ -303,7 +407,7 @@ private:
   [[nodiscard]] bool Cancelled() const { return cancel_ && cancel_(); }
   bool profile_{false};
   mutable std::size_t arena_used_{0};
-  mutable double profile_seconds_[10]{};
+  mutable double profile_seconds_[16]{};
   mutable std::chrono::steady_clock::time_point profile_mark_{};
   void Mark(int bucket) const;
   void DropGraph();

@@ -4874,17 +4874,22 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
       reader->GetMetadataString("general.architecture") == "glm5-next") {
     const bool dflash =
         speculative_config.backend == TextSpeculativeBackend::kDFlash;
+    const bool mtp = speculative_config.backend == TextSpeculativeBackend::kMtp;
     if (!vision_model_path.empty()) {
       SetError(error, "GLM-5.3 does not support --mmproj");
       return false;
     }
     if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
-        !dflash) {
-      SetError(error, "GLM-5.3 HTTP models support only DFlash2 drafting");
+        !dflash && !mtp) {
+      SetError(error, "GLM-5.3 HTTP models support DFlash2 and MTP drafting");
       return false;
     }
     if (dflash && speculative_config.draft_model_path.empty()) {
       SetError(error, "GLM-5.3 DFlash2 HTTP decoding requires --dflash-model");
+      return false;
+    }
+    if (mtp && speculative_config.draft_model_path.empty()) {
+      SetError(error, "GLM-5.3 MTP HTTP decoding requires the draft model");
       return false;
     }
     if (speculative_config.max_draft_tokens == 0 ||
@@ -4906,6 +4911,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             .max_context = max_context,
             .dflash_model_path =
                 dflash ? speculative_config.draft_model_path : std::string{},
+            .mtp_model_path =
+                mtp ? speculative_config.draft_model_path : std::string{},
             .max_draft_tokens = speculative_config.max_draft_tokens,
         },
         &load_error);
@@ -5720,16 +5727,18 @@ bool InferenceBackend::load(std::shared_ptr<models::glm53_flash::Model> model,
   }
   const bool use_dflash =
       speculative_config.backend == TextSpeculativeBackend::kDFlash;
+  const bool use_mtp =
+      speculative_config.backend == TextSpeculativeBackend::kMtp;
   if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
-      !(use_dflash && model->HasDflash())) {
+      !((use_dflash && model->HasDflash()) || (use_mtp && model->HasMtp()))) {
     SetError(error,
              "GLM-5.3 speculative decoding requires a model loaded with its "
-             "DFlash2 drafter");
+             "draft sidecar");
     return false;
   }
   if (DiskCacheEnabled(disk_cache_config) &&
       (!IsSha256Hex(disk_cache_config.model_artifact_fingerprint) ||
-       (use_dflash &&
+       ((use_dflash || use_mtp) &&
         !IsSha256Hex(disk_cache_config.draft_model_artifact_fingerprint)) ||
        disk_cache_config.capacity_bytes == 0)) {
     SetError(error, "GLM-5.3 persistent disk cache configuration is invalid");
@@ -5741,7 +5750,7 @@ bool InferenceBackend::load(std::shared_ptr<models::glm53_flash::Model> model,
     new_state->sampling_defaults.supplied = {};
     new_state->supports_images = false;
     auto runner = std::make_shared<GlmTextRunner>(
-        std::move(model), max_context, use_dflash,
+        std::move(model), max_context, use_dflash || use_mtp,
         disk_cache_config.model_artifact_fingerprint,
         disk_cache_config.draft_model_artifact_fingerprint);
     new_state->model_id = runner->Descriptor().model_id;

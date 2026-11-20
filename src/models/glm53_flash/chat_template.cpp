@@ -208,9 +208,15 @@ ChatRenderOptions RenderOptionsFor(const ReasoningOptions& reasoning) {
 
 bool ValidateGgufTemplate(const core::GgufReader& reader,
                           std::string* error_msg) {
-  // SHA-256 of the glm5next artifact's tokenizer.chat_template.
-  constexpr std::string_view kTemplateSha256 =
-      "a4fddbbf0b432101a296c17094f8bc5a2b0d30713b5b5cd92f86be78511aa724";
+  // SHA-256 of the accepted tokenizer.chat_template renderings. Both artifacts
+  // frame prompts identically for this renderer: the RCO export only differs in
+  // Jinja spelling (`.0.` instead of `[0]`, `~` instead of `+`) and in extra
+  // `can_sort` early breaks in its tool-sorting loop, none of which change the
+  // rendered text.
+  constexpr std::string_view kTemplateSha256[] = {
+      "a4fddbbf0b432101a296c17094f8bc5a2b0d30713b5b5cd92f86be78511aa724",
+      "0c4099f3382d6c92700dfb99725025360966fd73032f0ecf32377c0d9e6309c5",
+  };
   const auto text = reader.GetMetadataString("tokenizer.chat_template");
   if (!text) {
     if (error_msg != nullptr)
@@ -219,7 +225,11 @@ bool ValidateGgufTemplate(const core::GgufReader& reader,
   }
   const auto hash = crypto::Sha256Hex(
       {reinterpret_cast<const std::uint8_t*>(text->data()), text->size()});
-  if (hash != kTemplateSha256) {
+  bool matched = false;
+  for (const auto accepted : kTemplateSha256) {
+    matched = matched || hash == accepted;
+  }
+  if (!matched) {
     if (error_msg != nullptr)
       *error_msg = "template sha256 " + hash + " is not the compiled one";
     return false;

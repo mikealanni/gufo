@@ -10,6 +10,7 @@ are downloaded separately and are not part of the runtime package.
 | Qwen3.8 27B | Q4/Q8 GGUF; text/images | [Usage and modes](qwen3.8-27b/README.md) |
 | Qwen3.6 35B-A3B | UD-Q4_K_XL GGUF; text | [Usage and modes](qwen3.6-35b-a3b/README.md) |
 | Qwen3.8 Flash-Next | Sharded Q4 GGUF; text/images | [Usage and modes](qwen3.8-flash-next/README.md) |
+| GLM-5.3 Flash | AJ-IQ2_XXS / RCO-152E Q3_K_M sharded GGUF; text | [Usage and modes](glm53-flash/README.md) |
 | Qwen3.6 35B-A3B | Q4 GGUF; text | [Usage and modes](qwen3.6-35b-a3b/README.md) |
 | Qwen3-ASR 1.7B | BF16 safetensors; audio to text | [Usage](qwen3-asr/README.md) |
 | Qwen3-TTS 12Hz 1.7B | BF16 safetensors; text/reference audio to speech | [Voice modes](qwen3-tts/README.md) |

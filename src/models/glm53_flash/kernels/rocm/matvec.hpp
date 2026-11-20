@@ -11,6 +11,8 @@ namespace gufo::models::glm53_flash::rocm {
 // ggml type codes accepted by Matvec.
 inline constexpr int kTypeF32 = 0;
 inline constexpr int kTypeQ8_0 = 8;
+inline constexpr int kTypeQ3_K = 11;
+inline constexpr int kTypeQ4_K = 12;
 inline constexpr int kTypeQ5_K = 13;
 inline constexpr int kTypeQ6_K = 14;
 inline constexpr int kTypeIQ2_XXS = 16;

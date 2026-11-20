@@ -25,8 +25,11 @@ constexpr std::uint32_t kHistoryMinMatch = qfn::LookupIndex::kGram;
 constexpr std::uint32_t kHistoryMinDraft = 2;
 // Below this running acceptance the drafter costs more than it returns, so
 // ordinary steps run and the drafter is probed on every sixth.
-constexpr float kPlainBelow = 0.8F;
+constexpr float kPlainBelow = 0.45F;
 constexpr std::uint32_t kProbeEvery = 6;
+// Chain verification shares dense reads but multiplies routed experts, so
+// only the first MTP position beats break-even.
+constexpr std::uint32_t kMtpWidth = 1;
 
 constexpr std::array<char, 8> kSnapshotMagic{'G', 'L', 'M', 'S',
                                              'E', 'S', 'S', '1'};
@@ -178,6 +181,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   exec.max_context = options.max_context;
   exec.prefill_chunk = kPrefillChunk;
   exec.logit_rows = options.max_draft_tokens + 1;
+  exec.mtp_model_path = options.mtp_model_path;
   if (!options.dflash_model_path.empty()) {
     DrafterInfo info;
     if (!ReadDrafterInfo(options.dflash_model_path, &info, error_msg)) {
@@ -199,8 +203,14 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     const auto* embedding = m->executor_->TokenEmbedding();
     const auto* output = m->executor_->Output();
     if (embedding == nullptr || output == nullptr ||
-        embedding->type != rocm::kTypeQ6_K || output->type != rocm::kTypeQ6_K) {
-      AssignError(error_msg, "drafter needs Q6_K embedding and output tensors");
+        (embedding->type != rocm::kTypeQ6_K &&
+         embedding->type != rocm::kTypeQ8_0 &&
+         embedding->type != rocm::kTypeQ4_K) ||
+        (output->type != rocm::kTypeQ6_K && output->type != rocm::kTypeQ8_0 &&
+         output->type != rocm::kTypeQ4_K)) {
+      AssignError(
+          error_msg,
+          "drafter needs Q4_K, Q6_K or Q8_0 embedding and output tensors");
       return nullptr;
     }
     std::shared_ptr<const core::GgufReader> dflash_reader =
@@ -309,7 +319,8 @@ std::size_t Model::SessionBytes(core::SessionMode mode,
   const std::size_t rollback =
       kda_layers * (kKdaBytes + (options_.max_draft_tokens + 1) *
                                     (5 * 8192 + 64) * sizeof(float));
-  std::size_t total = kda_layers * kKdaBytes + mla_layers * per_mla + rollback;
+  std::size_t total = kda_layers * kKdaBytes +
+                      (mla_layers + (HasMtp() ? 1 : 0)) * per_mla + rollback;
   if (mode == core::SessionMode::kSpeculative && dflash_model_ != nullptr) {
     // Five layers of K and V over the sliding window plus the injection
     // scratch; measured allocations are an order of magnitude below this.
@@ -432,6 +443,9 @@ bool Session::Feed(std::span<const std::int32_t> tokens, bool prefill,
     ok = exec.Step(*session_, tokens, 1, error_msg);
     if (ok && dflash_) {
       ok = DflashInject(1, error_msg);
+    }
+    if (ok && exec.HasMtp()) {
+      ok = exec.MtpAdvance(*session_, tokens[0], error_msg);
     }
   }
   if (!ok) {
@@ -557,6 +571,111 @@ bool Session::DecodeImpl(std::size_t max_tokens,
           proposals.push_back(PointMass(token));
         }
       }
+    } else if (exec.HasMtp() && cap > 1 &&
+               (forced ? forced_width_ > 0
+                       : accepted_ema_ >= kPlainBelow ||
+                             ++plain_steps_ % kProbeEvery == 0)) {
+      // MTP: draft one token at a time through the sidecar block. The first
+      // draft reads the trunk hidden kept by the last forward; the rest
+      // recurse on the block's own hidden.
+      const auto wanted =
+          forced ? std::min<std::uint32_t>(
+                       static_cast<std::uint32_t>(forced_width_),
+                       static_cast<std::uint32_t>(cap - 1))
+                 : std::min<std::uint32_t>(kMtpWidth,
+                                           static_cast<std::uint32_t>(cap - 1));
+      const auto mtp_vocab = static_cast<std::size_t>(model_->VocabSize());
+      const float temperature = sampler.config().temperature;
+      const bool greedy_head = !sampled || !(temperature > 0.0F);
+      std::vector<float> row;
+      std::uint64_t draft_rng = 0;
+      if (!greedy_head) {
+        row.resize(mtp_vocab);
+        draft_rng = sampling::NextRandom(sampler.mutable_rng_state());
+      }
+      std::int32_t tok = anchor;
+      std::vector<qfn::MtpProposal> block;
+      bool mtp_ok = true;
+      for (std::uint32_t r = 0; r < wanted && chain.size() < cap; ++r) {
+        if (!exec.MtpDraftStep(*session_, tok, r == 0, error_msg)) {
+          mtp_ok = false;
+          break;
+        }
+        std::int32_t next = 0;
+        if (greedy_head) {
+          next = exec.ArgmaxRows(1)[0];
+        } else {
+          if (!exec.ReadLogitRows(0, 1, row.data())) {
+            mtp_ok = false;
+            break;
+          }
+          // Top-k sample of the draft head at the session temperature;
+          // verification keeps the target distribution exact, so the draft
+          // proposal only has to approximate the head's own sampling.
+          float max_logit = row[0];
+          for (std::size_t i = 1; i < mtp_vocab; ++i)
+            max_logit = std::max(max_logit, row[i]);
+          std::vector<std::pair<float, std::uint32_t>> top;
+          top.reserve(qfn::kMtpCandidates);
+          for (std::size_t i = 0; i < mtp_vocab; ++i) {
+            const float p = std::exp((row[i] - max_logit) / temperature);
+            if (top.size() < qfn::kMtpCandidates) {
+              top.emplace_back(p, static_cast<std::uint32_t>(i));
+              std::push_heap(top.begin(), top.end());
+            } else if (p > top.front().first) {
+              std::pop_heap(top.begin(), top.end());
+              top.back() = {p, static_cast<std::uint32_t>(i)};
+              std::push_heap(top.begin(), top.end());
+            }
+          }
+          double total = 0.0;
+          for (const auto& entry : top)
+            total += entry.first;
+          if (!(total > 0.0)) {
+            mtp_ok = false;
+            break;
+          }
+          const double pick = sampling::Uniform(&draft_rng) * total;
+          double acc = 0.0;
+          bool chosen = false;
+          for (const auto& entry : top) {
+            acc += entry.first;
+            if (acc >= pick) {
+              next = static_cast<std::int32_t>(entry.second);
+              chosen = true;
+              break;
+            }
+          }
+          if (!chosen) {
+            mtp_ok = false;
+            break;
+          }
+          std::vector<sampling::TokenId> ids;
+          std::vector<float> probs;
+          ids.reserve(top.size());
+          probs.reserve(top.size());
+          for (const auto& entry : top) {
+            ids.push_back(static_cast<sampling::TokenId>(entry.second));
+            probs.push_back(static_cast<float>(entry.first / total));
+          }
+          auto proposal =
+              MakeProposal(ids, probs, static_cast<sampling::TokenId>(next));
+          if (proposal.size == 0) {
+            mtp_ok = false;
+            break;
+          }
+          block.push_back(proposal);
+        }
+        chain.push_back(next);
+        tok = next;
+      }
+      if (!mtp_ok) {
+        return false;
+      }
+      if (!block.empty()) {
+        proposals = std::move(block);
+      }
+      drafted_by_model = true;
     } else if (DflashReady() && cap > 1 &&
                (forced ? forced_width_ > 0
                        : accepted_ema_ >= kPlainBelow ||
@@ -734,6 +853,9 @@ bool Session::DecodeImpl(std::size_t max_tokens,
   }
   tokens_.insert(tokens_.end(), chain.begin(), chain.begin() + keep);
   result->tokens.assign(chain.begin(), chain.begin() + keep);
+  if (exec.HasMtp() && !exec.MtpRefine(*session_, chain, keep, error_msg)) {
+    return false;
+  }
 
   stats_.cycles += 1;
   stats_.widths[k - 1] += 1;

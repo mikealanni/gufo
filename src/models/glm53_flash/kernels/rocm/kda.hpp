@@ -9,7 +9,6 @@ inline constexpr int kKdaHeads = 64;
 inline constexpr int kKdaHeadDim = 128;
 inline constexpr int kKdaInner = kKdaHeads * kKdaHeadDim;
 inline constexpr int kKdaConvTaps = 4;
-
 // Kimi Delta Attention pieces for `tokens` consecutive tokens (1 = decode).
 // q, k, v, f, decay, o and g are [tokens][8192]; beta and braw [tokens][64].
 //   hist    [3][3][8192] last three raw inputs per stream, oldest first
@@ -22,8 +21,6 @@ int KdaConv(float* q, float* k, float* v, float* hist, const float* conv_q,
             const float* conv_k, const float* conv_v, hipStream_t stream,
             int tokens = 1);
 
-// decay[i] = exp(-5 / (1 + exp((f[i] + dt[i]) * ssm_a[head]))), the per key
-// dimension log-decay gate; beta = sigmoid(braw).
 int KdaGates(const float* f, const float* dt, const float* ssm_a,
              const float* braw, float* decay, float* beta, hipStream_t stream,
              int tokens = 1);

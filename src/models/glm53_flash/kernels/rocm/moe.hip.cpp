@@ -29,27 +29,28 @@ __global__ void SwigluClampKernel(const float* __restrict__ gate,
 
 __global__ __launch_bounds__(kRouteThreads) void MoeRouteKernel(
     const float* __restrict__ logits, const float* __restrict__ bias,
-    float scale, int* __restrict__ ids, float* __restrict__ weights) {
-  logits += blockIdx.x * kMoeExperts;
+    float scale, int* __restrict__ ids, float* __restrict__ weights,
+    int experts) {
+  logits += blockIdx.x * experts;
   ids += blockIdx.x * kMoeUsed;
   weights += blockIdx.x * kMoeUsed;
-  __shared__ float prob[kMoeExperts];
-  __shared__ float sel[kMoeExperts];
-  __shared__ bool taken[kMoeExperts];
+  __shared__ float prob[kMaxMoeExperts];
+  __shared__ float sel[kMaxMoeExperts];
+  __shared__ bool taken[kMaxMoeExperts];
   __shared__ float best_value[kRouteThreads];
   __shared__ int best_index[kRouteThreads];
   const int t = threadIdx.x;
-  if (t < kMoeExperts) {
-    prob[t] = Sigmoid(logits[t]);
-    sel[t] = prob[t] + bias[t];
-    taken[t] = false;
+  for (int e = t; e < experts; e += kRouteThreads) {
+    prob[e] = Sigmoid(logits[e]);
+    sel[e] = prob[e] + bias[e];
+    taken[e] = false;
   }
   __syncthreads();
   __shared__ int chosen[kMoeUsed];
   for (int round = 0; round < kMoeUsed; ++round) {
     float value = -INFINITY;
-    int index = kMoeExperts;
-    if (t < kMoeExperts && !taken[t]) {
+    int index = experts;
+    if (t < experts && !taken[t]) {
       value = sel[t];
       index = t;
     }
@@ -145,9 +146,9 @@ int SwigluClamp(const float* gate, const float* up, float* act, int n,
 }
 
 int MoeRoute(const float* logits, const float* bias, float scale, int* ids,
-             float* weights, hipStream_t stream, int tokens) {
+             float* weights, int experts, hipStream_t stream, int tokens) {
   MoeRouteKernel<<<tokens, kRouteThreads, 0, stream>>>(logits, bias, scale, ids,
-                                                       weights);
+                                                       weights, experts);
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 

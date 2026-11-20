@@ -1039,8 +1039,16 @@ std::shared_ptr<models::glm53_flash::Model> LoadGlmModel(
     std::chrono::steady_clock::time_point load_start) {
   std::string error;
   const bool dflash = opt.speculative_backend == "dflash2";
-  if (!opt.speculative_backend.empty() && !dflash) {
-    std::cerr << "GLM-5.3 supports only --speculative dflash2\n";
+  const bool mtp = opt.speculative_backend == "mtp";
+  if (!opt.speculative_backend.empty() && !dflash && !mtp) {
+    std::cerr << "GLM-5.3 supports --speculative dflash2 or mtp\n";
+    return nullptr;
+  }
+  if (mtp && (opt.mtp_model_path.empty() || opt.min_draft_tokens != 1 ||
+              opt.draft_tokens == 0 ||
+              opt.draft_tokens > models::glm53_flash::kMaxDraftTokens)) {
+    std::cerr << "GLM-5.3 MTP requires --mtp-model, one to seven draft "
+                 "tokens and --min-draft-tokens 1\n";
     return nullptr;
   }
   if (dflash && (opt.dflash_model_path.empty() || opt.min_draft_tokens != 1 ||
@@ -1059,6 +1067,7 @@ std::shared_ptr<models::glm53_flash::Model> LoadGlmModel(
       opt.model_path,
       {.max_context = kDefaultContext,
        .dflash_model_path = dflash ? opt.dflash_model_path : "",
+       .mtp_model_path = mtp ? opt.mtp_model_path : "",
        .max_draft_tokens = opt.draft_tokens},
       &error);
   PrintModelLoadTime(load_start, model != nullptr);
@@ -1120,7 +1129,8 @@ int GenerateGlmResponse(const PromptOptions& opt,
             .count();
     const auto after = session.Statistics();
     const auto drafted = after.drafted - before.drafted;
-    if (opt.speculative_backend == "dflash2") {
+    if (opt.speculative_backend == "dflash2" ||
+        opt.speculative_backend == "mtp") {
       std::cerr << "[Speculative]: acceptance="
                 << (drafted ? static_cast<double>(after.accepted -
                                                   before.accepted) /

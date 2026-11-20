@@ -879,6 +879,55 @@ bool IsFlint(const core::GgufReader& reader) {
   return reader.GetMetadataString("general.architecture") == "flint";
 }
 
+// Compares logits from one multi-token Append (batched prefill) against the
+// same tokens appended one at a time (sequential reference), on fresh sessions.
+bool ValidateFlintPrefill(models::flint::gpu::Model& model,
+                          std::span<const std::int32_t> tokens,
+                          std::string* error_msg) {
+  auto batched = model.CreateSession(
+      static_cast<std::uint32_t>(tokens.size() + 1), error_msg);
+  if (!batched || !batched->Append(tokens, error_msg))
+    return false;
+  const std::vector<float> batched_logits(batched->Logits().begin(),
+                                          batched->Logits().end());
+
+  auto sequential = model.CreateSession(
+      static_cast<std::uint32_t>(tokens.size() + 1), error_msg);
+  if (!sequential)
+    return false;
+  for (const std::int32_t token : tokens) {
+    if (!sequential->Append(std::span(&token, 1), error_msg))
+      return false;
+  }
+  const auto sequential_logits = sequential->Logits();
+
+  const auto comparison = testing::CompareLogits(
+      std::vector<float>(sequential_logits.begin(), sequential_logits.end()),
+      batched_logits);
+  std::cout << "[Flint Prefill Validation] tokens=" << tokens.size()
+            << " top1_match=" << (comparison.top1_match ? "yes" : "no")
+            << " finite=" << (comparison.finite ? "yes" : "no") << '\n'
+            << "  max_abs_diff=" << comparison.max_abs_diff
+            << " mean_abs_diff=" << comparison.mean_abs_diff
+            << " rmse=" << comparison.root_mean_square_error
+            << " cosine_similarity=" << comparison.cosine_similarity << '\n';
+  if (!comparison.top1_match) {
+    const float ref_top1 = sequential_logits[comparison.reference_argmax];
+    const float cand_top1 = batched_logits[comparison.candidate_argmax];
+    const float ref_at_cand = sequential_logits[comparison.candidate_argmax];
+    const float cand_at_ref = batched_logits[comparison.reference_argmax];
+    std::cout << "  reference_argmax=" << comparison.reference_argmax
+              << " (logit=" << ref_top1 << ")"
+              << " candidate_argmax=" << comparison.candidate_argmax
+              << " (logit=" << cand_top1 << ")\n"
+              << "  reference's logit at candidate's token=" << ref_at_cand
+              << " (margin=" << (ref_top1 - ref_at_cand) << ")"
+              << " candidate's logit at reference's token=" << cand_at_ref
+              << " (margin=" << (cand_top1 - cand_at_ref) << ")\n";
+  }
+  return comparison.finite && comparison.top1_match;
+}
+
 int RunFlintBenchmark(const BenchOptions& options,
                       const std::shared_ptr<const core::GgufReader>& reader,
                       std::chrono::steady_clock::time_point model_load_start) {
@@ -896,7 +945,8 @@ int RunFlintBenchmark(const BenchOptions& options,
   const std::size_t max_generation = max_or_zero(options.n_gens);
   const std::size_t required_context =
       std::max({std::size_t{4096}, max_depth + max_prompt + 1,
-                std::max<std::size_t>(max_depth, 16) + max_generation + 1}) +
+                std::max<std::size_t>(max_depth, 16) + max_generation + 1,
+                options.validate_prefill_tokens + 1}) +
       flint::Session::kMaxVerifyRows;
 
   std::string error;
@@ -927,6 +977,15 @@ int RunFlintBenchmark(const BenchOptions& options,
     tokens.resize(required_context);
     for (std::size_t i = 0; i < tokens.size(); ++i)
       tokens[i] = static_cast<std::int32_t>(pattern[i % pattern.size()]);
+  }
+
+  if (options.validate_prefill_tokens != 0) {
+    const std::size_t width =
+        std::min(options.validate_prefill_tokens, tokens.size());
+    if (!ValidateFlintPrefill(*model, std::span(tokens).first(width), &error)) {
+      std::cerr << "Flint prefill validation FAILED: " << error << '\n';
+      return 1;
+    }
   }
 
   const double size_gib =
@@ -1582,12 +1641,17 @@ int RunGlm53Benchmark(const BenchOptions& options,
                 std::max<std::size_t>(max_depth, 16) + max_generation + 1,
                 options.validate_prefill_tokens + 1});
   const bool dflash = options.speculative_backend == "dflash2";
-  if (!options.speculative_backend.empty() && !dflash) {
-    std::cerr << "Error: GLM-5.3 supports --speculative dflash2 or off\n";
+  const bool mtp = options.speculative_backend == "mtp";
+  if (!options.speculative_backend.empty() && !dflash && !mtp) {
+    std::cerr << "Error: GLM-5.3 supports --speculative dflash2, mtp or off\n";
     return 1;
   }
   if (dflash && options.dflash_model_path.empty()) {
     std::cerr << "Error: --speculative dflash2 requires --dflash-model\n";
+    return 1;
+  }
+  if (mtp && options.mtp_model_path.empty()) {
+    std::cerr << "Error: --speculative mtp requires --mtp-model\n";
     return 1;
   }
   if (options.concurrency != std::vector<std::size_t>{1}) {
@@ -1595,7 +1659,7 @@ int RunGlm53Benchmark(const BenchOptions& options,
                  "benchmark for concurrent requests\n";
     return 1;
   }
-  if (dflash && options.min_draft_tokens != 1) {
+  if ((dflash || mtp) && options.min_draft_tokens != 1) {
     std::cerr << "Error: GLM-5.3 drafting requires --min-draft-tokens 1\n";
     return 1;
   }
@@ -1610,6 +1674,7 @@ int RunGlm53Benchmark(const BenchOptions& options,
       glm::ModelOptions{
           .max_context = static_cast<std::uint32_t>(required_context),
           .dflash_model_path = dflash ? options.dflash_model_path : "",
+          .mtp_model_path = mtp ? options.mtp_model_path : "",
           .max_draft_tokens = std::clamp<std::uint32_t>(options.draft_tokens, 1,
                                                         glm::kMaxDraftTokens),
       },

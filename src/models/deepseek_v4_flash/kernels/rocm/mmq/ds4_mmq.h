@@ -188,6 +188,14 @@ int ds4_mmq_iq2_s_moe(
     int             n_expert_used,
     hipStream_t    stream);
 
+int ds4_mmq_q4_K_dense_preq(const void * W, const void * Y_q8_mmq, size_t y_bytes,
+                            float * out, int M, int N, int K, hipStream_t stream);
+int ds4_mmq_q6_K_dense_preq(const void * W, const void * Y_q8_mmq, size_t y_bytes,
+                            float * out, int M, int N, int K, hipStream_t stream);
+size_t ds4_mmq_q8_1_mmq_bytes(int N, int K);
+int ds4_mmq_quantize_q8_1_mmq(const float * X_f32, void * Y_q8_mmq, int N, int K,
+                              int weight_type, hipStream_t stream);
+
 int ds4_mmq_q4_K_dense(
     const void  * W_q4_K,
     const float * X_f32,

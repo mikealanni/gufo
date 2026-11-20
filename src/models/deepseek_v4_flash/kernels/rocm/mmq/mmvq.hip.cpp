@@ -796,8 +796,10 @@ static void mul_mat_vec_q_switch_ncols_dst(
         return use;
     };
 
-    if (has_ids && ncols_dst > 1) {
-        // Multi-token MUL_MAT_ID path - dedicated MoE kernel
+    if (has_ids) {
+        // MUL_MAT_ID path - dedicated MoE kernel. Single-token calls must take
+        // this too: the ncols_dst == 1 path below indexes experts through the
+        // channel-ratio fastdiv, which is not wired for `ids`.
         mul_mat_vec_q_moe_launch<type>(
             vx, vy, ids, dst, ncols_x, nchannels_y_fd, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,

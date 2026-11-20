@@ -425,7 +425,8 @@ int Gemm(int type_code, const void* w, const float* x, float* out, int m, int n,
   if (type_code == kTypeF32 || n <= MMVQ_MAX_BATCH_SIZE) {
     return Matvec(type_code, w, x, out, m, n, k, scratch, stream);
   }
-  if ((k % 256) != 0 || (type_code != kTypeQ6_K && type_code != kTypeQ8_0)) {
+  if ((k % 256) != 0 || (type_code != kTypeQ6_K && type_code != kTypeQ8_0 &&
+                         type_code != kTypeQ4_K)) {
     for (int col = 0; col < n; col += MMVQ_MAX_BATCH_SIZE) {
       const int cols =
           n - col < MMVQ_MAX_BATCH_SIZE ? n - col : MMVQ_MAX_BATCH_SIZE;
@@ -443,6 +444,8 @@ int Gemm(int type_code, const void* w, const float* x, float* out, int m, int n,
       return ds4_mmq_q6_K_dense(w, x, out, m, n, k, stream);
     case kTypeQ8_0:
       return ds4_mmq_q8_0_dense(w, x, out, m, n, k, stream);
+    case kTypeQ4_K:
+      return ds4_mmq_q4_K_dense(w, x, out, m, n, k, stream);
     default:
       return -1;
   }

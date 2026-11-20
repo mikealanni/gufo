@@ -530,10 +530,11 @@ extern "C" int ds4_mmq_q8_0_dense(
  * the producer's sticky scratch may hold stale bytes).  Requires the
  * padded row width to equal K so the producer's block addressing
  * (ib = kseg*N + row) matches the quantizer's exactly. */
-extern "C" int ds4_mmq_q8_0_dense_preq(
+template <ggml_type type>
+static int ds4_mmq_dense_preq_impl(
+        const char * tag,
         const void * W, const void * Y_q8_mmq, size_t y_bytes, float * out,
         int M, int N, int K, hipStream_t stream) {
-    const char *tag = "ds4_mmq_q8_0_dense_preq";
     if (!W || !Y_q8_mmq || !out) {
         fprintf(stderr, "%s: null pointer\n", tag);
         return -1;
@@ -547,6 +548,7 @@ extern "C" int ds4_mmq_q8_0_dense_preq(
 
     const int dev = ds4_ggml_hip_get_device();
     const int cc  = ds4_ggml_hip_info().devices[dev].cc;
+    if (!ds4_mmq_k_tile_supported<type>(tag, K, cc)) return -1;
     ds4_ggml_hip_context * ctx = get_ctx_for_device(dev);
     if (!ctx) {
         fprintf(stderr, "%s: failed to get HIP context for device %d\n", tag, dev);
@@ -567,7 +569,7 @@ extern "C" int ds4_mmq_q8_0_dense_preq(
      * after the producer's emit on the same stream. */
     hipMemsetAsync((char *)Y_q8_mmq + data_bytes, 0, slack_bytes, stream);
 
-    const int64_t s01 = (int64_t)K / QK8_0;
+    const int64_t s01 = (int64_t)K / ggml_blck_size(type);
     const int64_t s12 = (int64_t)N * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
 
     const bool use_stream_k =
@@ -576,7 +578,7 @@ extern "C" int ds4_mmq_q8_0_dense_preq(
 
     mmq_args args = {
         /*x=*/(const char *)W,
-        /*type_x=*/GGML_TYPE_Q8_0,
+        /*type_x=*/type,
         /*y=*/(const int *)Y_q8_mmq,
         /*ids_dst=*/nullptr,
         /*expert_bounds=*/nullptr,
@@ -592,7 +594,7 @@ extern "C" int ds4_mmq_q8_0_dense_preq(
     };
     const bool inline_sanitize = !use_stream_k;
     args.sanitize_output = inline_sanitize;
-    mul_mat_q_case<GGML_TYPE_Q8_0>(*ctx, args, stream);
+    mul_mat_q_case<type>(*ctx, args, stream);
     hipError_t err = hipGetLastError();
     if (err != hipSuccess) {
         fprintf(stderr, "%s: mul_mat_q_case launch failed: %s\n", tag, hipGetErrorString(err));
@@ -602,6 +604,46 @@ extern "C" int ds4_mmq_q8_0_dense_preq(
         ds4_mmq_sanitize_f32(out, (uint64_t)M * (uint64_t)N, stream);
     }
     return 0;
+}
+
+extern "C" int ds4_mmq_q8_0_dense_preq(
+        const void * W, const void * Y, size_t y_bytes, float * out,
+        int M, int N, int K, hipStream_t stream) {
+    return ds4_mmq_dense_preq_impl<GGML_TYPE_Q8_0>("ds4_mmq_q8_0_dense_preq", W, Y, y_bytes, out, M, N, K, stream);
+}
+
+extern "C" int ds4_mmq_q4_K_dense_preq(
+        const void * W, const void * Y, size_t y_bytes, float * out,
+        int M, int N, int K, hipStream_t stream) {
+    return ds4_mmq_dense_preq_impl<GGML_TYPE_Q4_K>("ds4_mmq_q4_K_dense_preq", W, Y, y_bytes, out, M, N, K, stream);
+}
+
+extern "C" int ds4_mmq_q6_K_dense_preq(
+        const void * W, const void * Y, size_t y_bytes, float * out,
+        int M, int N, int K, hipStream_t stream) {
+    return ds4_mmq_dense_preq_impl<GGML_TYPE_Q6_K>("ds4_mmq_q6_K_dense_preq", W, Y, y_bytes, out, M, N, K, stream);
+}
+
+extern "C" size_t ds4_mmq_q8_1_mmq_bytes(int N, int K) {
+    const int dev = ds4_ggml_hip_get_device();
+    const int cc  = ds4_ggml_hip_info().devices[dev].cc;
+    const int64_t kp = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    return (size_t)N * (size_t)kp * sizeof(block_q8_1) / QK8_1 +
+           (size_t)get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
+}
+
+extern "C" int ds4_mmq_quantize_q8_1_mmq(
+        const float * X, void * Y, int N, int K, int weight_type,
+        hipStream_t stream) {
+    if (!X || !Y || N <= 0 || K <= 0 || K % 256 != 0) return -1;
+    const int dev = ds4_ggml_hip_get_device();
+    const int cc  = ds4_ggml_hip_info().devices[dev].cc;
+    const size_t total = ds4_mmq_q8_1_mmq_bytes(N, K);
+    const size_t slack = (size_t)get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
+    ds4_quantize_mmq_q8_1_hip(X, nullptr, Y, (ggml_type)weight_type, (int64_t)K,
+        (int64_t)K, 0, 0, (int64_t)K, (int64_t)N, 1, 1, stream);
+    hipMemsetAsync((char *)Y + (total - slack), 0, slack, stream);
+    return hipGetLastError() == hipSuccess ? 0 : -2;
 }
 
 // Dense Q8_0 D2R entry: same activation quantize + scratch treatment as

@@ -16,7 +16,7 @@ int SplitF16(const float* in, std::uint16_t* hi, std::uint16_t* lo, long long n,
 // (three matrix products per tile, agreement with the F32 product ~1e-7).
 int RouterGemm(const float* y, const std::uint16_t* w_hi,
                const std::uint16_t* w_lo, float* out, int tokens,
-               hipStream_t stream);
+               int num_experts, hipStream_t stream);
 
 }  // namespace gufo::models::glm53_flash::rocm
 
