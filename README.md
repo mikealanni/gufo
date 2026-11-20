@@ -238,6 +238,44 @@ reads the NPU result directly. One runtime-K program serves every reduction leng
   tokens; the runtime-M/K kernel in `tools/npu/runtime_mk` serves any chunk size
   without rebuilding the xclbin.
 
+## Pure NPU engine
+
+Separate from the GPU+NPU offload above, `tools/npu` carries a GPU-free engine
+that runs small models entirely on the XDNA2 NPU. The host only dispatches
+instruction streams and does token bookkeeping; the GPU is not used at all.
+
+- **`gufo-gen`** (`tools/npu/gen`) loads a dense GQA transformer straight from a
+  GGUF: the config comes from the metadata, weights are dequantized from any GGUF
+  type the repo can decode, decode runs RTN int5 programs and prefill runs
+  block-float 16 programs at 1024 rows per pass. Missing instruction streams are
+  generated on first use. It also runs the Qwen3.5-family decision model used by
+  jev.
+- **LFM3** has its own HIP-free build (`gufo-npu`, `GUFO_BUILD_NPU_ENGINE=ON`,
+  `ENGINE_ENABLE_HIP=OFF`) with fused-FFN chains and draft heads.
+
+| Model (Q6_K GGUF) | Prefill 1k / 4k (tok/s) | Decode at 1k (tok/s) |
+| --- | --- | --- |
+| MiniCPM5-1B | 2323 / 3204 | 35 (43 at short context) |
+| Qwen3-0.6B | 1918 / 2198 | 29 |
+| Qwen3-1.7B | 1567 / 1812 | 20 |
+| MiniCPM5-2B | 1228 / 1626 | 17 |
+
+LFM3 1.7B decodes at about 30 tok/s plain and 36 with draft heads at short
+context.
+
+Limits: FFN width must be a multiple of 512 and hidden size of 64; partial rope
+and attention bias are unsupported; NPU attention covers 16 heads of 128
+dimensions with 1, 2 or 4 KV heads, and other shapes (and contexts up to 256
+tokens) use host attention. Decode weights are int5 round-to-nearest from the
+GGUF, which is the weak spot for quality and decode speed.
+
+The goal is every tensor operation on the NPU in both prefill and decode. Norms,
+rope and some attention paths still run on the host as marked scaffolds, each
+with a named NPU replacement task; a stage only counts as done once it has no
+host tensor math. All NPU runs go through the shared lock script and binaries
+must be named `gufo*` so the clock service recognises them. Instruction
+streams, xclbins and kernels live in `tools/npu/decode_int5` and `tools/npu/gen`.
+
 ## Speculative decoding
 
 | Flag | Effect |
