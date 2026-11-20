@@ -436,8 +436,9 @@ __global__ void __launch_bounds__(256)
     Iu4Gemm3(const uint8_t* __restrict__ w, const uint8_t* __restrict__ qs,
              const float* __restrict__ ds, float* __restrict__ out, int M, int N,
              int K) {
-  __shared__ __attribute__((aligned(16))) uint8_t a_s[kTileT * kRowStride];
-  __shared__ __attribute__((aligned(16))) uint8_t b_s[kTileF * kRowStride];
+  constexpr int kRS = 144;  // 16-byte aligned LDS rows for 128-bit fragment loads
+  __shared__ __attribute__((aligned(16))) uint8_t a_s[kTileT * kRS];
+  __shared__ __attribute__((aligned(16))) uint8_t b_s[kTileF * kRS];
   __shared__ float sx_s[kTileT][2];
   const int tid = threadIdx.x;
   const int wave = tid >> 5, lane = tid & 31;
@@ -478,48 +479,78 @@ __global__ void __launch_bounds__(256)
   };
   prefetch(0);
   for (int kb = 0; kb < nblk; ++kb) {
+#ifndef EXP_NOSYNC
     __syncthreads();
+#endif
+#ifdef EXP_NOSTAGE
+    if (kb == 0) {
+#endif
     for (int j = 0; j < 4; ++j) {
       const int idx = tid + j * 256, row = idx >> 3, part = idx & 7;
-      *reinterpret_cast<uint4*>(a_s + row * kRowStride + part * 16) = ra[j];
+      *reinterpret_cast<uint4*>(a_s + row * kRS + part * 16) = ra[j];
     }
     for (int j = 0; j < 9; ++j) {
       const int idx = tid + j * 256;
       if (idx < kTileF * 17) {
         const int row = idx / 17, part = idx % 17;
-        *reinterpret_cast<uint2*>(b_s + row * kRowStride + part * 8) = rb[j];
+        *reinterpret_cast<uint2*>(b_s + row * kRS + (part == 0 ? 0 : part * 8 + 8)) = rb[j];
       }
     }
     sx_s[tid >> 1][tid & 1] = rs;
+#ifdef EXP_NOSTAGE
+    }
+#endif
+#ifndef EXP_NOSYNC
     __syncthreads();
+#endif
+#ifndef EXP_NOSTAGE
     if (kb + 1 < nblk) prefetch(kb + 1);
+#endif
 #pragma nounroll
     for (int hh = 0; hh < 2; ++hh) {
       i32x8 d[4][2];
       for (int a = 0; a < 4; ++a)
         for (int b = 0; b < 2; ++b) d[a][b] = (i32x8){0, 0, 0, 0, 0, 0, 0, 0};
+      const uint8_t* a_base = a_s + (wt * 64 + col) * kRS + 64 * hh;
+      const uint8_t* b_base = b_s + (wf * 32 + col) * kRS + 16 + 64 * hh;
+      uint4 fa[2][4], fb[2][2];
+      for (int a = 0; a < 4; ++a)
+        fa[0][a] = *reinterpret_cast<const uint4*>(a_base + a * 16 * kRS);
+      for (int b = 0; b < 2; ++b)
+        fb[0][b] = *reinterpret_cast<const uint4*>(b_base + b * 16 * kRS);
 #pragma unroll
-      for (int kk = 0; kk < 8; ++kk) {
-        i32x2 av[4], bv[2];
-        for (int a = 0; a < 4; ++a) {
-          const uint2 r = *reinterpret_cast<const uint2*>(
-              a_s + (wt * 64 + a * 16 + col) * kRowStride + 64 * hh + 8 * kk);
-          av[a] = (i32x2){(int)r.x, (int)r.y};
-        }
-        for (int b = 0; b < 2; ++b) {
-          const uint2 r = *reinterpret_cast<const uint2*>(
-              b_s + (wf * 32 + b * 16 + col) * kRowStride + 8 + 64 * hh + 8 * kk);
-          bv[b] = (i32x2){(int)r.x, (int)r.y};
-        }
-        for (int a = 0; a < 4; ++a)
+      for (int j = 0; j < 4; ++j) {
+        const int cur = j & 1, nxt = cur ^ 1;
+        if (j + 1 < 4) {
+          for (int a = 0; a < 4; ++a)
+            fa[nxt][a] = *reinterpret_cast<const uint4*>(a_base + a * 16 * kRS + 16 * (j + 1));
           for (int b = 0; b < 2; ++b)
-            d[a][b] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(
-                true, av[a], true, bv[b], d[a][b], false);
+            fb[nxt][b] = *reinterpret_cast<const uint4*>(b_base + b * 16 * kRS + 16 * (j + 1));
+        }
+        __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+          for (int a = 0; a < 4; ++a)
+            for (int b = 0; b < 2; ++b) {
+              const int ax = h ? (int)fa[cur][a].z : (int)fa[cur][a].x;
+              const int ay = h ? (int)fa[cur][a].w : (int)fa[cur][a].y;
+              const int bx = h ? (int)fb[cur][b].z : (int)fb[cur][b].x;
+              const int by = h ? (int)fb[cur][b].w : (int)fb[cur][b].y;
+              d[a][b] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(
+                  true, i32x2{ax, ay}, true, i32x2{bx, by}, d[a][b], false);
+            }
+        __builtin_amdgcn_sched_barrier(0);
       }
+#ifdef EXP_NO_EPI
+      for (int a = 0; a < 4; ++a)
+        for (int i = 0; i < 8; ++i)
+          for (int b = 0; b < 2; ++b) acc[a][b][i] += (float)d[a][b][i];
+      continue;
+#endif
       float sc[2];
       for (int b = 0; b < 2; ++b)
         sc[b] = __half2float(*reinterpret_cast<const __half*>(
-            b_s + (wf * 32 + b * 16 + col) * kRowStride + 4 * hh));
+            b_s + (wf * 32 + b * 16 + col) * kRS + 4 * hh));
       for (int a = 0; a < 4; ++a)
         for (int i = 0; i < 8; ++i) {
           const float sxr = sx_s[wt * 64 + a * 16 + 2 * i + half][hh];

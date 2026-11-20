@@ -81,3 +81,27 @@ Artifact facts needed by the integration (Qwen3.8-27B rotated int4 artifact):
   `src/models/qwen/hip/ops/prefill_fp16.hpp` (plain, residual-add, fused SwiGLU,
   row-range variants used by the NPU split); the new path plugs in behind the
   same signatures with a new `core::GgmlType`.
+
+### Ceiling analysis (2026-11-20)
+
+Isolated loop measurements (same 8-accumulator wave tile as the kernel):
+
+| Loop | TOPS |
+| --- | --- |
+| WMMA only, operands in registers | 107 |
+| plus pipelined LDS fragment loads | 83-90 |
+| plus per-128-group scale epilogue (cvt, mul, fma per element) | 76 |
+| full kernel with global staging and barriers | 54-62 |
+
+The epilogue VALU work does not overlap the WMMAs on this chip, so it adds
+directly; per element per group it is about 2 VALU cycles against 16 cycles of
+matrix work per 8 elements. The scale epilogue is required because both the
+weight scale and the activation scale change every 128 K values.
+
+An independent hand-tuned implementation of the same weight format measured
+57 to 67 TOPS on the same six shapes on this machine (N = 2048), and its
+published 27B prefill of 1,150 tok/s at pp8192 implies GEMMs averaging about
+65-73 TOPS. 100 TOPS has not been demonstrated for this format on this chip;
+the realistic target is about 70 TOPS. Going beyond needs a weight format with
+one scale per row (a single int32 accumulation over all of K), which is a
+different artifact, not a kernel change.
