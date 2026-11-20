@@ -741,6 +741,8 @@ private:
   float* iu4_scales_{nullptr};
   std::size_t iu4_tile_bytes_{0};
   std::size_t iu4_scale_bytes_{0};
+  void* iu4_npu_half_{nullptr};
+  std::size_t iu4_npu_half_bytes_{0};
   const detail::HipGraphCaptureKey graph_key_;
   detail::HipGraphDecodeExecutor graph_executor_;
   models::qwen::vision::DeviceInput vision_input_;

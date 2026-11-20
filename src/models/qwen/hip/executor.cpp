@@ -75,6 +75,8 @@ QwenGpuExecutor::~QwenGpuExecutor() {
     (void)hipFree(iu4_tiles_);
   if (iu4_scales_ != nullptr)
     (void)hipFree(iu4_scales_);
+  if (iu4_npu_half_ != nullptr)
+    (void)hipFree(iu4_npu_half_);
   (void)hipStreamSynchronize(arena_.stream);
   for (const auto event : prefill_events_) {
     if (event)

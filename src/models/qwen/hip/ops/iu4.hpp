@@ -49,18 +49,20 @@ void LaunchIu4NormQuantize(const float* x, const float* norm_weight,
                            hipStream_t stream);
 
 // True when the int4 GEMM can run a projection of this shape: rows must be a
-// multiple of 512 (a CTA group of four 128-feature tiles) and cols a multiple
-// of 256.
+// multiple of 128 (one feature tile) and cols a multiple of 256.
 bool Iu4GemmSupported(std::size_t rows, std::size_t cols);
 
 // out[t][f] = (or +=) sum over K of the rotated int4 weights times the int4
-// activations, in fp32, for t < n. act_tiles and act_scales come from the
-// activation producers with padded_n a multiple of 128; the weights come from
-// LaunchIu4RepackWeights. out is token-major [n x rows].
+// activations, in fp32, for t < n and f in [row_begin, rows). act_tiles and
+// act_scales come from the activation producers with padded_n a multiple of
+// 128; the weights come from LaunchIu4RepackWeights. out is token-major
+// [n x rows]; the columns below row_begin are not touched (the NPU computes
+// them). row_begin and rows must be multiples of 128.
 void LaunchIu4Gemm(const void* tiles, const std::uint16_t* weight_scales,
                    const std::uint8_t* act_tiles, const float* act_scales,
-                   float* out, bool accumulate, std::size_t rows, std::size_t n,
-                   std::size_t padded_n, std::size_t k, hipStream_t stream);
+                   float* out, bool accumulate, std::size_t rows,
+                   std::size_t row_begin, std::size_t n, std::size_t padded_n,
+                   std::size_t k, hipStream_t stream);
 
 // Scalar fallback for projections that fail Iu4GemmSupported (rows at most 256
 // and a divisor of 256): same inputs and outputs as LaunchIu4Gemm.
@@ -69,6 +71,14 @@ void LaunchIu4GemmSmall(const void* tiles, const std::uint16_t* weight_scales,
                         float* out, bool accumulate, std::size_t rows,
                         std::size_t n, std::size_t padded_n, std::size_t k,
                         hipStream_t stream);
+
+// Swaps the two forms of a [rows x ld] activation whose first `columns`
+// columns exist only as FP16 (from the NPU) and the rest only as FP32 (from the
+// GPU): afterwards the FP32 matrix holds the converted NPU columns and the FP16
+// matrix holds the converted GPU columns, so both are complete.
+void LaunchIu4SwapHalfColumns(float* act_f32, void* act_f16, std::size_t rows,
+                              std::size_t ld, std::size_t columns,
+                              hipStream_t stream);
 
 // Quantize-only activation producer for rows that are already normalized:
 // divide by awq (null for none), rotate, quantize, same output layout as

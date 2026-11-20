@@ -232,7 +232,29 @@ __global__ void __launch_bounds__(256) Iu4QuantizeKernel(
                       scales);
 }
 
+__global__ void Iu4SwapHalfColumnsKernel(float* __restrict__ f32,
+                                         __half* __restrict__ f16,
+                                         std::size_t total, std::uint32_t ld,
+                                         std::uint32_t columns) {
+  const std::size_t i = (std::size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= total)
+    return;
+  if (i % ld < columns)
+    f32[i] = __half2float(f16[i]);
+  else
+    f16[i] = __float2half(f32[i]);
+}
+
 }  // namespace
+
+void LaunchIu4SwapHalfColumns(float* act_f32, void* act_f16, std::size_t rows,
+                              std::size_t ld, std::size_t columns,
+                              hipStream_t stream) {
+  const std::size_t total = rows * ld;
+  Iu4SwapHalfColumnsKernel<<<(total + 255) / 256, 256, 0, stream>>>(
+      act_f32, static_cast<__half*>(act_f16), total,
+      static_cast<std::uint32_t>(ld), static_cast<std::uint32_t>(columns));
+}
 
 void FillIu4RotationSigns(float* out) {
   const std::uint32_t seeds[2] = {42u, 1042u};

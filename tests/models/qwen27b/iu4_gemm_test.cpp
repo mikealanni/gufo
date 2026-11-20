@@ -178,7 +178,7 @@ int main() {
         init[t * M + f] = 1.0f;
     hipMemcpy(d_out, init.data(), init.size() * 4, hipMemcpyHostToDevice);
     gufo::hip::LaunchIu4Gemm(proj.tiles, proj.scales, d_tiles, d_scales, d_out,
-                             true, M, n, padded, K, nullptr);
+                             true, M, 0, n, padded, K, nullptr);
     CHECK(hipDeviceSynchronize() == hipSuccess, "%s kernel failed", c.name);
     std::vector<float> got(padded * M);
     hipMemcpy(got.data(), d_out, got.size() * 4, hipMemcpyDeviceToHost);
@@ -222,6 +222,31 @@ int main() {
     CHECK(worst < 2e-5 * rms + 1e-5, "error too large");
     CHECK(tail_bad == 0, "wrote past n");
 
+    {
+      // Row range: the columns below row_begin belong to the NPU and must stay
+      // untouched, the rest must match the full run.
+      const std::size_t rb = (M / 4) / 128 * 128;
+      std::vector<float> keep(padded * M, sentinel);
+      hipMemcpy(d_out, keep.data(), keep.size() * 4, hipMemcpyHostToDevice);
+      gufo::hip::LaunchIu4Gemm(proj.tiles, proj.scales, d_tiles, d_scales,
+                               d_out, false, M, rb, n, padded, K, nullptr);
+      CHECK(hipDeviceSynchronize() == hipSuccess, "%s range kernel failed",
+            c.name);
+      std::vector<float> part(padded * M);
+      hipMemcpy(part.data(), d_out, part.size() * 4, hipMemcpyDeviceToHost);
+      std::size_t touched = 0, wrong = 0;
+      for (std::size_t t = 0; t < n; ++t)
+        for (std::size_t f = 0; f < M; f += 37) {
+          if (f < rb && part[t * M + f] != sentinel)
+            ++touched;
+          if (f >= rb && std::fabs(part[t * M + f] - (got[t * M + f] - 1.0f)) >
+                             1e-5f * (1.0f + std::fabs(got[t * M + f])))
+            ++wrong;
+        }
+      std::printf("  row_begin %zu: %zu columns touched below, %zu wrong\n", rb,
+                  touched, wrong);
+      CHECK(touched == 0 && wrong == 0, "row range result differs");
+    }
     if (c.n == 300) {
       // Throughput at 2048 tokens (not gating).
       const std::size_t N2 = 2048, E2 = K / 128;
@@ -238,11 +263,11 @@ int main() {
       hipEventCreate(&b);
       for (int w = 0; w < 5; ++w)
         gufo::hip::LaunchIu4Gemm(proj.tiles, proj.scales, d_t2, d_s2, d_o2,
-                                 false, M, N2, N2, K, nullptr);
+                                 false, M, 0, N2, N2, K, nullptr);
       hipEventRecord(a);
       for (int r = 0; r < 100; ++r)
         gufo::hip::LaunchIu4Gemm(proj.tiles, proj.scales, d_t2, d_s2, d_o2,
-                                 false, M, N2, N2, K, nullptr);
+                                 false, M, 0, N2, N2, K, nullptr);
       hipEventRecord(b);
       hipEventSynchronize(b);
       float ms;

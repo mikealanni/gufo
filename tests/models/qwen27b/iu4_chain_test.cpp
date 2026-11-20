@@ -159,7 +159,7 @@ int main() {
                                    1e-6f, n, padded, K, d_tiles, d_scales,
                                    nullptr);
   gufo::hip::LaunchIu4Gemm(proj.tiles, proj.scales, d_tiles, d_scales, d_out,
-                           false, M, n, padded, K, nullptr);
+                           false, M, 0, n, padded, K, nullptr);
   CHECK(hipDeviceSynchronize() == hipSuccess, "chain failed");
   std::vector<float> got(n * M);
   hipMemcpy(got.data(), d_out, got.size() * 4, hipMemcpyDeviceToHost);
