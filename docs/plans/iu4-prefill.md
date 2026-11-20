@@ -253,3 +253,24 @@ bench (heavy channels, rotation within 256-blocks only): relative RMS 0.160
 versus 0.115 for per-128 scales. That is 40% more activation error, so the
 per-token scale is not free and needs the real-activation quality test before
 it can ship.
+
+### v10-v12: staggered fold, tile-major layouts (exact per-128 scales)
+
+v10 splits each epoch into two token halves and staggers the two token-half
+waves so one wave's 32-WMMA phase overlaps the other's fold (waves with the
+second token half defer the last fold into the next epoch). Token scales come
+from a small LDS ring (no DPP: the DPP moves cost about 11 TOPS), and the
+integer chains start at 0x4B400000 so each fold converts with one exact
+subtract. v12 additionally stores tokens and weights in tile-major layouts
+chosen by the producer and the load-time repack, so every global load is a
+contiguous 256 B run, and reads token scales from an `[epoch][token]` array.
+
+| Variant (exact per-128 scales, N=2048) | TOPS |
+|---|---|
+| v5 (previous best exact) | 61-63 |
+| v10 | 63-65.5 |
+| v12 gate_proj / down_proj / up_proj | 70.4 / 72.8 / 68.4 |
+| v12 per-token activation scale | 71.8 |
+
+Ablations on v10/v12: without global loads 78, without loads and fold 82.7.
+Loads still cost about 8 TOPS and the fold about 4.

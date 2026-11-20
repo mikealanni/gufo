@@ -793,9 +793,10 @@ __device__ __forceinline__ int RowShare(int v, int k) {
     V6_SHARE(1)
     V6_SHARE(2)
     V6_SHARE(3)
-    V6_SHARE(4) V6_SHARE(5) V6_SHARE(6) V6_SHARE(7) V6_SHARE(8) V6_SHARE(9)
-        V6_SHARE(10) V6_SHARE(11) V6_SHARE(12) V6_SHARE(13) V6_SHARE(14)
-            V6_SHARE(15) default : __builtin_unreachable();
+    V6_SHARE(4)
+    V6_SHARE(5) V6_SHARE(6) V6_SHARE(7) V6_SHARE(8) V6_SHARE(9) V6_SHARE(10)
+        V6_SHARE(11) V6_SHARE(12) V6_SHARE(13) V6_SHARE(14) V6_SHARE(15) default
+        : __builtin_unreachable();
   }
 #undef V6_SHARE
 }
@@ -1781,7 +1782,8 @@ template<bool PT, bool Y>
 __device__ __forceinline__ void Gemm12Body(
     const uint8_t* __restrict__ pw, const unsigned short* __restrict__ psc,
     const uint8_t* __restrict__ qs, const float* __restrict__ ds,
-    float* __restrict__ out, int M, int N, int K, char* lds) {
+    const float* __restrict__ dsT, float* __restrict__ out, int M, int N, int K,
+    char* lds) {
   using namespace v6;
   const int tid = threadIdx.x;
   const int wave = __builtin_amdgcn_readfirstlane(tid >> 5);
@@ -1816,7 +1818,7 @@ __device__ __forceinline__ void Gemm12Body(
     for (int i = 0; i < 4; ++i)
       sa[i] = *At<i32x2>(gq, (uint32_t)e * 1024 + 256u * i);
     if (!PT && tid < 128)
-      sxn = ds[(size_t)(t0 + tid) * groups128 + e];
+      sxn = dsT[(size_t)e * N + t0 + tid];
   };
   const auto stage_store = [&](char* slot, char* sreg) {
     for (int i = 0; i < 4; ++i)
@@ -1995,12 +1997,13 @@ __global__ void __launch_bounds__(256)
     Iu4Gemm12(const uint8_t* __restrict__ pw,
               const unsigned short* __restrict__ psc,
               const uint8_t* __restrict__ qs, const float* __restrict__ ds,
-              float* __restrict__ out, int M, int N, int K) {
+              const float* __restrict__ dsT, float* __restrict__ out, int M,
+              int N, int K) {
   __shared__ __attribute__((aligned(16))) char lds[16384 + 2048];
   if ((threadIdx.x >> 7) & 1)
-    Gemm12Body<PT, true>(pw, psc, qs, ds, out, M, N, K, lds);
+    Gemm12Body<PT, true>(pw, psc, qs, ds, dsT, out, M, N, K, lds);
   else
-    Gemm12Body<PT, false>(pw, psc, qs, ds, out, M, N, K, lds);
+    Gemm12Body<PT, false>(pw, psc, qs, ds, dsT, out, M, N, K, lds);
 }
 
 __global__ void XorNibbles(uint8_t* w, size_t bytes) {
@@ -2393,6 +2396,9 @@ int main(int argc, char** argv) {
                                                                   K);
       RelayoutTok<<<((size_t)N * (K / 128) * 8 + 255) / 256, 256>>>(dqs, qsT, N,
                                                                     K);
+      float* dsTc;
+      HIP_OK(hipMalloc(&dsTc, (size_t)N * (K / 128) * 4));
+      TransposeScales<<<(N + 255) / 256, 256>>>(dds, dsTc, N, K / 128);
       float* doutc;
       HIP_OK(hipMalloc(&doutc, (size_t)N * M * 4));
       const int gc = (M / 128) * (N / 128);
@@ -2401,11 +2407,11 @@ int main(int argc, char** argv) {
 #else
       constexpr bool kPTc = false;
 #endif
-      Iu4Gemm12<kPTc><<<gc, 256>>>(pwT, pscc, qsT, dds, doutc, M, N, K);
+      Iu4Gemm12<kPTc><<<gc, 256>>>(pwT, pscc, qsT, dds, dsTc, doutc, M, N, K);
       HIP_OK(hipDeviceSynchronize());
       hipEventRecord(a);
       for (int i = 0; i < 1000; ++i)
-        Iu4Gemm12<kPTc><<<gc, 256>>>(pwT, pscc, qsT, dds, doutc, M, N, K);
+        Iu4Gemm12<kPTc><<<gc, 256>>>(pwT, pscc, qsT, dds, dsTc, doutc, M, N, K);
       hipEventRecord(b);
       hipEventSynchronize(b);
       float msc;
