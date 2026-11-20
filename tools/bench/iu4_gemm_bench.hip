@@ -761,18 +761,19 @@ int main(int argc, char** argv) {
       HIP_OK(hipMalloc(&dw3, we->len));
       HIP_OK(hipMemcpy(dw3, dw, we->len, hipMemcpyDeviceToDevice));
       XorNibbles<<<(we->len + 255) / 256, 256>>>(dw3, we->len);
+      const int reps3 = std::getenv("REPS3") ? std::atoi(std::getenv("REPS3")) : reps;
       float* dout3;
       HIP_OK(hipMalloc(&dout3, (size_t)N * M * 4));
       Iu4Gemm3<<<grid2, 256>>>(dw3, dqs, dds, dout3, M, N, K);
       HIP_OK(hipDeviceSynchronize());
       hipEventRecord(a);
-      for (int i = 0; i < reps; ++i)
+      for (int i = 0; i < reps3; ++i)
         Iu4Gemm3<<<grid2, 256>>>(dw3, dqs, dds, dout3, M, N, K);
       hipEventRecord(b);
       hipEventSynchronize(b);
       float ms3;
       hipEventElapsedTime(&ms3, a, b);
-      ms3 /= reps;
+      ms3 /= reps3;
       std::vector<float> o3((size_t)N * M);
       HIP_OK(hipMemcpy(o3.data(), dout3, o3.size() * 4, hipMemcpyDeviceToHost));
       double md3 = 0;
