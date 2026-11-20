@@ -135,3 +135,27 @@ results through LDS, epilogue waves convert, scale and accumulate). A first
 prototype was occupancy-limited (60 KB of LDS per block leaves about 2 MMA
 waves per SIMD, and the fragment loads need deeper prefetch at that
 occupancy); not yet measured at full effect.
+
+### Warp-specialized epilogue experiment (2026-11-20)
+
+Kernel variant with MMA waves publishing int16 group results through LDS to
+separate epilogue waves (which also stage global data); correct (max difference
+1e-6 against the single-wave kernel) but slower:
+
+| Variant | TOPS |
+| --- | --- |
+| single-wave epilogue (current best) | 57 |
+| core structure only (staging, barriers, no handoff, no epilogue) | 76.8 |
+| plus handoff writes, no waiting, no epilogue | 57.0 |
+| plus handoff wait, no epilogue | 53.8 |
+| complete warp-specialized kernel | 48 |
+
+Draining each group's WMMA results, packing and storing them costs more than
+the epilogue VALU work it removes. Isolated LDS-fragment loop at 120 W: 88 TOPS
+at 2 waves per SIMD, 95 at 4, 97 at 12, so the matrix and LDS paths are not the
+limit; the per-group handoff or epilogue is.
+
+Conclusion: with per-128-group weight and activation scales the full kernel
+tops out near 57-62 TOPS in HIP C++. Remaining untested levers: weights
+straight to registers, double-buffered A, a 256 x 256 tile, and a per-token
+activation scale (one cvt and one fma per element, at a quality cost).
