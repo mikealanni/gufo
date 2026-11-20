@@ -190,31 +190,25 @@ logits); chunk shrink 4096→1024 would save ~4 GiB for decode-only use.
 
 ## 7. State of the tree
 
-Uncommitted on `fork-enhancements`: NPU two-bank prefill + stage profiler
-(+bucket fix) + Q8 mirrors + GTT accounting + MTP (engine/executor/kernels)
-+ prefill matrix pp2048 640 / pp4096 719 / pp8192 711 / pp16384 702 with
-byte-identical NPU output. **`engine.cpp` currently carries the temporary
-experiment `kPlainBelow = 0.0F // TEMP EXPERIMENT: always draft`** — restore
-to `0.8F` (or a principled d=1 break-even ≈ 0.5) before committing.
-`tools/jev/guard.py` working-tree diff is the user's — never stage.
-`glm53.kda` test passes; `check-format.py` PASS.
+Committed on `fork-enhancements` and merged with `wp11/atb-prefill`,
+`feat/glm53-flash` and `feat/jevgate`: NPU two-bank prefill, stage profiler
+(+bucket fix), Q8 mirrors, GTT accounting, one-token MTP with the Q5 sidecar,
+slab session snapshots, and the opt-in native K-quant MMQ path
+(`GUFO_GLM53_NO_MIRROR=1`, pre-quantized activation reuse built but not yet
+benchmarked). `kPlainBelow` is 0.45 and `kMtpWidth` is 1.
+`tools/jev/guard.py` working-tree diff is the user's and was never staged.
 
 ## 8. Next steps (ordered)
 
-1. **Explain d=1's 400 ms/step** (rocprof `-n 12` d=1 trace; look for idle
-   gaps and non-graphed draft launches; keep draft logits on device / graph
-   the draft / overlap). If fixed → d=1 MTP ≈ 21 tok/s expected.
-2. **shexp overlap:** shared expert (0.64 GB @ 60% BW) is independent of the
-   routed experts — second stream hides most of 5.1 ms/token.
-3. **hc fusion** (90 HcMix + 92 HcSink launches/token for a 4×4 Sinkhorn —
-   one warp can do it), **router** fp32 GEMV (58 GB/s), **dsa** decode
-   (46% BW). Combined target ~20–21 tok/s plain.
-4. Restore `kPlainBelow` to a principled value; wire `ForceDraftWidth` or an
-   env knob for experiments.
-5. If MTP overhead is unfixable: document d=1 MTP as not-usable on RCO and
-   retest DFlash2 acceptance on RCO (needs > ~0.85 here; prior 0.389).
-6. Deferred prefill work (only if the 1000 tok/s goal is revisited): chunked
-   KDA scan, DSA attend rewrite — needed because pp is at the roofline.
+1. Benchmark and verify the activation-reuse MMQ path (section 9, step 1).
+2. **shexp overlap:** the shared expert (0.64 GB @ 60% BW) is independent of
+   the routed experts; a second stream hides most of 5.1 ms/token.
+3. **hc fusion** (90 HcMix + 92 HcSink launches/token for a 4x4 Sinkhorn),
+   **router** fp32 GEMV (58 GB/s), **dsa** decode (46% BW). Combined target
+   ~20-21 tok/s plain.
+4. Train a DFlash2 drafter on the RCO model (the Q2-trained one accepts ~0).
+5. Prefill 800: chunked KDA scan and a DSA attend rewrite, since pp is at the
+   roofline.
 
 ## 9. Future plan: shared fused K-quant prefill kernel, no Q8 mirrors
 
