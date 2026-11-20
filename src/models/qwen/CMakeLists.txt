@@ -29,6 +29,8 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/models/qwen/vision/device_input.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/attention.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/batched_ssm.hip
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/iu4_weights.cpp
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/iu4_repack.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/prefill_embed.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/prefill_gemm.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/prefill_quant_gemm.hip
