@@ -774,6 +774,173 @@ __global__ void __launch_bounds__(512)
         out[(size_t)n * M + m] = acc[a][b][i];
       }
 }
+namespace v6 {
+constexpr int kNW = 8;
+constexpr int kAB = 128 * 64;
+constexpr int kSlot = 2 * kAB;
+
+template <typename T>
+__device__ __forceinline__ const T* At(const void* p, uint32_t off) {
+  return reinterpret_cast<const T*>(reinterpret_cast<const char*>(p) + off);
+}
+
+__device__ __forceinline__ int RowShare(int v, int k) {
+#define V6_SHARE(k) \
+  case k: return __builtin_amdgcn_update_dpp(0, v, 0x150 + k, 0xf, 0xf, false);
+  switch (k) {
+    V6_SHARE(0) V6_SHARE(1) V6_SHARE(2) V6_SHARE(3) V6_SHARE(4) V6_SHARE(5)
+    V6_SHARE(6) V6_SHARE(7) V6_SHARE(8) V6_SHARE(9) V6_SHARE(10) V6_SHARE(11)
+    V6_SHARE(12) V6_SHARE(13) V6_SHARE(14) V6_SHARE(15)
+    default: __builtin_unreachable();
+  }
+#undef V6_SHARE
+}
+}  // namespace v6
+
+template <bool PT>
+__global__ void __launch_bounds__(256)
+    Iu4Gemm6(const uint8_t* __restrict__ w, const uint8_t* __restrict__ qs,
+             const float* __restrict__ ds, float* __restrict__ out, int M, int N, int K) {
+  using namespace v6;
+#ifdef EXP6_PAD
+  __shared__ char pad[EXP6_PAD];
+  if (threadIdx.x == 1023) pad[threadIdx.x] = 1;
+#endif
+  __shared__ __attribute__((aligned(16))) char lds[2 * kSlot];
+  const int tid = threadIdx.x;
+  const int wave = __builtin_amdgcn_readfirstlane(tid >> 5);
+  const int lane = tid & 31;
+  const int lr = lane & 15, hi = lane >> 4;
+  const int prow = 8 * (lr & 1) + (lr >> 1);
+  const int wt = wave & 3, wf = wave >> 2;
+  const int tb = N >> 7;
+  const int f0 = (blockIdx.x / tb) * 128, t0 = (blockIdx.x % tb) * 128;
+  const int E = K >> 7;
+  const int groups128 = K / kGroup;
+  const uint32_t wrow = (uint32_t)(K >> 8) * kBlockBytes;
+  const uint32_t qrow = (uint32_t)(K >> 1);
+  const int sr = 16 * wave + lr;
+  const char* gw = reinterpret_cast<const char*>(w) + (size_t)(f0 + sr) * wrow + 8u + 8u * hi;
+  const char* gq = reinterpret_cast<const char*>(qs) + (size_t)(t0 + sr) * qrow + 8u * hi;
+  const uint32_t lds_off = wave * 1024 + hi * 128 + lr * 8;
+  const uint32_t aoff = (wt * 2) * 1024 + prow * 8;
+  const uint32_t boff = kAB + (wf * 4) * 1024 + lr * 8;
+  const char* gsc = reinterpret_cast<const char*>(w) + (size_t)(f0 + wf * 64 + lr) * wrow;
+  const float* gd = ds + (size_t)(t0 + wt * 32 + 16 * (lr >> 3) + 8 * hi + (lr & 7)) * groups128;
+
+  float sum[2][4][8];
+  for (int a = 0; a < 2; ++a)
+    for (int c = 0; c < 4; ++c)
+      for (int j = 0; j < 8; ++j) sum[a][c][j] = 0.0f;
+
+  i32x2 sa[4], sb[4];
+  const auto stage_load = [&](int e) {
+    const uint32_t eo = (uint32_t)(e >> 1) * kBlockBytes + (uint32_t)(e & 1) * 64;
+    const uint32_t qo = (uint32_t)e * 64;
+    for (int i = 0; i < 4; ++i) {
+      sb[i] = *At<i32x2>(gw, eo + 16u * i);
+      sa[i] = *At<i32x2>(gq, qo + 16u * i);
+    }
+  };
+  const auto stage_store = [&](char* slot) {
+    for (int i = 0; i < 4; ++i) {
+      *reinterpret_cast<i32x2*>(slot + lds_off + i * 256) = sa[i];
+      *reinterpret_cast<i32x2*>(slot + kAB + lds_off + i * 256) = sb[i];
+    }
+  };
+  stage_load(0);
+  stage_store(lds);
+  unsigned short scn[4];
+  float wsn = 0.0f;
+  const auto meta_load = [&](int e) {
+    for (int c = 0; c < 4; ++c)
+      scn[c] = *At<unsigned short>(
+          gsc, (uint32_t)(e >> 1) * kBlockBytes + (uint32_t)(e & 1) * 4 + c * 16 * wrow);
+    if (!PT) wsn = gd[e];
+  };
+  meta_load(0);
+  __syncthreads();
+
+  const auto epoch = [&](auto nxt_tag, int e) {
+    constexpr bool nxt = decltype(nxt_tag)::value;
+    char* slot = lds + (e & 1) * kSlot;
+    float sc[4];
+    for (int c = 0; c < 4; ++c) sc[c] = __half2float(__ushort_as_half(scn[c]));
+    const int wsf = __float_as_int(wsn);
+    __builtin_amdgcn_sched_barrier(0);
+#ifndef EXP6_NOLOAD
+    if (nxt) stage_load(e + 1);
+#endif
+    if (nxt) meta_load(e + 1);
+    __builtin_amdgcn_sched_barrier(0);
+    i32x2 av = *reinterpret_cast<const i32x2*>(slot + aoff);
+    i32x2 bv[4];
+    for (int c = 0; c < 4; ++c) bv[c] = *reinterpret_cast<const i32x2*>(slot + boff + c * 1024);
+    i32x8 C[4];
+#pragma unroll
+    for (int a = 0; a < 2; ++a) {
+#pragma unroll
+      for (int s = 0; s < 8; ++s) {
+        const int i = a * 8 + s + 1;
+        i32x2 an;
+        i32x2 bn[4];
+        if (i < 16) {
+          const int na = i >> 3, ns = i & 7;
+          an = *reinterpret_cast<const i32x2*>(slot + aoff + na * 1024 + ns * 128);
+          for (int c = 0; c < 4; ++c)
+            bn[c] = *reinterpret_cast<const i32x2*>(slot + boff + c * 1024 + ns * 128);
+        }
+        for (int c = 0; c < 4; ++c) {
+          const i32x8 z = (i32x8){0, 0, 0, 0, 0, 0, 0, 0};
+          C[c] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(
+              true, av, true, bv[c], s == 0 ? z : C[c], false);
+        }
+        if (i < 16) {
+          av = an;
+          for (int c = 0; c < 4; ++c) bv[c] = bn[c];
+        }
+        if (s != 7) __builtin_amdgcn_sched_barrier(0);
+      }
+      float scf[8];
+      if (!PT) {
+        for (int j = 0; j < 8; ++j) {
+          scf[j] = __int_as_float(RowShare(wsf, 8 * a + j));
+          asm volatile("" : "+v"(scf[j]));
+        }
+      }
+      for (int c = 0; c < 4; ++c) {
+        for (int j = 0; j < 8; ++j) {
+#ifdef EXP6_NOFOLD
+          sum[a][c][j] += (float)C[c][j];
+#else
+          if (PT)
+            sum[a][c][j] = __builtin_fmaf(sc[c], (float)C[c][j], sum[a][c][j]);
+          else
+            sum[a][c][j] = __builtin_fmaf(scf[j] * sc[c], (float)C[c][j], sum[a][c][j]);
+#endif
+        }
+        asm volatile("" : "+v"(sum[a][c][0]), "+v"(sum[a][c][1]), "+v"(sum[a][c][2]),
+                     "+v"(sum[a][c][3]), "+v"(sum[a][c][4]), "+v"(sum[a][c][5]),
+                     "+v"(sum[a][c][6]), "+v"(sum[a][c][7]));
+      }
+      __builtin_amdgcn_sched_barrier(0);
+    }
+    if (nxt) stage_store(lds + ((e + 1) & 1) * kSlot);
+    __syncthreads();
+  };
+  for (int e = 0; e + 1 < E; ++e) epoch(std::true_type{}, e);
+  epoch(std::false_type{}, E - 1);
+
+  for (int a = 0; a < 2; ++a)
+    for (int j = 0; j < 8; ++j) {
+      const int t = t0 + wt * 32 + a * 16 + 8 * hi + j;
+      float r = 1.0f;
+      if (PT) r = ds[(size_t)t * groups128];
+      for (int c = 0; c < 4; ++c)
+        out[(size_t)t * M + f0 + wf * 64 + c * 16 + lr] = sum[a][c][j] * r;
+    }
+}
+
 __global__ void XorNibbles(uint8_t* w, size_t bytes) {
   const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
   if (i >= bytes)
@@ -1032,6 +1199,36 @@ int main(int argc, char** argv) {
         md5 = std::max(md5, (double)std::fabs(o5[i] - o2[i]));
       std::printf("v5   %.3f ms  %.1f TOPS  max |v2-v5| %.3e\n", ms5,
                   2.0 * M * N * K / (ms5 * 1e-3) / 1e12, md5);
+    }
+    {
+      uint8_t* dw6;
+      HIP_OK(hipMalloc(&dw6, we->len));
+      HIP_OK(hipMemcpy(dw6, dw, we->len, hipMemcpyDeviceToDevice));
+      XorNibbles<<<(we->len + 255) / 256, 256>>>(dw6, we->len);
+      float* dout6;
+      HIP_OK(hipMalloc(&dout6, (size_t)N * M * 4));
+      const int g6 = (M / 128) * (N / 128);
+#ifdef EXP_PT
+      constexpr bool kPT6 = true;
+#else
+      constexpr bool kPT6 = false;
+#endif
+      Iu4Gemm6<kPT6><<<g6, 256>>>(dw6, dqs, dds, dout6, M, N, K);
+      HIP_OK(hipDeviceSynchronize());
+      hipEventRecord(a);
+      for (int i = 0; i < 1000; ++i) Iu4Gemm6<kPT6><<<g6, 256>>>(dw6, dqs, dds, dout6, M, N, K);
+      hipEventRecord(b);
+      hipEventSynchronize(b);
+      float ms6;
+      hipEventElapsedTime(&ms6, a, b);
+      ms6 /= 1000;
+      std::vector<float> o6((size_t)N * M);
+      HIP_OK(hipMemcpy(o6.data(), dout6, o6.size() * 4, hipMemcpyDeviceToHost));
+      double md6 = 0;
+      for (size_t i = 0; i < o6.size(); ++i)
+        md6 = std::max(md6, (double)std::fabs(o6[i] - o2[i]));
+      std::printf("v6   %.3f ms  %.1f TOPS  max |v2-v6| %.3e\n", ms6,
+                  2.0 * M * N * K / (ms6 * 1e-3) / 1e12, md6);
     }
     hipEventRecord(a);
     for (int i = 0; i < reps; ++i)

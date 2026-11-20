@@ -185,3 +185,29 @@ roughly additive (about 65 TOPS); 100 TOPS is not reachable with this format.
 With the per-token scale the epilogue is free (removing it changes nothing),
 barriers are worth about 7%, and the rest is global-load staging. The bound for
 this design is about 70 TOPS.
+
+### Reference-architecture kernel (v6) and where the remaining time goes
+
+v6 follows the structure of the published production kernel for this format:
+K128 epochs, two 16 KiB LDS slots (one barrier per epoch), fragment-major LDS
+layout (each WMMA operand fragment is one contiguous 128-byte run, 64-bit
+reads), 32-token x 64-feature wave tile, fold per token fragment with the
+token scales shared through DPP row_share, weight scales prefetched one epoch
+ahead, tile-major grid order. It is exact (max diff 9.5e-7) and uses 170 VGPRs.
+
+| Variant | TOPS |
+|---|---|
+| v6 exact | 58.5-59.0 |
+| v6 per-token scale | 61-63 |
+| v6 without next-epoch loads | 68.5 |
+| v6 without the fold | 69.0 |
+| v6 without loads and fold | 74.6 |
+| v6 with 128-bit fragment reads (dropped, 46) | 46 |
+| v5 exact / v5 per-token | 61-63 / 65-67 |
+
+Findings: the production-style design lands on the same 58-59 as v3; the
+256x128 v5 tile is the better exact kernel. LDS co-residency (1, 2 or 3 CTAs per
+WGP) changes nothing, so cross-CTA overlap of fold and WMMA is not what limits
+it. Loads, fold and barriers each cost 6-8% and add up; even with loads and
+fold removed the structure reaches 74.6, not 88-97. Best exact: v5 at about 62;
+best with per-token scale: about 67.
