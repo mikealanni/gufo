@@ -2072,6 +2072,7 @@ __device__ __forceinline__ void Gemm13Body(
     }
   };
   uint4 wc[2][4];
+  uint4 wn[2][4];
   for (int b = 0; b < 2; ++b) {
     for (int q = 0; q < 4; ++q)
       wc[b][q] = *reinterpret_cast<const uint4*>(
@@ -2141,7 +2142,7 @@ __device__ __forceinline__ void Gemm13Body(
     __builtin_amdgcn_sched_barrier(0);
   };
 
-  const auto wmma = [&](int h, i32x8(&C)[2][2], const char* slot, bool reload,
+  const auto wmma = [&](int h, i32x8(&C)[2][2], const char* slot, uint4 (&wsrc)[2][4], uint4 (&wdst)[2][4], bool reload,
                         int e) {
 #pragma unroll
     for (int s = 0; s < 8; ++s) {
@@ -2151,7 +2152,7 @@ __device__ __forceinline__ void Gemm13Body(
                                                  (2 * h + a2) * 1024 + s * 128);
 #pragma unroll
       for (int b = 0; b < 2; ++b) {
-        const uint4 wq = wc[b][s >> 1];
+        const uint4 wq = wsrc[b][s >> 1];
         const i32x2 wv =
             (s & 1) ? i32x2{(int)wq.z, (int)wq.w} : i32x2{(int)wq.x, (int)wq.y};
 #pragma unroll
@@ -2169,7 +2170,7 @@ __device__ __forceinline__ void Gemm13Body(
       if (reload && (s & 1)) {
 #endif
         for (int b = 0; b < 2; ++b) {
-          wc[b][s >> 1] = *reinterpret_cast<const uint4*>(
+          wdst[b][s >> 1] = *reinterpret_cast<const uint4*>(
               reinterpret_cast<const char*>(pw) +
               (((size_t)(e + 1) * (M >> 4) + (frow >> 4) + b) * 4 + (s >> 1)) *
                   256 +
@@ -2181,7 +2182,7 @@ __device__ __forceinline__ void Gemm13Body(
     }
   };
 
-  const auto sub = [&](auto nxt_tag, int e, const char* slot) {
+  const auto sub = [&](auto nxt_tag, int e, const char* slot, uint4 (&wsrc)[2][4], uint4 (&wdst)[2][4]) {
     constexpr bool nxt = decltype(nxt_tag)::value;
     float sc[2];
     for (int b = 0; b < 2; ++b)
@@ -2194,9 +2195,9 @@ __device__ __forceinline__ void Gemm13Body(
     const char* ssl = lds + 32768 + (e & 7) * 512;
     if (Y)
       fold(1, Cp, scp, sslp);
-    wmma(0, C0, slot, false, e);
+    wmma(0, C0, slot, wsrc, wdst, nxt, e);
     fold(0, C0, sc, ssl);
-    wmma(1, C1, slot, nxt, e);
+    wmma(1, C1, slot, wsrc, wdst, false, e);
     if (Y) {
       for (int b = 0; b < 2; ++b)
         for (int a = 0; a < 2; ++a)
@@ -2212,15 +2213,15 @@ __device__ __forceinline__ void Gemm13Body(
   for (; e + 2 < E; e += 2) {
     const char* slot = lds + (e & 2) * 8192;
     stage_load(e + 2);
-    sub(std::true_type{}, e, slot);
-    sub(std::true_type{}, e + 1, slot + 8192);
+    sub(std::true_type{}, e, slot, wc, wn);
+    sub(std::true_type{}, e + 1, slot + 8192, wn, wc);
     stage_store(lds + ((e + 2) & 2) * 8192, e + 2);
     __syncthreads();
   }
   {
     const char* slot = lds + (e & 2) * 8192;
-    sub(std::true_type{}, e, slot);
-    sub(std::false_type{}, e + 1, slot + 8192);
+    sub(std::true_type{}, e, slot, wc, wn);
+    sub(std::false_type{}, e + 1, slot + 8192, wn, wc);
   }
   if (Y)
     fold(1, Cp, scp, sslp);
