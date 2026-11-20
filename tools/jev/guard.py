@@ -43,6 +43,8 @@ HEAVY = [re.compile(p) for p in (
     r"(?:^|\s)(?:\./)?build/[\w.-]+/(?:\S*/)?tests/\S*(?:_test|_tests|_bench|_probe)\b",
     r"\bgufo-(?:npu|sbtest[\w-]*)\b",
     r"npu-lock\.sh",
+    r"\bhipcc\b",
+    r"tools/bench/build\.sh",
 )]
 # Which shared resources a heavy pattern needs (gufo itself holds gpu, npu and a lot of ram).
 # A heavy command only stops gufo when it needs something gufo holds; pure-ram commands also
@@ -61,6 +63,8 @@ HEAVY_RES = [
     {"gpu"},                # built test binaries
     {"npu"},                # gufo-npu / gufo-sbtest*
     {"npu"},                # npu-lock.sh
+    {"ram"},                # hipcc (compiles need RAM, not the GPU)
+    {"ram"},                # tools/bench/build.sh
 ]
 assert len(HEAVY_RES) == len(HEAVY), "HEAVY and HEAVY_RES must stay parallel"
 # Models ~/run-gufo.sh can start (GUFO_MODEL).
@@ -593,7 +597,21 @@ def needle_for(segment):
     return " ".join(keep) or segment[:120]
 
 
-def find_pids(needle):
+def process_start_epoch(pid):
+    """When the process started, in epoch seconds; None if it cannot be read."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            ticks = int(f.read().rsplit(")", 1)[1].split()[19])
+        with open("/proc/uptime") as f:
+            uptime = float(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+    return time.time() - uptime + ticks / os.sysconf("SC_CLK_TCK")
+
+
+def find_pids(needle, since=None):
+    """Processes whose command line contains needle. With since, only those started at or after that epoch,
+    so long-lived daemons that happen to match a generic needle (such as 'python3 -') are ignored."""
     me = os.getpid()
     hits = []
     for entry in os.listdir("/proc"):
@@ -604,8 +622,13 @@ def find_pids(needle):
                 cmd = f.read().replace(b"\0", b" ").decode("utf-8", "replace")
         except OSError:
             continue
-        if needle in cmd:
-            hits.append(int(entry))
+        if needle not in cmd:
+            continue
+        if since is not None:
+            started = process_start_epoch(entry)
+            if started is not None and started < since:
+                continue
+        hits.append(int(entry))
     return hits
 
 KFD = "/dev/kfd"
@@ -1080,7 +1103,8 @@ class Guard:
             needle = needle_for(segment)
             log(f"watching processes matching {needle!r}")
             multi = bool(re.search(r"\.(py|sh)\b|&\s*$|\b(nohup|setsid)\b", segment))
-            self.begin_watch(segment[:60], lambda: find_pids(needle), quiet=MULTI_PASS_QUIET if multi else None)
+            since = time.time() - 3  # the command starts after the stop; older matches are unrelated daemons
+            self.begin_watch(segment[:60], lambda: find_pids(needle, since), quiet=MULTI_PASS_QUIET if multi else None)
 
     async def memory_watchdog(self):
         low = 0
@@ -1194,7 +1218,7 @@ class Guard:
         while not self.ready.is_set():
             if not self.want_up and self.state == "down":
                 log("gufo is not running and the guard did not stop it; not starting it for a request")
-                return
+                return True
             idle = self.starter is None or self.starter.done()
             if (self.want_up and self.state == "down" and idle and time.time() - self.last_fail > 15
                     and (self.watch_task is None or self.watch_task.done())):
@@ -1203,8 +1227,12 @@ class Guard:
                 await asyncio.wait_for(self.ready.wait(), 10)
             except asyncio.TimeoutError:
                 if resp is not None:
-                    await resp.write(b": jev-guard waiting for gufo\n\n")
+                    try:
+                        await resp.write(b": jev-guard waiting for gufo\n\n")
+                    except ConnectionResetError:
+                        return False  # the client gave up waiting
         log(f"request held {time.time() - t_wait:.1f}s")
+        return True
 
     async def proxy(self, request):
         self.inflight += 1
@@ -1269,7 +1297,8 @@ class Guard:
                 resp = web.StreamResponse(headers={"Content-Type": "text/event-stream",
                                                    "Cache-Control": "no-cache"})
                 await resp.prepare(request)
-            await self.wait_ready(resp)
+            if not await self.wait_ready(resp):
+                return resp
         headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP}
         if request.method == "POST":
             # Clients (opencode) keep asking for the model they were configured with after a switch.
