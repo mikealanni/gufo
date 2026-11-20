@@ -26,6 +26,24 @@ void LaunchIu4RepackWeights(const void* blocks, void* tiles,
                             std::size_t rows, std::size_t cols,
                             hipStream_t stream);
 
+// Rotation sign vectors the artifact was built with: 256 signs for the pre
+// butterfly diagonal followed by 256 for the post butterfly diagonal.
+void FillIu4RotationSigns(float* host_signs_512);
+
+// Norm-fed activation producer. For every token row of x [n x k] (f32, k a
+// multiple of 256 and at most 8192): RMSNorm with norm_weight, divide by awq
+// (null for none), rotate by the signed Hadamard transform over 256 and
+// quantize each 128-wide group to signed int4 with a float scale. Output is the
+// tile-major layout the int4 GEMM reads: tokens in tiles of 16, for every 128
+// group a 1024-byte block holding 16 lanes x 32 bytes, and scales stored
+// [group][padded token]. Rows from n to padded_n are written as zero codes with
+// scale zero so the GEMM can run on a multiple of 128 tokens.
+void LaunchIu4NormQuantize(const float* x, const float* norm_weight,
+                           const float* awq, const float* signs, float eps,
+                           std::size_t n, std::size_t padded_n, std::size_t k,
+                           std::uint8_t* tiles, float* scales,
+                           hipStream_t stream);
+
 }  // namespace gufo::hip
 #endif
 #endif

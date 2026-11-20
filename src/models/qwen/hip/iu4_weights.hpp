@@ -62,6 +62,8 @@ public:
   [[nodiscard]] const Iu4Projection& LmHead() const noexcept {
     return lm_head_;
   }
+  // 512 device floats: the two rotation sign vectors (see ops/iu4.hpp).
+  [[nodiscard]] const float* signs() const noexcept { return signs_; }
   [[nodiscard]] std::uint32_t layers() const noexcept { return layers_; }
   [[nodiscard]] std::size_t device_bytes() const noexcept {
     return device_bytes_;
@@ -70,6 +72,7 @@ public:
 private:
   std::vector<Iu4Projection> projections_;
   Iu4Projection lm_head_;
+  float* signs_{nullptr};
   std::uint32_t layers_{0};
   std::size_t device_bytes_{0};
 };

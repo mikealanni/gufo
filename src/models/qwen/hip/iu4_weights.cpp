@@ -171,6 +171,9 @@ void Iu4Weights::Release() noexcept {
     release(p);
   projections_.clear();
   release(lm_head_);
+  if (signs_ != nullptr)
+    (void)hipFree(signs_);
+  signs_ = nullptr;
   layers_ = 0;
   device_bytes_ = 0;
 }
@@ -286,6 +289,15 @@ bool Iu4Weights::Load(const std::string& path, std::uint32_t layers,
     return true;
   };
 
+  {
+    float host_signs[512];
+    FillIu4RotationSigns(host_signs);
+    if (hipMalloc(reinterpret_cast<void**>(&signs_), sizeof(host_signs)) !=
+            hipSuccess ||
+        hipMemcpy(signs_, host_signs, sizeof(host_signs),
+                  hipMemcpyHostToDevice) != hipSuccess)
+      return Fail(error, "device allocation failed for rotation signs");
+  }
   projections_.assign(static_cast<std::size_t>(layers) * kRoleCount, {});
   layers_ = layers;
   for (std::uint32_t l = 0; l < layers; ++l) {
