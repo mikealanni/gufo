@@ -779,32 +779,36 @@ constexpr int kNW = 8;
 constexpr int kAB = 128 * 64;
 constexpr int kSlot = 2 * kAB;
 
-template <typename T>
+template<typename T>
 __device__ __forceinline__ const T* At(const void* p, uint32_t off) {
   return reinterpret_cast<const T*>(reinterpret_cast<const char*>(p) + off);
 }
 
 __device__ __forceinline__ int RowShare(int v, int k) {
 #define V6_SHARE(k) \
-  case k: return __builtin_amdgcn_update_dpp(0, v, 0x150 + k, 0xf, 0xf, false);
+  case k:           \
+    return __builtin_amdgcn_update_dpp(0, v, 0x150 + k, 0xf, 0xf, false);
   switch (k) {
-    V6_SHARE(0) V6_SHARE(1) V6_SHARE(2) V6_SHARE(3) V6_SHARE(4) V6_SHARE(5)
-    V6_SHARE(6) V6_SHARE(7) V6_SHARE(8) V6_SHARE(9) V6_SHARE(10) V6_SHARE(11)
-    V6_SHARE(12) V6_SHARE(13) V6_SHARE(14) V6_SHARE(15)
-    default: __builtin_unreachable();
+    V6_SHARE(0)
+    V6_SHARE(1) V6_SHARE(2) V6_SHARE(3) V6_SHARE(4) V6_SHARE(5) V6_SHARE(6)
+        V6_SHARE(7) V6_SHARE(8) V6_SHARE(9) V6_SHARE(10) V6_SHARE(11)
+            V6_SHARE(12) V6_SHARE(13) V6_SHARE(14) V6_SHARE(15) default
+        : __builtin_unreachable();
   }
 #undef V6_SHARE
 }
 }  // namespace v6
 
-template <bool PT>
+template<bool PT>
 __global__ void __launch_bounds__(256)
     Iu4Gemm6(const uint8_t* __restrict__ w, const uint8_t* __restrict__ qs,
-             const float* __restrict__ ds, float* __restrict__ out, int M, int N, int K) {
+             const float* __restrict__ ds, float* __restrict__ out, int M,
+             int N, int K) {
   using namespace v6;
 #ifdef EXP6_PAD
   __shared__ char pad[EXP6_PAD];
-  if (threadIdx.x == 1023) pad[threadIdx.x] = 1;
+  if (threadIdx.x == 1023)
+    pad[threadIdx.x] = 1;
 #endif
   __shared__ __attribute__((aligned(16))) char lds[2 * kSlot];
   const int tid = threadIdx.x;
@@ -820,22 +824,29 @@ __global__ void __launch_bounds__(256)
   const uint32_t wrow = (uint32_t)(K >> 8) * kBlockBytes;
   const uint32_t qrow = (uint32_t)(K >> 1);
   const int sr = 16 * wave + lr;
-  const char* gw = reinterpret_cast<const char*>(w) + (size_t)(f0 + sr) * wrow + 8u + 8u * hi;
-  const char* gq = reinterpret_cast<const char*>(qs) + (size_t)(t0 + sr) * qrow + 8u * hi;
+  const char* gw = reinterpret_cast<const char*>(w) + (size_t)(f0 + sr) * wrow +
+                   8u + 8u * hi;
+  const char* gq =
+      reinterpret_cast<const char*>(qs) + (size_t)(t0 + sr) * qrow + 8u * hi;
   const uint32_t lds_off = wave * 1024 + hi * 128 + lr * 8;
   const uint32_t aoff = (wt * 2) * 1024 + prow * 8;
   const uint32_t boff = kAB + (wf * 4) * 1024 + lr * 8;
-  const char* gsc = reinterpret_cast<const char*>(w) + (size_t)(f0 + wf * 64 + lr) * wrow;
-  const float* gd = ds + (size_t)(t0 + wt * 32 + 16 * (lr >> 3) + 8 * hi + (lr & 7)) * groups128;
+  const char* gsc =
+      reinterpret_cast<const char*>(w) + (size_t)(f0 + wf * 64 + lr) * wrow;
+  const float* gd =
+      ds +
+      (size_t)(t0 + wt * 32 + 16 * (lr >> 3) + 8 * hi + (lr & 7)) * groups128;
 
   float sum[2][4][8];
   for (int a = 0; a < 2; ++a)
     for (int c = 0; c < 4; ++c)
-      for (int j = 0; j < 8; ++j) sum[a][c][j] = 0.0f;
+      for (int j = 0; j < 8; ++j)
+        sum[a][c][j] = 0.0f;
 
   i32x2 sa[4], sb[4];
   const auto stage_load = [&](int e) {
-    const uint32_t eo = (uint32_t)(e >> 1) * kBlockBytes + (uint32_t)(e & 1) * 64;
+    const uint32_t eo =
+        (uint32_t)(e >> 1) * kBlockBytes + (uint32_t)(e & 1) * 64;
     const uint32_t qo = (uint32_t)e * 64;
     for (int i = 0; i < 4; ++i) {
       sb[i] = *At<i32x2>(gw, eo + 16u * i);
@@ -854,9 +865,11 @@ __global__ void __launch_bounds__(256)
   float wsn = 0.0f;
   const auto meta_load = [&](int e) {
     for (int c = 0; c < 4; ++c)
-      scn[c] = *At<unsigned short>(
-          gsc, (uint32_t)(e >> 1) * kBlockBytes + (uint32_t)(e & 1) * 4 + c * 16 * wrow);
-    if (!PT) wsn = gd[e];
+      scn[c] =
+          *At<unsigned short>(gsc, (uint32_t)(e >> 1) * kBlockBytes +
+                                       (uint32_t)(e & 1) * 4 + c * 16 * wrow);
+    if (!PT)
+      wsn = gd[e];
   };
   meta_load(0);
   __syncthreads();
@@ -865,17 +878,21 @@ __global__ void __launch_bounds__(256)
     constexpr bool nxt = decltype(nxt_tag)::value;
     char* slot = lds + (e & 1) * kSlot;
     float sc[4];
-    for (int c = 0; c < 4; ++c) sc[c] = __half2float(__ushort_as_half(scn[c]));
+    for (int c = 0; c < 4; ++c)
+      sc[c] = __half2float(__ushort_as_half(scn[c]));
     const int wsf = __float_as_int(wsn);
     __builtin_amdgcn_sched_barrier(0);
 #ifndef EXP6_NOLOAD
-    if (nxt) stage_load(e + 1);
+    if (nxt)
+      stage_load(e + 1);
 #endif
-    if (nxt) meta_load(e + 1);
+    if (nxt)
+      meta_load(e + 1);
     __builtin_amdgcn_sched_barrier(0);
     i32x2 av = *reinterpret_cast<const i32x2*>(slot + aoff);
     i32x2 bv[4];
-    for (int c = 0; c < 4; ++c) bv[c] = *reinterpret_cast<const i32x2*>(slot + boff + c * 1024);
+    for (int c = 0; c < 4; ++c)
+      bv[c] = *reinterpret_cast<const i32x2*>(slot + boff + c * 1024);
     i32x8 C[4];
 #pragma unroll
     for (int a = 0; a < 2; ++a) {
@@ -886,9 +903,11 @@ __global__ void __launch_bounds__(256)
         i32x2 bn[4];
         if (i < 16) {
           const int na = i >> 3, ns = i & 7;
-          an = *reinterpret_cast<const i32x2*>(slot + aoff + na * 1024 + ns * 128);
+          an = *reinterpret_cast<const i32x2*>(slot + aoff + na * 1024 +
+                                               ns * 128);
           for (int c = 0; c < 4; ++c)
-            bn[c] = *reinterpret_cast<const i32x2*>(slot + boff + c * 1024 + ns * 128);
+            bn[c] = *reinterpret_cast<const i32x2*>(slot + boff + c * 1024 +
+                                                    ns * 128);
         }
         for (int c = 0; c < 4; ++c) {
           const i32x8 z = (i32x8){0, 0, 0, 0, 0, 0, 0, 0};
@@ -897,9 +916,11 @@ __global__ void __launch_bounds__(256)
         }
         if (i < 16) {
           av = an;
-          for (int c = 0; c < 4; ++c) bv[c] = bn[c];
+          for (int c = 0; c < 4; ++c)
+            bv[c] = bn[c];
         }
-        if (s != 7) __builtin_amdgcn_sched_barrier(0);
+        if (s != 7)
+          __builtin_amdgcn_sched_barrier(0);
       }
       float scf[8];
       if (!PT) {
@@ -916,26 +937,32 @@ __global__ void __launch_bounds__(256)
           if (PT)
             sum[a][c][j] = __builtin_fmaf(sc[c], (float)C[c][j], sum[a][c][j]);
           else
-            sum[a][c][j] = __builtin_fmaf(scf[j] * sc[c], (float)C[c][j], sum[a][c][j]);
+            sum[a][c][j] =
+                __builtin_fmaf(scf[j] * sc[c], (float)C[c][j], sum[a][c][j]);
 #endif
         }
-        asm volatile("" : "+v"(sum[a][c][0]), "+v"(sum[a][c][1]), "+v"(sum[a][c][2]),
-                     "+v"(sum[a][c][3]), "+v"(sum[a][c][4]), "+v"(sum[a][c][5]),
-                     "+v"(sum[a][c][6]), "+v"(sum[a][c][7]));
+        asm volatile(""
+                     : "+v"(sum[a][c][0]), "+v"(sum[a][c][1]),
+                       "+v"(sum[a][c][2]), "+v"(sum[a][c][3]),
+                       "+v"(sum[a][c][4]), "+v"(sum[a][c][5]),
+                       "+v"(sum[a][c][6]), "+v"(sum[a][c][7]));
       }
       __builtin_amdgcn_sched_barrier(0);
     }
-    if (nxt) stage_store(lds + ((e + 1) & 1) * kSlot);
+    if (nxt)
+      stage_store(lds + ((e + 1) & 1) * kSlot);
     __syncthreads();
   };
-  for (int e = 0; e + 1 < E; ++e) epoch(std::true_type{}, e);
+  for (int e = 0; e + 1 < E; ++e)
+    epoch(std::true_type{}, e);
   epoch(std::false_type{}, E - 1);
 
   for (int a = 0; a < 2; ++a)
     for (int j = 0; j < 8; ++j) {
       const int t = t0 + wt * 32 + a * 16 + 8 * hi + j;
       float r = 1.0f;
-      if (PT) r = ds[(size_t)t * groups128];
+      if (PT)
+        r = ds[(size_t)t * groups128];
       for (int c = 0; c < 4; ++c)
         out[(size_t)t * M + f0 + wf * 64 + c * 16 + lr] = sum[a][c][j] * r;
     }
@@ -1216,7 +1243,8 @@ int main(int argc, char** argv) {
       Iu4Gemm6<kPT6><<<g6, 256>>>(dw6, dqs, dds, dout6, M, N, K);
       HIP_OK(hipDeviceSynchronize());
       hipEventRecord(a);
-      for (int i = 0; i < 1000; ++i) Iu4Gemm6<kPT6><<<g6, 256>>>(dw6, dqs, dds, dout6, M, N, K);
+      for (int i = 0; i < 1000; ++i)
+        Iu4Gemm6<kPT6><<<g6, 256>>>(dw6, dqs, dds, dout6, M, N, K);
       hipEventRecord(b);
       hipEventSynchronize(b);
       float ms6;
