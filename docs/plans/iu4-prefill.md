@@ -293,3 +293,5 @@ All outputs match the CPU model within 1.2e-6 (zero mismatches). Grouped order n
 Double-buffered weight registers (reload a full epoch ahead, alternating between two register sets across the two sub-epochs): 74.7 -> 75.2 TOPS (216 VGPRs, 36.9 KiB LDS, 3 CTAs per WGP).
 
 Dead ends on v13: wave priority around the WMMA blocks (no change), removing the epilogue stores (no change, within noise), limiting occupancy to 2 CTAs per WGP (72.8), forcing 4 CTAs per WGP via 192 VGPRs (spills, 51). Clock under load 2.52-2.68 GHz (median 2.56), so 75.2 TOPS is 78.6% of the 95.7 TOPS WMMA peak at that clock; 80 is 83.6%.
+
+Four CTAs per WGP (8 waves per SIMD, 192 VGPR cap): measured on the v12 structure, which has the smallest register footprint (216 VGPRs, 18 KiB LDS): 70.8 -> 68.7 TOPS with the cap forced. v13 needs 234 VGPRs and 36.9 KiB LDS, so it cannot reach 4 CTAs without dropping the K=256 barrier or the weight double buffer (each worth more than the occupancy gain). Dead end.
