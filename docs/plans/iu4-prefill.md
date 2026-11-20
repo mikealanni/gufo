@@ -211,3 +211,19 @@ WGP) changes nothing, so cross-CTA overlap of fold and WMMA is not what limits
 it. Loads, fold and barriers each cost 6-8% and add up; even with loads and
 fold removed the structure reaches 74.6, not 88-97. Best exact: v5 at about 62;
 best with per-token scale: about 67.
+
+### Shape sweep, v8, and clock under load
+
+Shape sweep (N=2048, exact / per-token): gate_proj 58-63 / 62-66, down_proj
+(K=17408) 59-64 / 62-67, up_proj 56-60 / 60-65, q_proj 57-61 / 60-64, in_proj_qkv
+57-62 / 61-66. The kernels are not shape sensitive; v6 is better on the long-K
+down_proj and v5 on K=5120. v8 (256x128 tile with the K128 double-buffered
+structure) is correct and not better (56-62, 68.8 once on down_proj).
+
+Clock under load: the register-only WMMA loop sustains 2.88 GHz (107.6 TOPS,
+37.4 TOPS/GHz). The full kernels run at 2.50-2.52 GHz at 120 W (about 24.5
+TOPS/GHz); the loads-and-fold-removed ablation runs at 2.65 GHz and 140 W
+(28.1 TOPS/GHz). Even a perfect kernel at those clocks tops out near 94-99
+TOPS (37.4 x 2.5-2.65), and every byte moved through LDS, VMEM and VALU costs
+power and lowers the clock further. 92+ TOPS would need more than 95% of that
+bound, so the practical ceiling for a kernel that stages real data is about 75.
