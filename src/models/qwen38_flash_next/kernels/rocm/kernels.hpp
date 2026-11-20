@@ -43,6 +43,7 @@ enum class WeightType : std::uint32_t {
   kF16 = 1,
   kQ5_1 = 7,
   kQ8_0 = 8,
+  kQ3_K = 11,
   kQ4_K = 12,
   kQ5_K = 13,
   kQ6_K = 14,
@@ -530,7 +531,7 @@ bool RoutedGatedF16Gemm(const void* gate, const void* up, WeightType type,
                         const std::int32_t* rows_in,
                         const std::int32_t* rows_out, __half* out,
                         std::size_t m, std::size_t k, hipStream_t stream,
-                        float out_scale = 1.0F);
+                        float out_scale = 1.0F, bool swiglu_clamp = false);
 
 /// F32/BF16/F16 projection in groups of up to eight token rows. Each token
 /// keeps the same accumulation order at every batch width.
