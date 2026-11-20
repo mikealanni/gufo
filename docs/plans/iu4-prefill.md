@@ -289,3 +289,7 @@ Exact per-128 scales, Qwen3.8-27B MLP shapes, N=2048 unless noted.
 Shape sweep after all three: gate 74.7 / 74.2 (N=8192), up 74.5 / 74.5, down 74.6 (N=2048).
 Ablations on v13: barrier removed +0.2, weight reload removed +1.9, per-token scale removed (PT) 76.7.
 All outputs match the CPU model within 1.2e-6 (zero mismatches). Grouped order needs M % 512 == 0.
+
+Double-buffered weight registers (reload a full epoch ahead, alternating between two register sets across the two sub-epochs): 74.7 -> 75.2 TOPS (216 VGPRs, 36.9 KiB LDS, 3 CTAs per WGP).
+
+Dead ends on v13: wave priority around the WMMA blocks (no change), removing the epilogue stores (no change, within noise), limiting occupancy to 2 CTAs per WGP (72.8), forcing 4 CTAs per WGP via 192 VGPRs (spills, 51). Clock under load 2.52-2.68 GHz (median 2.56), so 75.2 TOPS is 78.6% of the 95.7 TOPS WMMA peak at that clock; 80 is 83.6%.
