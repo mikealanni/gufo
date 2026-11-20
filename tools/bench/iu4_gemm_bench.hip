@@ -2025,7 +2025,9 @@ __device__ __forceinline__ void Gemm13Body(
   const int prow = 8 * (lr & 1) + (lr >> 1);
   const int wf = wave & 3, wth = wave >> 2;
   const int tb = N >> 7;
-  const int f0 = (blockIdx.x / tb) * 128, t0 = (blockIdx.x % tb) * 128;
+  constexpr int G = 4;
+  const int gsz = G * tb, gid = blockIdx.x / gsz, wi = blockIdx.x % gsz;
+  const int f0 = (gid * G + wi % G) * 128, t0 = (wi / G) * 128;
   const int E = K >> 7;
   const int groups128 = K / kGroup;
   const uint32_t qrow = (uint32_t)(K >> 1);

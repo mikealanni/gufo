@@ -274,3 +274,18 @@ contiguous 256 B run, and reads token scales from an `[epoch][token]` array.
 
 Ablations on v10/v12: without global loads 78, without loads and fold 82.7.
 Loads still cost about 8 TOPS and the fold about 4.
+
+### v13: 16-byte token loads, K=256 per barrier, grouped CTA order
+
+Exact per-128 scales, Qwen3.8-27B MLP shapes, N=2048 unless noted.
+
+| Step | gate_proj TOPS |
+|---|---|
+| v12 | 69.7 |
+| + 16-byte token loads (lane-contiguous 32 B tile-major layout) | 70.6 |
+| + two 128-K groups per barrier (LDS 2 x 16 KiB slots, 8-entry scale ring) | 72.8 |
+| + CTA order grouped 4 feature blocks x all token blocks (L2 reuse) | 74.7 |
+
+Shape sweep after all three: gate 74.7 / 74.2 (N=8192), up 74.5 / 74.5, down 74.6 (N=2048).
+Ablations on v13: barrier removed +0.2, weight reload removed +1.9, per-token scale removed (PT) 76.7.
+All outputs match the CPU model within 1.2e-6 (zero mismatches). Grouped order needs M % 512 == 0.
