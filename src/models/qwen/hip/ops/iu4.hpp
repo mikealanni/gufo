@@ -44,6 +44,20 @@ void LaunchIu4NormQuantize(const float* x, const float* norm_weight,
                            std::uint8_t* tiles, float* scales,
                            hipStream_t stream);
 
+// True when the int4 GEMM can run a projection of this shape: rows must be a
+// multiple of 512 (a CTA group of four 128-feature tiles) and cols a multiple
+// of 256.
+bool Iu4GemmSupported(std::size_t rows, std::size_t cols);
+
+// out[t][f] = (or +=) sum over K of the rotated int4 weights times the int4
+// activations, in fp32, for t < n. act_tiles and act_scales come from the
+// activation producers with padded_n a multiple of 128; the weights come from
+// LaunchIu4RepackWeights. out is token-major [n x rows].
+void LaunchIu4Gemm(const void* tiles, const std::uint16_t* weight_scales,
+                   const std::uint8_t* act_tiles, const float* act_scales,
+                   float* out, bool accumulate, std::size_t rows, std::size_t n,
+                   std::size_t padded_n, std::size_t k, hipStream_t stream);
+
 }  // namespace gufo::hip
 #endif
 #endif

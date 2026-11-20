@@ -36,6 +36,11 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(qwen27b_iu4_producer_test PRIVATE hip::host)
   set_tests_properties(qwen27b_iu4_producer_test PROPERTIES ENVIRONMENT
     "GUFO_IU4_ARTIFACT=/mnt/raid0/hipfire-eval/models/qwen3.8-27b.mq4-xts")
+  add_qwen27b_test(qwen27b_iu4_gemm_test iu4_gemm_test.cpp
+    "gpu;hip;iu4;correctness;external-model")
+  target_link_libraries(qwen27b_iu4_gemm_test PRIVATE hip::host)
+  set_tests_properties(qwen27b_iu4_gemm_test PROPERTIES ENVIRONMENT
+    "GUFO_IU4_ARTIFACT=/mnt/raid0/hipfire-eval/models/qwen3.8-27b.mq4-xts")
   add_qwen27b_test(qwen27b_target_test target_test.cpp
     "gpu;hip;target;external-model")
   add_qwen27b_test(qwen_mtp_gpu_test mtp_test.cpp "gpu;hip;mtp;external-model")
