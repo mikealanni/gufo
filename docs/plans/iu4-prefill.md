@@ -159,3 +159,17 @@ Conclusion: with per-128-group weight and activation scales the full kernel
 tops out near 57-62 TOPS in HIP C++. Remaining untested levers: weights
 straight to registers, double-buffered A, a 256 x 256 tile, and a per-token
 activation scale (one cvt and one fma per element, at a quality cost).
+
+## Scale-consumption experiments (clocks locked, 120 W, 27B gate_proj, N=2048)
+
+| Variant | TOPS | Notes |
+|---|---|---|
+| v3 (128x128 tile, per-group activation and weight scales) | 58.5-58.9 | baseline |
+| per-token activation scale (timing ablation, `EXP_PT`) | 61.7 | epilogue `acc += sc*float(d)`, one row multiply at the end; output differs by design |
+| v5: 256x128 tile, 16 waves, exact semantics | 61.3 | correct (max diff 9.5e-7) |
+
+The weight scale is already loaded once per group per lane (two LDS reads) and
+held in registers across the WMMA block; the combined product costs one multiply
+per element. Removing the activation scale entirely only gains 5%, so the
+epilogue is not the dominant loss: staging and barriers are. The two gains are
+roughly additive (about 65 TOPS); 100 TOPS is not reachable with this format.

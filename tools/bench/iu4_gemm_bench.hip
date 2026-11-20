@@ -10,29 +10,29 @@
 //   sx * (sc * dot(q_w, q_x) + zp * sum(q_x)) per 128 block.
 //
 // Usage: iu4_gemm_bench <model.mq4> <weight tensor name> <awq tensor name> N
+#include <fcntl.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <fcntl.h>
 #include <string>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
 #include <vector>
 
-#define HIP_OK(x)                                                    \
-  do {                                                               \
-    hipError_t e_ = (x);                                             \
-    if (e_ != hipSuccess) {                                          \
-      std::fprintf(stderr, "%s:%d %s\n", __FILE__, __LINE__,         \
-                   hipGetErrorString(e_));                           \
-      std::exit(1);                                                  \
-    }                                                                \
+#define HIP_OK(x)                                            \
+  do {                                                       \
+    hipError_t e_ = (x);                                     \
+    if (e_ != hipSuccess) {                                  \
+      std::fprintf(stderr, "%s:%d %s\n", __FILE__, __LINE__, \
+                   hipGetErrorString(e_));                   \
+      std::exit(1);                                          \
+    }                                                        \
   } while (0)
 
 typedef int i32x2 __attribute__((ext_vector_type(2)));
@@ -44,11 +44,13 @@ constexpr int kBlockBytes = 136;
 // ---------------------------------------------------------------- producer
 // One workgroup of 256 threads per (token, 256-wide K group).
 __device__ __forceinline__ float WaveSum(float v) {
-  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor(v, o);
+  for (int o = 16; o > 0; o >>= 1)
+    v += __shfl_xor(v, o);
   return v;
 }
 __device__ __forceinline__ float WaveMax(float v) {
-  for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor(v, o));
+  for (int o = 16; o > 0; o >>= 1)
+    v = fmaxf(v, __shfl_xor(v, o));
   return v;
 }
 
@@ -81,10 +83,12 @@ __global__ void __launch_bounds__(256)
     __syncthreads();
   }
   float val = v[t] * 0.0625f * signs2[t];
-  if (rotated_f32) rotated_f32[(size_t)n * K + kk] = val;
+  if (rotated_f32)
+    rotated_f32[(size_t)n * K + kk] = val;
   const int wave = t >> 5, lane = t & 31;
   float amax = WaveMax(fabsf(val));
-  if (lane == 0) red[wave][0] = amax;
+  if (lane == 0)
+    red[wave][0] = amax;
   __syncthreads();
   // half h = t / 128 owns waves 4h..4h+3
   const int h = t >> 7;
@@ -101,7 +105,8 @@ __global__ void __launch_bounds__(256)
     }
     __syncthreads();
     if (lane == 0)
-      for (int c = 0; c < kCandidates; ++c) red[wave][c] = err[c];
+      for (int c = 0; c < kCandidates; ++c)
+        red[wave][c] = err[c];
     __syncthreads();
     float best = 1e30f;
     for (int c = 0; c < kCandidates; ++c) {
@@ -124,7 +129,8 @@ __global__ void __launch_bounds__(256)
   // integer sum of the half's codes
   float sq = WaveSum((float)q);
   __syncthreads();
-  if (lane == 0) red[wave][0] = sq;
+  if (lane == 0)
+    red[wave][0] = sq;
   __syncthreads();
   if ((t & 127) == 0) {
     const int sum = (int)(red[4 * h][0] + red[4 * h + 1][0] +
@@ -135,16 +141,18 @@ __global__ void __launch_bounds__(256)
   }
 }
 
-
-// ----------------------------------------------------- producer, wave per group
-// One wave handles one 256-wide group: lane l owns elements 8l..8l+7. Hadamard
-// strides 1,2,4 are in registers, strides 8..128 are lane-xor shuffles.
+// ----------------------------------------------------- producer, wave per
+// group One wave handles one 256-wide group: lane l owns elements 8l..8l+7.
+// Hadamard strides 1,2,4 are in registers, strides 8..128 are lane-xor
+// shuffles.
 __device__ __forceinline__ float Reduce16Max(float v) {
-  for (int o = 8; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor(v, o));
+  for (int o = 8; o > 0; o >>= 1)
+    v = fmaxf(v, __shfl_xor(v, o));
   return v;
 }
 __device__ __forceinline__ float Reduce16Sum(float v) {
-  for (int o = 8; o > 0; o >>= 1) v += __shfl_xor(v, o);
+  for (int o = 8; o > 0; o >>= 1)
+    v += __shfl_xor(v, o);
   return v;
 }
 
@@ -156,15 +164,18 @@ __global__ void __launch_bounds__(256)
                     int total_groups, int use_search) {
   const int lane = threadIdx.x & 31;
   const int gid = blockIdx.x * 8 + (threadIdx.x >> 5);
-  if (gid >= total_groups) return;
+  if (gid >= total_groups)
+    return;
   const int groups = K / 256;
   const int g256 = gid % groups;
   const int n = gid / groups;
   const size_t base = (size_t)n * K + (size_t)g256 * 256 + lane * 8;
   const float4 x0 = *reinterpret_cast<const float4*>(x + base);
   const float4 x1 = *reinterpret_cast<const float4*>(x + base + 4);
-  const float4 a0 = *reinterpret_cast<const float4*>(awq + g256 * 256 + lane * 8);
-  const float4 a1 = *reinterpret_cast<const float4*>(awq + g256 * 256 + lane * 8 + 4);
+  const float4 a0 =
+      *reinterpret_cast<const float4*>(awq + g256 * 256 + lane * 8);
+  const float4 a1 =
+      *reinterpret_cast<const float4*>(awq + g256 * 256 + lane * 8 + 4);
   const float4 p0 = *reinterpret_cast<const float4*>(signs1 + lane * 8);
   const float4 p1 = *reinterpret_cast<const float4*>(signs1 + lane * 8 + 4);
   float v[8] = {x0.x / a0.x * p0.x, x0.y / a0.y * p0.y, x0.z / a0.z * p0.z,
@@ -192,10 +203,12 @@ __global__ void __launch_bounds__(256)
   const float4 q1 = *reinterpret_cast<const float4*>(signs2 + lane * 8 + 4);
   const float sg[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
 #pragma unroll
-  for (int i = 0; i < 8; ++i) v[i] *= 0.0625f * sg[i];
+  for (int i = 0; i < 8; ++i)
+    v[i] *= 0.0625f * sg[i];
   float amax = 0.0f;
 #pragma unroll
-  for (int i = 0; i < 8; ++i) amax = fmaxf(amax, fabsf(v[i]));
+  for (int i = 0; i < 8; ++i)
+    amax = fmaxf(amax, fabsf(v[i]));
   amax = Reduce16Max(amax);  // lanes 0-15 = first half, 16-31 = second half
   float best_d = amax / 7.0f;
   if (use_search && amax > 0.0f) {
@@ -227,8 +240,10 @@ __global__ void __launch_bounds__(256)
   }
   uint32_t word = 0;
 #pragma unroll
-  for (int i = 0; i < 8; ++i) word |= (uint32_t)(q[i] & 0xF) << (4 * i);
-  *reinterpret_cast<uint32_t*>(qs + (size_t)n * (K / 2) + (size_t)g256 * 128 + lane * 4) = word;
+  for (int i = 0; i < 8; ++i)
+    word |= (uint32_t)(q[i] & 0xF) << (4 * i);
+  *reinterpret_cast<uint32_t*>(qs + (size_t)n * (K / 2) + (size_t)g256 * 128 +
+                               lane * 4) = word;
   float sum = Reduce16Sum((float)qsum);
   if ((lane & 15) == 0) {
     const size_t gi = (size_t)n * (K / kGroup) + g256 * 2 + (lane >> 4);
@@ -255,19 +270,22 @@ __global__ void __launch_bounds__(128)
   float acc[2][2][8];
   for (int a = 0; a < 2; ++a)
     for (int b = 0; b < 2; ++b)
-      for (int i = 0; i < 8; ++i) acc[a][b][i] = 0.0f;
+      for (int i = 0; i < 8; ++i)
+        acc[a][b][i] = 0.0f;
 
   for (int g = 0; g < groups128; ++g) {
     const int g256 = g >> 1, hh = g & 1;
     i32x8 d[2][2];
     for (int a = 0; a < 2; ++a)
-      for (int b = 0; b < 2; ++b) d[a][b] = (i32x8){0, 0, 0, 0, 0, 0, 0, 0};
+      for (int b = 0; b < 2; ++b)
+        d[a][b] = (i32x8){0, 0, 0, 0, 0, 0, 0, 0};
     // per-lane weight header values for the feature column this lane serves
     float sc[2], zp[2];
     const uint8_t* wp[2];
     for (int b = 0; b < 2; ++b) {
       const int m = m0 + b * 16 + col;
-      const uint8_t* blk = w + (size_t)m * wrow_bytes + (size_t)g256 * kBlockBytes;
+      const uint8_t* blk =
+          w + (size_t)m * wrow_bytes + (size_t)g256 * kBlockBytes;
       sc[b] = __half2float(*reinterpret_cast<const __half*>(blk + 4 * hh));
       zp[b] = __half2float(*reinterpret_cast<const __half*>(blk + 4 * hh + 2));
       wp[b] = blk + 8 + 64 * hh;
@@ -317,13 +335,13 @@ __global__ void __launch_bounds__(128)
       }
 }
 
-
 // ----------------------------------------------------------- GEMM, tiled v2
 // Block: 8 waves (2 token x 4 feature), tile 128 tokens x 128 features, one
 // 256-wide K block (two 128 groups) staged in LDS per step. Wave tile is
 // 64 tokens x 32 features (4 x 2 WMMA tiles).
 constexpr int kTileT = 128, kTileF = 128;
-constexpr int kRowStride = 136;  // LDS row stride in bytes (8-byte aligned, bank-skewed)
+constexpr int kRowStride =
+    136;  // LDS row stride in bytes (8-byte aligned, bank-skewed)
 
 __global__ void __launch_bounds__(256)
     Iu4Gemm2(const uint8_t* __restrict__ w, const uint8_t* __restrict__ qs,
@@ -346,7 +364,8 @@ __global__ void __launch_bounds__(256)
   float acc[4][2][8];
   for (int a = 0; a < 4; ++a)
     for (int b = 0; b < 2; ++b)
-      for (int i = 0; i < 8; ++i) acc[a][b][i] = 0.0f;
+      for (int i = 0; i < 8; ++i)
+        acc[a][b][i] = 0.0f;
 
   for (int kb = 0; kb < nblk; ++kb) {
     __syncthreads();
@@ -361,8 +380,9 @@ __global__ void __launch_bounds__(256)
     // stage weights: 128 features x 136 bytes
     for (int idx = tid; idx < kTileF * 17; idx += 256) {
       const int row = idx / 17, part = idx % 17;
-      const uint2 v = *reinterpret_cast<const uint2*>(
-          w + (size_t)(f0 + row) * wrow_bytes + (size_t)kb * kBlockBytes + part * 8);
+      const uint2 v =
+          *reinterpret_cast<const uint2*>(w + (size_t)(f0 + row) * wrow_bytes +
+                                          (size_t)kb * kBlockBytes + part * 8);
       *reinterpret_cast<uint2*>(b_s + row * kRowStride + part * 8) = v;
     }
     for (int idx = tid; idx < kTileT * 2; idx += 256) {
@@ -375,7 +395,8 @@ __global__ void __launch_bounds__(256)
     for (int hh = 0; hh < 2; ++hh) {
       i32x8 d[4][2];
       for (int a = 0; a < 4; ++a)
-        for (int b = 0; b < 2; ++b) d[a][b] = (i32x8){0, 0, 0, 0, 0, 0, 0, 0};
+        for (int b = 0; b < 2; ++b)
+          d[a][b] = (i32x8){0, 0, 0, 0, 0, 0, 0, 0};
 #pragma unroll
       for (int kk = 0; kk < 8; ++kk) {
         i32x2 av[4], bv[2];
@@ -386,7 +407,8 @@ __global__ void __launch_bounds__(256)
         }
         for (int b = 0; b < 2; ++b) {
           const uint2 r = *reinterpret_cast<const uint2*>(
-              b_s + (wf * 32 + b * 16 + col) * kRowStride + 8 + 64 * hh + 8 * kk);
+              b_s + (wf * 32 + b * 16 + col) * kRowStride + 8 + 64 * hh +
+              8 * kk);
           bv[b] = (i32x2){(int)r.x, (int)r.y};
         }
         for (int a = 0; a < 4; ++a)
@@ -396,15 +418,18 @@ __global__ void __launch_bounds__(256)
       }
       float sc[2], zp[2];
       for (int b = 0; b < 2; ++b) {
-        const uint8_t* hdr = b_s + (wf * 32 + b * 16 + col) * kRowStride + 4 * hh;
+        const uint8_t* hdr =
+            b_s + (wf * 32 + b * 16 + col) * kRowStride + 4 * hh;
         sc[b] = __half2float(*reinterpret_cast<const __half*>(hdr));
         zp[b] = __half2float(*reinterpret_cast<const __half*>(hdr + 2));
       }
 #ifdef EXP_NO_EPI
       for (int a = 0; a < 4; ++a)
         for (int i = 0; i < 8; ++i)
-          for (int b = 0; b < 2; ++b) acc[a][b][i] += (float)d[a][b][i];
-      (void)sc; (void)zp;
+          for (int b = 0; b < 2; ++b)
+            acc[a][b][i] += (float)d[a][b][i];
+      (void)sc;
+      (void)zp;
 #else
       for (int a = 0; a < 4; ++a)
         for (int i = 0; i < 8; ++i) {
@@ -426,7 +451,6 @@ __global__ void __launch_bounds__(256)
       }
 }
 
-
 // ------------------------------------------------------ GEMM, tiled v3
 // Weights are pre-XORed with 0x88 per byte so each nibble is the signed value
 // q - 8 (symmetric grid, zero point -8 scale): no zero-point correction and
@@ -434,9 +458,10 @@ __global__ void __launch_bounds__(256)
 // while the current one is multiplied.
 __global__ void __launch_bounds__(256)
     Iu4Gemm3(const uint8_t* __restrict__ w, const uint8_t* __restrict__ qs,
-             const float* __restrict__ ds, float* __restrict__ out, int M, int N,
-             int K) {
-  constexpr int kRS = 144;  // 16-byte aligned LDS rows for 128-bit fragment loads
+             const float* __restrict__ ds, float* __restrict__ out, int M,
+             int N, int K) {
+  constexpr int kRS =
+      144;  // 16-byte aligned LDS rows for 128-bit fragment loads
   __shared__ __attribute__((aligned(16))) uint8_t a_s[kTileT * kRS];
   __shared__ __attribute__((aligned(16))) uint8_t b_s[kTileF * kRS];
   __shared__ float sx_s[kTileT][2];
@@ -453,7 +478,8 @@ __global__ void __launch_bounds__(256)
   float acc[4][2][8];
   for (int a = 0; a < 4; ++a)
     for (int b = 0; b < 2; ++b)
-      for (int i = 0; i < 8; ++i) acc[a][b][i] = 0.0f;
+      for (int i = 0; i < 8; ++i)
+        acc[a][b][i] = 0.0f;
 
   uint4 ra[4];
   uint2 rb[9];
@@ -469,7 +495,8 @@ __global__ void __launch_bounds__(256)
       if (idx < kTileF * 17) {
         const int row = idx / 17, part = idx % 17;
         rb[j] = *reinterpret_cast<const uint2*>(
-            w + (size_t)(f0 + row) * wrow_bytes + (size_t)kb * kBlockBytes + part * 8);
+            w + (size_t)(f0 + row) * wrow_bytes + (size_t)kb * kBlockBytes +
+            part * 8);
       }
     }
     {
@@ -485,18 +512,19 @@ __global__ void __launch_bounds__(256)
 #ifdef EXP_NOSTAGE
     if (kb == 0) {
 #endif
-    for (int j = 0; j < 4; ++j) {
-      const int idx = tid + j * 256, row = idx >> 3, part = idx & 7;
-      *reinterpret_cast<uint4*>(a_s + row * kRS + part * 16) = ra[j];
-    }
-    for (int j = 0; j < 9; ++j) {
-      const int idx = tid + j * 256;
-      if (idx < kTileF * 17) {
-        const int row = idx / 17, part = idx % 17;
-        *reinterpret_cast<uint2*>(b_s + row * kRS + (part == 0 ? 0 : part * 8 + 8)) = rb[j];
+      for (int j = 0; j < 4; ++j) {
+        const int idx = tid + j * 256, row = idx >> 3, part = idx & 7;
+        *reinterpret_cast<uint4*>(a_s + row * kRS + part * 16) = ra[j];
       }
-    }
-    sx_s[tid >> 1][tid & 1] = rs;
+      for (int j = 0; j < 9; ++j) {
+        const int idx = tid + j * 256;
+        if (idx < kTileF * 17) {
+          const int row = idx / 17, part = idx % 17;
+          *reinterpret_cast<uint2*>(b_s + row * kRS +
+                                    (part == 0 ? 0 : part * 8 + 8)) = rb[j];
+        }
+      }
+      sx_s[tid >> 1][tid & 1] = rs;
 #ifdef EXP_NOSTAGE
     }
 #endif
@@ -504,13 +532,15 @@ __global__ void __launch_bounds__(256)
     __syncthreads();
 #endif
 #ifndef EXP_NOSTAGE
-    if (kb + 1 < nblk) prefetch(kb + 1);
+    if (kb + 1 < nblk)
+      prefetch(kb + 1);
 #endif
 #pragma nounroll
     for (int hh = 0; hh < 2; ++hh) {
       i32x8 d[4][2];
       for (int a = 0; a < 4; ++a)
-        for (int b = 0; b < 2; ++b) d[a][b] = (i32x8){0, 0, 0, 0, 0, 0, 0, 0};
+        for (int b = 0; b < 2; ++b)
+          d[a][b] = (i32x8){0, 0, 0, 0, 0, 0, 0, 0};
       const uint8_t* a_base = a_s + (wt * 64 + col) * kRS + 64 * hh;
       const uint8_t* b_base = b_s + (wf * 32 + col) * kRS + 16 + 64 * hh;
       uint4 fa[2][4], fb[2][2];
@@ -523,9 +553,11 @@ __global__ void __launch_bounds__(256)
         const int cur = j & 1, nxt = cur ^ 1;
         if (j + 1 < 4) {
           for (int a = 0; a < 4; ++a)
-            fa[nxt][a] = *reinterpret_cast<const uint4*>(a_base + a * 16 * kRS + 16 * (j + 1));
+            fa[nxt][a] = *reinterpret_cast<const uint4*>(a_base + a * 16 * kRS +
+                                                         16 * (j + 1));
           for (int b = 0; b < 2; ++b)
-            fb[nxt][b] = *reinterpret_cast<const uint4*>(b_base + b * 16 * kRS + 16 * (j + 1));
+            fb[nxt][b] = *reinterpret_cast<const uint4*>(b_base + b * 16 * kRS +
+                                                         16 * (j + 1));
         }
         __builtin_amdgcn_sched_barrier(0);
 #pragma unroll
@@ -544,21 +576,196 @@ __global__ void __launch_bounds__(256)
 #ifdef EXP_NO_EPI
       for (int a = 0; a < 4; ++a)
         for (int i = 0; i < 8; ++i)
-          for (int b = 0; b < 2; ++b) acc[a][b][i] += (float)d[a][b][i];
+          for (int b = 0; b < 2; ++b)
+            acc[a][b][i] += (float)d[a][b][i];
       continue;
 #endif
       float sc[2];
       for (int b = 0; b < 2; ++b)
         sc[b] = __half2float(*reinterpret_cast<const __half*>(
             b_s + (wf * 32 + b * 16 + col) * kRS + 4 * hh));
+#ifdef EXP_PT
+      for (int a = 0; a < 4; ++a)
+        for (int i = 0; i < 8; ++i)
+          for (int b = 0; b < 2; ++b)
+            acc[a][b][i] += sc[b] * (float)d[a][b][i];
+#else
       for (int a = 0; a < 4; ++a)
         for (int i = 0; i < 8; ++i) {
           const float sxr = sx_s[wt * 64 + a * 16 + 2 * i + half][hh];
           for (int b = 0; b < 2; ++b)
             acc[a][b][i] += (sxr * sc[b]) * (float)d[a][b][i];
         }
+#endif
     }
   }
+#ifdef EXP_PT
+  for (int a = 0; a < 4; ++a)
+    for (int i = 0; i < 8; ++i) {
+      const float sxr = sx_s[wt * 64 + a * 16 + 2 * i + half][0];
+      for (int b = 0; b < 2; ++b)
+        acc[a][b][i] *= sxr;
+    }
+#endif
+  for (int a = 0; a < 4; ++a)
+    for (int b = 0; b < 2; ++b)
+      for (int i = 0; i < 8; ++i) {
+        const int n = t0 + wt * 64 + a * 16 + 2 * i + half;
+        const int m = f0 + wf * 32 + b * 16 + col;
+        out[(size_t)n * M + m] = acc[a][b][i];
+      }
+}
+__global__ void __launch_bounds__(512)
+    Iu4Gemm5(const uint8_t* __restrict__ w, const uint8_t* __restrict__ qs,
+             const float* __restrict__ ds, float* __restrict__ out, int M,
+             int N, int K) {
+  constexpr int kRS =
+      144;  // 16-byte aligned LDS rows for 128-bit fragment loads
+  __shared__ __attribute__((aligned(16))) uint8_t a_s[256 * kRS];
+  __shared__ __attribute__((aligned(16))) uint8_t b_s[kTileF * kRS];
+  __shared__ float sx_s[256][2];
+  const int tid = threadIdx.x;
+  const int wave = tid >> 5, lane = tid & 31;
+  const int col = lane & 15, half = lane >> 4;
+  const int wt = wave & 3, wf = wave >> 2;
+  const int f0 = blockIdx.x * kTileF;
+  const int t0 = blockIdx.y * 256;
+  const int groups128 = K / kGroup;
+  const int nblk = K / 256;
+  const size_t wrow_bytes = (size_t)nblk * kBlockBytes;
+
+  float acc[4][2][8];
+  for (int a = 0; a < 4; ++a)
+    for (int b = 0; b < 2; ++b)
+      for (int i = 0; i < 8; ++i)
+        acc[a][b][i] = 0.0f;
+
+  uint4 ra[4];
+  uint2 rb[5];
+  float rs = 0.0f;
+  const auto prefetch = [&](int kb) {
+    for (int j = 0; j < 4; ++j) {
+      const int idx = tid + j * 512, row = idx >> 3, part = idx & 7;
+      ra[j] = *reinterpret_cast<const uint4*>(
+          qs + (size_t)(t0 + row) * (K / 2) + (size_t)kb * 128 + part * 16);
+    }
+    for (int j = 0; j < 5; ++j) {
+      const int idx = tid + j * 512;
+      if (idx < kTileF * 17) {
+        const int row = idx / 17, part = idx % 17;
+        rb[j] = *reinterpret_cast<const uint2*>(
+            w + (size_t)(f0 + row) * wrow_bytes + (size_t)kb * kBlockBytes +
+            part * 8);
+      }
+    }
+    {
+      const int row = tid >> 1, h = tid & 1;
+      rs = ds[(size_t)(t0 + row) * groups128 + kb * 2 + h];
+    }
+  };
+  prefetch(0);
+  for (int kb = 0; kb < nblk; ++kb) {
+#ifndef EXP_NOSYNC
+    __syncthreads();
+#endif
+#ifdef EXP_NOSTAGE
+    if (kb == 0) {
+#endif
+      for (int j = 0; j < 4; ++j) {
+        const int idx = tid + j * 512, row = idx >> 3, part = idx & 7;
+        *reinterpret_cast<uint4*>(a_s + row * kRS + part * 16) = ra[j];
+      }
+      for (int j = 0; j < 5; ++j) {
+        const int idx = tid + j * 512;
+        if (idx < kTileF * 17) {
+          const int row = idx / 17, part = idx % 17;
+          *reinterpret_cast<uint2*>(b_s + row * kRS +
+                                    (part == 0 ? 0 : part * 8 + 8)) = rb[j];
+        }
+      }
+      sx_s[tid >> 1][tid & 1] = rs;
+#ifdef EXP_NOSTAGE
+    }
+#endif
+#ifndef EXP_NOSYNC
+    __syncthreads();
+#endif
+#ifndef EXP_NOSTAGE
+    if (kb + 1 < nblk)
+      prefetch(kb + 1);
+#endif
+#pragma nounroll
+    for (int hh = 0; hh < 2; ++hh) {
+      i32x8 d[4][2];
+      for (int a = 0; a < 4; ++a)
+        for (int b = 0; b < 2; ++b)
+          d[a][b] = (i32x8){0, 0, 0, 0, 0, 0, 0, 0};
+      const uint8_t* a_base = a_s + (wt * 64 + col) * kRS + 64 * hh;
+      const uint8_t* b_base = b_s + (wf * 32 + col) * kRS + 16 + 64 * hh;
+      uint4 fa[2][4], fb[2][2];
+      for (int a = 0; a < 4; ++a)
+        fa[0][a] = *reinterpret_cast<const uint4*>(a_base + a * 16 * kRS);
+      for (int b = 0; b < 2; ++b)
+        fb[0][b] = *reinterpret_cast<const uint4*>(b_base + b * 16 * kRS);
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const int cur = j & 1, nxt = cur ^ 1;
+        if (j + 1 < 4) {
+          for (int a = 0; a < 4; ++a)
+            fa[nxt][a] = *reinterpret_cast<const uint4*>(a_base + a * 16 * kRS +
+                                                         16 * (j + 1));
+          for (int b = 0; b < 2; ++b)
+            fb[nxt][b] = *reinterpret_cast<const uint4*>(b_base + b * 16 * kRS +
+                                                         16 * (j + 1));
+        }
+        __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+          for (int a = 0; a < 4; ++a)
+            for (int b = 0; b < 2; ++b) {
+              const int ax = h ? (int)fa[cur][a].z : (int)fa[cur][a].x;
+              const int ay = h ? (int)fa[cur][a].w : (int)fa[cur][a].y;
+              const int bx = h ? (int)fb[cur][b].z : (int)fb[cur][b].x;
+              const int by = h ? (int)fb[cur][b].w : (int)fb[cur][b].y;
+              d[a][b] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(
+                  true, i32x2{ax, ay}, true, i32x2{bx, by}, d[a][b], false);
+            }
+        __builtin_amdgcn_sched_barrier(0);
+      }
+#ifdef EXP_NO_EPI
+      for (int a = 0; a < 4; ++a)
+        for (int i = 0; i < 8; ++i)
+          for (int b = 0; b < 2; ++b)
+            acc[a][b][i] += (float)d[a][b][i];
+      continue;
+#endif
+      float sc[2];
+      for (int b = 0; b < 2; ++b)
+        sc[b] = __half2float(*reinterpret_cast<const __half*>(
+            b_s + (wf * 32 + b * 16 + col) * kRS + 4 * hh));
+#ifdef EXP_PT
+      for (int a = 0; a < 4; ++a)
+        for (int i = 0; i < 8; ++i)
+          for (int b = 0; b < 2; ++b)
+            acc[a][b][i] += sc[b] * (float)d[a][b][i];
+#else
+      for (int a = 0; a < 4; ++a)
+        for (int i = 0; i < 8; ++i) {
+          const float sxr = sx_s[wt * 64 + a * 16 + 2 * i + half][hh];
+          for (int b = 0; b < 2; ++b)
+            acc[a][b][i] += (sxr * sc[b]) * (float)d[a][b][i];
+        }
+#endif
+    }
+  }
+#ifdef EXP_PT
+  for (int a = 0; a < 4; ++a)
+    for (int i = 0; i < 8; ++i) {
+      const float sxr = sx_s[wt * 64 + a * 16 + 2 * i + half][0];
+      for (int b = 0; b < 2; ++b)
+        acc[a][b][i] *= sxr;
+    }
+#endif
   for (int a = 0; a < 4; ++a)
     for (int b = 0; b < 2; ++b)
       for (int i = 0; i < 8; ++i) {
@@ -569,9 +776,11 @@ __global__ void __launch_bounds__(256)
 }
 __global__ void XorNibbles(uint8_t* w, size_t bytes) {
   const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-  if (i >= bytes) return;
+  if (i >= bytes)
+    return;
   // payload bytes are at block offsets 8..135 of every 136-byte block
-  if (i % 136 >= 8) w[i] ^= 0x88;
+  if (i % 136 >= 8)
+    w[i] ^= 0x88;
 }
 
 // -------------------------------------------------------------------- host
@@ -592,7 +801,8 @@ struct Entry {
   uint64_t off, len;
 };
 
-static bool ReadIndex(const uint8_t* base, size_t size, std::vector<Entry>* out) {
+static bool ReadIndex(const uint8_t* base, size_t size,
+                      std::vector<Entry>* out) {
   uint32_t count;
   uint64_t meta_off, data_off;
   std::memcpy(&count, base + 12, 4);
@@ -606,11 +816,18 @@ static bool ReadIndex(const uint8_t* base, size_t size, std::vector<Entry>* out)
   for (; pos < data_off; ++pos) {
     const char c = (char)base[pos];
     if (in_str) {
-      if (c == '\\') ++pos;
-      else if (c == '"') in_str = false;
-    } else if (c == '"') in_str = true;
-    else if (c == '{') ++depth;
-    else if (c == '}' && --depth == 0) { ++pos; break; }
+      if (c == '\\')
+        ++pos;
+      else if (c == '"')
+        in_str = false;
+    } else if (c == '"')
+      in_str = true;
+    else if (c == '{')
+      ++depth;
+    else if (c == '}' && --depth == 0) {
+      ++pos;
+      break;
+    }
   }
   uint32_t n;
   std::memcpy(&n, base + pos, 4);
@@ -664,8 +881,10 @@ int main(int argc, char** argv) {
   }
   const Entry *we = nullptr, *ae = nullptr;
   for (auto& e : index) {
-    if (e.name == argv[2]) we = &e;
-    if (e.name == argv[3]) ae = &e;
+    if (e.name == argv[2])
+      we = &e;
+    if (e.name == argv[3])
+      ae = &e;
   }
   if (!we || !ae || we->qt != 44) {
     std::fprintf(stderr, "tensor not found / not MQ4\n");
@@ -674,13 +893,16 @@ int main(int argc, char** argv) {
   const int M = we->dims[0], K = we->dims[1];
   std::printf("W %s [%d x %d] N=%d\n", argv[2], M, K, N);
   std::vector<float> awq(K);
-  for (int i = 0; i < K; ++i) awq[i] = Half(base + ae->off + 2 * i);
+  for (int i = 0; i < K; ++i)
+    awq[i] = Half(base + ae->off + 2 * i);
 
   // synthetic activations: gaussian with a few heavy channels
   std::vector<float> x((size_t)N * K);
   uint64_t r = 88172645463325252ull;
   auto rnd = [&]() {
-    r ^= r << 13; r ^= r >> 7; r ^= r << 17;
+    r ^= r << 13;
+    r ^= r >> 7;
+    r ^= r << 17;
     return (float)((r >> 11) * (1.0 / 9007199254740992.0));
   };
   for (auto& v : x) {
@@ -688,7 +910,8 @@ int main(int argc, char** argv) {
     v = std::sqrt(-2 * std::log(a)) * std::cos(6.2831853f * b) * awq[0];
   }
   for (int n = 0; n < N; ++n)
-    for (int c = 0; c < 8; ++c) x[(size_t)n * K + (c * 613) % K] *= 12.0f;
+    for (int c = 0; c < 8; ++c)
+      x[(size_t)n * K + (c * 613) % K] *= 12.0f;
 
   uint8_t *dw, *dqs;
   float *dx, *dawq, *ds1, *ds2, *dds, *dout, *drot;
@@ -711,8 +934,8 @@ int main(int argc, char** argv) {
   HIP_OK(hipMalloc(&dout, (size_t)N * M * 4));
 
   const int use_search = argc > 5 ? std::atoi(argv[5]) : 1;
-  ProduceInt4<<<N * (K / 256), 256>>>(dx, dawq, ds1, ds2, dqs, dds, dss, drot,
-                                      K, use_search);
+  ProduceInt4<<<N*(K / 256), 256>>>(dx, dawq, ds1, ds2, dqs, dds, dss, drot, K,
+                                    use_search);
   HIP_OK(hipDeviceSynchronize());
   dim3 grid(M / 64, N / 64);
   Iu4Gemm<<<grid, 128>>>(dw, dqs, dds, dss, dout, M, N, K);
@@ -729,11 +952,12 @@ int main(int argc, char** argv) {
   float ms;
   hipEventElapsedTime(&ms, a, b);
   ms /= reps;
-  std::printf("gemm %.3f ms  %.1f TOPS  (%.0f tok/s-equivalent for this shape)\n",
-              ms, 2.0 * M * N * K / (ms * 1e-3) / 1e12, N / (ms * 1e-3));
+  std::printf(
+      "gemm %.3f ms  %.1f TOPS  (%.0f tok/s-equivalent for this shape)\n", ms,
+      2.0 * M * N * K / (ms * 1e-3) / 1e12, N / (ms * 1e-3));
 
   {
-    float *dout2;
+    float* dout2;
     HIP_OK(hipMalloc(&dout2, (size_t)N * M * 4));
     dim3 grid2(M / kTileF, N / kTileT);
     Iu4Gemm2<<<grid2, 256>>>(dw, dqs, dds, dss, dout2, M, N, K);
@@ -754,14 +978,15 @@ int main(int argc, char** argv) {
       md = std::max(md, (double)std::fabs(o1[i] - o2[i]));
       mx = std::max(mx, (double)std::fabs(o1[i]));
     }
-    std::printf("v2   %.3f ms  %.1f TOPS  max |v1-v2| %.3e (max |out| %.3e)\n", ms2,
-                2.0 * M * N * K / (ms2 * 1e-3) / 1e12, md, mx);
+    std::printf("v2   %.3f ms  %.1f TOPS  max |v1-v2| %.3e (max |out| %.3e)\n",
+                ms2, 2.0 * M * N * K / (ms2 * 1e-3) / 1e12, md, mx);
     {
       uint8_t* dw3;
       HIP_OK(hipMalloc(&dw3, we->len));
       HIP_OK(hipMemcpy(dw3, dw, we->len, hipMemcpyDeviceToDevice));
       XorNibbles<<<(we->len + 255) / 256, 256>>>(dw3, we->len);
-      const int reps3 = std::getenv("REPS3") ? std::atoi(std::getenv("REPS3")) : reps;
+      const int reps3 =
+          std::getenv("REPS3") ? std::atoi(std::getenv("REPS3")) : reps;
       float* dout3;
       HIP_OK(hipMalloc(&dout3, (size_t)N * M * 4));
       Iu4Gemm3<<<grid2, 256>>>(dw3, dqs, dds, dout3, M, N, K);
@@ -782,9 +1007,36 @@ int main(int argc, char** argv) {
       std::printf("v3   %.3f ms  %.1f TOPS  max |v2-v3| %.3e\n", ms3,
                   2.0 * M * N * K / (ms3 * 1e-3) / 1e12, md3);
     }
+    {
+      uint8_t* dw5;
+      HIP_OK(hipMalloc(&dw5, we->len));
+      HIP_OK(hipMemcpy(dw5, dw, we->len, hipMemcpyDeviceToDevice));
+      XorNibbles<<<(we->len + 255) / 256, 256>>>(dw5, we->len);
+      float* dout5;
+      HIP_OK(hipMalloc(&dout5, (size_t)N * M * 4));
+      dim3 g5(M / 128, N / 256);
+      Iu4Gemm5<<<g5, 512>>>(dw5, dqs, dds, dout5, M, N, K);
+      HIP_OK(hipDeviceSynchronize());
+      hipEventRecord(a);
+      for (int i = 0; i < 1000; ++i)
+        Iu4Gemm5<<<g5, 512>>>(dw5, dqs, dds, dout5, M, N, K);
+      hipEventRecord(b);
+      hipEventSynchronize(b);
+      float ms5;
+      hipEventElapsedTime(&ms5, a, b);
+      ms5 /= 1000;
+      std::vector<float> o5((size_t)N * M);
+      HIP_OK(hipMemcpy(o5.data(), dout5, o5.size() * 4, hipMemcpyDeviceToHost));
+      double md5 = 0;
+      for (size_t i = 0; i < o5.size(); ++i)
+        md5 = std::max(md5, (double)std::fabs(o5[i] - o2[i]));
+      std::printf("v5   %.3f ms  %.1f TOPS  max |v2-v5| %.3e\n", ms5,
+                  2.0 * M * N * K / (ms5 * 1e-3) / 1e12, md5);
+    }
     hipEventRecord(a);
     for (int i = 0; i < reps; ++i)
-      ProduceInt4<<<N * (K / 256), 256>>>(dx, dawq, ds1, ds2, dqs, dds, dss, nullptr, K, use_search);
+      ProduceInt4<<<N*(K / 256), 256>>>(dx, dawq, ds1, ds2, dqs, dds, dss,
+                                        nullptr, K, use_search);
     hipEventRecord(b);
     hipEventSynchronize(b);
     float msp;
@@ -798,11 +1050,13 @@ int main(int argc, char** argv) {
       HIP_OK(hipMalloc(&ds2b, (size_t)N * (K / kGroup) * 4));
       HIP_OK(hipMalloc(&ss2, (size_t)N * (K / kGroup) * 4));
       const int tg = N * (K / 256);
-      ProduceInt4Wave<<<(tg + 7) / 8, 256>>>(dx, dawq, ds1, ds2, qs2, ds2b, ss2, K, tg, use_search);
+      ProduceInt4Wave<<<(tg + 7) / 8, 256>>>(dx, dawq, ds1, ds2, qs2, ds2b, ss2,
+                                             K, tg, use_search);
       HIP_OK(hipDeviceSynchronize());
       hipEventRecord(a);
       for (int i = 0; i < reps; ++i)
-        ProduceInt4Wave<<<(tg + 7) / 8, 256>>>(dx, dawq, ds1, ds2, qs2, ds2b, ss2, K, tg, use_search);
+        ProduceInt4Wave<<<(tg + 7) / 8, 256>>>(dx, dawq, ds1, ds2, qs2, ds2b,
+                                               ss2, K, tg, use_search);
       hipEventRecord(b);
       hipEventSynchronize(b);
       float msw;
@@ -811,13 +1065,16 @@ int main(int argc, char** argv) {
       HIP_OK(hipMemcpy(qa.data(), dqs, qa.size(), hipMemcpyDeviceToHost));
       HIP_OK(hipMemcpy(qb.data(), qs2, qb.size(), hipMemcpyDeviceToHost));
       size_t diff = 0;
-      for (size_t i = 0; i < qa.size(); ++i) diff += qa[i] != qb[i];
-      std::printf("producer wave %.3f ms; code bytes differing from v1: %.4f%%\n", msw / reps,
-                  100.0 * diff / qa.size());
+      for (size_t i = 0; i < qa.size(); ++i)
+        diff += qa[i] != qb[i];
+      std::printf(
+          "producer wave %.3f ms; code bytes differing from v1: %.4f%%\n",
+          msw / reps, 100.0 * diff / qa.size());
     }
   }
   // verification against a CPU model of the same arithmetic
-  std::vector<float> out((size_t)N * M), rot((size_t)N * K), dsv((size_t)N * K / kGroup);
+  std::vector<float> out((size_t)N * M), rot((size_t)N * K),
+      dsv((size_t)N * K / kGroup);
   std::vector<int> ssv((size_t)N * K / kGroup);
   std::vector<uint8_t> qsv((size_t)N * K / 2);
   HIP_OK(hipMemcpy(out.data(), dout, out.size() * 4, hipMemcpyDeviceToHost));
@@ -833,33 +1090,41 @@ int main(int argc, char** argv) {
       double kernel_ref = 0, a16 = 0;
       for (int g = 0; g < K / kGroup; ++g) {
         const uint8_t* blk = wr + (size_t)(g >> 1) * kBlockBytes;
-        const float sc = Half(blk + 4 * (g & 1)), zp = Half(blk + 4 * (g & 1) + 2);
+        const float sc = Half(blk + 4 * (g & 1)),
+                    zp = Half(blk + 4 * (g & 1) + 2);
         const uint8_t* pay = blk + 8 + 64 * (g & 1);
         long dot = 0;
         for (int j = 0; j < 64; ++j) {
           const int wlo = pay[j] & 15, whi = pay[j] >> 4;
           const uint8_t xb = qsv[(size_t)n * (K / 2) + (size_t)g * 64 + j];
           int xlo = xb & 15, xhi = xb >> 4;
-          if (xlo > 7) xlo -= 16;
-          if (xhi > 7) xhi -= 16;
+          if (xlo > 7)
+            xlo -= 16;
+          if (xhi > 7)
+            xhi -= 16;
           dot += wlo * xlo + whi * xhi;
-          a16 += (double)(sc * wlo + zp) * rot[(size_t)n * K + g * kGroup + 2 * j] +
-                 (double)(sc * whi + zp) * rot[(size_t)n * K + g * kGroup + 2 * j + 1];
+          a16 += (double)(sc * wlo + zp) *
+                     rot[(size_t)n * K + g * kGroup + 2 * j] +
+                 (double)(sc * whi + zp) *
+                     rot[(size_t)n * K + g * kGroup + 2 * j + 1];
         }
-        kernel_ref += (double)dsv[(size_t)n * (K / kGroup) + g] *
-                      (sc * (double)dot + zp * (double)ssv[(size_t)n * (K / kGroup) + g]);
+        kernel_ref +=
+            (double)dsv[(size_t)n * (K / kGroup) + g] *
+            (sc * (double)dot + zp * (double)ssv[(size_t)n * (K / kGroup) + g]);
       }
       const double got = out[(size_t)n * M + m];
-      max_rel_kernel = std::max(max_rel_kernel,
-                                std::fabs(got - kernel_ref) / (std::fabs(kernel_ref) + 1e-3));
+      max_rel_kernel =
+          std::max(max_rel_kernel, std::fabs(got - kernel_ref) /
+                                       (std::fabs(kernel_ref) + 1e-3));
       sum_a4 += (kernel_ref - a16) * (kernel_ref - a16);
       sum_ref += a16 * a16;
       ++checked;
     }
   }
-  std::printf("checked %d outputs: kernel vs cpu-model max rel err %.2e\n", checked,
-              max_rel_kernel);
-  std::printf("int4-activation error vs fp32-activation (same weights): rel RMS %.4f\n",
-              std::sqrt(sum_a4 / sum_ref));
+  std::printf("checked %d outputs: kernel vs cpu-model max rel err %.2e\n",
+              checked, max_rel_kernel);
+  std::printf(
+      "int4-activation error vs fp32-activation (same weights): rel RMS %.4f\n",
+      std::sqrt(sum_a4 / sum_ref));
   return 0;
 }
