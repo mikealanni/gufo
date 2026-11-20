@@ -173,3 +173,15 @@ held in registers across the WMMA block; the combined product costs one multiply
 per element. Removing the activation scale entirely only gains 5%, so the
 epilogue is not the dominant loss: staging and barriers are. The two gains are
 roughly additive (about 65 TOPS); 100 TOPS is not reachable with this format.
+
+### Stacked (256x128 tile + per-token activation scale), same conditions
+
+| Variant | TOPS |
+|---|---|
+| v5 + `EXP_PT` | 65.7 |
+| + no barriers (timing bound, incorrect output) | 70.5 |
+| + no epilogue as well | 70.7 |
+
+With the per-token scale the epilogue is free (removing it changes nothing),
+barriers are worth about 7%, and the rest is global-load staging. The bound for
+this design is about 70 TOPS.
