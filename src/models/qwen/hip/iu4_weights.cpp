@@ -225,6 +225,8 @@ bool Iu4Weights::Load(const std::string& path, std::uint32_t layers,
 
   const auto upload = [&](const std::string& name, const std::string& awq_name,
                           std::uint32_t perm_start, std::uint32_t perm_chunk,
+                          const std::vector<float>* awq_reference,
+                          std::vector<float>* awq_capture,
                           Iu4Projection* out) -> bool {
     const auto it = index.find(name);
     if (it == index.end())
@@ -275,6 +277,18 @@ bool Iu4Weights::Load(const std::string& path, std::uint32_t layers,
         std::memcpy(&h, src + 2 * i, 2);
         host[i] = HalfToFloat(h);
       }
+      if (awq_reference != nullptr) {
+        if (awq_reference->size() != cols ||
+            std::memcmp(awq_reference->data(), host.data(), cols * 4) != 0) {
+          (void)hipFree(p.tiles);
+          (void)hipFree(p.scales);
+          return Fail(error, awq_name +
+                                 " differs from the other projections that "
+                                 "read the same input");
+        }
+      }
+      if (awq_capture != nullptr)
+        *awq_capture = host;
       if (hipMalloc(reinterpret_cast<void**>(&p.awq), cols * 4) != hipSuccess ||
           hipMemcpyAsync(p.awq, host.data(), cols * 4, hipMemcpyHostToDevice,
                          stream) != hipSuccess) {
@@ -306,12 +320,30 @@ bool Iu4Weights::Load(const std::string& path, std::uint32_t layers,
   for (std::uint32_t l = 0; l < layers; ++l) {
     const std::string prefix =
         "model.language_model.layers." + std::to_string(l) + ".";
+    // Projections reading the same activation must share one AWQ vector: the
+    // attention-block input (q/k/v or the GDN in-projections) and the FFN input
+    // (gate, up). The producers apply that single vector once.
+    std::vector<float> block_awq, ffn_awq;
     for (const auto& r : kRoles) {
       const std::string name = prefix + r.path + ".weight";
       if (index.find(name) == index.end())
         continue;  // the layer type does not have this projection
+      const bool attn_in =
+          r.role == Iu4Role::kAttnQ || r.role == Iu4Role::kAttnK ||
+          r.role == Iu4Role::kAttnV || r.role == Iu4Role::kSsmQkv ||
+          r.role == Iu4Role::kSsmZ || r.role == Iu4Role::kSsmA ||
+          r.role == Iu4Role::kSsmB;
+      const bool ffn_in =
+          r.role == Iu4Role::kFfnGate || r.role == Iu4Role::kFfnUp;
+      std::vector<float>* group = attn_in  ? &block_awq
+                                  : ffn_in ? &ffn_awq
+                                           : nullptr;
+      const std::vector<float>* reference =
+          group != nullptr && !group->empty() ? group : nullptr;
+      std::vector<float>* capture =
+          group != nullptr && group->empty() ? group : nullptr;
       if (!upload(name, prefix + r.path + ".awq_scale.weight", r.perm_start,
-                  r.perm_chunk,
+                  r.perm_chunk, reference, capture,
                   &projections_[l * kRoleCount +
                                 static_cast<std::size_t>(r.role)])) {
         Release();
@@ -319,7 +351,7 @@ bool Iu4Weights::Load(const std::string& path, std::uint32_t layers,
       }
     }
   }
-  if (!upload("lm_head.weight", "", 0, 0, &lm_head_)) {
+  if (!upload("lm_head.weight", "", 0, 0, nullptr, nullptr, &lm_head_)) {
     Release();
     return false;
   }

@@ -62,6 +62,14 @@ void LaunchIu4Gemm(const void* tiles, const std::uint16_t* weight_scales,
                    float* out, bool accumulate, std::size_t rows, std::size_t n,
                    std::size_t padded_n, std::size_t k, hipStream_t stream);
 
+// Scalar fallback for projections that fail Iu4GemmSupported (rows at most 256
+// and a divisor of 256): same inputs and outputs as LaunchIu4Gemm.
+void LaunchIu4GemmSmall(const void* tiles, const std::uint16_t* weight_scales,
+                        const std::uint8_t* act_tiles, const float* act_scales,
+                        float* out, bool accumulate, std::size_t rows,
+                        std::size_t n, std::size_t padded_n, std::size_t k,
+                        hipStream_t stream);
+
 // Quantize-only activation producer for rows that are already normalized:
 // divide by awq (null for none), rotate, quantize, same output layout as
 // LaunchIu4NormQuantize. k is a multiple of 256, any size. With remap_gdn_heads

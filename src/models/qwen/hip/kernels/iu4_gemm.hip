@@ -252,6 +252,47 @@ __global__ void __launch_bounds__(256)
     Iu4GemmBody<kAdd, false>(pw, psc, qs, dsT, out, M, N, Npad, K, lds);
 }
 
+// Scalar fallback for projections too small for the WMMA tile (the 48 row GDN
+// a/b gates): one thread per output element, integer dot products group by
+// group.
+template<bool kAdd>
+__global__ void Iu4GemmSmallKernel(const std::uint8_t* __restrict__ pw,
+                                   const std::uint16_t* __restrict__ psc,
+                                   const std::uint8_t* __restrict__ qs,
+                                   const float* __restrict__ dsT,
+                                   float* __restrict__ out, int M, int N,
+                                   int Npad, int K) {
+  const int f = threadIdx.x % M;
+  const int t = blockIdx.x * (blockDim.x / M) + threadIdx.x / M;
+  if (t >= N)
+    return;
+  const int E = K >> 7;
+  float acc = 0.0f;
+  for (int e = 0; e < E; ++e) {
+    int dot = 0;
+    for (int b = 0; b < 64; ++b) {
+      const int q = b >> 4, within = b & 15;
+      const std::uint8_t wbyte =
+          pw[(((size_t)e * (M >> 4) + (f >> 4)) * 4 + q) * 256 + (f & 15) * 16 +
+             within];
+      const int chunk = b >> 3, w8 = b & 7;
+      const std::uint8_t abyte =
+          qs[((size_t)(t >> 4) * E + e) * 1024 +
+             ((chunk & 1) * 16 + (t & 15)) * 32 + (chunk >> 1) * 8 + w8];
+      const int w0 = (int)(wbyte & 15), w1 = (int)(wbyte >> 4);
+      const int a0 = (int)(abyte & 15), a1 = (int)(abyte >> 4);
+      dot += ((w0 ^ 8) - 8) * ((a0 ^ 8) - 8) + ((w1 ^ 8) - 8) * ((a1 ^ 8) - 8);
+    }
+    acc += dsT[(size_t)e * Npad + t] *
+           __half2float(__ushort_as_half(psc[(size_t)e * M + f])) * (float)dot;
+  }
+  float* dst = out + (size_t)t * M + f;
+  if (kAdd)
+    *dst += acc;
+  else
+    *dst = acc;
+}
+
 }  // namespace
 
 bool Iu4GemmSupported(std::size_t rows, std::size_t cols) {
@@ -271,6 +312,26 @@ void LaunchIu4Gemm(const void* tiles, const std::uint16_t* weight_scales,
         (int)padded_n, (int)k);
   else
     Iu4GemmKernel<false><<<blocks, 256, 0, stream>>>(
+        pw, weight_scales, act_tiles, act_scales, out, (int)rows, (int)n,
+        (int)padded_n, (int)k);
+}
+
+void LaunchIu4GemmSmall(const void* tiles, const std::uint16_t* weight_scales,
+                        const std::uint8_t* act_tiles, const float* act_scales,
+                        float* out, bool accumulate, std::size_t rows,
+                        std::size_t n, std::size_t padded_n, std::size_t k,
+                        hipStream_t stream) {
+  const int per_block = 256 / static_cast<int>(rows);
+  const unsigned blocks =
+      static_cast<unsigned>((n + per_block - 1) / per_block);
+  const unsigned threads = static_cast<unsigned>(per_block * rows);
+  const auto* pw = static_cast<const std::uint8_t*>(tiles);
+  if (accumulate)
+    Iu4GemmSmallKernel<true><<<blocks, threads, 0, stream>>>(
+        pw, weight_scales, act_tiles, act_scales, out, (int)rows, (int)n,
+        (int)padded_n, (int)k);
+  else
+    Iu4GemmSmallKernel<false><<<blocks, threads, 0, stream>>>(
         pw, weight_scales, act_tiles, act_scales, out, (int)rows, (int)n,
         (int)padded_n, (int)k);
 }

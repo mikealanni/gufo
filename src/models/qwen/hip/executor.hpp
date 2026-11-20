@@ -28,6 +28,7 @@
 #include "src/core/hip/detail/hip_graph_decode_executor.hpp"
 #include "src/models/qwen/hip/detail/prefill_task.hpp"
 #include "src/models/qwen/hip/execution_policy.hpp"
+#include "src/models/qwen/hip/iu4_weights.hpp"
 #include "src/models/qwen/hip/moe_prefill.hpp"
 #include "src/models/qwen/hip/npu_ffn.hpp"
 #include "src/models/qwen/hip/ops/attention.hpp"
@@ -122,6 +123,9 @@ public:
   [[nodiscard]] std::size_t GetResidentBytes() const noexcept;
   /// NPU offload of the FFN gate/up projections, or null when it is off.
   [[nodiscard]] QwenNpuFfn* NpuFfn() const;
+  /// Rotated 4-bit projections for the int4 prefill path, loaded on first use
+  /// from the artifact named by GUFO_IU4_ARTIFACT; null when unset or invalid.
+  [[nodiscard]] Iu4Weights* Iu4() const;
   /// Grouped-expert prefill for qwen35moe, or null when unavailable.
   [[nodiscard]] QwenMoePrefill* MoePrefill(std::uint32_t max_tokens) const;
   /// bf16 [hi, hi, lo] weights of the router and shared-expert gate rows of
@@ -140,6 +144,8 @@ private:
   std::shared_ptr<models::qwen::vision::Encoder> vision_;
   mutable std::once_flag npu_once_;
   mutable std::unique_ptr<QwenNpuFfn> npu_ffn_;
+  mutable std::once_flag iu4_once_;
+  mutable std::unique_ptr<Iu4Weights> iu4_;
   mutable std::once_flag moe_prefill_once_;
   mutable std::unique_ptr<QwenMoePrefill> moe_prefill_;
   mutable std::vector<std::uint16_t*> router_split_;
@@ -730,6 +736,11 @@ private:
   const tokenization::QwenTokenizer* tokenizer_;
   const QwenExecutionPolicy policy_;
   QwenGpuArena arena_;
+  // Activation tiles and scales of the int4 prefill path, sized on demand.
+  std::uint8_t* iu4_tiles_{nullptr};
+  float* iu4_scales_{nullptr};
+  std::size_t iu4_tile_bytes_{0};
+  std::size_t iu4_scale_bytes_{0};
   const detail::HipGraphCaptureKey graph_key_;
   detail::HipGraphDecodeExecutor graph_executor_;
   models::qwen::vision::DeviceInput vision_input_;

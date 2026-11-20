@@ -71,6 +71,10 @@ QwenGpuExecutor::QwenGpuExecutor(std::shared_ptr<const QwenGpuModel> model,
 }
 
 QwenGpuExecutor::~QwenGpuExecutor() {
+  if (iu4_tiles_ != nullptr)
+    (void)hipFree(iu4_tiles_);
+  if (iu4_scales_ != nullptr)
+    (void)hipFree(iu4_scales_);
   (void)hipStreamSynchronize(arena_.stream);
   for (const auto event : prefill_events_) {
     if (event)

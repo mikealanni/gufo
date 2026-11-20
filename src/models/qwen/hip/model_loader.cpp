@@ -19,6 +19,7 @@
 #include "src/core/platform/prefault.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen/hip/iu4_weights.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/moe.hpp"
 
@@ -400,6 +401,22 @@ QwenNpuFfn* QwenGpuModel::NpuFfn() const {
       std::fprintf(stderr, "NPU off: %s\n", error.c_str());
   });
   return npu_ffn_.get();
+}
+
+Iu4Weights* QwenGpuModel::Iu4() const {
+  std::call_once(iu4_once_, [this] {
+    const char* path = std::getenv("GUFO_IU4_ARTIFACT");
+    if (path == nullptr)
+      return;
+    auto loaded = std::make_unique<Iu4Weights>();
+    std::string error;
+    if (!loaded->Load(path, weights_.config.num_layers, &error)) {
+      std::fprintf(stderr, "int4 prefill off: %s\n", error.c_str());
+      return;
+    }
+    iu4_ = std::move(loaded);
+  });
+  return iu4_.get();
 }
 
 QwenMoePrefill* QwenGpuModel::MoePrefill(std::uint32_t max_tokens) const {

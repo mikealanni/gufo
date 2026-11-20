@@ -12,6 +12,7 @@
 #include "src/models/qwen/hip/moe_ffn.hpp"
 #include "src/models/qwen/hip/npu_ffn.hpp"
 #include "src/models/qwen/hip/ops.hpp"
+#include "src/models/qwen/hip/ops/iu4.hpp"
 #include "src/models/qwen/hip/ops/prefill_fp16.hpp"
 
 namespace gufo::hip {
@@ -161,13 +162,60 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
   vision_input_.Inject(scratch.decode.hidden.data(), start_pos, batch_size,
                        hidden_size, 1, arena_.stream);
 
-  const bool half_prefill = UseQwen27bFp16Prefill(weights_, batch_size);
+  // int4 x int4 prefill: the rotated 4-bit projections of the artifact named by
+  // GUFO_IU4_ARTIFACT replace the fp16 GEMMs of the dense 27B layers. Every
+  // projection's input is quantized by one of the iu4 producers; the NPU split
+  // is off on this path.
+  constexpr std::size_t kIu4MinBatch = 256;
+  Iu4Weights* const iu4_weights = model_->Iu4();
+  const bool iu4 =
+      iu4_weights != nullptr && batch_size >= kIu4MinBatch && !config.IsMoe() &&
+      config.hidden_size == 5120 && config.intermediate_size == 17408 &&
+      config.num_layers == 64 && iu4_weights->layers() == config.num_layers &&
+      config.AttentionSize() == 6144 && config.ssm_inner_size == 6144;
+  const std::size_t iu4_padded = (batch_size + 127) / 128 * 128;
+  if (iu4) {
+    const std::size_t tile_need = iu4_padded * 17408 / 2;
+    const std::size_t scale_need = (17408 / 128) * iu4_padded * sizeof(float);
+    if (iu4_tile_bytes_ < tile_need) {
+      if (iu4_tiles_ != nullptr)
+        HIP_CHECK(hipFree(iu4_tiles_));
+      iu4_tiles_ = nullptr;
+      HIP_CHECK(hipMalloc(&iu4_tiles_, tile_need));
+      iu4_tile_bytes_ = tile_need;
+    }
+    if (iu4_scale_bytes_ < scale_need) {
+      if (iu4_scales_ != nullptr)
+        HIP_CHECK(hipFree(iu4_scales_));
+      iu4_scales_ = nullptr;
+      HIP_CHECK(hipMalloc(&iu4_scales_, scale_need));
+      iu4_scale_bytes_ = scale_need;
+    }
+  }
+  const auto iu4_gemm = [&](const Iu4Projection& p, float* output,
+                            bool accumulate) {
+    if (Iu4GemmSupported(p.rows, p.cols)) {
+      LaunchIu4Gemm(p.tiles, p.scales, iu4_tiles_, iu4_scales_, output,
+                    accumulate, p.rows, batch_size, iu4_padded, p.cols,
+                    arena_.stream);
+    } else {
+      LaunchIu4GemmSmall(p.tiles, p.scales, iu4_tiles_, iu4_scales_, output,
+                         accumulate, p.rows, batch_size, iu4_padded, p.cols,
+                         arena_.stream);
+    }
+  };
+  const auto iu4_quantize = [&](const float* x, const float* awq, std::size_t k,
+                                bool remap_gdn_heads) {
+    LaunchIu4Quantize(x, awq, iu4_weights->signs(), remap_gdn_heads, batch_size,
+                      iu4_padded, k, iu4_tiles_, iu4_scales_, arena_.stream);
+  };
+  const bool half_prefill = iu4 || UseQwen27bFp16Prefill(weights_, batch_size);
   // The MoE models keep their quantized-activation dense path; only layers the
   // NPU takes columns of switch to FP16 activations for those projections.
   const bool npu_moe = !half_prefill && config.IsMoe() && batch_size >= 1024;
   const bool npu_attn = half_prefill || npu_moe;
   QwenNpuFfn* const npu_ffn =
-      (half_prefill || npu_moe) ? model_->NpuFfn() : nullptr;
+      (!iu4 && (half_prefill || npu_moe)) ? model_->NpuFfn() : nullptr;
   // The other chunk of a pair may change the active rows while this one is
   // suspended, so every resume point restores them.
   const auto set_rows = [&] {
@@ -268,7 +316,7 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
     // Keep its original 256-token GEMM tile, including the original tail mask
     // and FP16 rounding boundaries.
     const bool final_output_tile =
-        half_prefill && l + 1 == config.num_layers &&
+        half_prefill && !iu4 && l + 1 == config.num_layers &&
         (!capture_prompt_hidden_ ||
          (target_layer_count != 0 &&
           !arena_.GetTargetLayerCaptureIndex(l).has_value()));
@@ -319,7 +367,16 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
         is_q8(layer.ffn_gate) && is_q8(layer.ffn_up);
 
     // Pre-layer RMSNorm (generates BF16 into d_scratch_bf16 directly)
-    if (half_prefill) {
+    if (iu4) {
+      LaunchIu4NormQuantize(
+          arena_.d_hidden, static_cast<const float*>(layer.attn_norm.data),
+          iu4_weights
+              ->Find(l, layer.is_full_attention ? Iu4Role::kAttnQ
+                                                : Iu4Role::kSsmQkv)
+              .awq,
+          iu4_weights->signs(), eps, batch_size, iu4_padded, hidden_size,
+          iu4_tiles_, iu4_scales_, arena_.stream);
+    } else if (half_prefill) {
       LaunchBatchedRMSNormFp16(arena_.d_hidden, nullptr,
                                static_cast<const float*>(layer.attn_norm.data),
                                nullptr, arena_.d_scratch_bf16, batch_size,
@@ -348,7 +405,12 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
                                      hidden_size, arena_.stream);
       }
       std::uint32_t npu_q_columns = 0;
-      if (npu_q) {
+      if (iu4) {
+        iu4_gemm(iu4_weights->Find(l, Iu4Role::kAttnQ), arena_.d_ssm_qkv,
+                 false);
+        iu4_gemm(iu4_weights->Find(l, Iu4Role::kAttnK), arena_.d_k, false);
+        iu4_gemm(iu4_weights->Find(l, Iu4Role::kAttnV), arena_.d_v, false);
+      } else if (npu_q) {
         gemm_weight(layer.attn_k, arena_.d_scratch_bf16, arena_.d_normed,
                     arena_.d_k, kv_size, hidden_size, arena_.d_scratch_q8_act);
         gemm_weight(layer.attn_v, arena_.d_scratch_bf16, arena_.d_normed,
@@ -523,7 +585,11 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
       // from FP32 drops one launch and one round trip (about 75 MB per layer
       // at batch 2048) and keeps the activation's full precision going into the
       // Q8_1 codes instead of rounding to BF16 first.
-      if (half_prefill || npu_o) {
+      if (iu4) {
+        iu4_quantize(arena_.d_ssm_out,
+                     iu4_weights->Find(l, Iu4Role::kAttnO).awq, attention_size,
+                     false);
+      } else if (half_prefill || npu_o) {
         LaunchFloatToFp16(arena_.d_ssm_out + output_first_row * attention_size,
                           arena_.d_scratch_bf16, output_rows * attention_size,
                           arena_.stream);
@@ -538,7 +604,9 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
                                      arena_.d_scratch_q8_act, batch_size,
                                      attention_size, arena_.stream);
       }
-      if (npu_o) {
+      if (iu4) {
+        iu4_gemm(iu4_weights->Find(l, Iu4Role::kAttnO), arena_.d_hidden, true);
+      } else if (npu_o) {
         std::uint32_t npu_o_columns = 0;
         if (npu_ffn->BeginSsmOut(l, bank, arena_.d_scratch_bf16,
                                  arena_.stream)) {
@@ -589,7 +657,12 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
           set_rows();
         }
       }
-      if (npu_lin || npu_qkv != 0 || npu_gate != 0) {
+      if (iu4) {
+        iu4_gemm(iu4_weights->Find(l, Iu4Role::kSsmQkv), arena_.d_ssm_qkv,
+                 false);
+        iu4_gemm(iu4_weights->Find(l, Iu4Role::kSsmZ), arena_.d_ssm_gate,
+                 false);
+      } else if (npu_lin || npu_qkv != 0 || npu_gate != 0) {
         LaunchBatchedQuantGEMMFp16Rows(layer.attn_qkv.type, layer.attn_qkv.data,
                                        arena_.d_scratch_bf16, arena_.d_ssm_qkv,
                                        batch_size, ssm_qkv_size, hidden_size,
@@ -606,12 +679,19 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
                     arena_.d_ssm_gate, ssm_inner_size, hidden_size,
                     arena_.d_scratch_q8_act);
       }
-      gemm_weight(layer.ssm_alpha, arena_.d_scratch_bf16, arena_.d_normed,
-                  arena_.d_alpha_buf, time_step_rank, hidden_size,
-                  arena_.d_scratch_q8_act);
-      gemm_weight(layer.ssm_beta, arena_.d_scratch_bf16, arena_.d_normed,
-                  arena_.d_beta_buf, time_step_rank, hidden_size,
-                  arena_.d_scratch_q8_act);
+      if (iu4) {
+        iu4_gemm(iu4_weights->Find(l, Iu4Role::kSsmA), arena_.d_alpha_buf,
+                 false);
+        iu4_gemm(iu4_weights->Find(l, Iu4Role::kSsmB), arena_.d_beta_buf,
+                 false);
+      } else {
+        gemm_weight(layer.ssm_alpha, arena_.d_scratch_bf16, arena_.d_normed,
+                    arena_.d_alpha_buf, time_step_rank, hidden_size,
+                    arena_.d_scratch_q8_act);
+        gemm_weight(layer.ssm_beta, arena_.d_scratch_bf16, arena_.d_normed,
+                    arena_.d_beta_buf, time_step_rank, hidden_size,
+                    arena_.d_scratch_q8_act);
+      }
       if (npu_qkv != 0 || npu_gate != 0) {
         npu_ffn->FinishLinear(l, bank, arena_.d_ssm_qkv, ssm_qkv_size,
                               arena_.d_ssm_gate, ssm_inner_size, arena_.stream);
@@ -650,7 +730,8 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
             config.ssm_group_count, config.ssm_time_step_rank,
             config.ssm_state_size, config.SsmValueSize(), arena_.stream,
             arena_.GetRecurrentStateStorage(),
-            (half_prefill || npu_ssm) ? arena_.d_scratch_bf16 : nullptr);
+            ((half_prefill && !iu4) || npu_ssm) ? arena_.d_scratch_bf16
+                                                : nullptr);
       } else {
         LaunchBatchedSSMConvRecurrence(
             arena_.d_ssm_qkv, static_cast<const float*>(layer.ssm_conv1d.data),
@@ -664,7 +745,9 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
             arena_.GetRecurrentStateStorage());
       }
 
-      if (half_prefill || npu_ssm) {
+      if (iu4) {
+        // The int4 path quantizes d_ssm_out directly below.
+      } else if (half_prefill || npu_ssm) {
         if (!ssm_row_split) {
           LaunchFloatToFp16(arena_.d_ssm_out, arena_.d_scratch_bf16,
                             batch_size * ssm_inner_size, arena_.stream);
@@ -682,7 +765,12 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
                                      arena_.d_scratch_q8_act, batch_size,
                                      ssm_inner_size, arena_.stream);
       }
-      if (half_prefill || npu_ssm) {
+      if (iu4) {
+        iu4_quantize(arena_.d_ssm_out,
+                     iu4_weights->Find(l, Iu4Role::kSsmOut).awq, ssm_inner_size,
+                     true);
+        iu4_gemm(iu4_weights->Find(l, Iu4Role::kSsmOut), arena_.d_hidden, true);
+      } else if (half_prefill || npu_ssm) {
         attn_in_hidden = npu_ssm;
         std::uint32_t npu_ssm_out = 0;
         if (npu_ffn != nullptr && npu_ffn->Accepts(batch_size) &&
@@ -715,7 +803,13 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
       }
     }
 
-    if (half_prefill) {
+    if (iu4) {
+      LaunchIu4NormQuantize(
+          arena_.d_hidden, static_cast<const float*>(layer.ffn_norm.data),
+          iu4_weights->Find(l, Iu4Role::kFfnGate).awq, iu4_weights->signs(),
+          eps, batch_size, iu4_padded, hidden_size, iu4_tiles_, iu4_scales_,
+          arena_.stream);
+    } else if (half_prefill) {
       LaunchBatchedRMSNormFp16(output_hidden, nullptr,
                                static_cast<const float*>(layer.ffn_norm.data),
                                nullptr, arena_.d_scratch_bf16, output_rows,
@@ -785,7 +879,18 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
             IsFusedSwiGluGemmEpilogueSupported(
                 layer.ffn_gate.type, batch_size, intermediate_size,
                 batch_size * intermediate_size * sizeof(float));
-        if (half_prefill) {
+        if (iu4) {
+          iu4_gemm(iu4_weights->Find(l, Iu4Role::kFfnGate), arena_.d_ffn_gate,
+                   false);
+          iu4_gemm(iu4_weights->Find(l, Iu4Role::kFfnUp), arena_.d_ffn_up,
+                   false);
+          LaunchBatchedSwiGLUActivation(
+              arena_.d_ffn_gate, arena_.d_ffn_up, arena_.d_ffn_act, nullptr,
+              batch_size * intermediate_size, arena_.stream);
+          iu4_quantize(arena_.d_ffn_act,
+                       iu4_weights->Find(l, Iu4Role::kFfnDown).awq,
+                       intermediate_size, false);
+        } else if (half_prefill) {
           // The NPU takes the leading columns of a full 4096-token chunk when
           // the pair kernel can compute the remainder; its runs are queued
           // before the GPU kernel so the two overlap.
@@ -870,7 +975,10 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
         }
       }
 
-      if (half_prefill) {
+      if (iu4) {
+        iu4_gemm(iu4_weights->Find(l, Iu4Role::kFfnDown), arena_.d_hidden,
+                 true);
+      } else if (half_prefill) {
         std::uint32_t npu_down = 0;
         if (npu_ffn != nullptr && npu_ffn->Accepts(batch_size) &&
             npu_ffn->DownColumns(l) != 0 &&
