@@ -314,3 +314,14 @@ Captured the real FFN-input activations (post-RMSNorm, the gate/up projection in
 | 59 | 0.194 | 0.702 | 3.6x |
 
 Per-token output error through a random projection matches (0.42-0.81 vs 0.16-0.21). The activations have strong outlier channels (max/RMS 36-61), so a single per-token scale collapses most elements to zero. The 76.7 vs 75 TOPS gain is not worth a 3-4x error increase: per-token scale is dropped; exact per-128 scales stay. Note that per-128 int4 activations themselves sit at 0.16-0.21 relative RMS on real data, which the model-level quality gate (HumanEval etc.) must judge, and finer activation blocks (per-32) or outlier-aware handling are the levers if that gate fails.
+
+### Clock and the real-data WMMA ceiling (bench mode on: fclk held, 120 W / 140 W burst)
+
+Pure iu4 WMMA loop (8 independent accumulators per wave, 2880 CTAs of 8 waves, no memory traffic), operands held in registers:
+
+| Operand data | Clock | Package power | TOPS | TOPS per GHz |
+|---|---|---|---|---|
+| constant | 2829 MHz | 103 W | 111.0 | 39.2 |
+| random | 2694 MHz | 132 W (burst) | 90.0 | 33.3 |
+
+Random operands draw about 28% more power for a lower clock and 15% fewer TOPS per reported GHz, so the hardware slows matrix issue with data activity beyond what the reported clock shows. The constant-operand peak (107-111 TOPS, also what `gfx1151_peak.hip` measures) is not reachable with real weights and activations; the real-data pure-WMMA ceiling is about 90 TOPS at burst power and roughly 86 sustained at the 120 W limit. The exact v13 kernel at 75 TOPS is about 83% of that. The CPU Curve Optimizer (all-core -25 or 0) and an iGPU CO of -10 changed neither clock nor power. Measurements taken with bench mode off run under 85 W limits and are not comparable.
