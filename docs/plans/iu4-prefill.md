@@ -325,3 +325,7 @@ Pure iu4 WMMA loop (8 independent accumulators per wave, 2880 CTAs of 8 waves, n
 | random | 2694 MHz | 132 W (burst) | 90.0 | 33.3 |
 
 Random operands draw about 28% more power for a lower clock and 15% fewer TOPS per reported GHz, so the hardware slows matrix issue with data activity beyond what the reported clock shows. The constant-operand peak (107-111 TOPS, also what `gfx1151_peak.hip` measures) is not reachable with real weights and activations; the real-data pure-WMMA ceiling is about 90 TOPS at burst power and roughly 86 sustained at the 120 W limit. The exact v13 kernel at 75 TOPS is about 83% of that. The CPU Curve Optimizer (all-core -25 or 0) and an iGPU CO of -10 changed neither clock nor power. Measurements taken with bench mode off run under 85 W limits and are not comparable.
+
+### v14: 64-feature x 32-token wave tile (rejected)
+
+Same 128 x 128 CTA, 8 waves, K=256 per barrier, grouped CTA order, per-half weight reload instead of a double buffer (weights of each half of the feature blocks reload right after use), 252 VGPRs, no spills. Exact, zero mismatches. gate_proj 72.4, down_proj 72.4 TOPS (alternate wave-to-tile mapping: 72.0, 72.4) versus 75 for the 32 x 64 tile. The expected saving did not exist: each lane still needs one scale product per output element per epoch (64 per epoch for either shape), so the fold work is identical; the tile halves token fragment reads from LDS but doubles redundant weight loads (each weight tile is read by four waves instead of two) and uses 18 more VGPRs. The 32 x 64 wave tile stays.
