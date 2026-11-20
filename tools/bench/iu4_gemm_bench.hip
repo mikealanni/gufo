@@ -1756,8 +1756,8 @@ __global__ void RelayoutTok(const uint8_t* __restrict__ qs,
     return;
   const int t = idx / (E * 8), r = idx % (E * 8), e = r / 8, o = r % 8;
   const int i = o >> 1, hi = o & 1;
-  const size_t dst =
-      ((size_t)(t >> 4) * E + e) * 1024 + i * 256 + hi * 128 + (t & 15) * 8;
+  const size_t dst = ((size_t)(t >> 4) * E + e) * 1024 +
+                     (hi * 16 + (t & 15)) * 32 + i * 8;
   *reinterpret_cast<uint2*>(qsT + dst) = *reinterpret_cast<const uint2*>(
       qs + (size_t)t * (K / 2) + (size_t)e * 64 + 16 * i + 8 * hi);
 }
@@ -1798,7 +1798,7 @@ __device__ __forceinline__ void Gemm12Body(
   const uint32_t qrow = (uint32_t)(K >> 1);
   const int sr = 16 * wave + lr;
   const char* gq = reinterpret_cast<const char*>(qs) +
-                   (size_t)((t0 >> 4) + wave) * E * 1024 + lane * 8;
+                   (size_t)((t0 >> 4) + wave) * E * 1024 + lane * 32;
   const uint32_t lds_off = wave * 1024 + hi * 128 + lr * 8;
   const uint32_t aoff = (wth * 4) * 1024 + prow * 8;
   const int frow = f0 + wf * 32 + lr;
@@ -1815,8 +1815,11 @@ __device__ __forceinline__ void Gemm12Body(
   float sxn = 0.0f;
   i32x2 sa[4];
   const auto stage_load = [&](int e) {
-    for (int i = 0; i < 4; ++i)
-      sa[i] = *At<i32x2>(gq, (uint32_t)e * 1024 + 256u * i);
+    for (int i = 0; i < 2; ++i) {
+      const uint4 v = *reinterpret_cast<const uint4*>(gq + e * 1024 + 16 * i);
+      sa[2 * i] = i32x2{(int)v.x, (int)v.y};
+      sa[2 * i + 1] = i32x2{(int)v.z, (int)v.w};
+    }
     if (!PT && tid < 128)
       sxn = dsT[(size_t)e * N + t0 + tid];
   };
