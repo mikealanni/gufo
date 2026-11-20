@@ -792,9 +792,10 @@ __device__ __forceinline__ int RowShare(int v, int k) {
     V6_SHARE(0)
     V6_SHARE(1)
     V6_SHARE(2)
-    V6_SHARE(3) V6_SHARE(4) V6_SHARE(5) V6_SHARE(6) V6_SHARE(7) V6_SHARE(8)
-        V6_SHARE(9) V6_SHARE(10) V6_SHARE(11) V6_SHARE(12) V6_SHARE(13)
-            V6_SHARE(14) V6_SHARE(15) default : __builtin_unreachable();
+    V6_SHARE(3)
+    V6_SHARE(4) V6_SHARE(5) V6_SHARE(6) V6_SHARE(7) V6_SHARE(8) V6_SHARE(9)
+        V6_SHARE(10) V6_SHARE(11) V6_SHARE(12) V6_SHARE(13) V6_SHARE(14)
+            V6_SHARE(15) default : __builtin_unreachable();
   }
 #undef V6_SHARE
 }
@@ -1310,6 +1311,698 @@ __global__ void __launch_bounds__(256)
     }
 }
 
+template<bool PT, bool Y>
+__device__ __forceinline__ void Gemm10Body(
+    const uint8_t* __restrict__ pw, const unsigned short* __restrict__ psc,
+    const uint8_t* __restrict__ qs, const float* __restrict__ ds,
+    float* __restrict__ out, int M, int N, int K, char* lds) {
+  using namespace v6;
+  const int tid = threadIdx.x;
+  const int wave = __builtin_amdgcn_readfirstlane(tid >> 5);
+  const int lane = tid & 31;
+  const int lr = lane & 15, hi = lane >> 4;
+  const int prow = 8 * (lr & 1) + (lr >> 1);
+  const int wf = wave & 3, wth = wave >> 2;
+  const int tb = N >> 7;
+  const int f0 = (blockIdx.x / tb) * 128, t0 = (blockIdx.x % tb) * 128;
+  const int E = K >> 7;
+  const int groups128 = K / kGroup;
+  const uint32_t qrow = (uint32_t)(K >> 1);
+  const int sr = 16 * wave + lr;
+  const char* gq =
+      reinterpret_cast<const char*>(qs) + (size_t)(t0 + sr) * qrow + 8u * hi;
+  const uint32_t lds_off = wave * 1024 + hi * 128 + lr * 8;
+  const uint32_t aoff = (wth * 4) * 1024 + prow * 8;
+  const int frow = f0 + wf * 32 + lr;
+  const float* gd =
+      ds +
+      (size_t)(t0 + wth * 64 + 16 * (lr >> 3) + 8 * hi + (lr & 7)) * groups128;
+
+  float sum[4][2][8];
+  for (int a = 0; a < 4; ++a)
+    for (int b = 0; b < 2; ++b)
+      for (int j = 0; j < 8; ++j)
+        sum[a][b][j] = 0.0f;
+
+  float sxn = 0.0f;
+  i32x2 sa[4];
+  const auto stage_load = [&](int e) {
+    for (int i = 0; i < 4; ++i)
+      sa[i] = *At<i32x2>(gq, (uint32_t)e * 64 + 16u * i);
+    if (!PT && tid < 128)
+      sxn = ds[(size_t)(t0 + tid) * groups128 + e];
+  };
+  const auto stage_store = [&](char* slot, char* sreg) {
+    for (int i = 0; i < 4; ++i)
+      *reinterpret_cast<i32x2*>(slot + lds_off + i * 256) = sa[i];
+    if (!PT && tid < 128)
+      *reinterpret_cast<float*>(sreg + tid * 4) = sxn;
+  };
+  uint4 wc[2][4];
+  for (int b = 0; b < 2; ++b) {
+    const char* p = reinterpret_cast<const char*>(pw) +
+                    ((size_t)0 * M + frow + 16 * b) * 64;
+    for (int q = 0; q < 4; ++q)
+      wc[b][q] = *reinterpret_cast<const uint4*>(p + 16 * q);
+  }
+  unsigned short scn[2];
+  const auto meta_load = [&](int e) {
+    for (int b = 0; b < 2; ++b)
+      scn[b] = psc[(size_t)e * M + frow + 16 * b];
+  };
+  stage_load(0);
+  stage_store(lds, lds + 16384);
+  meta_load(0);
+  __syncthreads();
+
+  i32x8 Cp[2][2];
+  for (int b = 0; b < 2; ++b)
+    for (int a = 0; a < 2; ++a)
+      Cp[b][a] = (i32x8){0x4B400000, 0x4B400000, 0x4B400000, 0x4B400000,
+                         0x4B400000, 0x4B400000, 0x4B400000, 0x4B400000};
+  float scp[2] = {0.0f, 0.0f};
+  const char* sslp = lds + 16384;
+
+  const auto fold = [&](int h, i32x8(&C)[2][2], const float (&sc)[2],
+                        const char* ssl) {
+#pragma unroll
+    for (int a2 = 0; a2 < 2; ++a2) {
+      const int a = 2 * h + a2;
+      float scf[8];
+      if (!PT) {
+        const float4 s0 = *reinterpret_cast<const float4*>(
+            ssl + (wth * 64 + 16 * a + 8 * hi) * 4);
+        const float4 s1 = *reinterpret_cast<const float4*>(
+            ssl + (wth * 64 + 16 * a + 8 * hi) * 4 + 16);
+        const float sv[8] = {s0.x, s0.y, s0.z, s0.w, s1.x, s1.y, s1.z, s1.w};
+        for (int j = 0; j < 8; ++j) {
+          scf[j] = sv[j];
+
+          asm volatile("" : "+v"(scf[j]));
+        }
+      }
+#pragma unroll
+      for (int b = 0; b < 2; ++b) {
+        for (int j = 0; j < 8; ++j) {
+#ifdef EXP10_NOFOLD
+          sum[a][b][j] += __fsub_rn(__int_as_float(C[b][a2][j]), 12582912.0f);
+          continue;
+#endif
+          if (PT)
+            sum[a][b][j] = __builtin_fmaf(
+                sc[b], __fsub_rn(__int_as_float(C[b][a2][j]), 12582912.0f),
+                sum[a][b][j]);
+          else
+            sum[a][b][j] = __builtin_fmaf(
+                scf[j] * sc[b],
+                __fsub_rn(__int_as_float(C[b][a2][j]), 12582912.0f),
+                sum[a][b][j]);
+        }
+        asm volatile(""
+                     : "+v"(sum[a][b][0]), "+v"(sum[a][b][1]),
+                       "+v"(sum[a][b][2]), "+v"(sum[a][b][3]),
+                       "+v"(sum[a][b][4]), "+v"(sum[a][b][5]),
+                       "+v"(sum[a][b][6]), "+v"(sum[a][b][7]));
+      }
+    }
+    __builtin_amdgcn_sched_barrier(0);
+  };
+
+  const auto wmma = [&](int h, i32x8(&C)[2][2], const char* slot, bool reload,
+                        int e) {
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+      i32x2 ar[2];
+      for (int a2 = 0; a2 < 2; ++a2)
+        ar[a2] = *reinterpret_cast<const i32x2*>(slot + aoff +
+                                                 (2 * h + a2) * 1024 + s * 128);
+#pragma unroll
+      for (int b = 0; b < 2; ++b) {
+        const uint4 wq = wc[b][s >> 1];
+        const i32x2 wv =
+            (s & 1) ? i32x2{(int)wq.z, (int)wq.w} : i32x2{(int)wq.x, (int)wq.y};
+#pragma unroll
+        for (int a2 = 0; a2 < 2; ++a2) {
+          const i32x8 z =
+              (i32x8){0x4B400000, 0x4B400000, 0x4B400000, 0x4B400000,
+                      0x4B400000, 0x4B400000, 0x4B400000, 0x4B400000};
+          C[b][a2] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(
+              true, ar[a2], true, wv, s == 0 ? z : C[b][a2], false);
+        }
+      }
+#if defined(EXP10_NOLOAD) || defined(EXP10_NOW)
+      if (false) {
+#else
+      if (reload && (s & 1)) {
+#endif
+        for (int b = 0; b < 2; ++b) {
+          const char* p = reinterpret_cast<const char*>(pw) +
+                          ((size_t)(e + 1) * M + frow + 16 * b) * 64;
+          wc[b][s >> 1] = *reinterpret_cast<const uint4*>(p + 16 * (s >> 1));
+        }
+      }
+      if (s != 7)
+        __builtin_amdgcn_sched_barrier(0);
+    }
+  };
+
+  const auto epoch = [&](auto nxt_tag, int e, int par) {
+    constexpr bool nxt = decltype(nxt_tag)::value;
+    const char* slot = lds + par * 8192;
+    float sc[2];
+    for (int b = 0; b < 2; ++b)
+      sc[b] = __half2float(__ushort_as_half(scn[b]));
+
+    __builtin_amdgcn_sched_barrier(0);
+#ifndef EXP10_NOLOAD
+    if (nxt) {
+#ifndef EXP10_NOTOK
+      stage_load(e + 1);
+#endif
+      meta_load(e + 1);
+    }
+#endif
+    __builtin_amdgcn_sched_barrier(0);
+    i32x8 C0[2][2], C1[2][2];
+    if (Y)
+      fold(1, Cp, scp, sslp);
+    wmma(0, C0, slot, false, e);
+    fold(0, C0, sc, lds + 16384 + (e & 3) * 512);
+    wmma(1, C1, slot, nxt, e);
+    if (Y) {
+      for (int b = 0; b < 2; ++b)
+        for (int a = 0; a < 2; ++a)
+          Cp[b][a] = C1[b][a];
+      scp[0] = sc[0];
+      scp[1] = sc[1];
+      sslp = lds + 16384 + (e & 3) * 512;
+    } else {
+      fold(1, C1, sc, lds + 16384 + (e & 3) * 512);
+    }
+    if (nxt)
+      stage_store(lds + (par ^ 1) * 8192, lds + 16384 + ((e + 1) & 3) * 512);
+    __syncthreads();
+  };
+  int e = 0;
+  for (; e + 2 < E; e += 2) {
+    epoch(std::true_type{}, e, 0);
+    epoch(std::true_type{}, e + 1, 1);
+  }
+  epoch(std::true_type{}, e, 0);
+  epoch(std::false_type{}, e + 1, 1);
+  if (Y)
+    fold(1, Cp, scp, sslp);
+
+  for (int a = 0; a < 4; ++a)
+    for (int j = 0; j < 8; ++j) {
+      const int t = t0 + wth * 64 + a * 16 + 8 * hi + j;
+      const float r = PT ? ds[(size_t)t * groups128] : 1.0f;
+      for (int b = 0; b < 2; ++b)
+        out[(size_t)t * M + f0 + wf * 32 + b * 16 + lr] = sum[a][b][j] * r;
+    }
+}
+
+template<bool PT>
+__global__ void __launch_bounds__(256)
+    Iu4Gemm10(const uint8_t* __restrict__ pw,
+              const unsigned short* __restrict__ psc,
+              const uint8_t* __restrict__ qs, const float* __restrict__ ds,
+              float* __restrict__ out, int M, int N, int K) {
+  __shared__ __attribute__((aligned(16))) char lds[16384 + 2048];
+  if ((threadIdx.x >> 7) & 1)
+    Gemm10Body<PT, true>(pw, psc, qs, ds, out, M, N, K, lds);
+  else
+    Gemm10Body<PT, false>(pw, psc, qs, ds, out, M, N, K, lds);
+}
+
+__global__ void TransposeScales(const float* __restrict__ ds,
+                                float* __restrict__ dsT, int N, int G) {
+  const int t = blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= N)
+    return;
+  for (int e = 0; e < G; ++e)
+    dsT[(size_t)e * N + t] = ds[(size_t)t * G + e];
+}
+
+template<bool PT, bool Y>
+__device__ __forceinline__ void Gemm11Body(
+    const uint8_t* __restrict__ pw, const unsigned short* __restrict__ psc,
+    const uint8_t* __restrict__ qs, const float* __restrict__ dsT,
+    const float* __restrict__ ds, float* __restrict__ out, int M, int N,
+    int K) {
+  using namespace v6;
+  const int tid = threadIdx.x;
+  const int wave = __builtin_amdgcn_readfirstlane(tid >> 5);
+  const int lane = tid & 31;
+  const int lr = lane & 15, hi = lane >> 4;
+  const int prow = 8 * (lr & 1) + (lr >> 1);
+  const int wf = wave & 3, wth = wave >> 2;
+  const int tb = N >> 7;
+  const int f0 = (blockIdx.x / tb) * 128, t0 = (blockIdx.x % tb) * 128;
+  const int E = K >> 7;
+  const int groups128 = K / kGroup;
+  const uint32_t qrow = (uint32_t)(K >> 1);
+  const int frow = f0 + wf * 32 + lr;
+  const char* tokp[4];
+  for (int a = 0; a < 4; ++a)
+    tokp[a] = reinterpret_cast<const char*>(qs) +
+              (size_t)(t0 + wth * 64 + 16 * a + prow) * qrow;
+  const float* sxp = dsT + (t0 + wth * 64 + 8 * hi);
+
+  float sum[4][2][8];
+  for (int a = 0; a < 4; ++a)
+    for (int b = 0; b < 2; ++b)
+      for (int j = 0; j < 8; ++j)
+        sum[a][b][j] = 0.0f;
+
+  uint4 tc[2][4], wc[2][4];
+  const auto tload = [&](int h, int e) {
+    for (int a2 = 0; a2 < 2; ++a2) {
+      const char* p = tokp[2 * h + a2] + (size_t)e * 64;
+      for (int q = 0; q < 4; ++q)
+        tc[a2][q] = *reinterpret_cast<const uint4*>(p + 16 * q);
+    }
+  };
+  const auto tload1 = [&](int h, int e, int q) {
+    for (int a2 = 0; a2 < 2; ++a2)
+      tc[a2][q] = *reinterpret_cast<const uint4*>(tokp[2 * h + a2] +
+                                                  (size_t)e * 64 + 16 * q);
+  };
+  const auto wload1 = [&](int e, int q) {
+    for (int b = 0; b < 2; ++b)
+      wc[b][q] = *reinterpret_cast<const uint4*>(
+          reinterpret_cast<const char*>(pw) +
+          ((size_t)e * M + frow + 16 * b) * 64 + 16 * q);
+  };
+  for (int q = 0; q < 4; ++q)
+    wload1(0, q);
+  tload(0, 0);
+  unsigned short scn[2];
+  const auto meta_load = [&](int e) {
+    for (int b = 0; b < 2; ++b)
+      scn[b] = psc[(size_t)e * M + frow + 16 * b];
+  };
+  meta_load(0);
+
+  const i32x8 kz = (i32x8){0x4B400000, 0x4B400000, 0x4B400000, 0x4B400000,
+                           0x4B400000, 0x4B400000, 0x4B400000, 0x4B400000};
+  i32x8 Cp[2][2];
+  for (int b = 0; b < 2; ++b)
+    for (int a = 0; a < 2; ++a)
+      Cp[b][a] = kz;
+  float scp[2] = {0.0f, 0.0f};
+  float svp[2][8];
+  int lastE = 0;
+
+  const auto sload = [&](int h, int e, float (&sv)[2][8]) {
+    if (PT)
+      return;
+    for (int a2 = 0; a2 < 2; ++a2) {
+      const float4 s0 = *reinterpret_cast<const float4*>(sxp + (size_t)e * N +
+                                                         16 * (2 * h + a2));
+      const float4 s1 = *reinterpret_cast<const float4*>(sxp + (size_t)e * N +
+                                                         16 * (2 * h + a2) + 4);
+      sv[a2][0] = s0.x;
+      sv[a2][1] = s0.y;
+      sv[a2][2] = s0.z;
+      sv[a2][3] = s0.w;
+      sv[a2][4] = s1.x;
+      sv[a2][5] = s1.y;
+      sv[a2][6] = s1.z;
+      sv[a2][7] = s1.w;
+    }
+  };
+
+  const auto fold = [&](int h, i32x8(&C)[2][2], const float (&sc)[2],
+                        const float (&sv)[2][8]) {
+#pragma unroll
+    for (int a2 = 0; a2 < 2; ++a2) {
+      const int a = 2 * h + a2;
+#pragma unroll
+      for (int b = 0; b < 2; ++b) {
+        for (int j = 0; j < 8; ++j) {
+          const float cf = __fsub_rn(__int_as_float(C[b][a2][j]), 12582912.0f);
+          if (PT)
+            sum[a][b][j] = __builtin_fmaf(sc[b], cf, sum[a][b][j]);
+          else
+            sum[a][b][j] = __builtin_fmaf(sv[a2][j] * sc[b], cf, sum[a][b][j]);
+        }
+        asm volatile(""
+                     : "+v"(sum[a][b][0]), "+v"(sum[a][b][1]),
+                       "+v"(sum[a][b][2]), "+v"(sum[a][b][3]),
+                       "+v"(sum[a][b][4]), "+v"(sum[a][b][5]),
+                       "+v"(sum[a][b][6]), "+v"(sum[a][b][7]));
+      }
+    }
+    __builtin_amdgcn_sched_barrier(0);
+  };
+
+  const auto wmma = [&](int h, i32x8(&C)[2][2], int e, bool nxt) {
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+#pragma unroll
+      for (int b = 0; b < 2; ++b) {
+        const uint4 wq = wc[b][s >> 1];
+        const i32x2 wv =
+            (s & 1) ? i32x2{(int)wq.z, (int)wq.w} : i32x2{(int)wq.x, (int)wq.y};
+#pragma unroll
+        for (int a2 = 0; a2 < 2; ++a2) {
+          const uint4 tq = tc[a2][s >> 1];
+          const i32x2 tv = (s & 1) ? i32x2{(int)tq.z, (int)tq.w}
+                                   : i32x2{(int)tq.x, (int)tq.y};
+          C[b][a2] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(
+              true, tv, true, wv, s == 0 ? kz : C[b][a2], false);
+        }
+      }
+      if (s & 1) {
+        if (h == 0)
+          tload1(1, e, s >> 1);
+        else if (nxt)
+          tload1(0, e + 1, s >> 1);
+        if (h == 1 && nxt)
+          wload1(e + 1, s >> 1);
+      }
+      if (s != 7)
+        __builtin_amdgcn_sched_barrier(0);
+    }
+  };
+
+  const auto epoch = [&](auto nxt_tag, int e) {
+    constexpr bool nxt = decltype(nxt_tag)::value;
+    float sc[2];
+    for (int b = 0; b < 2; ++b)
+      sc[b] = __half2float(__ushort_as_half(scn[b]));
+    if (nxt)
+      meta_load(e + 1);
+    float sv0[2][8], sv1[2][8];
+    i32x8 C0[2][2], C1[2][2];
+    sload(0, e, sv0);
+    if (Y) {
+      sload(1, e > 0 ? e - 1 : 0, svp);
+      fold(1, Cp, scp, svp);
+    }
+    wmma(0, C0, e, nxt);
+    fold(0, C0, sc, sv0);
+    sload(1, e, sv1);
+    wmma(1, C1, e, nxt);
+    if (Y) {
+      for (int b = 0; b < 2; ++b)
+        for (int a = 0; a < 2; ++a)
+          Cp[b][a] = C1[b][a];
+      scp[0] = sc[0];
+      scp[1] = sc[1];
+      lastE = e;
+    } else {
+      fold(1, C1, sc, sv1);
+    }
+  };
+  for (int e = 0; e + 1 < E; ++e)
+    epoch(std::true_type{}, e);
+  epoch(std::false_type{}, E - 1);
+  if (Y) {
+    sload(1, lastE, svp);
+    fold(1, Cp, scp, svp);
+  }
+
+  for (int a = 0; a < 4; ++a)
+    for (int j = 0; j < 8; ++j) {
+      const int t = t0 + wth * 64 + a * 16 + 8 * hi + j;
+      const float r = PT ? ds[(size_t)t * groups128] : 1.0f;
+      for (int b = 0; b < 2; ++b)
+        out[(size_t)t * M + f0 + wf * 32 + b * 16 + lr] = sum[a][b][j] * r;
+    }
+}
+
+template<bool PT>
+__global__ void __launch_bounds__(256)
+    Iu4Gemm11(const uint8_t* __restrict__ pw,
+              const unsigned short* __restrict__ psc,
+              const uint8_t* __restrict__ qs, const float* __restrict__ dsT,
+              const float* __restrict__ ds, float* __restrict__ out, int M,
+              int N, int K) {
+  if ((threadIdx.x >> 7) & 1)
+    Gemm11Body<PT, true>(pw, psc, qs, dsT, ds, out, M, N, K);
+  else
+    Gemm11Body<PT, false>(pw, psc, qs, dsT, ds, out, M, N, K);
+}
+
+__global__ void RelayoutTok(const uint8_t* __restrict__ qs,
+                            uint8_t* __restrict__ qsT, int N, int K) {
+  const int E = K >> 7;
+  const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t total = (size_t)N * E * 8;
+  if (idx >= total)
+    return;
+  const int t = idx / (E * 8), r = idx % (E * 8), e = r / 8, o = r % 8;
+  const int i = o >> 1, hi = o & 1;
+  const size_t dst =
+      ((size_t)(t >> 4) * E + e) * 1024 + i * 256 + hi * 128 + (t & 15) * 8;
+  *reinterpret_cast<uint2*>(qsT + dst) = *reinterpret_cast<const uint2*>(
+      qs + (size_t)t * (K / 2) + (size_t)e * 64 + 16 * i + 8 * hi);
+}
+
+__global__ void RelayoutW(const uint8_t* __restrict__ pw,
+                          uint8_t* __restrict__ pwT, int M, int K) {
+  const int E = K >> 7;
+  const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t total = (size_t)E * M * 4;
+  if (idx >= total)
+    return;
+  const int q = idx & 3;
+  const size_t er = idx >> 2;
+  const int row = er % M, e = er / M;
+  const size_t dst =
+      (((size_t)e * (M >> 4) + (row >> 4)) * 4 + q) * 256 + (row & 15) * 16;
+  *reinterpret_cast<uint4*>(pwT + dst) =
+      *reinterpret_cast<const uint4*>(pw + ((size_t)e * M + row) * 64 + 16 * q);
+}
+
+template<bool PT, bool Y>
+__device__ __forceinline__ void Gemm12Body(
+    const uint8_t* __restrict__ pw, const unsigned short* __restrict__ psc,
+    const uint8_t* __restrict__ qs, const float* __restrict__ ds,
+    float* __restrict__ out, int M, int N, int K, char* lds) {
+  using namespace v6;
+  const int tid = threadIdx.x;
+  const int wave = __builtin_amdgcn_readfirstlane(tid >> 5);
+  const int lane = tid & 31;
+  const int lr = lane & 15, hi = lane >> 4;
+  const int prow = 8 * (lr & 1) + (lr >> 1);
+  const int wf = wave & 3, wth = wave >> 2;
+  const int tb = N >> 7;
+  const int f0 = (blockIdx.x / tb) * 128, t0 = (blockIdx.x % tb) * 128;
+  const int E = K >> 7;
+  const int groups128 = K / kGroup;
+  const uint32_t qrow = (uint32_t)(K >> 1);
+  const int sr = 16 * wave + lr;
+  const char* gq = reinterpret_cast<const char*>(qs) +
+                   (size_t)((t0 >> 4) + wave) * E * 1024 + lane * 8;
+  const uint32_t lds_off = wave * 1024 + hi * 128 + lr * 8;
+  const uint32_t aoff = (wth * 4) * 1024 + prow * 8;
+  const int frow = f0 + wf * 32 + lr;
+  const float* gd =
+      ds +
+      (size_t)(t0 + wth * 64 + 16 * (lr >> 3) + 8 * hi + (lr & 7)) * groups128;
+
+  float sum[4][2][8];
+  for (int a = 0; a < 4; ++a)
+    for (int b = 0; b < 2; ++b)
+      for (int j = 0; j < 8; ++j)
+        sum[a][b][j] = 0.0f;
+
+  float sxn = 0.0f;
+  i32x2 sa[4];
+  const auto stage_load = [&](int e) {
+    for (int i = 0; i < 4; ++i)
+      sa[i] = *At<i32x2>(gq, (uint32_t)e * 1024 + 256u * i);
+    if (!PT && tid < 128)
+      sxn = ds[(size_t)(t0 + tid) * groups128 + e];
+  };
+  const auto stage_store = [&](char* slot, char* sreg) {
+    for (int i = 0; i < 4; ++i)
+      *reinterpret_cast<i32x2*>(slot + lds_off + i * 256) = sa[i];
+    if (!PT && tid < 128)
+      *reinterpret_cast<float*>(sreg + tid * 4) = sxn;
+  };
+  uint4 wc[2][4];
+  for (int b = 0; b < 2; ++b) {
+    for (int q = 0; q < 4; ++q)
+      wc[b][q] = *reinterpret_cast<const uint4*>(
+          reinterpret_cast<const char*>(pw) +
+          (((size_t)0 * (M >> 4) + (frow >> 4) + b) * 4 + q) * 256 + lr * 16);
+  }
+  unsigned short scn[2];
+  const auto meta_load = [&](int e) {
+    for (int b = 0; b < 2; ++b)
+      scn[b] = psc[(size_t)e * M + frow + 16 * b];
+  };
+  stage_load(0);
+  stage_store(lds, lds + 16384);
+  meta_load(0);
+  __syncthreads();
+
+  i32x8 Cp[2][2];
+  for (int b = 0; b < 2; ++b)
+    for (int a = 0; a < 2; ++a)
+      Cp[b][a] = (i32x8){0x4B400000, 0x4B400000, 0x4B400000, 0x4B400000,
+                         0x4B400000, 0x4B400000, 0x4B400000, 0x4B400000};
+  float scp[2] = {0.0f, 0.0f};
+  const char* sslp = lds + 16384;
+
+  const auto fold = [&](int h, i32x8(&C)[2][2], const float (&sc)[2],
+                        const char* ssl) {
+#pragma unroll
+    for (int a2 = 0; a2 < 2; ++a2) {
+      const int a = 2 * h + a2;
+      float scf[8];
+      if (!PT) {
+        const float4 s0 = *reinterpret_cast<const float4*>(
+            ssl + (wth * 64 + 16 * a + 8 * hi) * 4);
+        const float4 s1 = *reinterpret_cast<const float4*>(
+            ssl + (wth * 64 + 16 * a + 8 * hi) * 4 + 16);
+        const float sv[8] = {s0.x, s0.y, s0.z, s0.w, s1.x, s1.y, s1.z, s1.w};
+        for (int j = 0; j < 8; ++j) {
+          scf[j] = sv[j];
+
+          asm volatile("" : "+v"(scf[j]));
+        }
+      }
+#pragma unroll
+      for (int b = 0; b < 2; ++b) {
+        for (int j = 0; j < 8; ++j) {
+#ifdef EXP10_NOFOLD
+          sum[a][b][j] += __fsub_rn(__int_as_float(C[b][a2][j]), 12582912.0f);
+          continue;
+#endif
+          if (PT)
+            sum[a][b][j] = __builtin_fmaf(
+                sc[b], __fsub_rn(__int_as_float(C[b][a2][j]), 12582912.0f),
+                sum[a][b][j]);
+          else
+            sum[a][b][j] = __builtin_fmaf(
+                scf[j] * sc[b],
+                __fsub_rn(__int_as_float(C[b][a2][j]), 12582912.0f),
+                sum[a][b][j]);
+        }
+        asm volatile(""
+                     : "+v"(sum[a][b][0]), "+v"(sum[a][b][1]),
+                       "+v"(sum[a][b][2]), "+v"(sum[a][b][3]),
+                       "+v"(sum[a][b][4]), "+v"(sum[a][b][5]),
+                       "+v"(sum[a][b][6]), "+v"(sum[a][b][7]));
+      }
+    }
+    __builtin_amdgcn_sched_barrier(0);
+  };
+
+  const auto wmma = [&](int h, i32x8(&C)[2][2], const char* slot, bool reload,
+                        int e) {
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+      i32x2 ar[2];
+      for (int a2 = 0; a2 < 2; ++a2)
+        ar[a2] = *reinterpret_cast<const i32x2*>(slot + aoff +
+                                                 (2 * h + a2) * 1024 + s * 128);
+#pragma unroll
+      for (int b = 0; b < 2; ++b) {
+        const uint4 wq = wc[b][s >> 1];
+        const i32x2 wv =
+            (s & 1) ? i32x2{(int)wq.z, (int)wq.w} : i32x2{(int)wq.x, (int)wq.y};
+#pragma unroll
+        for (int a2 = 0; a2 < 2; ++a2) {
+          const i32x8 z =
+              (i32x8){0x4B400000, 0x4B400000, 0x4B400000, 0x4B400000,
+                      0x4B400000, 0x4B400000, 0x4B400000, 0x4B400000};
+          C[b][a2] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(
+              true, ar[a2], true, wv, s == 0 ? z : C[b][a2], false);
+        }
+      }
+#if defined(EXP10_NOLOAD) || defined(EXP10_NOW)
+      if (false) {
+#else
+      if (reload && (s & 1)) {
+#endif
+        for (int b = 0; b < 2; ++b) {
+          wc[b][s >> 1] = *reinterpret_cast<const uint4*>(
+              reinterpret_cast<const char*>(pw) +
+              (((size_t)(e + 1) * (M >> 4) + (frow >> 4) + b) * 4 + (s >> 1)) *
+                  256 +
+              lr * 16);
+        }
+      }
+      if (s != 7)
+        __builtin_amdgcn_sched_barrier(0);
+    }
+  };
+
+  const auto epoch = [&](auto nxt_tag, int e, int par) {
+    constexpr bool nxt = decltype(nxt_tag)::value;
+    const char* slot = lds + par * 8192;
+    float sc[2];
+    for (int b = 0; b < 2; ++b)
+      sc[b] = __half2float(__ushort_as_half(scn[b]));
+
+    __builtin_amdgcn_sched_barrier(0);
+#ifndef EXP10_NOLOAD
+    if (nxt) {
+#ifndef EXP10_NOTOK
+      stage_load(e + 1);
+#endif
+      meta_load(e + 1);
+    }
+#endif
+    __builtin_amdgcn_sched_barrier(0);
+    i32x8 C0[2][2], C1[2][2];
+    if (Y)
+      fold(1, Cp, scp, sslp);
+    wmma(0, C0, slot, false, e);
+    fold(0, C0, sc, lds + 16384 + (e & 3) * 512);
+    wmma(1, C1, slot, nxt, e);
+    if (Y) {
+      for (int b = 0; b < 2; ++b)
+        for (int a = 0; a < 2; ++a)
+          Cp[b][a] = C1[b][a];
+      scp[0] = sc[0];
+      scp[1] = sc[1];
+      sslp = lds + 16384 + (e & 3) * 512;
+    } else {
+      fold(1, C1, sc, lds + 16384 + (e & 3) * 512);
+    }
+    if (nxt)
+      stage_store(lds + (par ^ 1) * 8192, lds + 16384 + ((e + 1) & 3) * 512);
+    __syncthreads();
+  };
+  int e = 0;
+  for (; e + 2 < E; e += 2) {
+    epoch(std::true_type{}, e, 0);
+    epoch(std::true_type{}, e + 1, 1);
+  }
+  epoch(std::true_type{}, e, 0);
+  epoch(std::false_type{}, e + 1, 1);
+  if (Y)
+    fold(1, Cp, scp, sslp);
+
+  for (int a = 0; a < 4; ++a)
+    for (int j = 0; j < 8; ++j) {
+      const int t = t0 + wth * 64 + a * 16 + 8 * hi + j;
+      const float r = PT ? ds[(size_t)t * groups128] : 1.0f;
+      for (int b = 0; b < 2; ++b)
+        out[(size_t)t * M + f0 + wf * 32 + b * 16 + lr] = sum[a][b][j] * r;
+    }
+}
+
+template<bool PT>
+__global__ void __launch_bounds__(256)
+    Iu4Gemm12(const uint8_t* __restrict__ pw,
+              const unsigned short* __restrict__ psc,
+              const uint8_t* __restrict__ qs, const float* __restrict__ ds,
+              float* __restrict__ out, int M, int N, int K) {
+  __shared__ __attribute__((aligned(16))) char lds[16384 + 2048];
+  if ((threadIdx.x >> 7) & 1)
+    Gemm12Body<PT, true>(pw, psc, qs, ds, out, M, N, K, lds);
+  else
+    Gemm12Body<PT, false>(pw, psc, qs, ds, out, M, N, K, lds);
+}
+
 __global__ void XorNibbles(uint8_t* w, size_t bytes) {
   const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
   if (i >= bytes)
@@ -1635,6 +2328,157 @@ int main(int argc, char** argv) {
         md9 = std::max(md9, (double)std::fabs(o9[i] - o2[i]));
       std::printf("v9   %.3f ms  %.1f TOPS  max |v2-v9| %.3e\n", ms9,
                   2.0 * M * N * K / (ms9 * 1e-3) / 1e12, md9);
+    }
+    {
+      uint8_t* dwa;
+      HIP_OK(hipMalloc(&dwa, we->len));
+      HIP_OK(hipMemcpy(dwa, dw, we->len, hipMemcpyDeviceToDevice));
+      XorNibbles<<<(we->len + 255) / 256, 256>>>(dwa, we->len);
+      uint8_t* pwa;
+      unsigned short* psca;
+      HIP_OK(hipMalloc(&pwa, (size_t)M * K / 2));
+      HIP_OK(hipMalloc(&psca, (size_t)M * (K / 128) * 2));
+      Repack9<<<dim3(M, K / 128), 128>>>(dwa, pwa, psca, M, K);
+      float* douta;
+      HIP_OK(hipMalloc(&douta, (size_t)N * M * 4));
+      const int ga = (M / 128) * (N / 128);
+#ifdef EXP_PT
+      constexpr bool kPTa = true;
+#else
+      constexpr bool kPTa = false;
+#endif
+      Iu4Gemm10<kPTa><<<ga, 256>>>(pwa, psca, dqs, dds, douta, M, N, K);
+      HIP_OK(hipDeviceSynchronize());
+      hipEventRecord(a);
+      for (int i = 0; i < 1000; ++i)
+        Iu4Gemm10<kPTa><<<ga, 256>>>(pwa, psca, dqs, dds, douta, M, N, K);
+      hipEventRecord(b);
+      hipEventSynchronize(b);
+      float msa;
+      hipEventElapsedTime(&msa, a, b);
+      msa /= 1000;
+      std::vector<float> oa((size_t)N * M);
+      HIP_OK(hipMemcpy(oa.data(), douta, oa.size() * 4, hipMemcpyDeviceToHost));
+      double mda = 0;
+      size_t nbad = 0, ex = 0;
+      for (size_t i = 0; i < oa.size(); ++i) {
+        const double d = std::fabs(oa[i] - o2[i]);
+        mda = std::max(mda, d);
+        if (d > 1e-4) {
+          if (nbad < 6)
+            std::printf("bad n=%zu m=%zu got %g want %g\n", i / M, i % M, oa[i],
+                        o2[i]);
+          ++nbad;
+        }
+      }
+      std::printf("bad count %zu of %zu\n", nbad, oa.size());
+      (void)ex;
+      std::printf("v10   %.3f ms  %.1f TOPS  max |v2-v10| %.3e\n", msa,
+                  2.0 * M * N * K / (msa * 1e-3) / 1e12, mda);
+    }
+    {
+      uint8_t* dwc;
+      HIP_OK(hipMalloc(&dwc, we->len));
+      HIP_OK(hipMemcpy(dwc, dw, we->len, hipMemcpyDeviceToDevice));
+      XorNibbles<<<(we->len + 255) / 256, 256>>>(dwc, we->len);
+      uint8_t* pwc;
+      unsigned short* pscc;
+      HIP_OK(hipMalloc(&pwc, (size_t)M * K / 2));
+      HIP_OK(hipMalloc(&pscc, (size_t)M * (K / 128) * 2));
+      Repack9<<<dim3(M, K / 128), 128>>>(dwc, pwc, pscc, M, K);
+      uint8_t *pwT, *qsT;
+      HIP_OK(hipMalloc(&pwT, (size_t)M * K / 2));
+      HIP_OK(hipMalloc(&qsT, (size_t)N * K / 2));
+      RelayoutW<<<((size_t)(K / 128) * M * 4 + 255) / 256, 256>>>(pwc, pwT, M,
+                                                                  K);
+      RelayoutTok<<<((size_t)N * (K / 128) * 8 + 255) / 256, 256>>>(dqs, qsT, N,
+                                                                    K);
+      float* doutc;
+      HIP_OK(hipMalloc(&doutc, (size_t)N * M * 4));
+      const int gc = (M / 128) * (N / 128);
+#ifdef EXP_PT
+      constexpr bool kPTc = true;
+#else
+      constexpr bool kPTc = false;
+#endif
+      Iu4Gemm12<kPTc><<<gc, 256>>>(pwT, pscc, qsT, dds, doutc, M, N, K);
+      HIP_OK(hipDeviceSynchronize());
+      hipEventRecord(a);
+      for (int i = 0; i < 1000; ++i)
+        Iu4Gemm12<kPTc><<<gc, 256>>>(pwT, pscc, qsT, dds, doutc, M, N, K);
+      hipEventRecord(b);
+      hipEventSynchronize(b);
+      float msc;
+      hipEventElapsedTime(&msc, a, b);
+      msc /= 1000;
+      std::vector<float> oc((size_t)N * M);
+      HIP_OK(hipMemcpy(oc.data(), doutc, oc.size() * 4, hipMemcpyDeviceToHost));
+      double mdc = 0;
+      size_t nbad = 0, ex = 0;
+      for (size_t i = 0; i < oc.size(); ++i) {
+        const double d = std::fabs(oc[i] - o2[i]);
+        mdc = std::max(mdc, d);
+        if (d > 1e-4) {
+          if (nbad < 6)
+            std::printf("bad n=%zu m=%zu got %g want %g\n", i / M, i % M, oc[i],
+                        o2[i]);
+          ++nbad;
+        }
+      }
+      std::printf("bad count %zu of %zu\n", nbad, oc.size());
+      (void)ex;
+      std::printf("v12   %.3f ms  %.1f TOPS  max |v2-v12| %.3e\n", msc,
+                  2.0 * M * N * K / (msc * 1e-3) / 1e12, mdc);
+    }
+    {
+      uint8_t* dwb;
+      HIP_OK(hipMalloc(&dwb, we->len));
+      HIP_OK(hipMemcpy(dwb, dw, we->len, hipMemcpyDeviceToDevice));
+      XorNibbles<<<(we->len + 255) / 256, 256>>>(dwb, we->len);
+      uint8_t* pwb;
+      unsigned short* pscb;
+      HIP_OK(hipMalloc(&pwb, (size_t)M * K / 2));
+      HIP_OK(hipMalloc(&pscb, (size_t)M * (K / 128) * 2));
+      Repack9<<<dim3(M, K / 128), 128>>>(dwb, pwb, pscb, M, K);
+      float* dsTb;
+      HIP_OK(hipMalloc(&dsTb, (size_t)N * (K / 128) * 4));
+      TransposeScales<<<(N + 255) / 256, 256>>>(dds, dsTb, N, K / 128);
+      float* doutb;
+      HIP_OK(hipMalloc(&doutb, (size_t)N * M * 4));
+      const int gb = (M / 128) * (N / 128);
+#ifdef EXP_PT
+      constexpr bool kPTb = true;
+#else
+      constexpr bool kPTb = false;
+#endif
+      Iu4Gemm11<kPTb><<<gb, 256>>>(pwb, pscb, dqs, dsTb, dds, doutb, M, N, K);
+      HIP_OK(hipDeviceSynchronize());
+      hipEventRecord(a);
+      for (int i = 0; i < 1000; ++i)
+        Iu4Gemm11<kPTb><<<gb, 256>>>(pwb, pscb, dqs, dsTb, dds, doutb, M, N, K);
+      hipEventRecord(b);
+      hipEventSynchronize(b);
+      float msb;
+      hipEventElapsedTime(&msb, a, b);
+      msb /= 1000;
+      std::vector<float> ob((size_t)N * M);
+      HIP_OK(hipMemcpy(ob.data(), doutb, ob.size() * 4, hipMemcpyDeviceToHost));
+      double mdb = 0;
+      size_t nbad = 0, ex = 0;
+      for (size_t i = 0; i < ob.size(); ++i) {
+        const double d = std::fabs(ob[i] - o2[i]);
+        mdb = std::max(mdb, d);
+        if (d > 1e-4) {
+          if (nbad < 6)
+            std::printf("bad n=%zu m=%zu got %g want %g\n", i / M, i % M, ob[i],
+                        o2[i]);
+          ++nbad;
+        }
+      }
+      std::printf("bad count %zu of %zu\n", nbad, ob.size());
+      (void)ex;
+      std::printf("v11   %.3f ms  %.1f TOPS  max |v2-v11| %.3e\n", msb,
+                  2.0 * M * N * K / (msb * 1e-3) / 1e12, mdb);
     }
     {
       uint8_t* dw8;
