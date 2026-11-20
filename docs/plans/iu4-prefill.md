@@ -227,3 +227,29 @@ TOPS/GHz); the loads-and-fold-removed ablation runs at 2.65 GHz and 140 W
 TOPS (37.4 x 2.5-2.65), and every byte moved through LDS, VMEM and VALU costs
 power and lowers the clock further. 92+ TOPS would need more than 95% of that
 bound, so the practical ceiling for a kernel that stages real data is about 75.
+
+### v9: weights straight from global memory into registers
+
+Weights are repacked once at load time into `[epoch][row][64 B]` payload plus a
+`[epoch][row]` scale array (a lossless relayout), so each lane reads its weight
+fragment with four 16-byte loads per 128-K epoch and no LDS staging. Only the
+token tile goes through LDS (8 KB slots, double buffered, one barrier per
+epoch). The next epoch's weight registers are reloaded in place as each K32
+pair is consumed. Wave tile 32 features x 64 tokens, 128x128 CTA.
+
+| Variant (gate_proj, N=2048) | TOPS | VGPRs |
+|---|---|---|
+| v9 per-token activation scale | 69-71 | 256 |
+| v5 per-token (previous best) | 66 | |
+| v9 exact per-128 scales | 46 | 244, no spill |
+
+The weights-to-registers change is worth about +5 TOPS. The exact fold is
+slow here (46): all waves leave the barrier in lock-step, so every wave runs
+its 240 fold VALU instructions at the same time and nothing overlaps the
+WMMAs.
+
+Per-token activation scale quality, same synthetic activations as the
+bench (heavy channels, rotation within 256-blocks only): relative RMS 0.160
+versus 0.115 for per-128 scales. That is 40% more activation error, so the
+per-token scale is not free and needs the real-activation quality test before
+it can ship.

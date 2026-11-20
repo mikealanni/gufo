@@ -791,10 +791,10 @@ __device__ __forceinline__ int RowShare(int v, int k) {
   switch (k) {
     V6_SHARE(0)
     V6_SHARE(1)
-    V6_SHARE(2) V6_SHARE(3) V6_SHARE(4) V6_SHARE(5) V6_SHARE(6) V6_SHARE(7)
-        V6_SHARE(8) V6_SHARE(9) V6_SHARE(10) V6_SHARE(11) V6_SHARE(12)
-            V6_SHARE(13) V6_SHARE(14) V6_SHARE(15) default
-        : __builtin_unreachable();
+    V6_SHARE(2)
+    V6_SHARE(3) V6_SHARE(4) V6_SHARE(5) V6_SHARE(6) V6_SHARE(7) V6_SHARE(8)
+        V6_SHARE(9) V6_SHARE(10) V6_SHARE(11) V6_SHARE(12) V6_SHARE(13)
+            V6_SHARE(14) V6_SHARE(15) default : __builtin_unreachable();
   }
 #undef V6_SHARE
 }
@@ -1136,6 +1136,180 @@ __global__ void __launch_bounds__(512)
     }
 }
 
+__global__ void Repack9(const uint8_t* __restrict__ w, uint8_t* __restrict__ pw,
+                        unsigned short* __restrict__ psc, int M, int K) {
+  const int row = blockIdx.x, e = blockIdx.y;
+  const int nblk = K / 256;
+  const uint8_t* src =
+      w + (size_t)row * nblk * kBlockBytes + (size_t)(e >> 1) * kBlockBytes;
+  const int t = threadIdx.x;
+  if (t < 64)
+    pw[((size_t)e * M + row) * 64 + t] = src[8 + 64 * (e & 1) + t];
+  if (t == 64)
+    psc[(size_t)e * M + row] =
+        *reinterpret_cast<const unsigned short*>(src + 4 * (e & 1));
+}
+
+template<bool PT>
+__global__ void __launch_bounds__(256)
+    Iu4Gemm9(const uint8_t* __restrict__ pw,
+             const unsigned short* __restrict__ psc,
+             const uint8_t* __restrict__ qs, const float* __restrict__ ds,
+             float* __restrict__ out, int M, int N, int K) {
+  using namespace v6;
+  __shared__ __attribute__((aligned(16))) char lds[2 * 8192];
+  const int tid = threadIdx.x;
+  const int wave = __builtin_amdgcn_readfirstlane(tid >> 5);
+  const int lane = tid & 31;
+  const int lr = lane & 15, hi = lane >> 4;
+  const int prow = 8 * (lr & 1) + (lr >> 1);
+  const int wf = wave & 3, wth = wave >> 2;
+  const int tb = N >> 7;
+  const int f0 = (blockIdx.x / tb) * 128, t0 = (blockIdx.x % tb) * 128;
+  const int E = K >> 7;
+  const int groups128 = K / kGroup;
+  const uint32_t qrow = (uint32_t)(K >> 1);
+  const int sr = 16 * wave + lr;
+  const char* gq =
+      reinterpret_cast<const char*>(qs) + (size_t)(t0 + sr) * qrow + 8u * hi;
+  const uint32_t lds_off = wave * 1024 + hi * 128 + lr * 8;
+  const uint32_t aoff = (wth * 4) * 1024 + prow * 8;
+  const int frow = f0 + wf * 32 + lr;
+  const float* gd =
+      ds +
+      (size_t)(t0 + wth * 64 + 16 * (lr >> 3) + 8 * hi + (lr & 7)) * groups128;
+
+  float sum[4][2][8];
+  for (int a = 0; a < 4; ++a)
+    for (int b = 0; b < 2; ++b)
+      for (int j = 0; j < 8; ++j)
+        sum[a][b][j] = 0.0f;
+
+  i32x2 sa[4];
+  const auto stage_load = [&](int e) {
+    for (int i = 0; i < 4; ++i)
+      sa[i] = *At<i32x2>(gq, (uint32_t)e * 64 + 16u * i);
+  };
+  const auto stage_store = [&](char* slot) {
+    for (int i = 0; i < 4; ++i)
+      *reinterpret_cast<i32x2*>(slot + lds_off + i * 256) = sa[i];
+  };
+  using W = uint4[2][4];
+  uint4 wA[2][4];
+  const auto wload = [&](W& dst, int e) {
+    for (int b = 0; b < 2; ++b) {
+      const char* p = reinterpret_cast<const char*>(pw) +
+                      ((size_t)e * M + frow + 16 * b) * 64;
+      for (int q = 0; q < 4; ++q)
+        dst[b][q] = *reinterpret_cast<const uint4*>(p + 16 * q);
+    }
+  };
+  unsigned short scn[2];
+  float wsn0 = 0.0f, wsn1 = 0.0f;
+  const auto meta_load = [&](int e) {
+    for (int b = 0; b < 2; ++b)
+      scn[b] = psc[(size_t)e * M + frow + 16 * b];
+    if (!PT) {
+      wsn0 = gd[e];
+      wsn1 = gd[e + 32 * groups128];
+    }
+  };
+  stage_load(0);
+  stage_store(lds);
+  wload(wA, 0);
+  meta_load(0);
+  __syncthreads();
+
+  const auto epoch = [&](W& wc, auto nxt_tag, int e, int par) {
+    constexpr bool nxt = decltype(nxt_tag)::value;
+    char* slot = lds + par * 8192;
+    float sc[2];
+    for (int b = 0; b < 2; ++b)
+      sc[b] = __half2float(__ushort_as_half(scn[b]));
+    const int wsf0 = __float_as_int(wsn0), wsf1 = __float_as_int(wsn1);
+    __builtin_amdgcn_sched_barrier(0);
+    if (nxt) {
+      stage_load(e + 1);
+      meta_load(e + 1);
+    }
+    __builtin_amdgcn_sched_barrier(0);
+    i32x8 C[2][4];
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+      i32x2 ar[4];
+      for (int a = 0; a < 4; ++a)
+        ar[a] =
+            *reinterpret_cast<const i32x2*>(slot + aoff + a * 1024 + s * 128);
+#pragma unroll
+      for (int b = 0; b < 2; ++b) {
+        const uint4 wq = wc[b][s >> 1];
+        const i32x2 wv =
+            (s & 1) ? i32x2{(int)wq.z, (int)wq.w} : i32x2{(int)wq.x, (int)wq.y};
+#pragma unroll
+        for (int a = 0; a < 4; ++a) {
+          const i32x8 z = (i32x8){0, 0, 0, 0, 0, 0, 0, 0};
+          C[b][a] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(
+              true, ar[a], true, wv, s == 0 ? z : C[b][a], false);
+        }
+      }
+      if (nxt && (s & 1)) {
+        for (int b = 0; b < 2; ++b) {
+          const char* p = reinterpret_cast<const char*>(pw) +
+                          ((size_t)(e + 1) * M + frow + 16 * b) * 64;
+          wc[b][s >> 1] = *reinterpret_cast<const uint4*>(p + 16 * (s >> 1));
+        }
+      }
+      if (s != 7)
+        __builtin_amdgcn_sched_barrier(0);
+    }
+#pragma unroll
+    for (int a = 0; a < 4; ++a) {
+      float scf[8];
+      if (!PT) {
+        const int wsf = a < 2 ? wsf0 : wsf1;
+        for (int j = 0; j < 8; ++j) {
+          scf[j] = __int_as_float(RowShare(wsf, 8 * (a & 1) + j));
+          asm volatile("" : "+v"(scf[j]));
+        }
+      }
+      for (int b = 0; b < 2; ++b) {
+        for (int j = 0; j < 8; ++j) {
+          if (PT)
+            sum[a][b][j] =
+                __builtin_fmaf(sc[b], (float)C[b][a][j], sum[a][b][j]);
+          else
+            sum[a][b][j] =
+                __builtin_fmaf(scf[j] * sc[b], (float)C[b][a][j], sum[a][b][j]);
+        }
+        asm volatile(""
+                     : "+v"(sum[a][b][0]), "+v"(sum[a][b][1]),
+                       "+v"(sum[a][b][2]), "+v"(sum[a][b][3]),
+                       "+v"(sum[a][b][4]), "+v"(sum[a][b][5]),
+                       "+v"(sum[a][b][6]), "+v"(sum[a][b][7]));
+      }
+      __builtin_amdgcn_sched_barrier(0);
+    }
+    if (nxt)
+      stage_store(lds + (par ^ 1) * 8192);
+    __syncthreads();
+  };
+  int e = 0;
+  for (; e + 2 < E; e += 2) {
+    epoch(wA, std::true_type{}, e, 0);
+    epoch(wA, std::true_type{}, e + 1, 1);
+  }
+  epoch(wA, std::true_type{}, e, 0);
+  epoch(wA, std::false_type{}, e + 1, 1);
+
+  for (int a = 0; a < 4; ++a)
+    for (int j = 0; j < 8; ++j) {
+      const int t = t0 + wth * 64 + a * 16 + 8 * hi + j;
+      const float r = PT ? ds[(size_t)t * groups128] : 1.0f;
+      for (int b = 0; b < 2; ++b)
+        out[(size_t)t * M + f0 + wf * 32 + b * 16 + lr] = sum[a][b][j] * r;
+    }
+}
+
 __global__ void XorNibbles(uint8_t* w, size_t bytes) {
   const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
   if (i >= bytes)
@@ -1427,6 +1601,42 @@ int main(int argc, char** argv) {
                   2.0 * M * N * K / (ms6 * 1e-3) / 1e12, md6);
     }
     {
+      uint8_t* dw9;
+      HIP_OK(hipMalloc(&dw9, we->len));
+      HIP_OK(hipMemcpy(dw9, dw, we->len, hipMemcpyDeviceToDevice));
+      XorNibbles<<<(we->len + 255) / 256, 256>>>(dw9, we->len);
+      uint8_t* pw9;
+      unsigned short* psc9;
+      HIP_OK(hipMalloc(&pw9, (size_t)M * K / 2));
+      HIP_OK(hipMalloc(&psc9, (size_t)M * (K / 128) * 2));
+      Repack9<<<dim3(M, K / 128), 128>>>(dw9, pw9, psc9, M, K);
+      float* dout9;
+      HIP_OK(hipMalloc(&dout9, (size_t)N * M * 4));
+      const int g9 = (M / 128) * (N / 128);
+#ifdef EXP_PT
+      constexpr bool kPT9 = true;
+#else
+      constexpr bool kPT9 = false;
+#endif
+      Iu4Gemm9<kPT9><<<g9, 256>>>(pw9, psc9, dqs, dds, dout9, M, N, K);
+      HIP_OK(hipDeviceSynchronize());
+      hipEventRecord(a);
+      for (int i = 0; i < 1000; ++i)
+        Iu4Gemm9<kPT9><<<g9, 256>>>(pw9, psc9, dqs, dds, dout9, M, N, K);
+      hipEventRecord(b);
+      hipEventSynchronize(b);
+      float ms9;
+      hipEventElapsedTime(&ms9, a, b);
+      ms9 /= 1000;
+      std::vector<float> o9((size_t)N * M);
+      HIP_OK(hipMemcpy(o9.data(), dout9, o9.size() * 4, hipMemcpyDeviceToHost));
+      double md9 = 0;
+      for (size_t i = 0; i < o9.size(); ++i)
+        md9 = std::max(md9, (double)std::fabs(o9[i] - o2[i]));
+      std::printf("v9   %.3f ms  %.1f TOPS  max |v2-v9| %.3e\n", ms9,
+                  2.0 * M * N * K / (ms9 * 1e-3) / 1e12, md9);
+    }
+    {
       uint8_t* dw8;
       HIP_OK(hipMalloc(&dw8, we->len));
       HIP_OK(hipMemcpy(dw8, dw, we->len, hipMemcpyDeviceToDevice));
@@ -1506,10 +1716,19 @@ int main(int argc, char** argv) {
   HIP_OK(hipMemcpy(dsv.data(), dds, dsv.size() * 4, hipMemcpyDeviceToHost));
   HIP_OK(hipMemcpy(ssv.data(), dss, ssv.size() * 4, hipMemcpyDeviceToHost));
   HIP_OK(hipMemcpy(qsv.data(), dqs, qsv.size(), hipMemcpyDeviceToHost));
-  double max_rel_kernel = 0, sum_a4 = 0, sum_ref = 0;
+  double max_rel_kernel = 0, sum_a4 = 0, sum_ref = 0, sum_pt = 0;
+  std::vector<int> ptq(K);
   int checked = 0;
   for (int n = 0; n < N; n += std::max(1, N / 7)) {
+    float ptmax = 0;
+    for (int i = 0; i < K; ++i)
+      ptmax = std::max(ptmax, std::fabs(rot[(size_t)n * K + i]));
+    const float pts = ptmax / 7.0f;
+    for (int i = 0; i < K; ++i)
+      ptq[i] = std::max(
+          -8, std::min(7, (int)std::lrintf(rot[(size_t)n * K + i] / pts)));
     for (int m = 0; m < M; m += std::max(1, M / 61)) {
+      double ptd = 0;
       const uint8_t* wr = base + we->off + (size_t)m * (K / 256) * kBlockBytes;
       double kernel_ref = 0, a16 = 0;
       for (int g = 0; g < K / kGroup; ++g) {
@@ -1527,6 +1746,8 @@ int main(int argc, char** argv) {
           if (xhi > 7)
             xhi -= 16;
           dot += wlo * xlo + whi * xhi;
+          ptd += (double)(sc * wlo + zp) * ptq[g * kGroup + 2 * j] * pts +
+                 (double)(sc * whi + zp) * ptq[g * kGroup + 2 * j + 1] * pts;
           a16 += (double)(sc * wlo + zp) *
                      rot[(size_t)n * K + g * kGroup + 2 * j] +
                  (double)(sc * whi + zp) *
@@ -1541,6 +1762,7 @@ int main(int argc, char** argv) {
           std::max(max_rel_kernel, std::fabs(got - kernel_ref) /
                                        (std::fabs(kernel_ref) + 1e-3));
       sum_a4 += (kernel_ref - a16) * (kernel_ref - a16);
+      sum_pt += (ptd - a16) * (ptd - a16);
       sum_ref += a16 * a16;
       ++checked;
     }
@@ -1550,5 +1772,7 @@ int main(int argc, char** argv) {
   std::printf(
       "int4-activation error vs fp32-activation (same weights): rel RMS %.4f\n",
       std::sqrt(sum_a4 / sum_ref));
+  std::printf("per-token-scale int4 activation error: rel RMS %.4f\n",
+              std::sqrt(sum_pt / sum_ref));
   return 0;
 }
