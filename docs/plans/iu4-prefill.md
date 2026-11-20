@@ -297,3 +297,20 @@ Dead ends on v13: wave priority around the WMMA blocks (no change), removing the
 Four CTAs per WGP (8 waves per SIMD, 192 VGPR cap): measured on the v12 structure, which has the smallest register footprint (216 VGPRs, 18 KiB LDS): 70.8 -> 68.7 TOPS with the cap forced. v13 needs 234 VGPRs and 36.9 KiB LDS, so it cannot reach 4 CTAs without dropping the K=256 barrier or the weight double buffer (each worth more than the occupancy gain). Dead end.
 
 Re-ablation of v13 (sequential, one job on the GPU at a time): no fold 80.6 TOPS (fold costs about 6). The no-weight-reload variants read 97.0 and 109.1 TOPS, above the 95 TOPS WMMA peak at the measured 2.54 GHz median clock (the same clock as the full kernel), so those builds drop work and are not valid measurements. Interleaving the token loads across the second half of each sub-epoch: 74.6 vs 74.3 baseline, no gain. VOPD dual-issue is already used in the fold (394 v_dual instructions in the kernel). External reading (AMD FP16 GEMM blog, GPUOpen RDNA3 WMMA page, community FP16 tables) confirmed grouped CTA order, setprio and prefetch interleaving as already applied or neutral here; none give iu4 hazard or throughput data.
+
+### Per-token activation scale on real activations: rejected
+
+Captured the real FFN-input activations (post-RMSNorm, the gate/up projection input) of Qwen3.8-27B for a 3972-token prompt at layers 3, 11, 19, 27, 35, 43, 51, 59 (every fourth token used). Relative RMS error of 4-bit activation quantization (symmetric, max/7):
+
+| layer | per-128 block scale | per-token scale | ratio |
+|---|---|---|---|
+| 3 | 0.157 | 0.419 | 2.7x |
+| 11 | 0.192 | 0.760 | 4.0x |
+| 19 | 0.201 | 0.819 | 4.1x |
+| 27 | 0.185 | 0.790 | 4.3x |
+| 35 | 0.196 | 0.782 | 4.0x |
+| 43 | 0.190 | 0.777 | 4.1x |
+| 51 | 0.214 | 0.752 | 3.5x |
+| 59 | 0.194 | 0.702 | 3.6x |
+
+Per-token output error through a random projection matches (0.42-0.81 vs 0.16-0.21). The activations have strong outlier channels (max/RMS 36-61), so a single per-token scale collapses most elements to zero. The 76.7 vs 75 TOPS gain is not worth a 3-4x error increase: per-token scale is dropped; exact per-128 scales stay. Note that per-128 int4 activations themselves sit at 0.16-0.21 relative RMS on real data, which the model-level quality gate (HumanEval etc.) must judge, and finer activation blocks (per-32) or outlier-aware handling are the levers if that gate fails.
