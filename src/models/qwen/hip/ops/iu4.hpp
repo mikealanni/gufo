@@ -19,11 +19,15 @@ inline constexpr std::size_t kIu4BlockBytes = 136;
 // converted to signed codes. scales[e * rows + row] receives the f16 group
 // scale. bad_zero_points counts groups whose zero point is not -8 scales (those
 // groups cannot use the symmetric kernel); rows must be a multiple of 16 and
-// cols a multiple of 256.
+// cols a multiple of 256. For Gated DeltaNet projections the artifact groups
+// value heads by key head while the engine tiles them: when perm_chunk is not
+// zero, rows from perm_start on are taken in chunks of perm_chunk rows (one
+// head) and engine chunk e reads artifact chunk (e % 16) * 3 + e / 16.
 void LaunchIu4RepackWeights(const void* blocks, void* tiles,
                             std::uint16_t* scales,
                             unsigned long long* bad_zero_points,
                             std::size_t rows, std::size_t cols,
+                            std::uint32_t perm_start, std::uint32_t perm_chunk,
                             hipStream_t stream);
 
 // Rotation sign vectors the artifact was built with: 256 signs for the pre
@@ -57,6 +61,16 @@ void LaunchIu4Gemm(const void* tiles, const std::uint16_t* weight_scales,
                    const std::uint8_t* act_tiles, const float* act_scales,
                    float* out, bool accumulate, std::size_t rows, std::size_t n,
                    std::size_t padded_n, std::size_t k, hipStream_t stream);
+
+// Quantize-only activation producer for rows that are already normalized:
+// divide by awq (null for none), rotate, quantize, same output layout as
+// LaunchIu4NormQuantize. k is a multiple of 256, any size. With remap_gdn_heads
+// the 128-wide chunks of the artifact-order row are read from the engine's
+// tiled value-head order (the Gated DeltaNet output projection input).
+void LaunchIu4Quantize(const float* x, const float* awq, const float* signs,
+                       bool remap_gdn_heads, std::size_t n,
+                       std::size_t padded_n, std::size_t k, std::uint8_t* tiles,
+                       float* scales, hipStream_t stream);
 
 }  // namespace gufo::hip
 #endif

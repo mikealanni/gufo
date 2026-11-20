@@ -130,22 +130,24 @@ bool ReadIndex(const Mapping& map, std::unordered_map<std::string, Entry>* out,
 
 struct RoleName {
   Iu4Role role;
-  const char* path;  // below "model.language_model.layers.N."
+  const char* path;          // below "model.language_model.layers.N."
+  std::uint32_t perm_start;  // first row of the permuted value heads
+  std::uint32_t perm_chunk;  // rows per head, zero when rows keep their order
 };
 
 constexpr RoleName kRoles[] = {
-    {Iu4Role::kAttnQ, "self_attn.q_proj"},
-    {Iu4Role::kAttnK, "self_attn.k_proj"},
-    {Iu4Role::kAttnV, "self_attn.v_proj"},
-    {Iu4Role::kAttnO, "self_attn.o_proj"},
-    {Iu4Role::kSsmQkv, "linear_attn.in_proj_qkv"},
-    {Iu4Role::kSsmZ, "linear_attn.in_proj_z"},
-    {Iu4Role::kSsmA, "linear_attn.in_proj_a"},
-    {Iu4Role::kSsmB, "linear_attn.in_proj_b"},
-    {Iu4Role::kSsmOut, "linear_attn.out_proj"},
-    {Iu4Role::kFfnGate, "mlp.gate_proj"},
-    {Iu4Role::kFfnUp, "mlp.up_proj"},
-    {Iu4Role::kFfnDown, "mlp.down_proj"},
+    {Iu4Role::kAttnQ, "self_attn.q_proj", 0, 0},
+    {Iu4Role::kAttnK, "self_attn.k_proj", 0, 0},
+    {Iu4Role::kAttnV, "self_attn.v_proj", 0, 0},
+    {Iu4Role::kAttnO, "self_attn.o_proj", 0, 0},
+    {Iu4Role::kSsmQkv, "linear_attn.in_proj_qkv", 4096, 128},
+    {Iu4Role::kSsmZ, "linear_attn.in_proj_z", 0, 128},
+    {Iu4Role::kSsmA, "linear_attn.in_proj_a", 0, 1},
+    {Iu4Role::kSsmB, "linear_attn.in_proj_b", 0, 1},
+    {Iu4Role::kSsmOut, "linear_attn.out_proj", 0, 0},
+    {Iu4Role::kFfnGate, "mlp.gate_proj", 0, 0},
+    {Iu4Role::kFfnUp, "mlp.up_proj", 0, 0},
+    {Iu4Role::kFfnDown, "mlp.down_proj", 0, 0},
 };
 
 constexpr std::size_t kRoleCount = static_cast<std::size_t>(Iu4Role::kCount);
@@ -222,6 +224,7 @@ bool Iu4Weights::Load(const std::string& path, std::uint32_t layers,
   } stream_guard{stream};
 
   const auto upload = [&](const std::string& name, const std::string& awq_name,
+                          std::uint32_t perm_start, std::uint32_t perm_chunk,
                           Iu4Projection* out) -> bool {
     const auto it = index.find(name);
     if (it == index.end())
@@ -256,7 +259,7 @@ bool Iu4Weights::Load(const std::string& path, std::uint32_t layers,
     }
     device_bytes_ += tile_bytes + scale_bytes;
     LaunchIu4RepackWeights(d_blocks, p.tiles, p.scales, d_bad, rows, cols,
-                           stream);
+                           perm_start, perm_chunk, stream);
     if (!awq_name.empty()) {
       const auto ait = index.find(awq_name);
       if (ait == index.end() || ait->second.length != cols * 2 ||
@@ -307,7 +310,8 @@ bool Iu4Weights::Load(const std::string& path, std::uint32_t layers,
       const std::string name = prefix + r.path + ".weight";
       if (index.find(name) == index.end())
         continue;  // the layer type does not have this projection
-      if (!upload(name, prefix + r.path + ".awq_scale.weight",
+      if (!upload(name, prefix + r.path + ".awq_scale.weight", r.perm_start,
+                  r.perm_chunk,
                   &projections_[l * kRoleCount +
                                 static_cast<std::size_t>(r.role)])) {
         Release();
@@ -315,7 +319,7 @@ bool Iu4Weights::Load(const std::string& path, std::uint32_t layers,
       }
     }
   }
-  if (!upload("lm_head.weight", "", &lm_head_)) {
+  if (!upload("lm_head.weight", "", 0, 0, &lm_head_)) {
     Release();
     return false;
   }

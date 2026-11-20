@@ -119,9 +119,16 @@ int failures = 0;
     }                                  \
   } while (0)
 
+std::size_t SourceRow(std::size_t row, std::size_t start, std::size_t chunk) {
+  if (chunk == 0 || row < start)
+    return row;
+  const std::size_t rr = row - start, c = rr / chunk, w = rr % chunk;
+  return start + ((c % 16) * 3 + c / 16) * chunk + w;
+}
+
 void CheckProjection(const std::uint8_t* base, std::size_t size,
-                     const gufo::hip::Iu4Projection& p,
-                     const std::string& name) {
+                     const gufo::hip::Iu4Projection& p, const std::string& name,
+                     std::size_t perm_start = 0, std::size_t perm_chunk = 0) {
   Entry e{};
   CHECK(FindEntry(base, size, name, &e), "%s not in artifact", name.c_str());
   CHECK(p.valid() && p.rows == e.rows && p.cols == e.cols, "%s shape",
@@ -147,9 +154,10 @@ void CheckProjection(const std::uint8_t* base, std::size_t size,
   std::size_t checked = 0;
   for (int s = 0; s < 4000; ++s) {
     const std::size_t row = next() % rows, g = next() % groups;
+    const std::size_t src_row = SourceRow(row, perm_start, perm_chunk);
     const std::size_t byte = next() % 64;  // payload byte inside the 128 group
     const std::uint8_t* block =
-        base + e.offset + (row * (cols / 256) + g / 2) * 136;
+        base + e.offset + (src_row * (cols / 256) + g / 2) * 136;
     const std::uint16_t sc_bits =
         *reinterpret_cast<const std::uint16_t*>(block + 4 * (g & 1));
     CHECK(scales[g * rows + row] == sc_bits, "scale %zu %zu", row, g);
@@ -228,7 +236,13 @@ int main() {
       CHECK(!weights.Find(l, Iu4Role::kSsmQkv).valid(), "attn layer has ssm");
     } else {
       CheckProjection(base, st.st_size, weights.Find(l, Iu4Role::kSsmQkv),
-                      lp + "linear_attn.in_proj_qkv.weight");
+                      lp + "linear_attn.in_proj_qkv.weight", 4096, 128);
+      CheckProjection(base, st.st_size, weights.Find(l, Iu4Role::kSsmZ),
+                      lp + "linear_attn.in_proj_z.weight", 0, 128);
+      CheckProjection(base, st.st_size, weights.Find(l, Iu4Role::kSsmA),
+                      lp + "linear_attn.in_proj_a.weight", 0, 1);
+      CheckProjection(base, st.st_size, weights.Find(l, Iu4Role::kSsmB),
+                      lp + "linear_attn.in_proj_b.weight", 0, 1);
       CheckProjection(base, st.st_size, weights.Find(l, Iu4Role::kSsmOut),
                       lp + "linear_attn.out_proj.weight");
       CHECK(!weights.Find(l, Iu4Role::kAttnQ).valid(), "ssm layer has attn");

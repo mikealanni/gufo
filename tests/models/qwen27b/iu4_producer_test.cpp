@@ -39,6 +39,72 @@ void Hadamard256(double* v) {
       }
 }
 
+// Compares device tiles/scales with the double precision model whose
+// pre-rotation inputs (normalized and awq-divided) are given per token.
+void CompareToHost(const char* label, const std::vector<std::uint8_t>& tiles,
+                   const std::vector<float>& scales,
+                   const std::vector<double>& pre,
+                   const std::vector<float>& signs, std::size_t n,
+                   std::size_t padded, std::size_t K) {
+  const std::size_t e_groups = K / 128;
+  std::size_t compared = 0, off_by_one = 0, bigger = 0;
+  double worst_scale = 0.0;
+  std::vector<double> v(K);
+  for (std::size_t t = 0; t < padded; ++t) {
+    if (t < n) {
+      for (std::size_t b = 0; b < K / 256; ++b) {
+        double blk[256];
+        for (int i = 0; i < 256; ++i)
+          blk[i] = pre[t * K + b * 256 + i] * signs[i];
+        Hadamard256(blk);
+        for (int i = 0; i < 256; ++i)
+          v[b * 256 + i] = blk[i] * 0.0625 * signs[256 + i];
+      }
+    } else {
+      std::fill(v.begin(), v.end(), 0.0);
+    }
+    for (std::size_t e = 0; e < e_groups; ++e) {
+      double amax = 0.0;
+      for (int i = 0; i < 128; ++i)
+        amax = std::max(amax, std::fabs(v[e * 128 + i]));
+      const double scale = amax / 7.0;
+      const float got_scale = scales[e * padded + t];
+      if (scale > 0.0)
+        worst_scale =
+            std::max(worst_scale, std::fabs(got_scale - scale) / scale);
+      else
+        CHECK(got_scale == 0.0f, "pad scale %zu %zu: %g", t, e, got_scale);
+      for (int i = 0; i < 128; ++i) {
+        const int byte = i / 2, chunk = byte / 8, within = byte % 8;
+        const std::size_t off = ((t / 16) * e_groups + e) * 1024 +
+                                ((chunk & 1) * 16 + (t % 16)) * 32 +
+                                (chunk >> 1) * 8 + within;
+        const int code4 = (tiles[off] >> (4 * (i & 1))) & 15;
+        const int code = code4 >= 8 ? code4 - 16 : code4;
+        const double want_real = scale > 0.0 ? v[e * 128 + i] / scale : 0.0;
+        const int want = static_cast<int>(
+            std::min(7.0, std::max(-8.0, std::nearbyint(want_real))));
+        ++compared;
+        if (code != want) {
+          if (std::abs(code - want) == 1 &&
+              std::fabs(std::fabs(want_real - std::floor(want_real) - 0.5)) <
+                  1e-3)
+            ++off_by_one;
+          else
+            ++bigger;
+        }
+      }
+    }
+  }
+  std::printf(
+      "%s: compared %zu codes: %zu rounding-boundary flips, %zu real "
+      "mismatches, worst scale error %.2e\n",
+      label, compared, off_by_one, bigger, worst_scale);
+  CHECK(bigger == 0, "%s: codes differ beyond rounding boundaries", label);
+  CHECK(worst_scale < 1e-5, "%s: scale error %.3e", label, worst_scale);
+  CHECK(off_by_one < compared / 10000, "%s: too many boundary flips", label);
+}
+
 }  // namespace
 
 int main() {
@@ -100,71 +166,76 @@ int main() {
   hipMemcpy(tiles.data(), d_tiles, tile_bytes, hipMemcpyDeviceToHost);
   hipMemcpy(scales.data(), d_scales, scales.size() * 4, hipMemcpyDeviceToHost);
 
-  std::size_t compared = 0, off_by_one = 0, bigger = 0;
-  double worst_scale = 0.0;
-  std::vector<double> v(kK);
-  for (std::size_t t = 0; t < kPadded; ++t) {
-    if (t < kTokens) {
+  {
+    std::vector<double> pre(kPadded * kK, 0.0);
+    for (std::size_t t = 0; t < kTokens; ++t) {
       double ss = 0.0;
       for (std::size_t k = 0; k < kK; ++k)
         ss += static_cast<double>(x[t * kK + k]) * x[t * kK + k];
       const double inv = 1.0 / std::sqrt(ss / kK + 1e-6);
-      for (std::size_t b = 0; b < kK / 256; ++b) {
-        double blk[256];
-        for (int i = 0; i < 256; ++i) {
-          const std::size_t k = b * 256 + i;
-          blk[i] = x[t * kK + k] * inv * norm[k] / awq[k] * signs[i];
-        }
-        Hadamard256(blk);
-        for (int i = 0; i < 256; ++i)
-          v[b * 256 + i] = blk[i] * 0.0625 * signs[256 + i];
-      }
-    } else {
-      std::fill(v.begin(), v.end(), 0.0);
+      for (std::size_t k = 0; k < kK; ++k)
+        pre[t * kK + k] = x[t * kK + k] * inv * norm[k] / awq[k];
     }
-    for (std::size_t e = 0; e < e_groups; ++e) {
-      double amax = 0.0;
-      for (int i = 0; i < 128; ++i)
-        amax = std::max(amax, std::fabs(v[e * 128 + i]));
-      const double scale = amax / 7.0;
-      const float got_scale = scales[e * kPadded + t];
-      if (scale > 0.0)
-        worst_scale =
-            std::max(worst_scale, std::fabs(got_scale - scale) / scale);
-      else
-        CHECK(got_scale == 0.0f, "pad scale %zu %zu: %g", t, e, got_scale);
-      for (int i = 0; i < 128; ++i) {
-        // K value i of the group sits in payload byte i/2, nibble i%2; the
-        // GEMM layout keeps 8-byte chunks: chunk c -> (c&1)*16 lane offset and
-        // (c>>1)*8 byte offset inside a 32-byte lane record.
-        const int byte = i / 2, chunk = byte / 8, within = byte % 8;
-        const std::size_t off = ((t / 16) * e_groups + e) * 1024 +
-                                ((chunk & 1) * 16 + (t % 16)) * 32 +
-                                (chunk >> 1) * 8 + within;
-        const int code4 = (tiles[off] >> (4 * (i & 1))) & 15;
-        const int code = code4 >= 8 ? code4 - 16 : code4;
-        const double want_real = scale > 0.0 ? v[e * 128 + i] / scale : 0.0;
-        const int want = static_cast<int>(
-            std::min(7.0, std::max(-8.0, std::nearbyint(want_real))));
-        ++compared;
-        if (code != want) {
-          if (std::abs(code - want) == 1 &&
-              std::fabs(std::fabs(want_real - std::floor(want_real) - 0.5)) <
-                  1e-3)
-            ++off_by_one;
-          else
-            ++bigger;
-        }
-      }
-    }
+    CompareToHost("norm-fed", tiles, scales, pre, signs, kTokens, kPadded, kK);
   }
-  std::printf(
-      "compared %zu codes: %zu rounding-boundary flips, %zu real "
-      "mismatches, worst scale error %.2e\n",
-      compared, off_by_one, bigger, worst_scale);
-  CHECK(bigger == 0, "codes differ beyond rounding boundaries");
-  CHECK(worst_scale < 1e-5, "scale error %.3e", worst_scale);
-  CHECK(off_by_one < compared / 10000, "too many boundary flips");
+
+  // Quantize-only producer: attention output and GDN output (K = 6144, the GDN
+  // one with the value-head remap) and the SwiGLU product (K = 17408).
+  struct Case {
+    const char* label;
+    gufo::hip::Iu4Role role;
+    std::uint32_t layer;
+    bool remap;
+  };
+  const Case cases[] = {
+      {"attn-out", gufo::hip::Iu4Role::kAttnO, 3, false},
+      {"gdn-out remap", gufo::hip::Iu4Role::kSsmOut, 0, true},
+      {"swiglu", gufo::hip::Iu4Role::kFfnDown, 0, false},
+  };
+  for (const Case& c : cases) {
+    const auto& p = weights.Find(c.layer, c.role);
+    const std::size_t K = p.cols, ge = K / 128;
+    std::vector<float> a(K), xs(kTokens * K);
+    CHECK(
+        hipMemcpy(a.data(), p.awq, K * 4, hipMemcpyDeviceToHost) == hipSuccess,
+        "awq copy");
+    for (auto& v : xs)
+      v = static_cast<float>(std::sqrt(-2 * std::log(uniform() + 1e-12)) *
+                             std::cos(6.283185307179586 * uniform()));
+    for (std::size_t t = 0; t < kTokens; ++t)
+      for (int ch = 0; ch < 8; ++ch)
+        xs[t * K + (ch * 613) % K] *= 30.0f;
+    float *dx, *dscale;
+    std::uint8_t* dtile;
+    const std::size_t tb = (kPadded / 16) * ge * 1024;
+    hipMalloc(&dx, xs.size() * 4);
+    hipMalloc(&dscale, ge * kPadded * 4);
+    hipMalloc(&dtile, tb);
+    hipMemcpy(dx, xs.data(), xs.size() * 4, hipMemcpyHostToDevice);
+    hipMemset(dtile, 0xAB, tb);
+    hipMemset(dscale, 0xFF, ge * kPadded * 4);
+    gufo::hip::LaunchIu4Quantize(dx, p.awq, weights.signs(), c.remap, kTokens,
+                                 kPadded, K, dtile, dscale, nullptr);
+    CHECK(hipDeviceSynchronize() == hipSuccess, "%s failed", c.label);
+    std::vector<std::uint8_t> ht(tb);
+    std::vector<float> hs(ge * kPadded);
+    hipMemcpy(ht.data(), dtile, tb, hipMemcpyDeviceToHost);
+    hipMemcpy(hs.data(), dscale, hs.size() * 4, hipMemcpyDeviceToHost);
+    std::vector<double> pre(kPadded * K, 0.0);
+    for (std::size_t t = 0; t < kTokens; ++t)
+      for (std::size_t pos = 0; pos < K; ++pos) {
+        std::size_t src = pos;
+        if (c.remap) {
+          const std::size_t h = pos / 128;
+          src = ((h % 3) * 16 + h / 3) * 128 + pos % 128;
+        }
+        pre[t * K + pos] = xs[t * K + src] / a[pos];
+      }
+    CompareToHost(c.label, ht, hs, pre, signs, kTokens, kPadded, K);
+    hipFree(dx);
+    hipFree(dscale);
+    hipFree(dtile);
+  }
   if (failures != 0) {
     std::printf("%d failures\n", failures);
     return 1;
