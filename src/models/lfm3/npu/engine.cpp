@@ -407,6 +407,10 @@ std::unique_ptr<Engine> Engine::Create(const Options& options_in,
 
     if (std::getenv("GUFO_ATB") != nullptr && s.m64) {
       s.atb = std::make_unique<gufo::npu::runtime::FfnAtbChain>();
+      // Rows per prefill chunk; 1024 is the production default, GUFO_ROWS=512
+      // selects the shorter-chunk chain under measurement.
+      if (const char* r = std::getenv("GUFO_ROWS"))
+        options.rows = static_cast<std::uint32_t>(std::atoi(r));
       s.atb->SetRows(options.rows);
       std::string aerr;
       if (!s.atb->Init(options.programs, &aerr)) {
