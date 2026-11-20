@@ -47,3 +47,37 @@ Stages:
    quality tools; NLL gate.
 4. Retune the NPU split on top; remove the mirrors for that model.
 5. Repeat for Flash-Next (dense + routed experts), then GLM.
+
+## Status (2026-11-20)
+
+Kernel experiment: `tools/bench/iu4_gemm_bench.hip`. Verified against a CPU
+model of the same arithmetic on all six distinct Qwen3.8-27B projection shapes
+(relative error 7e-5 or better). Measured at 2048 tokens:
+
+| Stage | TOPS (peak 110) |
+| --- | --- |
+| first version, operands read straight from global memory | 23.7 |
+| LDS tiled, 128 x 128 block, 8 waves | 42 |
+| signed weights (nibble ^ 0x88), register prefetch, non-unrolled group loop | 54-62 |
+| core loop only (no staging, barriers or epilogue), pipelined fragments | 77.8 |
+
+The activation producer (divide by AWQ scale, rotate, int4 quantize, integer
+sum) runs in 0.25 ms for 2048 x 5120, bit-identical to the first version.
+
+Target for production: 100 +/- 8 TOPS in the full GEMM.
+
+Artifact facts needed by the integration (Qwen3.8-27B rotated int4 artifact):
+- Every projection and the lm_head are 136-byte symmetric 4-bit groups; the
+  embedding is 8-bit with f16 scales per 32 values (the GGUF Q8_0 layout);
+  norms and small tensors are f16. A lossless container conversion into GGUF
+  with a new tensor type for the 4-bit groups is enough; no requantization.
+- The AWQ divide vector is identical for every projection that reads the same
+  input (q/k/v, GDN qkv/z/a/b, gate/up), so for norm-fed inputs it folds into
+  the RMSNorm weight. The o, out and down inputs need an explicit divide in
+  their fused producer.
+- The GDN output projection input follows an `hf-kmajor-vminor` head order that
+  the engine's GDN output layout must match.
+- Prefill call sites are the `LaunchBatchedQuantGEMM*Fp16` family in
+  `src/models/qwen/hip/ops/prefill_fp16.hpp` (plain, residual-add, fused SwiGLU,
+  row-range variants used by the NPU split); the new path plugs in behind the
+  same signatures with a new `core::GgmlType`.
