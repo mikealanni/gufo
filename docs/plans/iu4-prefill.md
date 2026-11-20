@@ -105,3 +105,33 @@ published 27B prefill of 1,150 tok/s at pp8192 implies GEMMs averaging about
 the realistic target is about 70 TOPS. Going beyond needs a weight format with
 one scale per row (a single int32 accumulation over all of K), which is a
 different artifact, not a kernel change.
+
+### Power and overlap measurements (2026-11-20)
+
+Clock under sustained load (`hwmon freq1_input`):
+
+| Run | Power limit | GFX clock | TOPS |
+| --- | --- | --- | --- |
+| WMMA only, registers | default | 2.73 GHz | 103 |
+| full kernel | default | about 2.04 GHz | 50 |
+| WMMA only, registers | 120 W | 2.88 GHz | 107.6 |
+| full kernel | 120 W | 2.59 GHz | 57-58 |
+
+At the 120 W limit the clock is no longer the limiter; the full kernel runs at
+about 59% of the clock-adjusted register-only rate.
+
+VALU/WMMA overlap (8 accumulators, VALU work as independent fmaf chains):
+
+| Placement of the VALU work | WMMA TOPS |
+| --- | --- |
+| none | 108.2 |
+| same wave, 8 / 16 / 24 / 32 fmaf per 8 WMMA | 100.5 / 95.2 / 90.5 / 86.4 |
+| other waves (half the waves), 24 or 64 fmaf per step | unchanged (51.0 vs 51.6 for the WMMA half) |
+
+VALU work in the same wave serializes with its WMMAs (0.8% of WMMA time per
+fmaf per 8 WMMA); VALU work in other waves is free. The per-group scale
+epilogue therefore has to move to separate waves (MMA waves publish int32
+results through LDS, epilogue waves convert, scale and accumulate). A first
+prototype was occupancy-limited (60 KB of LDS per block leaves about 2 MMA
+waves per SIMD, and the fragment loads need deeper prefetch at that
+occupancy); not yet measured at full effect.
