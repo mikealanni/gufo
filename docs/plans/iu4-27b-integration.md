@@ -61,3 +61,22 @@ problem and the NLL gate is worth running.
 - [ ] hook the dense layers behind the weight-type routing, NLL run
 - [ ] SwiGLU, o and out producers; lm_head; remaining layers
 - [ ] speed at pp2048/8192 with bench mode on; NPU split retune; remove mirrors
+
+## First end-to-end results (2026-11-20, GPU only, no NPU)
+
+Release build, bench mode on, `gufo bench -p 2048,8192 -n 128 -r 2`, base GGUF
+UD-Q4_K_XL with `GUFO_IU4_ARTIFACT` set or unset:
+
+| | pp2048 | pp8192 | tg128 |
+| --- | --- | --- | --- |
+| base fp16 prefill | 687.5 | 643.1 | 12.47 |
+| int4 prefill | 1076.9 | 1004.7 | 12.30 |
+
+Prefill +57% at 2k and +56% at 8k; decode is unchanged (it still reads the base
+GGUF and the plain decode path).
+
+Quality (`qwen27b_prefill_nll`, 240 samples of a 2048-token context from
+`ppl_corpus.txt`, next-token NLL): base 1.0215, int4 1.0205, paired difference
+-0.0010 +- 0.0362 (standard error), top-1 agreement 92.1%. Within the resolution
+of the sample no quality loss shows up; the base and the artifact are different
+weight quantizations, so this is the combined effect of weights and activations.
