@@ -30,6 +30,21 @@ struct Reader {
     return *value;
   }
 
+  std::uint32_t U32First(std::string_view key) {
+    const auto* meta = gguf.FindMetadata(key);
+    if (meta != nullptr) {
+      if (const auto* u = std::get_if<std::vector<std::uint64_t>>(&meta->value);
+          u != nullptr && !u->empty()) {
+        return static_cast<std::uint32_t>(u->front());
+      }
+      if (const auto* i = std::get_if<std::vector<std::int64_t>>(&meta->value);
+          i != nullptr && !i->empty()) {
+        return static_cast<std::uint32_t>(i->front());
+      }
+    }
+    return U32(key);
+  }
+
   float F32(std::string_view key) {
     const auto value = gguf.GetMetadataFloat32(key);
     if (!value || !std::isfinite(*value)) {
@@ -101,15 +116,12 @@ std::optional<Config> ParseConfig(const core::GgufReader& reader,
   c.context_length = r.U32(key("context_length"));
   c.hidden_size = r.U32(key("embedding_length"));
   c.dense_ff = r.U32(key("feed_forward_length"));
-  c.num_heads = r.U32(key("attention.head_count"));
-  c.num_kv = r.U32(key("attention.head_count_kv"));
+  c.num_heads = r.U32First(key("attention.head_count"));
+  c.num_kv = r.U32First(key("attention.head_count_kv"));
   c.head_dim = r.U32(key("attention.key_length"));
   c.expert_count = r.U32(key("expert_count"));
   c.expert_used = r.U32(key("expert_used_count"));
   c.expert_ff = r.U32(key("expert_feed_forward_length"));
-  c.shared_ff = r.U32(key("expert_shared_feed_forward_length"));
-  c.leading_dense = r.U32(key("leading_dense_block_count"));
-  c.expert_shared = r.U32(key("expert_shared_count"));
   c.sliding_window = r.U32(key("attention.sliding_window"));
   c.loop_num_loops = r.U32(key("num_loops"));
   c.loop_core_start = r.U32(key("loop.core_start"));
@@ -128,8 +140,8 @@ std::optional<Config> ParseConfig(const core::GgufReader& reader,
   c.situ_linear_beta = r.F32(key("activation.situ_linear_beta"));
   c.rms_eps = r.F32(key("attention.layer_norm_rms_epsilon"));
   c.expert_weights_scale = r.F32(key("expert_weights_scale"));
-  c.expert_weights_norm = r.Bool(key("expert_weights_norm"), true);
-  c.expert_gating_func = r.U32(key("expert_gating_func"));
+  c.vocab_padded = r.U32(key("vocab_size"));
+  c.vocab_unpadded = r.U32(key("vocab_size_unpadded"));
   c.rope_dimension_count = r.U32(key("rope.dimension_count"));
   c.has_relative = c.relative_length > 0;
   c.is_swa = r.BoolArray(key("attention.sliding_window_pattern"));

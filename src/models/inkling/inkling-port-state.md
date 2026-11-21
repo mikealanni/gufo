@@ -38,33 +38,24 @@ looped 3x -> 5.4B effective active; 24 physical layers, middle core looped).
 - Weights: download `Inkling-2-Mini-UD-Q4_K_XL.gguf` (the Q4_K_XL the user picked;
   imatrix-calibrated, mean KLD vs UD-Q8_K_XL 0.0107, same top token 98.0%).
 
-## Status snapshot (port resumed)
+## Status snapshot (2026-11-21)
 
-- CPU reference (`src/models/inkling/reference.cpp`) is mid-write: helpers,
-  `Loaded` (dequant/matvec), `Mix` exist; `RunLayer` / `Evaluate` still pending;
-  `DeqNvfp4Row` needs the row count from tensor `dimensions` (no `rowspan_of`).
-- Upstream oracle (`/tmp/opencode/llamacpp`, build `/tmp/opencode/lcmake`) patched:
-  `llama_model_inkling2_loop::load_arch_hparams` now derives
-  `n_phys = hparams.n_layer() - (n_passes - 1) * (core_end - core_start)`, so
-  `block_count = 48` is read as loop slots (n_phys = 24 physical).
-- GGUF re-emitted with `general.architecture = "inkling2_loop"` and
-  `inkling2.*` -> `inkling2_loop.*` keys (+ `inkling2_loop.loop.count = 3`):
-  `/tmp/opencode/Inkling-2-Mini-UD-Q4_K_XL-looparch.gguf` (17 GB). Header and tensor
-  offsets verified consistent (data_start == src data_start 11978720; 734 tensors, 63 kvs).
-- Oracle (`/tmp/opencode/lcmake/bin/llama`) patched: `n_phys` derivation applied
-  (`block_count = 48` read as loop slots; physical layers blk.0..23).
-- Current blocker (oracle): re-emit key remap produces `blk.<n>.loop_*` tensor names,
-  upstream looped arch expects `blk.<n>.loop_{msg_query,q,k,v,ffn}_ctrl_*` naming;
-  last run progressed past file-bounds and hyperparameter checks, now stuck on
-  `check_tensor_dims: tensor 'blk.6.loop_msg_query.weight' not found`.
+- User targets: pp ~3k tok/s with NPU, decode ~100 tok/s.
+- Oracle route abandoned (upstream loop-msg query layout guessed; reemit scripts broken).
+  Upstream graph source (`/tmp/opencode/llamacpp/src/models/inkling2{,-loop}.cpp`) used as the spec.
+- CPU reference `reference.cpp` complete: full forward (attn_res block mixing, shortconv with
+  dynamic taps on full layers, relative-bias + sink attention, NVFP4/Q8_0 SiTU MoE, loop
+  passes with message control). Builds; `gufo_inkling_ref_check <gguf> <token...>` runs
+  ~13 s/token, finite plausible logits. NOT yet validated against any reference.
+- Reader now supports NVFP4 (ggml type 40). Slots 20-23 use Q8_0 experts with no `.scale`.
+- Loop message queries: per core layer c, columns (attn, k, v, ffn) =
+  (res[2c], kv[2c], kv[2c+1], res[2c+1]) - unverified guess.
 
-## Resume checklist (next session)
+## Next
 
-1. Fix loop tensor naming mismatch (re-emit script or upstream source patch).
-2. Rebuild oracle, run CPU baseline logits (`-n 2 -f inkling_kv.txt`).
-3. Finish Gufo `RunLayer` / `Evaluate`; fix `DeqNvfp4Row` row-count handling.
-4. Add NVFP4 dequant case to Gufo `Loaded::DequantizeRow`; register `reference.cpp`.
-5. Build Gufo, compare CPU reference against oracle; commit `gufo/src/core/gguf_reader.hpp` kNVFP4 change.
+1. Validate reference on real prose (needs tokenizer) - check coherent greedy text.
+2. GPU engine stage 1 (reuse qfn_mmq / routed gemm; NVFP4 expert kernel is new).
+3. Serve runner, then NPU prefill + decode drafter toward the targets.
 
 ## Open questions / next steps (skill default order)
 

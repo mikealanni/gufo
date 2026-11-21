@@ -49,7 +49,8 @@ struct Config {
   float rms_eps{0.0F};
   float expert_weights_scale{1.0F};
   float expert_weights_norm{1.0F};
-  float expert_gating_func{0.0F};
+  std::uint32_t vocab_padded{0};
+  std::uint32_t vocab_unpadded{0};
   std::uint32_t rope_dimension_count{0};
   bool has_relative{false};
   std::vector<bool> is_swa;

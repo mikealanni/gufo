@@ -130,6 +130,8 @@ inline constexpr std::int8_t kValuesIq4Nl[16] = {
     case core::GgmlType::kQ6_K:
     case core::GgmlType::kQ8_K:
       return 256;
+    case core::GgmlType::kNVFP4:
+      return 64;
     default:
       return 0;
   }
