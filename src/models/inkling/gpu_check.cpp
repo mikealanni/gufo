@@ -54,7 +54,8 @@ int main(int argc, char** argv) {
       (void)session->Append(std::span(&one, 1), &error);
     }
     const auto t2 = std::chrono::steady_clock::now();
-    std::printf("pp %d: %.1f tok/s, tg: %.2f tok/s\n", n, n / std::chrono::duration<double>(t1 - t0).count(),
+    std::printf("pp %d: %.1f tok/s, tg: %.2f tok/s\n", n,
+                n / std::chrono::duration<double>(t1 - t0).count(),
                 kDecode / std::chrono::duration<double>(t2 - t1).count());
   }
   return 0;

@@ -51,11 +51,18 @@ looped 3x -> 5.4B effective active; 24 physical layers, middle core looped).
 - Loop message queries: per core layer c, columns (attn, k, v, ffn) =
   (res[2c], kv[2c], kv[2c+1], res[2c+1]) - unverified guess.
 
-## Next
+## GPU engine stage 1 (2026-11-21, done)
 
-1. Validate reference on real prose (needs tokenizer) - check coherent greedy text.
-2. GPU engine stage 1 (reuse qfn_mmq / routed gemm; NVFP4 expert kernel is new).
-3. Serve runner, then NPU prefill + decode drafter toward the targets.
+- `gpu/engine.hip.cpp`: single-file HIP engine (own kernels, no shared Flash-Next kernels yet).
+  Matches the CPU reference to ~4 digits on tokens 1000/2000/3000, batched prefill == token-by-token.
+  Build: `cmake --preset gpu-test` then `--target gufo_inkling_gpu_check` (plain cmake, no nix on
+  this box); run with `LD_LIBRARY_PATH=/opt/rocm/core-7.14/lib`. `INKLING_BENCH=N` prints pp/tg.
+- Measured: pp 89 tok/s (2k, naive per-item NVFP4 expert GEMM), tg 29 tok/s (graph-captured n=1).
+- Decode profile (per token, 34 ms wall, 28 ms kernels, 2705 kernels): dense Q8 8.9 ms (~1.8 GB
+  incl. 492 MB output.weight), NVFP4 experts 8.9 ms (~1.7 GB), Mix 2.4, Rms 1.6, F32 ctrl gemms 1.75.
+  GEMMs already run near ~200 GB/s, so plain decode ceiling is ~55-60 tok/s; 100 needs fewer bytes
+  (4-bit dense, check KL) and/or speculation (idea: self-draft with 1 loop pass instead of 3).
+- Next: fuse Mix/Rms/ctrl kernels; WMMA routed experts + dense for prefill (3k target); serve runner.
 
 ## Open questions / next steps (skill default order)
 
