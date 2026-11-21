@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -11,8 +12,10 @@
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/detail/decode_step.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen/hip/iu4_weights.hpp"
 #include "src/models/qwen/hip/kernels/verify_gemm_27b.hpp"
 #include "src/models/qwen/hip/ops.hpp"
+#include "src/models/qwen/hip/ops/iu4.hpp"
 #include "src/models/qwen/hip/ops/moe.hpp"
 #include "src/models/qwen/hip/ops/moe_vec.hpp"
 
@@ -50,6 +53,66 @@ void LaunchProjection(const models::QwenTensorRef& weight, const float* input,
     LaunchGEMV(weight.data, weight.type, input + (row * input_size),
                output + (row * output_size), output_size, input_size, stream);
   }
+}
+
+// Rotated-int4 projections for the multi-row decode paths (GUFO_IU4_DECODE=1):
+// rows are rotated into fp32 by the producers and multiplied by the GEMV over
+// the prefill tile layout. Scratch is the prefill activation buffer, idle here.
+struct Iu4Ctx {
+  const Iu4Weights* w{nullptr};
+  float* x{nullptr};
+  void* x16{nullptr};
+};
+
+constexpr std::size_t kIu4MaxRows = 64;
+constexpr std::size_t kIu4MaxK = 17408;
+
+Iu4Ctx MakeIu4Ctx(const Iu4Weights* weights,
+                  const core::ModelConfig& config,
+                  const QwenGpuArena& arena) {
+  Iu4Ctx ctx;
+  const char* v = std::getenv("GUFO_IU4_DECODE");
+  if (weights == nullptr || v == nullptr || v[0] != '1' || config.IsMoe() ||
+      config.num_layers != 64 || weights->layers() != config.num_layers ||
+      arena.d_scratch_bf16 == nullptr)
+    return ctx;
+  constexpr std::size_t x_bytes = kIu4MaxRows * kIu4MaxK * sizeof(float);
+  constexpr std::size_t x16_bytes = 16 * kIu4MaxK * sizeof(std::uint16_t);
+  if (arena.GetMaxBatch() * kIu4MaxK * 2 < x_bytes + x16_bytes)
+    return ctx;
+  ctx.w = weights;
+  ctx.x = static_cast<float*>(arena.d_scratch_bf16);
+  ctx.x16 = static_cast<std::uint8_t*>(arena.d_scratch_bf16) + x_bytes;
+  return ctx;
+}
+
+void Iu4Rotate(const Iu4Ctx& c, const float* in, const float* awq,
+               std::size_t k, bool remap, std::size_t rows,
+               hipStream_t stream) {
+  LaunchIu4Quantize(in, awq, c.w->signs(), remap, rows, rows, k, nullptr,
+                    nullptr, stream, c.x);
+}
+
+void Iu4Proj(const Iu4Ctx& c, const Iu4Projection& p, float* out,
+             std::size_t rows, hipStream_t stream) {
+  LaunchIu4Gemv(p.tiles, p.scales, c.x, out, false, p.padded_rows, p.rows,
+                p.cols, stream, rows, c.x16);
+}
+
+void Iu4Ffn(const Iu4Ctx& c, std::uint32_t layer,
+            const QwenGpuScratchView& scratch, std::size_t rows,
+            hipStream_t stream) {
+  const auto& gate = c.w->Find(layer, Iu4Role::kFfnGate);
+  const auto& down = c.w->Find(layer, Iu4Role::kFfnDown);
+  Iu4Rotate(c, scratch.decode.normed.data(), gate.awq, gate.cols, false, rows,
+            stream);
+  Iu4Proj(c, gate, scratch.ffn.gate.data(), rows, stream);
+  Iu4Proj(c, c.w->Find(layer, Iu4Role::kFfnUp), scratch.ffn.up.data(), rows,
+          stream);
+  LaunchIu4SwiGluQuantize(scratch.ffn.gate.data(), scratch.ffn.up.data(),
+                          nullptr, nullptr, 0, down.awq, c.w->signs(), rows,
+                          rows, down.cols, nullptr, nullptr, stream, c.x);
+  Iu4Proj(c, down, scratch.ffn.out.data(), rows, stream);
 }
 
 void LaunchFfnActivation(const models::QwenLayerWeights& layer,
@@ -164,11 +227,18 @@ struct SsmControls {
   std::size_t row_stride;
 };
 
-SsmControls LaunchSsmControls(const models::QwenLayerWeights& layer,
-                              const QwenGpuScratchView& scratch,
-                              std::size_t batch_size,
-                              std::size_t time_step_rank,
-                              std::size_t hidden_size, hipStream_t stream) {
+SsmControls LaunchSsmControls(
+    const models::QwenLayerWeights& layer, const QwenGpuScratchView& scratch,
+    std::size_t batch_size, std::size_t time_step_rank, std::size_t hidden_size,
+    hipStream_t stream, const Iu4Ctx& iu4 = {}, std::uint32_t layer_index = 0) {
+  if (iu4.w != nullptr) {
+    // The qkv projection already rotated this normalized input.
+    Iu4Proj(iu4, iu4.w->Find(layer_index, Iu4Role::kSsmA),
+            scratch.ssm.alpha.data(), batch_size, stream);
+    Iu4Proj(iu4, iu4.w->Find(layer_index, Iu4Role::kSsmB),
+            scratch.ssm.beta.data(), batch_size, stream);
+    return {scratch.ssm.alpha.data(), scratch.ssm.beta.data(), time_step_rank};
+  }
   const auto& alpha = layer.ssm_alpha;
   const auto& beta = layer.ssm_beta;
   if (time_step_rank == 48 && hidden_size == 5120 &&
@@ -262,6 +332,7 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
   const auto& config = weights.config;
   auto& arena = coordinator->arena_;
   const auto scratch = arena.GetScratchView(batch_size);
+  const Iu4Ctx iu4 = MakeIu4Ctx(coordinator->model_->Iu4(), config, arena);
   const std::size_t hidden_size = config.hidden_size;
   const std::size_t intermediate_size = config.intermediate_size;
   const std::size_t vocab_size = config.vocab_size;
@@ -316,15 +387,27 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
                          hidden_size, 1e-6F, arena.stream);
 
     if (layer.is_full_attention) {
-      LaunchProjection(layer.attn_q, scratch.decode.normed.data(),
-                       scratch.ssm.qkv.data(), batch_size, q_projection_size,
-                       hidden_size, arena.stream);
-      LaunchProjection(layer.attn_k, scratch.decode.normed.data(),
-                       scratch.attention.k.data(), batch_size, kv_size,
-                       hidden_size, arena.stream);
-      LaunchProjection(layer.attn_v, scratch.decode.normed.data(),
-                       scratch.attention.v.data(), batch_size, kv_size,
-                       hidden_size, arena.stream);
+      if (iu4.w != nullptr) {
+        Iu4Rotate(iu4, scratch.decode.normed.data(),
+                  iu4.w->Find(layer_index, Iu4Role::kAttnQ).awq, hidden_size,
+                  false, batch_size, arena.stream);
+        Iu4Proj(iu4, iu4.w->Find(layer_index, Iu4Role::kAttnQ),
+                scratch.ssm.qkv.data(), batch_size, arena.stream);
+        Iu4Proj(iu4, iu4.w->Find(layer_index, Iu4Role::kAttnK),
+                scratch.attention.k.data(), batch_size, arena.stream);
+        Iu4Proj(iu4, iu4.w->Find(layer_index, Iu4Role::kAttnV),
+                scratch.attention.v.data(), batch_size, arena.stream);
+      } else {
+        LaunchProjection(layer.attn_q, scratch.decode.normed.data(),
+                         scratch.ssm.qkv.data(), batch_size, q_projection_size,
+                         hidden_size, arena.stream);
+        LaunchProjection(layer.attn_k, scratch.decode.normed.data(),
+                         scratch.attention.k.data(), batch_size, kv_size,
+                         hidden_size, arena.stream);
+        LaunchProjection(layer.attn_v, scratch.decode.normed.data(),
+                         scratch.attention.v.data(), batch_size, kv_size,
+                         hidden_size, arena.stream);
+      }
       LaunchBatchedUnpackQG(scratch.ssm.qkv.data(), scratch.attention.q.data(),
                             scratch.ssm.gate.data(), batch_size,
                             config.num_attention_heads, config.head_dim,
@@ -376,19 +459,37 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
             config.head_dim, arena.stream,
             use_split_k ? arena.d_split_k_attention : nullptr);
       }
-      LaunchProjection(layer.attn_output, scratch.ssm.out.data(),
-                       scratch.attention.output.data(), batch_size, hidden_size,
-                       attention_size, arena.stream);
+      if (iu4.w != nullptr) {
+        Iu4Rotate(iu4, scratch.ssm.out.data(),
+                  iu4.w->Find(layer_index, Iu4Role::kAttnO).awq, attention_size,
+                  false, batch_size, arena.stream);
+        Iu4Proj(iu4, iu4.w->Find(layer_index, Iu4Role::kAttnO),
+                scratch.attention.output.data(), batch_size, arena.stream);
+      } else {
+        LaunchProjection(layer.attn_output, scratch.ssm.out.data(),
+                         scratch.attention.output.data(), batch_size,
+                         hidden_size, attention_size, arena.stream);
+      }
     } else {
-      LaunchProjection(layer.attn_qkv, scratch.decode.normed.data(),
-                       scratch.ssm.qkv.data(), batch_size, ssm_qkv_size,
-                       hidden_size, arena.stream);
-      LaunchProjection(layer.attn_gate, scratch.decode.normed.data(),
-                       scratch.ssm.gate.data(), batch_size, ssm_inner_size,
-                       hidden_size, arena.stream);
+      if (iu4.w != nullptr) {
+        Iu4Rotate(iu4, scratch.decode.normed.data(),
+                  iu4.w->Find(layer_index, Iu4Role::kSsmQkv).awq, hidden_size,
+                  false, batch_size, arena.stream);
+        Iu4Proj(iu4, iu4.w->Find(layer_index, Iu4Role::kSsmQkv),
+                scratch.ssm.qkv.data(), batch_size, arena.stream);
+        Iu4Proj(iu4, iu4.w->Find(layer_index, Iu4Role::kSsmZ),
+                scratch.ssm.gate.data(), batch_size, arena.stream);
+      } else {
+        LaunchProjection(layer.attn_qkv, scratch.decode.normed.data(),
+                         scratch.ssm.qkv.data(), batch_size, ssm_qkv_size,
+                         hidden_size, arena.stream);
+        LaunchProjection(layer.attn_gate, scratch.decode.normed.data(),
+                         scratch.ssm.gate.data(), batch_size, ssm_inner_size,
+                         hidden_size, arena.stream);
+      }
       const auto controls =
           LaunchSsmControls(layer, scratch, batch_size, time_step_rank,
-                            hidden_size, arena.stream);
+                            hidden_size, arena.stream, iu4, layer_index);
 
       LaunchSSMConvRecurrenceBatch(
           scratch.ssm.qkv.data(),
@@ -404,9 +505,17 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
           config.ssm_state_size, config.SsmValueSize(), controls.row_stride,
           ssm_inner_size, arena.stream, arena.GetRecurrentStateStorage());
 
-      LaunchProjection(layer.ssm_out, scratch.ssm.out.data(),
-                       scratch.attention.output.data(), batch_size, hidden_size,
-                       ssm_inner_size, arena.stream);
+      if (iu4.w != nullptr) {
+        Iu4Rotate(iu4, scratch.ssm.out.data(),
+                  iu4.w->Find(layer_index, Iu4Role::kSsmOut).awq,
+                  ssm_inner_size, true, batch_size, arena.stream);
+        Iu4Proj(iu4, iu4.w->Find(layer_index, Iu4Role::kSsmOut),
+                scratch.attention.output.data(), batch_size, arena.stream);
+      } else {
+        LaunchProjection(layer.ssm_out, scratch.ssm.out.data(),
+                         scratch.attention.output.data(), batch_size,
+                         hidden_size, ssm_inner_size, arena.stream);
+      }
     }
 
     LaunchBatchedResidualAdd(
@@ -420,6 +529,8 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
     if (config.IsMoe()) {
       LaunchMoeFfnRows(layer, config, arena, scratch.decode.normed.data(),
                        scratch.ffn.out.data(), batch_size);
+    } else if (iu4.w != nullptr) {
+      Iu4Ffn(iu4, layer_index, scratch, batch_size, arena.stream);
     } else {
       LaunchFfnActivation(layer, scratch, batch_size, intermediate_size,
                           hidden_size, arena.stream);
@@ -449,9 +560,16 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
                        scratch.decode.normed.data(), nullptr, batch_size,
                        hidden_size, 1e-6F, arena.stream);
   coordinator->EnsureVerificationLogits(batch_size);
-  LaunchProjection(weights.output, scratch.decode.normed.data(),
-                   coordinator->d_verification_logits_, batch_size, vocab_size,
-                   hidden_size, arena.stream);
+  if (iu4.w != nullptr) {
+    Iu4Rotate(iu4, scratch.decode.normed.data(), nullptr, hidden_size, false,
+              batch_size, arena.stream);
+    Iu4Proj(iu4, iu4.w->LmHead(), coordinator->d_verification_logits_,
+            batch_size, arena.stream);
+  } else {
+    LaunchProjection(weights.output, scratch.decode.normed.data(),
+                     coordinator->d_verification_logits_, batch_size,
+                     vocab_size, hidden_size, arena.stream);
+  }
   LaunchBatchedGPUArgmax(coordinator->d_verification_logits_,
                          scratch.decode.prompt_tokens.data(), batch_size,
                          vocab_size, scratch.ffn.out, arena.stream);
@@ -562,6 +680,7 @@ QwenGpuExecutor::ForwardVerificationBatch(
     executor.h_verification_logits_.clear();
   }
   const auto scratch = arena_.GetScratchView(batch_size);
+  const Iu4Ctx iu4 = MakeIu4Ctx(coordinator.model_->Iu4(), config, arena_);
   const std::size_t hidden_size = config.hidden_size;
   const std::size_t intermediate_size = config.intermediate_size;
   const std::size_t vocab_size = config.vocab_size;
@@ -646,15 +765,27 @@ QwenGpuExecutor::ForwardVerificationBatch(
                          hidden_size, 1e-6F, arena_.stream);
 
     if (layer.is_full_attention) {
-      LaunchProjection(layer.attn_q, scratch.decode.normed.data(),
-                       scratch.ssm.qkv.data(), batch_size, q_projection_size,
-                       hidden_size, arena_.stream);
-      LaunchProjection(layer.attn_k, scratch.decode.normed.data(),
-                       scratch.attention.k.data(), batch_size, kv_size,
-                       hidden_size, arena_.stream);
-      LaunchProjection(layer.attn_v, scratch.decode.normed.data(),
-                       scratch.attention.v.data(), batch_size, kv_size,
-                       hidden_size, arena_.stream);
+      if (iu4.w != nullptr) {
+        Iu4Rotate(iu4, scratch.decode.normed.data(),
+                  iu4.w->Find(layer_index, Iu4Role::kAttnQ).awq, hidden_size,
+                  false, batch_size, arena_.stream);
+        Iu4Proj(iu4, iu4.w->Find(layer_index, Iu4Role::kAttnQ),
+                scratch.ssm.qkv.data(), batch_size, arena_.stream);
+        Iu4Proj(iu4, iu4.w->Find(layer_index, Iu4Role::kAttnK),
+                scratch.attention.k.data(), batch_size, arena_.stream);
+        Iu4Proj(iu4, iu4.w->Find(layer_index, Iu4Role::kAttnV),
+                scratch.attention.v.data(), batch_size, arena_.stream);
+      } else {
+        LaunchProjection(layer.attn_q, scratch.decode.normed.data(),
+                         scratch.ssm.qkv.data(), batch_size, q_projection_size,
+                         hidden_size, arena_.stream);
+        LaunchProjection(layer.attn_k, scratch.decode.normed.data(),
+                         scratch.attention.k.data(), batch_size, kv_size,
+                         hidden_size, arena_.stream);
+        LaunchProjection(layer.attn_v, scratch.decode.normed.data(),
+                         scratch.attention.v.data(), batch_size, kv_size,
+                         hidden_size, arena_.stream);
+      }
       LaunchBatchedUnpackQG(scratch.ssm.qkv.data(), scratch.attention.q.data(),
                             scratch.ssm.gate.data(), batch_size,
                             config.num_attention_heads, config.head_dim,
@@ -797,19 +928,37 @@ QwenGpuExecutor::ForwardVerificationBatch(
           }
         }
       }
-      LaunchProjection(layer.attn_output, scratch.ssm.out.data(),
-                       scratch.attention.output.data(), batch_size, hidden_size,
-                       attention_size, arena_.stream);
+      if (iu4.w != nullptr) {
+        Iu4Rotate(iu4, scratch.ssm.out.data(),
+                  iu4.w->Find(layer_index, Iu4Role::kAttnO).awq, attention_size,
+                  false, batch_size, arena_.stream);
+        Iu4Proj(iu4, iu4.w->Find(layer_index, Iu4Role::kAttnO),
+                scratch.attention.output.data(), batch_size, arena_.stream);
+      } else {
+        LaunchProjection(layer.attn_output, scratch.ssm.out.data(),
+                         scratch.attention.output.data(), batch_size,
+                         hidden_size, attention_size, arena_.stream);
+      }
     } else {
-      LaunchProjection(layer.attn_qkv, scratch.decode.normed.data(),
-                       scratch.ssm.qkv.data(), batch_size, ssm_qkv_size,
-                       hidden_size, arena_.stream);
-      LaunchProjection(layer.attn_gate, scratch.decode.normed.data(),
-                       scratch.ssm.gate.data(), batch_size, ssm_inner_size,
-                       hidden_size, arena_.stream);
+      if (iu4.w != nullptr) {
+        Iu4Rotate(iu4, scratch.decode.normed.data(),
+                  iu4.w->Find(layer_index, Iu4Role::kSsmQkv).awq, hidden_size,
+                  false, batch_size, arena_.stream);
+        Iu4Proj(iu4, iu4.w->Find(layer_index, Iu4Role::kSsmQkv),
+                scratch.ssm.qkv.data(), batch_size, arena_.stream);
+        Iu4Proj(iu4, iu4.w->Find(layer_index, Iu4Role::kSsmZ),
+                scratch.ssm.gate.data(), batch_size, arena_.stream);
+      } else {
+        LaunchProjection(layer.attn_qkv, scratch.decode.normed.data(),
+                         scratch.ssm.qkv.data(), batch_size, ssm_qkv_size,
+                         hidden_size, arena_.stream);
+        LaunchProjection(layer.attn_gate, scratch.decode.normed.data(),
+                         scratch.ssm.gate.data(), batch_size, ssm_inner_size,
+                         hidden_size, arena_.stream);
+      }
       const auto controls =
           LaunchSsmControls(layer, scratch, batch_size, time_step_rank,
-                            hidden_size, arena_.stream);
+                            hidden_size, arena_.stream, iu4, layer_index);
       LaunchSSMConvRecurrenceBatch(
           scratch.ssm.qkv.data(),
           static_cast<const float*>(layer.ssm_conv1d.data),
@@ -824,9 +973,17 @@ QwenGpuExecutor::ForwardVerificationBatch(
           config.ssm_state_size, config.SsmValueSize(), controls.row_stride,
           ssm_inner_size, arena_.stream, arena_.GetRecurrentStateStorage());
 
-      LaunchProjection(layer.ssm_out, scratch.ssm.out.data(),
-                       scratch.attention.output.data(), batch_size, hidden_size,
-                       ssm_inner_size, arena_.stream);
+      if (iu4.w != nullptr) {
+        Iu4Rotate(iu4, scratch.ssm.out.data(),
+                  iu4.w->Find(layer_index, Iu4Role::kSsmOut).awq,
+                  ssm_inner_size, true, batch_size, arena_.stream);
+        Iu4Proj(iu4, iu4.w->Find(layer_index, Iu4Role::kSsmOut),
+                scratch.attention.output.data(), batch_size, arena_.stream);
+      } else {
+        LaunchProjection(layer.ssm_out, scratch.ssm.out.data(),
+                         scratch.attention.output.data(), batch_size,
+                         hidden_size, ssm_inner_size, arena_.stream);
+      }
     }
 
     LaunchBatchedResidualAdd(
@@ -840,6 +997,8 @@ QwenGpuExecutor::ForwardVerificationBatch(
     if (config.IsMoe()) {
       LaunchMoeFfnRows(layer, config, arena_, scratch.decode.normed.data(),
                        scratch.ffn.out.data(), batch_size);
+    } else if (iu4.w != nullptr) {
+      Iu4Ffn(iu4, layer_index, scratch, batch_size, arena_.stream);
     } else {
       LaunchFfnActivation(layer, scratch, batch_size, intermediate_size,
                           hidden_size, arena_.stream);
@@ -900,8 +1059,15 @@ QwenGpuExecutor::ForwardVerificationBatch(
                        static_cast<const float*>(weights_.output_norm.data),
                        scratch.decode.normed.data(), nullptr, batch_size,
                        hidden_size, 1e-6F, arena_.stream);
-  LaunchProjection(weights_.output, scratch.decode.normed.data(), logits_buffer,
-                   batch_size, vocab_size, hidden_size, arena_.stream);
+  if (iu4.w != nullptr) {
+    Iu4Rotate(iu4, scratch.decode.normed.data(), nullptr, hidden_size, false,
+              batch_size, arena_.stream);
+    Iu4Proj(iu4, iu4.w->LmHead(), logits_buffer, batch_size, arena_.stream);
+  } else {
+    LaunchProjection(weights_.output, scratch.decode.normed.data(),
+                     logits_buffer, batch_size, vocab_size, hidden_size,
+                     arena_.stream);
+  }
   auto* const d_out_tokens = scratch.decode.prompt_tokens.data();
   LaunchBatchedGPUArgmax(logits_buffer, d_out_tokens, batch_size, vocab_size,
                          scratch.ffn.out, arena_.stream);
