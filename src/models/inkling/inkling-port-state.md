@@ -64,6 +64,19 @@ looped 3x -> 5.4B effective active; 24 physical layers, middle core looped).
   (4-bit dense, check KL) and/or speculation (idea: self-draft with 1 loop pass instead of 3).
 - Next: fuse Mix/Rms/ctrl kernels; WMMA routed experts + dense for prefill (3k target); serve runner.
 
+## GPU prefill (2026-11-21)
+
+- Added own WMMA kernels: routed NVFP4/Q8 expert gemm (sorted per-expert tiles), dense gemm for
+  n>=32, flash attention with relative bias + sink. pp 2k: 89 -> 1295 tok/s; decode still 25-29.
+- Prefill split at 2k (1.6 s): expert WMMA 0.57+0.27 s (~22 TFLOPs), dense F32/Q8 WMMA 0.09,
+  flash attention 0.18, ~0.4 s in ~10 small kernels (Conv, Mix, Rms, Combine, Situ, Clip, Control).
+- Tried, no gain: register prefetch of next K step, 128x64 tile with 256 threads, K step 64
+  (slower, 1049), batch 2048 instead of 512. Gemm is neither dequant- nor wmma-bound alone
+  (removing either gives only ~+17%), so it is sync/latency bound.
+- FLOP budget: ~9.2 GFLOP/token -> 3k tok/s needs ~28 TFLOPs sustained; GPU-only is at ~12.
+  Remaining levers: fuse the small kernels (-25% time), LDS double buffer / direct-to-register
+  B fragments, NPU offload of dense + shared parts, then drafter for decode.
+
 ## Open questions / next steps (skill default order)
 
 1. CPU reference (`src/models/inkling/reference.cpp`) + config parser.

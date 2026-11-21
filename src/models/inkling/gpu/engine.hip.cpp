@@ -511,7 +511,6 @@ __global__ void Softcap(float* x, int count, float cap) {
     x[i] = cap * tanhf(x[i] / cap);
 }
 
-
 using V16h = __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
 using V8f = __attribute__((__vector_size__(8 * sizeof(float)))) float;
 
@@ -535,28 +534,34 @@ struct WmmaArgs {
 };
 
 // 16 consecutive K elements [k0, k0 + 16) of one weight row as F16.
-template <int TY>
+template<int TY>
 __device__ void LoadB16(const unsigned char* row, int k0, __half* dst) {
   if constexpr (TY == kTypeF32) {
     const float* p = reinterpret_cast<const float*>(row) + k0;
-    for (int i = 0; i < 16; ++i) dst[i] = __float2half(p[i]);
+    for (int i = 0; i < 16; ++i)
+      dst[i] = __float2half(p[i]);
   } else if constexpr (TY == kTypeBf16) {
     const unsigned short* p = reinterpret_cast<const unsigned short*>(row) + k0;
-    for (int i = 0; i < 16; ++i) dst[i] = __float2half(__uint_as_float(static_cast<unsigned>(p[i]) << 16));
+    for (int i = 0; i < 16; ++i)
+      dst[i] = __float2half(__uint_as_float(static_cast<unsigned>(p[i]) << 16));
   } else if constexpr (TY == kTypeQ8) {
     const unsigned char* b = row + (k0 >> 5) * 34;
     const float d = __half2float(*reinterpret_cast<const __half*>(b));
-    const unsigned short* q = reinterpret_cast<const unsigned short*>(b + 2) + ((k0 & 31) >> 1);
+    const unsigned short* q =
+        reinterpret_cast<const unsigned short*>(b + 2) + ((k0 & 31) >> 1);
     for (int i = 0; i < 8; ++i) {
       const unsigned short v = q[i];
-      dst[2 * i] = __float2half(d * static_cast<float>(static_cast<signed char>(v & 0xFF)));
-      dst[2 * i + 1] = __float2half(d * static_cast<float>(static_cast<signed char>(v >> 8)));
+      dst[2 * i] = __float2half(
+          d * static_cast<float>(static_cast<signed char>(v & 0xFF)));
+      dst[2 * i + 1] = __float2half(
+          d * static_cast<float>(static_cast<signed char>(v >> 8)));
     }
   } else {
     const unsigned char* blk = row + (k0 >> 6) * 36;
     const int s = (k0 >> 4) & 3;
     const float d = Ue4m3(blk[s]);
-    const unsigned int* qp = reinterpret_cast<const unsigned int*>(blk + 4 + s * 8);
+    const unsigned int* qp =
+        reinterpret_cast<const unsigned int*>(blk + 4 + s * 8);
     const unsigned int u[2] = {qp[0], qp[1]};
     for (int j = 0; j < 8; ++j) {
       const unsigned int byte = (u[j >> 2] >> ((j & 3) * 8)) & 0xFF;
@@ -566,8 +571,9 @@ __device__ void LoadB16(const unsigned char* row, int k0, __half* dst) {
   }
 }
 
-// Y[item][n] = scale[e] * sum_k X[item / a_div][k] * W[e*rows + n][k]; 64x64 tile per block, 4 waves of 32x32.
-template <int TY>
+// Y[item][n] = scale[e] * sum_k X[item / a_div][k] * W[e*rows + n][k]; 64x64
+// tile per block, 4 waves of 32x32.
+template<int TY>
 __global__ void __launch_bounds__(kWmmaThreads) WmmaGemm(WmmaArgs a) {
   __shared__ __half As[kTileM][kLdsStride];
   __shared__ __half Bs[kTileN][kLdsStride];
@@ -586,12 +592,17 @@ __global__ void __launch_bounds__(kWmmaThreads) WmmaGemm(WmmaArgs a) {
     start = blockIdx.y * kTileM;
     cnt = min(kTileM, a.n - start);
   }
-  if (cnt <= 0) return;
+  if (cnt <= 0)
+    return;
   const int lr = tid >> 1;
   const int lh = tid & 1;
-  const int item = lr < cnt ? (a.sorted != nullptr ? a.sorted[start + lr] : start + lr) : -1;
-  const float* xr = item >= 0 ? a.x + static_cast<std::size_t>(item / a.a_div) * a.cols : nullptr;
-  const unsigned char* wr = a.w + (static_cast<std::size_t>(expert) * a.rows + n0 + lr) * a.row_bytes;
+  const int item =
+      lr < cnt ? (a.sorted != nullptr ? a.sorted[start + lr] : start + lr) : -1;
+  const float* xr =
+      item >= 0 ? a.x + static_cast<std::size_t>(item / a.a_div) * a.cols
+                : nullptr;
+  const unsigned char* wr =
+      a.w + (static_cast<std::size_t>(expert) * a.rows + n0 + lr) * a.row_bytes;
   V8f acc[2][2] = {};
   const int wm = wave >> 1;
   const int wn = wave & 1;
@@ -607,7 +618,8 @@ __global__ void __launch_bounds__(kWmmaThreads) WmmaGemm(WmmaArgs a) {
         ad[4 * i + 3] = __float2half(v.w);
       }
     } else {
-      for (int i = 0; i < 16; ++i) ad[i] = __float2half(0.0F);
+      for (int i = 0; i < 16; ++i)
+        ad[i] = __float2half(0.0F);
     }
     LoadB16<TY>(wr, k0 + lh * 16, &Bs[lr][lh * 16]);
     __syncthreads();
@@ -616,14 +628,18 @@ __global__ void __launch_bounds__(kWmmaThreads) WmmaGemm(WmmaArgs a) {
       V16h bf[2];
       for (int mi = 0; mi < 2; ++mi) {
         const __half* p = &As[wm * 32 + mi * 16 + (lane & 15)][kk * 16];
-        for (int i = 0; i < 16; ++i) af[mi][i] = static_cast<_Float16>(__half2float(p[i]));
+        for (int i = 0; i < 16; ++i)
+          af[mi][i] = static_cast<_Float16>(__half2float(p[i]));
       }
       for (int ni = 0; ni < 2; ++ni) {
         const __half* p = &Bs[wn * 32 + ni * 16 + (lane & 15)][kk * 16];
-        for (int i = 0; i < 16; ++i) bf[ni][i] = static_cast<_Float16>(__half2float(p[i]));
+        for (int i = 0; i < 16; ++i)
+          bf[ni][i] = static_cast<_Float16>(__half2float(p[i]));
       }
       for (int mi = 0; mi < 2; ++mi) {
-        for (int ni = 0; ni < 2; ++ni) acc[mi][ni] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af[mi], bf[ni], acc[mi][ni]);
+        for (int ni = 0; ni < 2; ++ni)
+          acc[mi][ni] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+              af[mi], bf[ni], acc[mi][ni]);
       }
     }
     __syncthreads();
@@ -634,15 +650,19 @@ __global__ void __launch_bounds__(kWmmaThreads) WmmaGemm(WmmaArgs a) {
       for (int i = 0; i < 8; ++i) {
         const int m = wm * 32 + mi * 16 + 2 * i + (lane >> 4);
         const int nn = n0 + wn * 32 + ni * 16 + (lane & 15);
-        if (m >= cnt) continue;
-        const int out_item = a.sorted != nullptr ? a.sorted[start + m] : start + m;
-        a.y[static_cast<std::size_t>(out_item) * a.rows + nn] = acc[mi][ni][i] * sc;
+        if (m >= cnt)
+          continue;
+        const int out_item =
+            a.sorted != nullptr ? a.sorted[start + m] : start + m;
+        a.y[static_cast<std::size_t>(out_item) * a.rows + nn] =
+            acc[mi][ni][i] * sc;
       }
     }
   }
 }
 
-__global__ void SortItems(const int* ids, int items, int ne, int* sorted, int* tiles, int max_tiles) {
+__global__ void SortItems(const int* ids, int items, int ne, int* sorted,
+                          int* tiles, int max_tiles) {
   __shared__ int cnt[256];
   __shared__ int start[256];
   __shared__ int cursor[256];
@@ -651,7 +671,8 @@ __global__ void SortItems(const int* ids, int items, int ne, int* sorted, int* t
     cursor[e] = 0;
   }
   __syncthreads();
-  for (int i = threadIdx.x; i < items; i += blockDim.x) atomicAdd(&cnt[ids[i]], 1);
+  for (int i = threadIdx.x; i < items; i += blockDim.x)
+    atomicAdd(&cnt[ids[i]], 1);
   __syncthreads();
   if (threadIdx.x == 0) {
     int s = 0;
@@ -666,7 +687,8 @@ __global__ void SortItems(const int* ids, int items, int ne, int* sorted, int* t
       }
       s += cnt[e];
     }
-    for (; k < max_tiles; ++k) tiles[3 * k + 2] = 0;
+    for (; k < max_tiles; ++k)
+      tiles[3 * k + 2] = 0;
   }
   __syncthreads();
   for (int i = threadIdx.x; i < items; i += blockDim.x) {
@@ -674,7 +696,6 @@ __global__ void SortItems(const int* ids, int items, int ne, int* sorted, int* t
     sorted[start[e] + atomicAdd(&cursor[e], 1)] = i;
   }
 }
-
 
 constexpr int kFlashQ = 64;
 constexpr int kFlashK = 64;
@@ -685,10 +706,12 @@ constexpr int kFlashHd = 128;
 constexpr int kFlashRel = 16;
 constexpr float kNegInf = -1e30F;
 
-// Flash attention with relative bias and a zero sink logit. One block: 64 queries of one head; 4 waves x 16 query rows.
+// Flash attention with relative bias and a zero sink logit. One block: 64
+// queries of one head; 4 waves x 16 query rows.
 __global__ void __launch_bounds__(128)
-FlashRel(AttnArgs a, const float* q, const float* r, const float* sink, const __half* kc, const __half* vc,
-         const float* bias, float* out, int n) {
+    FlashRel(AttnArgs a, const float* q, const float* r, const float* sink,
+             const __half* kc, const __half* vc, const float* bias, float* out,
+             int n) {
   __shared__ __half Ks[kFlashK][kKStride];
   __shared__ __half Vt[kFlashHd][kVStride];
   __shared__ __half Ps[kFlashQ][kPStride];
@@ -706,7 +729,8 @@ FlashRel(AttnArgs a, const float* q, const float* r, const float* sink, const __
   for (int i = tid; i < kFlashQ * kFlashRel; i += 128) {
     const int row = i / kFlashRel;
     const int t = min(q0 + row, n - 1);
-    Rs[row][i % kFlashRel] = r[(static_cast<std::size_t>(t) * a.nh + h) * kFlashRel + i % kFlashRel];
+    Rs[row][i % kFlashRel] =
+        r[(static_cast<std::size_t>(t) * a.nh + h) * kFlashRel + i % kFlashRel];
   }
   // Q fragments for this wave's 16 rows
   V16h qf[8];
@@ -714,7 +738,8 @@ FlashRel(AttnArgs a, const float* q, const float* r, const float* sink, const __
     const int t = min(q0 + wave * 16 + (lane & 15), n - 1);
     const float* qp = q + (static_cast<std::size_t>(t) * a.nh + h) * kFlashHd;
     for (int c = 0; c < 8; ++c) {
-      for (int i = 0; i < 16; ++i) qf[c][i] = static_cast<_Float16>(qp[c * 16 + i]);
+      for (int i = 0; i < 16; ++i)
+        qf[c][i] = static_cast<_Float16>(qp[c * 16 + i]);
     }
   }
   float sinkv[8];
@@ -733,18 +758,23 @@ FlashRel(AttnArgs a, const float* q, const float* r, const float* sink, const __
     l[i] = 1.0F / 16.0F;  // zero sink counted once after the 16-lane sum
   }
   const int kfirst_pos = a.window > 0 ? max(0, qmin_pos - a.window + 1) : 0;
-  for (int kb = (kfirst_pos / kFlashK) * kFlashK; kb <= qmax_pos; kb += kFlashK) {
+  for (int kb = (kfirst_pos / kFlashK) * kFlashK; kb <= qmax_pos;
+       kb += kFlashK) {
     __syncthreads();
     {
       const int key = tid >> 1;
       const int half = tid & 1;
       const int j = kb + key;
       const bool ok = j <= qmax_pos;
-      const uint4* ks = reinterpret_cast<const uint4*>(kc + static_cast<std::size_t>(j) * kvdim + g * kFlashHd + half * 64);
-      const __half* vs = vc + static_cast<std::size_t>(j) * kvdim + g * kFlashHd + half * 64;
+      const uint4* ks = reinterpret_cast<const uint4*>(
+          kc + static_cast<std::size_t>(j) * kvdim + g * kFlashHd + half * 64);
+      const __half* vs =
+          vc + static_cast<std::size_t>(j) * kvdim + g * kFlashHd + half * 64;
       uint4* kd = reinterpret_cast<uint4*>(&Ks[key][half * 64]);
-      for (int i = 0; i < 8; ++i) kd[i] = ok ? ks[i] : make_uint4(0, 0, 0, 0);
-      for (int i = 0; i < 64; ++i) Vt[half * 64 + i][key] = ok ? vs[i] : __float2half(0.0F);
+      for (int i = 0; i < 8; ++i)
+        kd[i] = ok ? ks[i] : make_uint4(0, 0, 0, 0);
+      for (int i = 0; i < 64; ++i)
+        Vt[half * 64 + i][key] = ok ? vs[i] : __float2half(0.0F);
     }
     __syncthreads();
     V8f sc[4] = {};
@@ -752,12 +782,14 @@ FlashRel(AttnArgs a, const float* q, const float* r, const float* sink, const __
       for (int ni = 0; ni < 4; ++ni) {
         V16h bf;
         const __half* kp = &Ks[ni * 16 + (lane & 15)][c * 16];
-        for (int i = 0; i < 16; ++i) bf[i] = static_cast<_Float16>(__half2float(kp[i]));
+        for (int i = 0; i < 16; ++i)
+          bf[i] = static_cast<_Float16>(__half2float(kp[i]));
         sc[ni] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(qf[c], bf, sc[ni]);
       }
     }
     float pmax[8];
-    for (int i = 0; i < 8; ++i) pmax[i] = kNegInf;
+    for (int i = 0; i < 8; ++i)
+      pmax[i] = kNegInf;
     for (int ni = 0; ni < 4; ++ni) {
       const int jpos = kb + ni * 16 + (lane & 15);
       for (int i = 0; i < 8; ++i) {
@@ -769,7 +801,8 @@ FlashRel(AttnArgs a, const float* q, const float* r, const float* sink, const __
           if (dist < a.extent) {
             const float* bp = bias + static_cast<std::size_t>(dist) * kFlashRel;
             const float* rp = Rs[wave * 16 + 2 * i + (lane >> 4)];
-            for (int d = 0; d < kFlashRel; ++d) b += bp[d] * rp[d];
+            for (int d = 0; d < kFlashRel; ++d)
+              b += bp[d] * rp[d];
           }
           v = sc[ni][i] * a.scale + b - sinkv[i];
         }
@@ -778,40 +811,48 @@ FlashRel(AttnArgs a, const float* q, const float* r, const float* sink, const __
       }
     }
     for (int i = 0; i < 8; ++i) {
-      for (int off = 8; off > 0; off >>= 1) pmax[i] = fmaxf(pmax[i], __shfl_xor(pmax[i], off));
+      for (int off = 8; off > 0; off >>= 1)
+        pmax[i] = fmaxf(pmax[i], __shfl_xor(pmax[i], off));
       const float mn = fmaxf(m[i], pmax[i]);
       const float alpha = expf(m[i] - mn);
       m[i] = mn;
       l[i] *= alpha;
-      for (int ni = 0; ni < 8; ++ni) o[ni][i] *= alpha;
+      for (int ni = 0; ni < 8; ++ni)
+        o[ni][i] *= alpha;
     }
     for (int ni = 0; ni < 4; ++ni) {
       for (int i = 0; i < 8; ++i) {
         const float pv = sc[ni][i] <= kNegInf ? 0.0F : expf(sc[ni][i] - m[i]);
         l[i] += pv;
-        Ps[wave * 16 + 2 * i + (lane >> 4)][ni * 16 + (lane & 15)] = __float2half(pv);
+        Ps[wave * 16 + 2 * i + (lane >> 4)][ni * 16 + (lane & 15)] =
+            __float2half(pv);
       }
     }
     __syncthreads();
     for (int c = 0; c < 4; ++c) {
       V16h pf;
       const __half* pp = &Ps[wave * 16 + (lane & 15)][c * 16];
-      for (int i = 0; i < 16; ++i) pf[i] = static_cast<_Float16>(__half2float(pp[i]));
+      for (int i = 0; i < 16; ++i)
+        pf[i] = static_cast<_Float16>(__half2float(pp[i]));
       for (int ni = 0; ni < 8; ++ni) {
         V16h vf;
         const __half* vp = &Vt[ni * 16 + (lane & 15)][c * 16];
-        for (int i = 0; i < 16; ++i) vf[i] = static_cast<_Float16>(__half2float(vp[i]));
+        for (int i = 0; i < 16; ++i)
+          vf[i] = static_cast<_Float16>(__half2float(vp[i]));
         o[ni] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pf, vf, o[ni]);
       }
     }
   }
   for (int i = 0; i < 8; ++i) {
     float ls = l[i];
-    for (int off = 8; off > 0; off >>= 1) ls += __shfl_xor(ls, off);
+    for (int off = 8; off > 0; off >>= 1)
+      ls += __shfl_xor(ls, off);
     const int t = q0 + wave * 16 + 2 * i + (lane >> 4);
-    if (t >= n) continue;
+    if (t >= n)
+      continue;
     for (int ni = 0; ni < 8; ++ni) {
-      out[(static_cast<std::size_t>(t) * a.nh + h) * kFlashHd + ni * 16 + (lane & 15)] = o[ni][i] / ls;
+      out[(static_cast<std::size_t>(t) * a.nh + h) * kFlashHd + ni * 16 +
+          (lane & 15)] = o[ni][i] / ls;
     }
   }
 }
@@ -969,15 +1010,34 @@ struct Session::Impl {
   void Dense(const Tensor& w, const float* xin, std::size_t ldx, float* yout,
              std::size_t ldy, int n, int rows = -1) {
     const int nrows = rows < 0 ? static_cast<int>(w.rows) : rows;
-    if (n >= kWmmaMinTokens && nrows % kTileN == 0 && ldy == static_cast<std::size_t>(nrows) && static_cast<std::uint64_t>(nrows) <= w.rows) {
-      WmmaArgs wa{static_cast<const unsigned char*>(w.dev), w.row_bytes, static_cast<int>(w.cols), nrows, xin, 1, yout, nullptr, nullptr, nullptr, n};
+    if (n >= kWmmaMinTokens && nrows % kTileN == 0 &&
+        ldy == static_cast<std::size_t>(nrows) &&
+        static_cast<std::uint64_t>(nrows) <= w.rows) {
+      WmmaArgs wa{static_cast<const unsigned char*>(w.dev),
+                  w.row_bytes,
+                  static_cast<int>(w.cols),
+                  nrows,
+                  xin,
+                  1,
+                  yout,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  n};
       const dim3 wg(nrows / kTileN, (n + kTileM - 1) / kTileM);
       if (ldx == w.cols) {
         switch (w.type) {
-          case kTypeF32: WmmaGemm<kTypeF32><<<wg, kWmmaThreads, 0, stream>>>(wa); return;
-          case kTypeBf16: WmmaGemm<kTypeBf16><<<wg, kWmmaThreads, 0, stream>>>(wa); return;
-          case kTypeQ8: WmmaGemm<kTypeQ8><<<wg, kWmmaThreads, 0, stream>>>(wa); return;
-          default: break;
+          case kTypeF32:
+            WmmaGemm<kTypeF32><<<wg, kWmmaThreads, 0, stream>>>(wa);
+            return;
+          case kTypeBf16:
+            WmmaGemm<kTypeBf16><<<wg, kWmmaThreads, 0, stream>>>(wa);
+            return;
+          case kTypeQ8:
+            WmmaGemm<kTypeQ8><<<wg, kWmmaThreads, 0, stream>>>(wa);
+            return;
+          default:
+            break;
         }
       }
     }
@@ -1155,12 +1215,13 @@ struct Session::Impl {
     if (n >= kWmmaMinTokens && hd == kFlashHd && nrel == kFlashRel) {
       FlashRel<<<dim3((n + kFlashQ - 1) / kFlashQ, nh), 128, 0, stream>>>(
           aa, q, r, sink, sl.k, sl.v,
-          static_cast<const float*>(m->T(m->P(p, "attn_rel_bias.weight")).dev), att, n);
+          static_cast<const float*>(m->T(m->P(p, "attn_rel_bias.weight")).dev),
+          att, n);
     } else {
-    Attention<<<dim3(nh, n), kThreads, (span + 1) * sizeof(float), stream>>>(
-        aa, q, r, sink, sl.k, sl.v,
-        static_cast<const float*>(m->T(m->P(p, "attn_rel_bias.weight")).dev),
-        att);
+      Attention<<<dim3(nh, n), kThreads, (span + 1) * sizeof(float), stream>>>(
+          aa, q, r, sink, sl.k, sl.v,
+          static_cast<const float*>(m->T(m->P(p, "attn_rel_bias.weight")).dev),
+          att);
     }
     Dense(m->T(m->P(p, "attn_gate.weight")), in[0], h, gate, nh * hd, n);
     SigmoidMul<<<(n * nh * hd + 255) / 256, 256, 0, stream>>>(
@@ -1212,11 +1273,32 @@ struct Session::Impl {
     const int items = n * nu;
     if (n >= kWmmaMinTokens) {
       const int max_tiles = items / kTileM + ne;
-      SortItems<<<1, 1024, 0, stream>>>(ids, items, ne, sorted, tiles, max_tiles);
+      SortItems<<<1, 1024, 0, stream>>>(ids, items, ne, sorted, tiles,
+                                        max_tiles);
       const Tensor& wgu = m->T(m->P(p, "ffn_gate_up_exps.weight"));
       const Tensor& wdn = m->T(m->P(p, "ffn_down_exps.weight"));
-      WmmaArgs a1{static_cast<const unsigned char*>(wgu.dev), wgu.row_bytes, static_cast<int>(wgu.cols), 2 * ff, x, nu, gu, nullptr, tiles, sorted, n};
-      WmmaArgs a2{static_cast<const unsigned char*>(wdn.dev), wdn.row_bytes, static_cast<int>(wdn.cols), h, act, 1, y, s_dn, tiles, sorted, n};
+      WmmaArgs a1{static_cast<const unsigned char*>(wgu.dev),
+                  wgu.row_bytes,
+                  static_cast<int>(wgu.cols),
+                  2 * ff,
+                  x,
+                  nu,
+                  gu,
+                  nullptr,
+                  tiles,
+                  sorted,
+                  n};
+      WmmaArgs a2{static_cast<const unsigned char*>(wdn.dev),
+                  wdn.row_bytes,
+                  static_cast<int>(wdn.cols),
+                  h,
+                  act,
+                  1,
+                  y,
+                  s_dn,
+                  tiles,
+                  sorted,
+                  n};
       const dim3 g1(2 * ff / kTileN, max_tiles);
       const dim3 g2(h / kTileN, max_tiles);
       if (wgu.type == kTypeNvfp4) {
@@ -1224,7 +1306,8 @@ struct Session::Impl {
       } else {
         WmmaGemm<kTypeQ8><<<g1, kWmmaThreads, 0, stream>>>(a1);
       }
-      Situ<<<items, 256, 0, stream>>>(gu, ids, s_gu, act, ff, c.situ_beta, c.situ_linear_beta);
+      Situ<<<items, 256, 0, stream>>>(gu, ids, s_gu, act, ff, c.situ_beta,
+                                      c.situ_linear_beta);
       if (wdn.type == kTypeNvfp4) {
         WmmaGemm<kTypeNvfp4><<<g2, kWmmaThreads, 0, stream>>>(a2);
       } else {
@@ -1433,7 +1516,8 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
   i.d_logits = i.Alloc(c.vocab_padded);
   i.d_pos = static_cast<int*>(i.AllocBytes(4));
   i.sorted = static_cast<int*>(i.AllocBytes(b * c.expert_used * 4));
-  i.tiles = static_cast<int*>(i.AllocBytes((b * c.expert_used / kTileM + c.expert_count) * 3 * 4));
+  i.tiles = static_cast<int*>(
+      i.AllocBytes((b * c.expert_used / kTileM + c.expert_count) * 3 * 4));
   {
     std::vector<int> tok(b * c.expert_used);
     std::vector<int> item(b * c.expert_used);
