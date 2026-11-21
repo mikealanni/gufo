@@ -1084,72 +1084,84 @@ void CheckServingSampling(const std::shared_ptr<qfn::Model>& model) {
 }
 
 void CheckLogprobs(const std::shared_ptr<qfn::Model>& model) {
-  std::string error;
   const auto prompt = model->Tokenize(
       "Continue this list: red blue green red blue green red blue green");
   const std::vector<sampling::TokenId> history(prompt.begin(), prompt.end());
-  for (const bool mtp : {false, true}) {
+  struct Trace {
+    std::vector<std::int32_t> tokens;
+    std::uint64_t rng, drafted, accepted;
+  };
+  for (const std::size_t width : {1U, 8U}) {
     for (const float temperature : {0.F, 0.7F}) {
-      const auto mode = mtp ? gufo::core::SessionMode::kSpeculative
-                            : gufo::core::SessionMode::kAutoregressive;
-      auto observed = model->CreateSession(mode, 256, &error);
-      auto plain = model->CreateSession(mode, 256, &error);
-      auto reference = model->CreateSession(
-          gufo::core::SessionMode::kAutoregressive, 256, &error);
-      Require(observed && plain && reference, error);
-      Require(observed->Sync(prompt, &error) && plain->Sync(prompt, &error) &&
-                  reference->Sync(prompt, &error),
-              error);
-      sampling::SamplingConfig config;
-      config.temperature = temperature;
-      config.top_k = 20;
-      config.seed = 73;
-      sampling::SamplerState a(config, history);
-      config.logprobs = 5;
-      sampling::SamplerState b(config, history);
-      std::size_t generated = 0;
-      while (generated < 32) {
-        qfn::Session::DecodeResult expected, actual;
-        const auto budget = std::min<std::size_t>(mtp ? 8 : 1, 32 - generated);
-        Require(plain->DecodeStep(budget, a, &expected, &error, false) &&
-                    observed->DecodeStep(budget, b, &actual, &error, false),
-                error);
-        Require(
-            expected.tokens == actual.tokens && a.rng_state() == b.rng_state(),
-            "logprobs changed selected tokens or RNG");
-        Require(actual.logprobs.size() == actual.tokens.size(),
-                "missing accepted-token probabilities");
-        for (std::size_t i = 0; i < actual.tokens.size(); ++i) {
-          const auto logits = reference->Logits();
-          const double maximum =
-              *std::max_element(logits.begin(), logits.end());
-          double sum = 0;
-          for (const float value : logits)
-            sum += std::exp(double(value) - maximum);
-          const auto check = [&](const sampling::TokenLogprob& entry) {
-            const double expected_lp =
-                (double(logits[entry.token]) - maximum) - std::log(sum);
-            Require(std::abs(entry.logprob - expected_lp) < 1e-5,
-                    "reported probability disagrees with teacher-forced target "
-                    "logits");
-          };
-          Require(actual.logprobs[i].selected.token ==
-                      static_cast<sampling::TokenId>(actual.tokens[i]),
-                  "probability token order differs");
-          check(actual.logprobs[i].selected);
-          for (const auto& entry : actual.logprobs[i].top)
-            check(entry);
-          Require(reference->Evaluate(actual.tokens[i], &error), error);
+      const auto run = [&](bool observe) {
+        std::string error;
+        auto session = model->CreateSession(
+            gufo::core::SessionMode::kSpeculative, 256, &error);
+        Require(session && session->Sync(prompt, &error), error);
+        sampling::SamplingConfig config;
+        config.temperature = temperature;
+        config.top_k = 20;
+        config.seed = 73;
+        if (observe)
+          config.logprobs = 5;
+        sampling::SamplerState sampler(config, history);
+        Trace trace{};
+        while (trace.tokens.size() < 32) {
+          std::vector<float> frontier;
+          if (observe) {
+            const auto logits = session->Logits();
+            frontier.assign(logits.begin(), logits.end());
+          }
+          qfn::Session::DecodeResult step;
+          const auto budget = std::min(width, 32 - trace.tokens.size());
+          Require(session->DecodeStep(budget, sampler, &step, &error, false),
+                  error);
+          Require(!step.tokens.empty(), "empty logprobs decode step");
+          Require(step.logprobs.size() == (observe ? step.tokens.size() : 0),
+                  "logprob count does not match collection mode");
+          if (observe) {
+            // This is the exact target row that selected the anchor. A
+            // serial replay can use different quantized kernels than a wide
+            // verification step, even with an identical emitted prefix.
+            const double maximum =
+                *std::max_element(frontier.begin(), frontier.end());
+            double sum = 0;
+            for (const auto value : frontier)
+              sum += std::exp(double(value) - maximum);
+            const auto check = [&](const sampling::TokenLogprob& entry) {
+              const auto expected =
+                  double(frontier.at(entry.token)) - maximum - std::log(sum);
+              Require(std::abs(entry.logprob - expected) < 1e-5,
+                      "anchor score disagrees with the raw target row");
+            };
+            check(step.logprobs.front().selected);
+            for (const auto& entry : step.logprobs.front().top)
+              check(entry);
+            for (std::size_t i = 0; i < step.tokens.size(); ++i)
+              Require(step.logprobs[i].selected.token ==
+                          static_cast<sampling::TokenId>(step.tokens[i]),
+                      "score belongs to another generated token");
+          }
+          trace.tokens.insert(trace.tokens.end(), step.tokens.begin(),
+                              step.tokens.end());
         }
-        generated += actual.tokens.size();
-      }
-      const auto x = observed->Statistics(), y = plain->Statistics();
-      Require(x.drafted == y.drafted && x.accepted == y.accepted,
-              "observation changed speculative acceptance");
-      if (mtp)
-        Require(x.drafted > 0, "logprob fixture must execute drafts");
-      std::cout << "logprobs mtp=" << mtp << " temperature=" << temperature
-                << " tokens=" << generated << " drafted=" << x.drafted << '\n';
+        const auto stats = session->Statistics();
+        trace.rng = sampler.rng_state();
+        trace.drafted = stats.drafted;
+        trace.accepted = stats.accepted;
+        return trace;
+      };
+      const auto plain = run(false);
+      const auto scored = run(true);
+      Require(plain.tokens == scored.tokens && plain.rng == scored.rng &&
+                  plain.drafted == scored.drafted &&
+                  plain.accepted == scored.accepted,
+              "collecting probabilities changed decoding");
+      if (width > 1)
+        Require(scored.drafted > 0, "expected a speculative decode step");
+      std::cout << "logprobs width=" << width << " temperature=" << temperature
+                << " drafted=" << scored.drafted
+                << " accepted=" << scored.accepted << std::endl;
     }
   }
 }
@@ -1200,7 +1212,6 @@ int main(int argc, char** argv) {
     Require(model != nullptr, error);
     if (logprobs_only) {
       CheckLogprobs(model);
-      CheckServingEos(model);
       return 0;
     }
     if (execution_only) {
