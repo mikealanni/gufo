@@ -113,3 +113,10 @@ time is attention (dense WMMA attention at ~27 TFLOPS, near the real-data fp16
 ceiling), so more NPU FFN slices do not help. Remaining levers: NPU attention
 (exact, uses the idle NPU), a faster sparse kernel (approximate, currently 12 TFLOPS),
 int4 QK attention (approximate).
+
+## NPU attention feasibility gate (2026-11-20)
+
+- Shape: 27B full attention is 24 q heads, 4 kv heads, head_dim 256, 16 of 64 layers. The existing wp10 attnp kernel is fixed at 16/4/128, so this needs a new kernel.
+- Idle budget (GUFO_NPU_STATS at pp32768, lockstep): NPU worker ~43 ms per layer-chunk, ~22 s of a ~31 s run, so the NPU is ~70% busy and ~9 s idle.
+- Probe (gufo-attnp, final_attnp2.xclbin, hd128 16 heads): 5.35 ms at L=16128, 21.06 ms at L=65128, i.e. ~3.2 TFLOPS (rel err printed nan, unresolved).
+- Projection with an exact KV-group split: NPU share 3.2/(27+3.2) = 10.6% of attention, so about +2.5% at 32k and +6% at 128k. Not enough alone for 1250; a multi-day kernel for that gain is deferred, the sparse kernel (12 vs 27 TFLOPS) goes first.
