@@ -11,6 +11,8 @@ namespace gufo::models {
 struct QwenModelWeights;
 }
 
+#include "src/models/qwen/hip/iu4_weights.hpp"
+
 namespace gufo::hip {
 
 class QwenGpuArena;
@@ -30,7 +32,8 @@ void ExecuteDecodeStep(
     const QwenExecutionPolicy& policy, tokenization::TokenId token_id,
     std::uint32_t pos, bool compute_logits,
     QwenRecurrentStateIo recurrent_state,
-    models::qwen::vision::DeviceInput* image_input = nullptr);
+    models::qwen::vision::DeviceInput* image_input = nullptr,
+    const Iu4Weights* iu4 = nullptr);
 
 }  // namespace gufo::hip
 

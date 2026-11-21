@@ -130,3 +130,7 @@ int4 + NPU, GUFO_QWEN_SPARSE_ATTN=1, single runs: 16k 1203, 32k 1103, 64k 1054, 
 ### Sparse attention quality at 32k (int4 + NPU, 40 samples, seed 7, window 32768)
 
 Dense mean NLL 0.6972, sparse 0.6821, paired delta -0.0150 +- 0.0298 (se); median delta -1e-5; top-1 agreement dense vs sparse 0.975 (39/40); top-1 equals the true next token 0.800 dense vs 0.775 sparse. Worst single-sample increase +0.73 nats, best -0.51 (per-sample NLL is chaotic here). No measurable loss at 32k; 64k+ and a larger sample are still to run before sparse becomes the default.
+
+## Decode GEMV (GUFO_IU4_DECODE=1, 2026-11-21)
+
+LaunchIu4Gemv reads the same tile-major weights as the prefill GEMM with the rotated fp32 activation (producers take rot_out for it): one workgroup per 16-row tile, eight waves split the K groups, lane = row x two of four 16-byte chunks. Unit test iu4_gemv_test: worst abs error 1e-6 vs the host model; 215-220 GB/s on the big projections (DRAM bound), 700-800 GB/s on the small cached ones. Plain 27B decode 12.51 -> 14.84 tok/s; greedy generation matches the base path in the opening 100 tokens apart from small wording differences. Decode step wiring: attention q/k/v/o, GDN qkv/z/a/b/out, FFN gate/up/down and lm_head, prefill scratch reused for x_rot and gate/up. Not yet: the batched verify path (speculative decode), loader skip of the base GGUF projections.

@@ -88,7 +88,8 @@ __device__ __forceinline__ void RotateQuantizeStore(
     float (&v)[8], bool live, const float* __restrict__ signs,
     std::uint32_t lane, std::uint32_t group256, std::uint32_t token,
     std::uint32_t padded_n, std::uint32_t e_groups,
-    std::uint8_t* __restrict__ tiles, float* __restrict__ scales) {
+    std::uint8_t* __restrict__ tiles, float* __restrict__ scales,
+    float* __restrict__ rot_out) {
   if (live) {
 #pragma unroll
     for (int i = 0; i < 8; ++i)
@@ -124,6 +125,16 @@ __device__ __forceinline__ void RotateQuantizeStore(
     for (int i = 0; i < 8; ++i)
       v[i] = 0.0f;
   }
+  if (rot_out != nullptr) {
+    // Decode: the rotated fp32 row feeds the GEMV directly.
+    if (live) {
+      float* dst = rot_out + (std::size_t)token * (e_groups * 128) +
+                   group256 * 256 + lane * 8;
+      *reinterpret_cast<float4*>(dst) = make_float4(v[0], v[1], v[2], v[3]);
+      *reinterpret_cast<float4*>(dst + 4) = make_float4(v[4], v[5], v[6], v[7]);
+    }
+    return;
+  }
   float amax = 0.0f;
 #pragma unroll
   for (int i = 0; i < 8; ++i)
@@ -155,7 +166,7 @@ __global__ void __launch_bounds__(1024) Iu4NormQuantizeKernel(
     const float* __restrict__ awq, const float* __restrict__ signs, float eps,
     std::uint32_t n, std::uint32_t padded_n, std::uint32_t k,
     std::uint8_t* __restrict__ tiles, float* __restrict__ scales,
-    __half* __restrict__ half_out) {
+    __half* __restrict__ half_out, float* __restrict__ rot_out) {
   __shared__ float partial[32];
   const std::uint32_t token = blockIdx.x;
   const std::uint32_t wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -202,7 +213,7 @@ __global__ void __launch_bounds__(1024) Iu4NormQuantizeKernel(
     }
   }
   RotateQuantizeStore(v, live, signs, lane, wave, token, padded_n, k >> 7,
-                      tiles, scales);
+                      tiles, scales, rot_out);
 }
 
 // Value heads of the engine's GDN output are tiled (engine head e belongs to
@@ -218,7 +229,8 @@ __global__ void __launch_bounds__(256) Iu4QuantizeKernel(
     const float* __restrict__ x, const float* __restrict__ awq,
     const float* __restrict__ signs, std::uint32_t n, std::uint32_t padded_n,
     std::uint32_t k, std::uint32_t remap_heads,
-    std::uint8_t* __restrict__ tiles, float* __restrict__ scales) {
+    std::uint8_t* __restrict__ tiles, float* __restrict__ scales,
+    float* __restrict__ rot_out) {
   const std::uint32_t lane = threadIdx.x & 31;
   const std::uint32_t gid = blockIdx.x * 8 + (threadIdx.x >> 5);
   const std::uint32_t groups256 = k >> 8;
@@ -251,7 +263,7 @@ __global__ void __launch_bounds__(256) Iu4QuantizeKernel(
     }
   }
   RotateQuantizeStore(v, live, signs, lane, g, token, padded_n, k >> 7, tiles,
-                      scales);
+                      scales, rot_out);
 }
 
 // Converts the leading `columns` FP16 columns (from the NPU) of each row to
@@ -300,7 +312,7 @@ __global__ void __launch_bounds__(256) Iu4SwiGluQuantizeKernel(
     std::uint32_t npu_columns, const float* __restrict__ awq,
     const float* __restrict__ signs, std::uint32_t n, std::uint32_t padded_n,
     std::uint32_t k, std::uint8_t* __restrict__ tiles,
-    float* __restrict__ scales) {
+    float* __restrict__ scales, float* __restrict__ rot_out) {
   const std::uint32_t lane = threadIdx.x & 31;
   const std::uint32_t gid = blockIdx.x * 8 + (threadIdx.x >> 5);
   const std::uint32_t groups256 = k >> 8;
@@ -354,7 +366,7 @@ __global__ void __launch_bounds__(256) Iu4SwiGluQuantizeKernel(
       v[i] /= awq[pos + i];
   }
   RotateQuantizeStore(v, live, signs, lane, g, token, padded_n, k >> 7, tiles,
-                      scales);
+                      scales, rot_out);
 }
 
 // Gated DeltaNet output: per (token, head) RMSNorm over the 128 value dims with
@@ -366,7 +378,7 @@ __global__ void __launch_bounds__(256) Iu4PostNormGateQuantizeKernel(
     const float* __restrict__ gate, const float* __restrict__ awq,
     const float* __restrict__ signs, std::uint32_t n, std::uint32_t padded_n,
     std::uint32_t inner, std::uint8_t* __restrict__ tiles,
-    float* __restrict__ scales) {
+    float* __restrict__ scales, float* __restrict__ rot_out) {
   const std::uint32_t lane = threadIdx.x & 31;
   const std::uint32_t gid = blockIdx.x * 8 + (threadIdx.x >> 5);
   const std::uint32_t groups256 = inner >> 8;
@@ -399,7 +411,7 @@ __global__ void __launch_bounds__(256) Iu4PostNormGateQuantizeKernel(
     }
   }
   RotateQuantizeStore(v, live, signs, lane, g, token, padded_n, inner >> 7,
-                      tiles, scales);
+                      tiles, scales, rot_out);
 }
 
 }  // namespace
@@ -437,30 +449,32 @@ void LaunchIu4NormQuantize(const float* x, const float* norm_weight,
                            const float* awq, const float* signs, float eps,
                            std::size_t n, std::size_t padded_n, std::size_t k,
                            std::uint8_t* tiles, float* scales,
-                           hipStream_t stream, void* half_out) {
+                           hipStream_t stream, void* half_out,
+                           float* rot_out) {
   Iu4NormQuantizeKernel<<<static_cast<unsigned>(padded_n),
                           static_cast<unsigned>(32 * (k >> 8)), 0, stream>>>(
       x, norm_weight, awq, signs, eps, static_cast<std::uint32_t>(n),
       static_cast<std::uint32_t>(padded_n), static_cast<std::uint32_t>(k),
-      tiles, scales, static_cast<__half*>(half_out));
+      tiles, scales, static_cast<__half*>(half_out), rot_out);
 }
 
 void LaunchIu4Quantize(const float* x, const float* awq, const float* signs,
                        bool remap_gdn_heads, std::size_t n,
                        std::size_t padded_n, std::size_t k, std::uint8_t* tiles,
-                       float* scales, hipStream_t stream) {
+                       float* scales, hipStream_t stream, float* rot_out) {
   const std::size_t waves = padded_n * (k >> 8);
   Iu4QuantizeKernel<<<static_cast<unsigned>((waves + 7) / 8), 256, 0, stream>>>(
       x, awq, signs, static_cast<std::uint32_t>(n),
       static_cast<std::uint32_t>(padded_n), static_cast<std::uint32_t>(k),
-      remap_gdn_heads ? 1u : 0u, tiles, scales);
+      remap_gdn_heads ? 1u : 0u, tiles, scales, rot_out);
 }
 
 void LaunchIu4SwiGluQuantize(
     const float* gate, const float* up, const void* npu_half,
     const Iu4NpuSwigluSource* npu_source, std::size_t npu_columns,
     const float* awq, const float* signs, std::size_t n, std::size_t padded_n,
-    std::size_t k, std::uint8_t* tiles, float* scales, hipStream_t stream) {
+    std::size_t k, std::uint8_t* tiles, float* scales, hipStream_t stream,
+    float* rot_out) {
   const std::size_t waves = padded_n * (k >> 8);
   Iu4NpuSwigluSource source;
   if (npu_source != nullptr)
@@ -470,7 +484,7 @@ void LaunchIu4SwiGluQuantize(
       gate, up, static_cast<const __half*>(npu_half), source,
       static_cast<std::uint32_t>(npu_columns), awq, signs,
       static_cast<std::uint32_t>(n), static_cast<std::uint32_t>(padded_n),
-      static_cast<std::uint32_t>(k), tiles, scales);
+      static_cast<std::uint32_t>(k), tiles, scales, rot_out);
 }
 
 void LaunchIu4PostNormGateQuantize(const float* raw, const float* ssm_norm,
@@ -478,13 +492,13 @@ void LaunchIu4PostNormGateQuantize(const float* raw, const float* ssm_norm,
                                    const float* signs, std::size_t n,
                                    std::size_t padded_n, std::size_t inner,
                                    std::uint8_t* tiles, float* scales,
-                                   hipStream_t stream) {
+                                   hipStream_t stream, float* rot_out) {
   const std::size_t waves = padded_n * (inner >> 8);
   Iu4PostNormGateQuantizeKernel<<<static_cast<unsigned>((waves + 7) / 8), 256,
                                   0, stream>>>(
       raw, ssm_norm, gate, awq, signs, static_cast<std::uint32_t>(n),
       static_cast<std::uint32_t>(padded_n), static_cast<std::uint32_t>(inner),
-      tiles, scales);
+      tiles, scales, rot_out);
 }
 
 void LaunchIu4RepackWeights(const void* blocks, void* tiles,

@@ -1,4 +1,5 @@
 #if defined(ENGINE_ENABLE_HIP)
+#include <cstdlib>
 #include <stdexcept>
 
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
@@ -50,7 +51,21 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
                            arena_.stream));
 
   EmitDecodeRouteTelemetry(weights_, policy_);
+  // GUFO_IU4_DECODE=1: projections read the rotated int4 artifact through the
+  // GEMV instead of the base GGUF weights.
+  const Iu4Weights* iu4_decode = nullptr;
+  if (Iu4Weights* candidate = model_->Iu4();
+      candidate != nullptr && !config.IsMoe() && config.num_layers == 64 &&
+      candidate->layers() == config.num_layers &&
+      arena_.d_scratch_bf16 != nullptr && arena_.d_ffn_gate != nullptr) {
+    const char* v = std::getenv("GUFO_IU4_DECODE");
+    if (v != nullptr && v[0] == '1')
+      iu4_decode = candidate;
+  }
   auto graph_key = graph_key_;
+  if (iu4_decode != nullptr)
+    graph_key.workload_identity =
+        ExtendQwenGraphWorkloadIdentity(graph_key.workload_identity, 0x14u);
   const auto target_layers = arena_.GetTargetLayerCapture();
   graph_key.workload_identity = ExtendQwenGraphWorkloadIdentity(
       graph_key.workload_identity, target_layers.size());
@@ -93,18 +108,20 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
       const bool ok =
           graph_executor_.TryCapture(arena_.stream, graph_key, [&]() {
             ExecuteDecodeStep(arena_, weights_, policy_, token_id, pos,
-                              compute_logits, recurrent_state, &vision_input_);
+                              compute_logits, recurrent_state, &vision_input_,
+                              iu4_decode);
           });
       if (ok) {
         launch_captured_graph();
       } else {
         ExecuteDecodeStep(arena_, weights_, policy_, token_id, pos,
-                          compute_logits, recurrent_state, &vision_input_);
+                          compute_logits, recurrent_state, &vision_input_,
+                          iu4_decode);
       }
     }
   } else {
     ExecuteDecodeStep(arena_, weights_, policy_, token_id, pos, compute_logits,
-                      recurrent_state, &vision_input_);
+                      recurrent_state, &vision_input_, iu4_decode);
   }
 
   if (!compute_logits) {

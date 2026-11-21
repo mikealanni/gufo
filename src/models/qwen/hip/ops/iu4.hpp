@@ -48,7 +48,8 @@ void LaunchIu4NormQuantize(const float* x, const float* norm_weight,
                            const float* awq, const float* signs, float eps,
                            std::size_t n, std::size_t padded_n, std::size_t k,
                            std::uint8_t* tiles, float* scales,
-                           hipStream_t stream, void* half_out = nullptr);
+                           hipStream_t stream, void* half_out = nullptr,
+                           float* rot_out = nullptr);
 
 // True when the int4 GEMM can run a projection of this shape: rows must be a
 // multiple of 128 (one feature tile) and cols a multiple of 256.
@@ -108,7 +109,8 @@ void LaunchIu4SwiGluQuantize(
     const float* gate, const float* up, const void* npu_half,
     const Iu4NpuSwigluSource* npu_source, std::size_t npu_columns,
     const float* awq, const float* signs, std::size_t n, std::size_t padded_n,
-    std::size_t k, std::uint8_t* tiles, float* scales, hipStream_t stream);
+    std::size_t k, std::uint8_t* tiles, float* scales, hipStream_t stream,
+    float* rot_out = nullptr);
 
 // Gated DeltaNet epilogue fused into the quantizer of the out projection: per
 // (token, head) RMSNorm of `raw` with `ssm_norm`, times silu(gate), through the
@@ -119,7 +121,8 @@ void LaunchIu4PostNormGateQuantize(const float* raw, const float* ssm_norm,
                                    const float* signs, std::size_t n,
                                    std::size_t padded_n, std::size_t inner,
                                    std::uint8_t* tiles, float* scales,
-                                   hipStream_t stream);
+                                   hipStream_t stream,
+                                   float* rot_out = nullptr);
 
 // Quantize-only activation producer for rows that are already normalized:
 // divide by awq (null for none), rotate, quantize, same output layout as
@@ -129,7 +132,12 @@ void LaunchIu4PostNormGateQuantize(const float* raw, const float* ssm_norm,
 void LaunchIu4Quantize(const float* x, const float* awq, const float* signs,
                        bool remap_gdn_heads, std::size_t n,
                        std::size_t padded_n, std::size_t k, std::uint8_t* tiles,
-                       float* scales, hipStream_t stream);
+                       float* scales, hipStream_t stream,
+                       float* rot_out = nullptr);
+
+// Every producer takes an optional rot_out: when set, the rotated (and awq
+// divided) fp32 row is written there instead of int4 codes, for the decode
+// GEMV. Use n = padded_n = 1 and tiles/scales may be null.
 
 }  // namespace gufo::hip
 #endif

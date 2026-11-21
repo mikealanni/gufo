@@ -7,6 +7,7 @@
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/moe_ffn.hpp"
 #include "src/models/qwen/hip/ops.hpp"
+#include "src/models/qwen/hip/ops/iu4.hpp"
 #include "src/models/qwen/modules/modules.hpp"
 
 namespace gufo::hip {
@@ -40,7 +41,8 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
                        tokenization::TokenId token_id, std::uint32_t pos,
                        bool compute_logits,
                        QwenRecurrentStateIo recurrent_state,
-                       models::qwen::vision::DeviceInput* image_input) {
+                       models::qwen::vision::DeviceInput* image_input,
+                       const Iu4Weights* iu4) {
   const auto* rope = image_input != nullptr ? image_input->rope() : nullptr;
   (void)token_id;
   const auto& config = weights.config;
@@ -62,6 +64,19 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
   const bool use_split_k_decode = detail::IsSplitKDecodeAttentionSupported(
       sequence_length, config.num_attention_heads, config.num_key_value_heads,
       config.head_dim);
+
+  // Rotated-int4 decode: x_rot holds the rotated activation row, gate/up the
+  // FFN intermediates (prefill scratch, idle during decode).
+  float* const iu4_x = static_cast<float*>(arena.d_scratch_bf16);
+  const auto iu4_gemv = [&](const Iu4Projection& p, float* out) {
+    LaunchIu4Gemv(p.tiles, p.scales, iu4_x, out, false, p.padded_rows, p.rows,
+                  p.cols, arena.stream);
+  };
+  const auto iu4_rotate = [&](const float* x, const float* awq, std::size_t k,
+                              bool remap) {
+    LaunchIu4Quantize(x, awq, iu4->signs(), remap, 1, 1, k, nullptr, nullptr,
+                      arena.stream, iu4_x);
+  };
 
   // GPU parameter buffers
   const std::uint32_t* d_in_token = decode_scratch.prompt_tokens.data();
@@ -100,12 +115,20 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
       const std::size_t total_k = arena.GetAttentionKvPlaneElements();
       const std::uint32_t attn_layer_idx = l / config.full_attention_interval;
 
-      LaunchFusedQKVProjections(
-          layer.attn_q.data, layer.attn_q.type, layer.attn_k.data,
-          layer.attn_k.type, layer.attn_v.data, layer.attn_v.type,
-          decode_scratch.normed.data(), ssm_scratch.qkv.data(),
-          attention_scratch.k.data(), attention_scratch.v.data(),
-          q_projection_size, kv_size, hidden_size, arena.stream);
+      if (iu4 != nullptr) {
+        iu4_rotate(decode_scratch.normed.data(),
+                   iu4->Find(l, Iu4Role::kAttnQ).awq, hidden_size, false);
+        iu4_gemv(iu4->Find(l, Iu4Role::kAttnQ), ssm_scratch.qkv.data());
+        iu4_gemv(iu4->Find(l, Iu4Role::kAttnK), attention_scratch.k.data());
+        iu4_gemv(iu4->Find(l, Iu4Role::kAttnV), attention_scratch.v.data());
+      } else {
+        LaunchFusedQKVProjections(
+            layer.attn_q.data, layer.attn_q.type, layer.attn_k.data,
+            layer.attn_k.type, layer.attn_v.data, layer.attn_v.type,
+            decode_scratch.normed.data(), ssm_scratch.qkv.data(),
+            attention_scratch.k.data(), attention_scratch.v.data(),
+            q_projection_size, kv_size, hidden_size, arena.stream);
+      }
       // De-interleave Q and Gate from attn_q projection
       LaunchUnpackQG(ssm_scratch.qkv.data(), attention_scratch.q.data(),
                      ssm_scratch.gate.data(), config.num_attention_heads,
@@ -201,20 +224,37 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
       // Output projection, routed through the quant_gemm module (HIP
       // backend). Same kernel, same args, same arena slices (d_ssm_out in,
       // d_attn_out out); behavior-identical to the former inline `LaunchGEMV`.
-      gufo::models::qwen::QuantGemm(
-          module_ctx, layer.attn_output, ssm_scratch.out.first(attention_size),
-          hidden_size, attention_size, attention_scratch.output);
+      if (iu4 != nullptr) {
+        iu4_rotate(ssm_scratch.out.data(), iu4->Find(l, Iu4Role::kAttnO).awq,
+                   attention_size, false);
+        iu4_gemv(iu4->Find(l, Iu4Role::kAttnO),
+                 attention_scratch.output.data());
+      } else {
+        gufo::models::qwen::QuantGemm(module_ctx, layer.attn_output,
+                                      ssm_scratch.out.first(attention_size),
+                                      hidden_size, attention_size,
+                                      attention_scratch.output);
+      }
     } else {
       // SSM path
 
-      LaunchFusedSSMInputProjections(
-          layer.attn_qkv.data, layer.attn_qkv.type, layer.attn_gate.data,
-          layer.attn_gate.type, layer.ssm_alpha.data, layer.ssm_alpha.type,
-          layer.ssm_beta.data, layer.ssm_beta.type,
-          decode_scratch.normed.data(), ssm_scratch.qkv.data(),
-          ssm_scratch.gate.data(), ssm_scratch.alpha.data(),
-          ssm_scratch.beta.data(), hidden_size, ssm_qkv_size, ssm_inner_size,
-          time_step_rank, arena.stream);
+      if (iu4 != nullptr) {
+        iu4_rotate(decode_scratch.normed.data(),
+                   iu4->Find(l, Iu4Role::kSsmQkv).awq, hidden_size, false);
+        iu4_gemv(iu4->Find(l, Iu4Role::kSsmQkv), ssm_scratch.qkv.data());
+        iu4_gemv(iu4->Find(l, Iu4Role::kSsmZ), ssm_scratch.gate.data());
+        iu4_gemv(iu4->Find(l, Iu4Role::kSsmA), ssm_scratch.alpha.data());
+        iu4_gemv(iu4->Find(l, Iu4Role::kSsmB), ssm_scratch.beta.data());
+      } else {
+        LaunchFusedSSMInputProjections(
+            layer.attn_qkv.data, layer.attn_qkv.type, layer.attn_gate.data,
+            layer.attn_gate.type, layer.ssm_alpha.data, layer.ssm_alpha.type,
+            layer.ssm_beta.data, layer.ssm_beta.type,
+            decode_scratch.normed.data(), ssm_scratch.qkv.data(),
+            ssm_scratch.gate.data(), ssm_scratch.alpha.data(),
+            ssm_scratch.beta.data(), hidden_size, ssm_qkv_size, ssm_inner_size,
+            time_step_rank, arena.stream);
+      }
       LaunchSSMConvRecurrence(
           ssm_scratch.qkv.data(),
           static_cast<const float*>(layer.ssm_conv1d.data), recurrent_state,
@@ -228,9 +268,16 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
           config.SsmValueSize(), arena.stream, arena.GetSsmReplayCapture(),
           arena.GetRecurrentStateStorage());
 
-      LaunchGEMV(layer.ssm_out.data, layer.ssm_out.type, ssm_scratch.out.data(),
-                 attention_scratch.output.data(), hidden_size, ssm_inner_size,
-                 arena.stream);
+      if (iu4 != nullptr) {
+        iu4_rotate(ssm_scratch.out.data(), iu4->Find(l, Iu4Role::kSsmOut).awq,
+                   ssm_inner_size, true);
+        iu4_gemv(iu4->Find(l, Iu4Role::kSsmOut),
+                 attention_scratch.output.data());
+      } else {
+        LaunchGEMV(layer.ssm_out.data, layer.ssm_out.type,
+                   ssm_scratch.out.data(), attention_scratch.output.data(),
+                   hidden_size, ssm_inner_size, arena.stream);
+      }
     }
 
     if (hidden_size != kRowCachedHidden) {
@@ -248,7 +295,17 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
     }
 
     // Fused SwiGLU FFN
-    if (config.IsMoe()) {
+    if (iu4 != nullptr) {
+      const auto& gate = iu4->Find(l, Iu4Role::kFfnGate);
+      iu4_rotate(decode_scratch.normed.data(), gate.awq, hidden_size, false);
+      iu4_gemv(gate, arena.d_ffn_gate);
+      iu4_gemv(iu4->Find(l, Iu4Role::kFfnUp), arena.d_ffn_up);
+      const auto& down = iu4->Find(l, Iu4Role::kFfnDown);
+      LaunchIu4SwiGluQuantize(arena.d_ffn_gate, arena.d_ffn_up, nullptr,
+                              nullptr, 0, down.awq, iu4->signs(), 1, 1,
+                              down.cols, nullptr, nullptr, arena.stream, iu4_x);
+      iu4_gemv(down, ffn_scratch.out.data());
+    } else if (config.IsMoe()) {
       MoeFfnDecodeToken(layer, config, arena.moe, decode_scratch.normed.data(),
                         ffn_scratch.out.data(), arena.stream);
     } else {
@@ -283,9 +340,14 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
                   arena.stream);
 
     // 4. LM Head Logits GEMV on final token
-    LaunchGEMV(weights.output.data, weights.output.type,
-               decode_scratch.normed.data(), decode_scratch.logits.data(),
-               vocab_size, hidden_size, arena.stream);
+    if (iu4 != nullptr) {
+      iu4_rotate(decode_scratch.normed.data(), nullptr, hidden_size, false);
+      iu4_gemv(iu4->LmHead(), decode_scratch.logits.data());
+    } else {
+      LaunchGEMV(weights.output.data, weights.output.type,
+                 decode_scratch.normed.data(), decode_scratch.logits.data(),
+                 vocab_size, hidden_size, arena.stream);
+    }
 
     // 5. Parallel GPU Argmax
     LaunchBatchedGPUArgmax(decode_scratch.logits.data(), d_out_token, 1,
