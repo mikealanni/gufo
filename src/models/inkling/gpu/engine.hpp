@@ -1,0 +1,55 @@
+#ifndef GUFO_MODELS_INKLING_GPU_ENGINE_HPP_
+#define GUFO_MODELS_INKLING_GPU_ENGINE_HPP_
+
+#include <cstdint>
+#include <memory>
+#include <span>
+#include <string>
+
+#include "src/models/inkling/runtime/config.hpp"
+
+namespace gufo::models::inkling::gpu {
+
+class Model;
+struct ModelState;
+
+class Session final {
+public:
+  ~Session();
+  Session(const Session&) = delete;
+  Session& operator=(const Session&) = delete;
+
+  /// Appends `tokens` and leaves the logits of the last one in Logits().
+  [[nodiscard]] bool Append(std::span<const std::int32_t> tokens,
+                            std::string* error_msg);
+  [[nodiscard]] std::span<const float> Logits() const noexcept;
+  [[nodiscard]] std::uint32_t Position() const noexcept;
+  void Reset() noexcept;
+
+private:
+  friend class Model;
+  Session();
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
+class Model final {
+public:
+  ~Model();
+  Model(const Model&) = delete;
+  Model& operator=(const Model&) = delete;
+
+  [[nodiscard]] static std::shared_ptr<Model> Load(
+      const std::string& model_path, std::string* error_msg = nullptr);
+  [[nodiscard]] std::unique_ptr<Session> CreateSession(
+      std::uint32_t max_context, std::string* error_msg = nullptr);
+  [[nodiscard]] const Config& config() const noexcept;
+
+private:
+  Model() = default;
+  std::shared_ptr<ModelState> state_;
+};
+
+}  // namespace gufo::models::inkling::gpu
+
+#endif  // GUFO_MODELS_INKLING_GPU_ENGINE_HPP_
