@@ -192,6 +192,19 @@ public:
 
   /// Ingests target multi-layer hidden states and injects K/V into the draft
   /// cache.
+  /// Rows before this distance from the end of a prefill are never attended.
+  [[nodiscard]] std::uint32_t ContextWindowRows() const noexcept {
+    return history_capacity_ + injection_capacity_;
+  }
+  /// Marks `num_tokens` rows at `position` as covered without injecting them;
+  /// only valid for rows the attention window will have moved past.
+  bool SkipTargetContext(std::uint32_t position, std::uint32_t num_tokens) {
+    if (position != injected_context_len_ || position > max_context_ ||
+        num_tokens > max_context_ - position)
+      return false;
+    injected_context_len_ = position + num_tokens;
+    return true;
+  }
   bool InjectTargetContext(std::span<const float> target_features,
                            std::uint32_t position, std::uint32_t num_tokens,
                            const DFlashTrace& trace = {});
@@ -405,6 +418,16 @@ public:
   [[nodiscard]] bool AppendTargetContext(
       const speculative::DraftTargetContext& context,
       std::uint32_t position) override;
+  /// True when the chunk at `position` ends before the final attention window
+  /// of its prefill, so its features need not be injected.
+  [[nodiscard]] bool CanSkipTargetContext(
+      const speculative::DraftTargetContext& context,
+      std::uint32_t position) const {
+    return context.final_position != 0 &&
+           position + context.prompt_tokens.size() +
+                   executor_->ContextWindowRows() <=
+               context.final_position;
+  }
 
   void UpdateTargetHidden(std::span<const float> hidden) override;
 

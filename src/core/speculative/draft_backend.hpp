@@ -34,6 +34,10 @@ struct DraftTargetContext {
   std::span<const float> prompt_hidden_states;
   std::size_t hidden_size{0};
   tokenization::TokenId first_token{0};
+  /// Position just past the last row of the prefill this chunk belongs to;
+  /// zero when unknown. Lets a draft that only attends a recent window skip
+  /// rows that can no longer be read.
+  std::size_t final_position{0};
 };
 
 class IDraftBackend;

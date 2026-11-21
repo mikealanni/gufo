@@ -39,6 +39,14 @@ void QwenGpuExecutor::PrefillLayerCheckpoint(std::uint32_t layer) {
   HIP_CHECK(status);
 }
 
+void QwenGpuExecutor::FinishPromptSinks() {
+  auto chain = std::move(prompt_sink_chain_);
+  prompt_sink_chain_ = {};
+  prompt_sink_bank_ = {};
+  if (chain.valid())
+    chain.get();
+}
+
 std::size_t QwenGpuExecutor::GetMaxPromptCall() {
   const std::size_t batch = arena_.GetMaxBatch();
   const char* lockstep_env = std::getenv("GUFO_QWEN_LOCKSTEP");
@@ -61,6 +69,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
   arena_.DisableSsmReplayCapture();
   if (capture_prompt_hidden_) {
     h_prompt_hidden_.Clear();
+    prompt_sink_chain_ = {};
+    prompt_sink_bank_ = {};
     prompt_sink_row_ = 0;
     const std::size_t captured_layers =
         std::max<std::size_t>(arena_.GetTargetLayerCapture().size(), 1U);
@@ -128,6 +138,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
                            start_pos + static_cast<std::uint32_t>(offset),
                            compute_logits && is_last);
   }
+  FinishPromptSinks();
   return next_token;
 }
 

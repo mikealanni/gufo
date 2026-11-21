@@ -144,6 +144,8 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
   PromptHiddenBuffer& capture_buffer =
       bank == 1 ? h_prompt_hidden_spare_ : h_prompt_hidden_;
   if (capture_prompt_hidden_ && prompt_hidden_sink_) {
+    if (prompt_sink_bank_[bank].valid())
+      prompt_sink_bank_[bank].get();
     capture_buffer.Clear();
   }
   const std::size_t prompt_capture_offset = capture_buffer.Size();
@@ -1194,7 +1196,17 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
     }
     HIP_CHECK(hipStreamSynchronize(arena_.stream));
     if (prompt_hidden_sink_) {
-      prompt_hidden_sink_(capture_buffer.View(), prompt_sink_row_, batch_size);
+      auto job = std::async(std::launch::async, [sink = &prompt_hidden_sink_,
+                                                 previous = prompt_sink_chain_,
+                                                 view = capture_buffer.View(),
+                                                 row = prompt_sink_row_,
+                                                 count = batch_size] {
+                   if (previous.valid())
+                     previous.get();
+                   (*sink)(view, row, count);
+                 }).share();
+      prompt_sink_chain_ = job;
+      prompt_sink_bank_[bank] = job;
       prompt_sink_row_ += batch_size;
     }
   }

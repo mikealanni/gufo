@@ -4,7 +4,10 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <numeric>
 #include <optional>
@@ -1454,6 +1457,8 @@ std::optional<tokenization::TokenId> SpeculativeVerifier::ForwardPromptStreamed(
             .prompt_hidden_states = rows,
             .hidden_size = rows.size() / count,
             .first_token = 0,
+            .final_position =
+                static_cast<std::size_t>(position) + tokens.size(),
         };
         const bool fresh = position == 0 && first_row == 0;
         failed = fresh ? !Draft()->PrimeTargetContext(context)

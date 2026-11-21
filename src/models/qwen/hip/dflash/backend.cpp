@@ -262,6 +262,13 @@ bool QwenDFlashGpuDraftBackend::PrimeTargetContext(
 
   const std::size_t num_tokens = context.prompt_tokens.size();
   const std::size_t enc_in_dim = executor_->GetTargetFeaturesSize();
+  if (CanSkipTargetContext(context, 0)) {
+    if (!executor_->SkipTargetContext(0,
+                                      static_cast<std::uint32_t>(num_tokens)))
+      return false;
+    primed_ = true;
+    return true;
+  }
 
   if (context.hidden_size != enc_in_dim ||
       context.prompt_hidden_states.size() != num_tokens * enc_in_dim) {
@@ -638,8 +645,14 @@ void QwenDFlashGpuDraftBackend::InjectPendingFeatures(
 
 bool QwenDFlashGpuDraftBackend::AppendTargetContext(
     const speculative::DraftTargetContext& context, std::uint32_t position) {
-  if (!primed_ || proposal_active_ ||
-      context.hidden_size != executor_->GetTargetFeaturesSize() ||
+  if (!primed_ || proposal_active_)
+    return false;
+  if (CanSkipTargetContext(context, position)) {
+    InjectPendingFeatures(position);
+    return executor_->SkipTargetContext(
+        position, static_cast<std::uint32_t>(context.prompt_tokens.size()));
+  }
+  if (context.hidden_size != executor_->GetTargetFeaturesSize() ||
       context.prompt_hidden_states.size() !=
           context.prompt_tokens.size() * context.hidden_size) {
     return false;

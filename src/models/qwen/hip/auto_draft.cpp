@@ -2,6 +2,9 @@
 #include "src/models/qwen/hip/auto_draft.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -137,8 +140,10 @@ bool QwenAutoDraftBackend::PrimeTargetContext(
   Reset();
   const std::size_t rows = context.prompt_tokens.size();
   const std::size_t mtp_columns[] = {mtp_column_};
-  Columns(context.prompt_hidden_states, rows, dflash_columns_,
-          dflash_columns_scratch_);
+  const bool skip_dflash = dflash_->CanSkipTargetContext(context, 0);
+  if (!skip_dflash)
+    Columns(context.prompt_hidden_states, rows, dflash_columns_,
+            dflash_columns_scratch_);
   Columns(context.prompt_hidden_states, rows, mtp_columns,
           mtp_columns_scratch_);
   const auto& dflash_states = dflash_columns_scratch_;
@@ -163,8 +168,10 @@ bool QwenAutoDraftBackend::AppendTargetContext(
   }
   const std::size_t rows = context.prompt_tokens.size();
   const std::size_t mtp_columns[] = {mtp_column_};
-  Columns(context.prompt_hidden_states, rows, dflash_columns_,
-          dflash_columns_scratch_);
+  const bool skip_dflash = dflash_->CanSkipTargetContext(context, position);
+  if (!skip_dflash)
+    Columns(context.prompt_hidden_states, rows, dflash_columns_,
+            dflash_columns_scratch_);
   Columns(context.prompt_hidden_states, rows, mtp_columns,
           mtp_columns_scratch_);
   const auto& dflash_states = dflash_columns_scratch_;

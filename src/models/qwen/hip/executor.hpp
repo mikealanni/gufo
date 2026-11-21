@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <exception>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -783,6 +784,12 @@ private:
   std::function<void(std::span<const float>, std::size_t, std::size_t)>
       prompt_hidden_sink_;
   std::size_t prompt_sink_row_{0};
+  // The draft is primed on a worker thread so the next chunk's GPU work keeps
+  // flowing; jobs run in chunk order and a bank's buffer is reused only after
+  // its job has finished.
+  std::shared_future<void> prompt_sink_chain_;
+  std::array<std::shared_future<void>, 2> prompt_sink_bank_;
+  void FinishPromptSinks();
   bool replaying_ssm_state_{false};
   bool moe_warmed_{false};
 };
