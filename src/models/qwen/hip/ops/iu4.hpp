@@ -72,13 +72,16 @@ void LaunchIu4GemmSmall(const void* tiles, const std::uint16_t* weight_scales,
                         std::size_t n, std::size_t padded_n, std::size_t k,
                         hipStream_t stream);
 
-// Swaps the two forms of a [rows x ld] activation whose first `columns`
-// columns exist only as FP16 (from the NPU) and the rest only as FP32 (from the
-// GPU): afterwards the FP32 matrix holds the converted NPU columns and the FP16
-// matrix holds the converted GPU columns, so both are complete.
-void LaunchIu4SwapHalfColumns(float* act_f32, void* act_f16, std::size_t rows,
-                              std::size_t ld, std::size_t columns,
-                              hipStream_t stream);
+// NPU glue for the SwiGLU product: the leading `columns` columns exist only as
+// FP16 (from the NPU), the rest only as FP32 (from the GPU). The first call
+// completes the FP32 matrix; the second builds the FP16 matrix the NPU reads
+// for the down projection.
+void LaunchIu4HalfColumnsToF32(float* act_f32, const void* act_f16,
+                               std::size_t rows, std::size_t ld,
+                               std::size_t columns, hipStream_t stream);
+void LaunchIu4F32ColumnsToHalf(const float* act_f32, void* act_f16,
+                               std::size_t rows, std::size_t ld,
+                               std::size_t first, hipStream_t stream);
 
 // Quantize-only activation producer for rows that are already normalized:
 // divide by awq (null for none), rotate, quantize, same output layout as

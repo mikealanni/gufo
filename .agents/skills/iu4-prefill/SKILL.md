@@ -25,10 +25,11 @@ GLM-5.3 follow. Read `docs/plans/iu4-prefill.md` (kernel experiments) and
 
 ## Result on 27B (release build, bench mode on, GPU only)
 
-pp2048 687 -> 1077 tok/s, pp8192 643 -> 1005 (+56%). Decode unchanged (still
-the base GGUF). Next-token NLL over 240 samples (2048-token contexts of
+pp2048 693 -> 1090 tok/s, pp8192 646 -> 1013, pp16384 624 -> 957 (GPU only), and
+with the NPU 1118 at pp8192 / 1036 at pp16384 (the old base + NPU was 801 / 764).
+Decode unchanged (still the base GGUF, 12.5 tok/s plain). Next-token NLL over 240 samples (2048-token contexts of
 `~/ppl_corpus.txt`): 1.0215 base, 1.0205 int4, difference -0.001 +- 0.036,
-top-1 agreement 92%. The NPU adds nothing on top (see NPU below).
+top-1 agreement 92%. The NPU adds about +10% on top for prompts of 5000+ tokens (see NPU below).
 
 ## Hardware facts that matter
 
@@ -141,21 +142,53 @@ CPU or GPU (no clock effect). The fold costs about 6 TOPS and cannot shrink
 exactly (three VALU ops per output element per group; gfx11 has no packed fp32
 fma; fp16 packing loses exactness).
 
-## NPU (27B) - done functionally, no gain today
+## NPU (27B) - works, +10% at pp8192, FFN gate/up only
 
 All NPU sites work on the int4 path (qkv/gate, o, ssm_out, gate/up, down): the
 GPU runs `row_begin = NPU columns`, the NPU keeps the leading columns, FP16
-activations are produced only where the NPU takes columns, and the SwiGLU
-product is swapped between FP32 (GPU) and FP16 (NPU) columns by
-`LaunchIu4SwapHalfColumns`. Run it with `GUFO_NPU_DIR=<repo>/tools/npu`,
+activations are produced only where the NPU takes columns, and the NPU's FP16
+SwiGLU columns are converted into the FP32 activation by
+`LaunchIu4HalfColumnsToF32` (and the GPU columns into an FP16 copy by
+`LaunchIu4F32ColumnsToHalf` only when the NPU also takes down columns).
+Run it with `GUFO_NPU_DIR=<repo>/tools/npu`,
 `LD_LIBRARY_PATH=/opt/xilinx/xrt/lib:/home/majed/npu-work/boostshim`, bench mode
-on (fabric clock held), and only inside binaries named `gufo*`.
-pp8192: base + default NPU split 794, int4 + default split 866, int4 with every
-slice 0 1016, int4 alone 1005. Every single-slice setting (FFN 1-2, qkv 1-2,
-gate 1, down 1, ssm_out 1, attn q/o) is within +-1% of that or worse (down 1:
-972): the faster GPU leaves the NPU on the critical path. Keep the NPU slices at
-0 for 27B on this path unless a design hides NPU work behind a long independent
-GPU phase.
+on (fabric clock held), only inside binaries named `gufo*`.
+
+Lessons (each cost a wrong number):
+- The two chunks of a lockstep pair interleave mid-layer (they `co_yield` after
+  an NPU begin). Any scratch the int4 path owns (activation tiles, scales, the
+  NPU half buffer) must be per bank, indexed by the task's `bank`; a shared
+  buffer silently corrupts the other chunk.
+- The NPU only pays when the other chunk of a pair hides its hand-off: pairs
+  start at 5000 tokens (`GUFO_QWEN_PAIR_MIN`) and need 4096-token chunks. A lone
+  chunk waits for the NPU, so the int4 path leaves `npu_ffn` null unless
+  `Paired()` (pp2048 stays 1094 with or without the NPU).
+- The NPU does about 20 TOPS-equivalent (bfp16, K=5120: 2.5 ms per 1024 columns
+  per 4096 tokens) against 75 on the int4 GPU GEMM, so its useful share is about
+  a fifth. Only the FFN gate/up columns (same K as the attention inputs, one
+  hardware context, output needed late) help. FFN slices at pp8192: 0 1033, 6
+  1064, 8 1102, 10 1125, 12 1148, 14 1152, 16 1084 (NPU becomes the bottleneck).
+  Adding qkv, gate, ssm_out, down or attention slices on top lowers throughput
+  (down 827, qkv 952, ssm_out 1100) because the NPU queue is already full and
+  those outputs are needed immediately or use another K (3.7 ms context switch).
+  The loader sets 14 FFN slices and 0 elsewhere (explicit env still wins).
+- Glue cost matters: converting the whole [tokens x 17408] activation per layer
+  between FP16 and FP32 cost more than a slice gained; convert only the NPU
+  strip.
+- Result (release, bench mode on, GPU base 646 at pp8192): base + NPU 801, int4
+  GPU 1013, int4 + NPU 1118 (pp16384: 624 / 764 / 957 / 1036). Ideal overlap of
+  a 20-TOPS NPU on a 75-TOPS GPU is about +27% (about 1290); the gap is the
+  NPU's 42% utilisation of its bfp16 peak and the paired schedule.
+- Next NPU lever is the NPU kernel itself: it computes in bfp16 (9 bits per
+  weight) at about 42% of the 50 TOPS peak. XDNA2 also lists int8 at 50 TOPS and
+  int4 as a supported type (no published peak). An int8 activation x int4-weight
+  K=5120 kernel (weights straight from the artifact, per-group scales applied on
+  the host or in the epilogue) is a new AIE kernel project (30+ min builds per
+  iteration); measure its realised TOPS on a standalone probe first.
+- Validation numbers: `gufo bench --validate-prefill 4096` compares batched
+  prefill logits with the sequential decode path on the base weights, so with the
+  artifact it measures the weight difference too: base 0.008 rmse / cosine
+  0.99999, int4 0.515 / 0.989, int4 + NPU 0.627 / 0.986, top-1 matches.
 
 ## Decode
 

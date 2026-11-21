@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -392,6 +393,8 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
 }
 
 QwenNpuFfn* QwenGpuModel::NpuFfn() const {
+  // Loading the int4 artifact sets the NPU split that suits it.
+  (void)Iu4();
   std::call_once(npu_once_, [this] {
     if (std::getenv("GUFO_NPU_DIR") == nullptr)
       return;
@@ -415,6 +418,18 @@ Iu4Weights* QwenGpuModel::Iu4() const {
       return;
     }
     iu4_ = std::move(loaded);
+    // With the int4 GEMM the GPU is about 3.5 times faster than the NPU per
+    // column, so only the FFN gate/up columns (same K as the rest, finished
+    // behind the paired chunk's GPU work) pay for their hand-off; every other
+    // NPU site ends up on the critical path. Measured at pp8192: 14 FFN slices
+    // 1152 tok/s, any other slice setting lower. Explicit settings still win.
+    setenv("GUFO_QWEN_NPU_FFN_SLICES", "14", 0);
+    setenv("GUFO_QWEN_NPU_QKV_SLICES", "0", 0);
+    setenv("GUFO_QWEN_NPU_GATE_SLICES", "0", 0);
+    setenv("GUFO_QWEN_NPU_DOWN_SLICES", "0", 0);
+    setenv("GUFO_QWEN_NPU_SSM_OUT_SLICES", "0", 0);
+    setenv("GUFO_QWEN_NPU_ATTN_Q_SLICES", "0", 0);
+    setenv("GUFO_QWEN_NPU_ATTN_O_SLICES", "0", 0);
   });
   return iu4_.get();
 }

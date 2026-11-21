@@ -177,19 +177,19 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
   if (iu4) {
     const std::size_t tile_need = iu4_padded * 17408 / 2;
     const std::size_t scale_need = (17408 / 128) * iu4_padded * sizeof(float);
-    if (iu4_tile_bytes_ < tile_need) {
-      if (iu4_tiles_ != nullptr)
-        HIP_CHECK(hipFree(iu4_tiles_));
-      iu4_tiles_ = nullptr;
-      HIP_CHECK(hipMalloc(&iu4_tiles_, tile_need));
-      iu4_tile_bytes_ = tile_need;
+    if (iu4_tile_bytes_[bank] < tile_need) {
+      if (iu4_tiles_[bank] != nullptr)
+        HIP_CHECK(hipFree(iu4_tiles_[bank]));
+      iu4_tiles_[bank] = nullptr;
+      HIP_CHECK(hipMalloc(&iu4_tiles_[bank], tile_need));
+      iu4_tile_bytes_[bank] = tile_need;
     }
-    if (iu4_scale_bytes_ < scale_need) {
-      if (iu4_scales_ != nullptr)
-        HIP_CHECK(hipFree(iu4_scales_));
-      iu4_scales_ = nullptr;
-      HIP_CHECK(hipMalloc(&iu4_scales_, scale_need));
-      iu4_scale_bytes_ = scale_need;
+    if (iu4_scale_bytes_[bank] < scale_need) {
+      if (iu4_scales_[bank] != nullptr)
+        HIP_CHECK(hipFree(iu4_scales_[bank]));
+      iu4_scales_[bank] = nullptr;
+      HIP_CHECK(hipMalloc(&iu4_scales_[bank], scale_need));
+      iu4_scale_bytes_[bank] = scale_need;
     }
   }
   const bool iu4_npu = iu4 && model_->NpuFfn() != nullptr;
@@ -197,38 +197,45 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
     // The NPU hands back the leading gate/up columns and takes the SwiGLU
     // product for down as FP16 rows of the full width.
     const std::size_t need = iu4_padded * 17408 * 2;
-    if (iu4_npu_half_bytes_ < need) {
-      if (iu4_npu_half_ != nullptr)
-        HIP_CHECK(hipFree(iu4_npu_half_));
-      iu4_npu_half_ = nullptr;
-      HIP_CHECK(hipMalloc(&iu4_npu_half_, need));
-      iu4_npu_half_bytes_ = need;
+    if (iu4_npu_half_bytes_[bank] < need) {
+      if (iu4_npu_half_[bank] != nullptr)
+        HIP_CHECK(hipFree(iu4_npu_half_[bank]));
+      iu4_npu_half_[bank] = nullptr;
+      HIP_CHECK(hipMalloc(&iu4_npu_half_[bank], need));
+      iu4_npu_half_bytes_[bank] = need;
     }
   }
   const auto iu4_gemm = [&](const Iu4Projection& p, float* output,
                             bool accumulate, std::size_t row_begin = 0) {
     if (Iu4GemmSupported(p.rows, p.cols)) {
-      LaunchIu4Gemm(p.tiles, p.scales, iu4_tiles_, iu4_scales_, output,
-                    accumulate, p.rows, row_begin, batch_size, iu4_padded,
-                    p.cols, arena_.stream);
+      LaunchIu4Gemm(p.tiles, p.scales, iu4_tiles_[bank], iu4_scales_[bank],
+                    output, accumulate, p.rows, row_begin, batch_size,
+                    iu4_padded, p.cols, arena_.stream);
     } else {
-      LaunchIu4GemmSmall(p.tiles, p.scales, iu4_tiles_, iu4_scales_, output,
-                         accumulate, p.rows, batch_size, iu4_padded, p.cols,
-                         arena_.stream);
+      LaunchIu4GemmSmall(p.tiles, p.scales, iu4_tiles_[bank], iu4_scales_[bank],
+                         output, accumulate, p.rows, batch_size, iu4_padded,
+                         p.cols, arena_.stream);
     }
   };
   const auto iu4_quantize = [&](const float* x, const float* awq, std::size_t k,
                                 bool remap_gdn_heads) {
     LaunchIu4Quantize(x, awq, iu4_weights->signs(), remap_gdn_heads, batch_size,
-                      iu4_padded, k, iu4_tiles_, iu4_scales_, arena_.stream);
+                      iu4_padded, k, iu4_tiles_[bank], iu4_scales_[bank],
+                      arena_.stream);
   };
   const bool half_prefill = iu4 || UseQwen27bFp16Prefill(weights_, batch_size);
   // The MoE models keep their quantized-activation dense path; only layers the
   // NPU takes columns of switch to FP16 activations for those projections.
   const bool npu_moe = !half_prefill && config.IsMoe() && batch_size >= 1024;
   const bool npu_attn = half_prefill || npu_moe;
-  QwenNpuFfn* const npu_ffn =
-      (half_prefill || npu_moe) ? model_->NpuFfn() : nullptr;
+  // On the int4 path the NPU only pays when the other chunk of a lockstep pair
+  // hides its hand-off; a lone chunk would wait for it, so it stays on the GPU.
+  QwenNpuFfn* const npu_ffn = [&]() -> QwenNpuFfn* {
+    QwenNpuFfn* const candidate =
+        (half_prefill || npu_moe) ? model_->NpuFfn() : nullptr;
+    return iu4 && candidate != nullptr && !candidate->Paired() ? nullptr
+                                                               : candidate;
+  }();
   // The other chunk of a pair may change the active rows while this one is
   // suspended, so every resume point restores them.
   const auto set_rows = [&] {
@@ -388,7 +395,7 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
                                                 : Iu4Role::kSsmQkv)
               .awq,
           iu4_weights->signs(), eps, batch_size, iu4_padded, hidden_size,
-          iu4_tiles_, iu4_scales_, arena_.stream);
+          iu4_tiles_[bank], iu4_scales_[bank], arena_.stream);
       if (npu_ffn != nullptr && npu_ffn->Accepts(batch_size) &&
           (npu_ffn->QkvColumns(l) != 0 ||
            (!layer.is_full_attention && npu_ffn->GateColumns(l) != 0))) {
@@ -870,8 +877,8 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
       LaunchIu4NormQuantize(
           arena_.d_hidden, static_cast<const float*>(layer.ffn_norm.data),
           iu4_weights->Find(l, Iu4Role::kFfnGate).awq, iu4_weights->signs(),
-          eps, batch_size, iu4_padded, hidden_size, iu4_tiles_, iu4_scales_,
-          arena_.stream);
+          eps, batch_size, iu4_padded, hidden_size, iu4_tiles_[bank],
+          iu4_scales_[bank], arena_.stream);
       if (npu_ffn != nullptr && npu_ffn->Accepts(batch_size) &&
           npu_ffn->Columns(l) != 0) {
         LaunchBatchedRMSNormFp16(arena_.d_hidden, nullptr,
@@ -968,18 +975,21 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
               arena_.d_ffn_gate, arena_.d_ffn_up, arena_.d_ffn_act, nullptr,
               batch_size * intermediate_size, arena_.stream);
           if (npu_columns != 0) {
-            npu_ffn->Finish(l, bank, iu4_npu_half_, intermediate_size,
+            npu_ffn->Finish(l, bank, iu4_npu_half_[bank], intermediate_size,
                             arena_.stream);
           }
           const bool npu_down_wanted = npu_ffn != nullptr &&
                                        npu_ffn->Accepts(batch_size) &&
                                        npu_ffn->DownColumns(l) != 0;
-          if (npu_columns != 0 || npu_down_wanted) {
-            // The NPU columns arrive as FP16, the GPU columns as FP32: swap
-            // each into the other form so both consumers see the full row.
-            LaunchIu4SwapHalfColumns(arena_.d_ffn_act, iu4_npu_half_,
-                                     batch_size, intermediate_size, npu_columns,
-                                     arena_.stream);
+          if (npu_columns != 0) {
+            LaunchIu4HalfColumnsToF32(arena_.d_ffn_act, iu4_npu_half_[bank],
+                                      batch_size, intermediate_size,
+                                      npu_columns, arena_.stream);
+          }
+          if (npu_down_wanted) {
+            LaunchIu4F32ColumnsToHalf(arena_.d_ffn_act, iu4_npu_half_[bank],
+                                      batch_size, intermediate_size,
+                                      npu_columns, arena_.stream);
           }
           iu4_quantize(arena_.d_ffn_act,
                        iu4_weights->Find(l, Iu4Role::kFfnDown).awq,
@@ -1073,7 +1083,7 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
         std::uint32_t npu_down = 0;
         if (npu_ffn != nullptr && npu_ffn->Accepts(batch_size) &&
             npu_ffn->DownColumns(l) != 0 &&
-            npu_ffn->BeginDown(l, bank, iu4_npu_half_, arena_.stream)) {
+            npu_ffn->BeginDown(l, bank, iu4_npu_half_[bank], arena_.stream)) {
           npu_down = npu_ffn->DownColumns(l);
           if ((yield_mask & 8U) != 0) {
             co_yield 0;

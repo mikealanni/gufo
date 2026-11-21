@@ -32,6 +32,8 @@ public:
   virtual void SetRows(std::uint32_t rows) noexcept = 0;
   /// Whether the chunk runs beside a partner whose GPU work hides NPU waits.
   virtual void SetPaired(bool paired) noexcept = 0;
+  /// True while a lockstep pair of chunks is in flight.
+  [[nodiscard]] virtual bool Paired() const noexcept { return false; }
   /// Leading FFN columns the NPU computes for `layer`; 0 when the layer stays
   /// on the GPU.
   [[nodiscard]] virtual std::uint32_t Columns(

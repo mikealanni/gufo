@@ -317,6 +317,7 @@ public:
   }
   void SetRows(std::uint32_t rows) noexcept override { rows_ = rows; }
   void SetPaired(bool paired) noexcept override { paired_ = paired; }
+  bool Paired() const noexcept override { return paired_; }
   std::uint32_t Columns(std::uint32_t layer) const noexcept override {
     return layer < columns_.size() ? FfnUsed() * kSliceColumns : 0;
   }

@@ -736,13 +736,15 @@ private:
   const tokenization::QwenTokenizer* tokenizer_;
   const QwenExecutionPolicy policy_;
   QwenGpuArena arena_;
-  // Activation tiles and scales of the int4 prefill path, sized on demand.
-  std::uint8_t* iu4_tiles_{nullptr};
-  float* iu4_scales_{nullptr};
-  std::size_t iu4_tile_bytes_{0};
-  std::size_t iu4_scale_bytes_{0};
-  void* iu4_npu_half_{nullptr};
-  std::size_t iu4_npu_half_bytes_{0};
+  // Activation tiles and scales of the int4 prefill path, sized on demand. The
+  // two chunks of a lockstep pair interleave mid-layer, so each bank keeps its
+  // own.
+  std::uint8_t* iu4_tiles_[2]{nullptr, nullptr};
+  float* iu4_scales_[2]{nullptr, nullptr};
+  std::size_t iu4_tile_bytes_[2]{0, 0};
+  std::size_t iu4_scale_bytes_[2]{0, 0};
+  void* iu4_npu_half_[2]{nullptr, nullptr};
+  std::size_t iu4_npu_half_bytes_[2]{0, 0};
   const detail::HipGraphCaptureKey graph_key_;
   detail::HipGraphDecodeExecutor graph_executor_;
   models::qwen::vision::DeviceInput vision_input_;

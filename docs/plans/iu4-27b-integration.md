@@ -80,3 +80,12 @@ Quality (`qwen27b_prefill_nll`, 240 samples of a 2048-token context from
 -0.0010 +- 0.0362 (standard error), top-1 agreement 92.1%. Within the resolution
 of the sample no quality loss shows up; the base and the artifact are different
 weight quantizations, so this is the combined effect of weights and activations.
+
+## NPU on the int4 path (2026-11-20)
+
+pp8192, release build, bench mode on: base GPU 646, base + NPU 801, int4 GPU
+1013, int4 + NPU 1118; pp16384 624 / 764 / 957 / 1036; pp2048 693 / 736 / 1090 /
+1094 (the NPU stays out of lone chunks). 14 FFN gate/up slices and nothing else
+on the NPU is the best split; see the iu4-prefill skill for the sweep, the
+per-bank scratch requirement of the lockstep pair, and the NPU kernel
+opportunity.

@@ -232,28 +232,50 @@ __global__ void __launch_bounds__(256) Iu4QuantizeKernel(
                       scales);
 }
 
-__global__ void Iu4SwapHalfColumnsKernel(float* __restrict__ f32,
-                                         __half* __restrict__ f16,
-                                         std::size_t total, std::uint32_t ld,
-                                         std::uint32_t columns) {
+// Converts the leading `columns` FP16 columns (from the NPU) of each row to
+// FP32.
+__global__ void Iu4HalfColumnsToF32Kernel(float* __restrict__ f32,
+                                          const __half* __restrict__ f16,
+                                          std::size_t rows, std::uint32_t ld,
+                                          std::uint32_t columns) {
   const std::size_t i = (std::size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= total)
+  if (i >= rows * columns)
     return;
-  if (i % ld < columns)
-    f32[i] = __half2float(f16[i]);
-  else
-    f16[i] = __float2half(f32[i]);
+  const std::size_t r = i / columns, c = i % columns;
+  f32[r * ld + c] = __half2float(f16[r * ld + c]);
+}
+
+// Converts the columns from `first` on of each row from FP32 to FP16.
+__global__ void Iu4F32ColumnsToHalfKernel(const float* __restrict__ f32,
+                                          __half* __restrict__ f16,
+                                          std::size_t rows, std::uint32_t ld,
+                                          std::uint32_t first) {
+  const std::size_t i = (std::size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t width = ld - first;
+  if (i >= rows * width)
+    return;
+  const std::size_t r = i / width, c = first + i % width;
+  f16[r * ld + c] = __float2half(f32[r * ld + c]);
 }
 
 }  // namespace
 
-void LaunchIu4SwapHalfColumns(float* act_f32, void* act_f16, std::size_t rows,
-                              std::size_t ld, std::size_t columns,
-                              hipStream_t stream) {
-  const std::size_t total = rows * ld;
-  Iu4SwapHalfColumnsKernel<<<(total + 255) / 256, 256, 0, stream>>>(
-      act_f32, static_cast<__half*>(act_f16), total,
+void LaunchIu4HalfColumnsToF32(float* act_f32, const void* act_f16,
+                               std::size_t rows, std::size_t ld,
+                               std::size_t columns, hipStream_t stream) {
+  const std::size_t total = rows * columns;
+  Iu4HalfColumnsToF32Kernel<<<(total + 255) / 256, 256, 0, stream>>>(
+      act_f32, static_cast<const __half*>(act_f16), rows,
       static_cast<std::uint32_t>(ld), static_cast<std::uint32_t>(columns));
+}
+
+void LaunchIu4F32ColumnsToHalf(const float* act_f32, void* act_f16,
+                               std::size_t rows, std::size_t ld,
+                               std::size_t first, hipStream_t stream) {
+  const std::size_t total = rows * (ld - first);
+  Iu4F32ColumnsToHalfKernel<<<(total + 255) / 256, 256, 0, stream>>>(
+      act_f32, static_cast<__half*>(act_f16), rows,
+      static_cast<std::uint32_t>(ld), static_cast<std::uint32_t>(first));
 }
 
 void FillIu4RotationSigns(float* out) {
