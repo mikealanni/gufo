@@ -44,6 +44,7 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/openai_chat.hpp"
 #include "src/cli/serve/poison.hpp"
+#include "src/cli/serve/responses_logprobs.hpp"
 #include "src/cli/serve/sampling_request.hpp"
 #include "src/cli/serve/stop_sequences.hpp"
 #include "src/cli/serve/trace.hpp"
@@ -701,6 +702,7 @@ struct CompatibilityAllowances {
   bool stream{false};
   bool stream_options{false};
   bool ignore_eos{false};
+  bool logprobs{false};
   bool response_controls{false};
   bool thinking{false};
   bool output_config{false};
@@ -770,6 +772,7 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
     if (field != allowances.stop_field &&
         !(field == "stream_options" && allowances.stream_options) &&
         !(field == "ignore_eos" && allowances.ignore_eos) &&
+        !(field == "logprobs" && allowances.logprobs) &&
         !(field == "thinking" && allowances.thinking) &&
         !(field == "output_config" && allowances.output_config) &&
         !((field == "tools" || field == "tool_choice") && allowances.tools) &&
@@ -777,10 +780,7 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
         !(allowances.response_controls &&
           (field == "text" || field == "reasoning" || field == "tools" ||
            field == "tool_choice" || field == "parallel_tool_calls" ||
-           // include is a standard Responses field (for example encrypted
-           // reasoning); gufo keeps no server-side conversation, so its value
-           // is accepted and ignored.
-           field == "include"))) {
+           field == "include" || field == "top_logprobs"))) {
       return InvalidCompatibilityRequest("request field '" + field +
                                          "' is not supported on this endpoint");
     }
@@ -908,9 +908,12 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                                                 .stream = true,
                                                 .stream_options = true,
                                                 .ignore_eos = true,
+                                                .logprobs = true,
                                             })) {
     return std::move(*error);
   }
+  if (const auto error = ParseLogprobs(body, false, &sampling_config))
+    return InvalidCompatibilityRequest(error->message);
   const auto* stream_field = body.find("stream");
   const bool stream = stream_field != nullptr && stream_field->as_bool();
   bool include_usage = false;
@@ -978,8 +981,11 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
         .streaming_body =
             [generation = std::move(generation), id, created, model,
              include_usage, return_progress,
+             logprobs = sampling_config.logprobs,
              stream_log](const HttpResponse::BodyWriter& writer) {
               bool started = return_progress;
+              std::optional<json::Value> pending_logprobs;
+              std::size_t text_offset = 0;
               const auto write_chunk =
                   [&](std::string_view piece, std::string_view finish_reason,
                       const json::Value* usage = nullptr,
@@ -995,7 +1001,10 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                       json::Value choice = json::Value::object();
                       choice["text"] = std::string(piece);
                       choice["index"] = 0;
-                      choice["logprobs"] = json::Value();
+                      choice["logprobs"] = pending_logprobs
+                                               ? std::move(*pending_logprobs)
+                                               : json::Value();
+                      pending_logprobs.reset();
                       choice["finish_reason"] =
                           finish_reason.empty()
                               ? json::Value()
@@ -1026,8 +1035,12 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
               }
               try {
                 const auto result = generation->Wait(
-                    [&](std::string_view piece) {
-                      const auto text = decoder.Push(piece, false);
+                    [&](const TokenPiece& piece) {
+                      if (logprobs && piece.logprobs)
+                        pending_logprobs = CompletionLogprobs(
+                            std::span(piece.logprobs, 1), text_offset);
+                      const auto text = decoder.Push(piece.text, false);
+                      text_offset += UnicodeLength(text);
                       connected = write_chunk(text, {});
                       return connected;
                     },
@@ -1106,7 +1119,8 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
   json::Value c = json::Value::object();
   c["text"] = core::Utf8Decoder{}.Push(res.text, true);
   c["index"] = 0;
-  c["logprobs"] = json::Value();
+  c["logprobs"] = sampling_config.logprobs ? CompletionLogprobs(res.logprobs)
+                                           : json::Value();
   c["finish_reason"] =
       res.finish_reason == TextGenerationBackend::FinishReason::kLength
           ? "length"
@@ -1146,6 +1160,9 @@ HttpResponse OpenAiResponses(const HttpRequest& req,
           {.stream = true, .response_controls = true})) {
     return std::move(*error);
   }
+  if (const auto error = ParseResponsesLogprobs(body, &sampling_config))
+    return Err(400, "Bad Request", error->message.c_str(),
+               "invalid_request_error", error->code.c_str());
 
   std::vector<tokenization::ChatMessage> messages;
   if (const auto* instructions = body.find("instructions")) {

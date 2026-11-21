@@ -868,12 +868,17 @@ void CheckServingEos(const std::shared_ptr<qfn::Model>& model) {
       });
   sampling::SamplingConfig config;
   config.constraint = std::move(constraint);
+  config.logprobs = 2;
   const std::array<std::string, 2> prompts{
       "EOS fixture one: continue red, blue,",
       "EOS fixture two: continue green, yellow,"};
   std::array<Backend::Result, 2> references;
   for (std::size_t row = 0; row < prompts.size(); ++row) {
     references[row] = backend.complete(prompts[row], 8, config);
+    Require(references[row].logprobs.size() == 2 &&
+                model->IsStopToken(
+                    references[row].logprobs.back().entries.front().id),
+            "constrained EOS must retain its raw token probability");
     Require(
         references[row].tokens.size() == 1 &&
             !model->IsStopToken(references[row].tokens.front()),
@@ -895,6 +900,9 @@ void CheckServingEos(const std::shared_ptr<qfn::Model>& model) {
   std::size_t batched = 0;
   for (std::size_t row = 0; row < pending.size(); ++row) {
     const auto result = pending[row].get();
+    Require(result.logprobs.size() == 2 &&
+                model->IsStopToken(result.logprobs.back().entries.front().id),
+            "batched cached EOS must retain token metadata");
     Require(result.tokens == references[row].tokens,
             "batched EOS accounting differs from the scalar checkpoint");
     batched += result.physical_execution_width > 1;
@@ -1075,7 +1083,80 @@ void CheckServingSampling(const std::shared_ptr<qfn::Model>& model) {
   }
 }
 
+void CheckLogprobs(const std::shared_ptr<qfn::Model>& model) {
+  std::string error;
+  const auto prompt = model->Tokenize(
+      "Continue this list: red blue green red blue green red blue green");
+  const std::vector<sampling::TokenId> history(prompt.begin(), prompt.end());
+  for (const bool mtp : {false, true}) {
+    for (const float temperature : {0.F, 0.7F}) {
+      const auto mode = mtp ? gufo::core::SessionMode::kSpeculative
+                            : gufo::core::SessionMode::kAutoregressive;
+      auto observed = model->CreateSession(mode, 256, &error);
+      auto plain = model->CreateSession(mode, 256, &error);
+      auto reference = model->CreateSession(
+          gufo::core::SessionMode::kAutoregressive, 256, &error);
+      Require(observed && plain && reference, error);
+      Require(observed->Sync(prompt, &error) && plain->Sync(prompt, &error) &&
+                  reference->Sync(prompt, &error),
+              error);
+      sampling::SamplingConfig config;
+      config.temperature = temperature;
+      config.top_k = 20;
+      config.seed = 73;
+      sampling::SamplerState a(config, history);
+      config.logprobs = 5;
+      sampling::SamplerState b(config, history);
+      std::size_t generated = 0;
+      while (generated < 32) {
+        qfn::Session::DecodeResult expected, actual;
+        const auto budget = std::min<std::size_t>(mtp ? 8 : 1, 32 - generated);
+        Require(plain->DecodeStep(budget, a, &expected, &error, false) &&
+                    observed->DecodeStep(budget, b, &actual, &error, false),
+                error);
+        Require(
+            expected.tokens == actual.tokens && a.rng_state() == b.rng_state(),
+            "logprobs changed selected tokens or RNG");
+        Require(actual.logprobs.size() == actual.tokens.size(),
+                "missing accepted-token probabilities");
+        for (std::size_t i = 0; i < actual.tokens.size(); ++i) {
+          const auto logits = reference->Logits();
+          const double maximum =
+              *std::max_element(logits.begin(), logits.end());
+          double sum = 0;
+          for (const float value : logits)
+            sum += std::exp(double(value) - maximum);
+          const auto check = [&](const sampling::TokenLogprob& entry) {
+            const double expected_lp =
+                (double(logits[entry.token]) - maximum) - std::log(sum);
+            Require(std::abs(entry.logprob - expected_lp) < 1e-5,
+                    "reported probability disagrees with teacher-forced target "
+                    "logits");
+          };
+          Require(actual.logprobs[i].selected.token ==
+                      static_cast<sampling::TokenId>(actual.tokens[i]),
+                  "probability token order differs");
+          check(actual.logprobs[i].selected);
+          for (const auto& entry : actual.logprobs[i].top)
+            check(entry);
+          Require(reference->Evaluate(actual.tokens[i], &error), error);
+        }
+        generated += actual.tokens.size();
+      }
+      const auto x = observed->Statistics(), y = plain->Statistics();
+      Require(x.drafted == y.drafted && x.accepted == y.accepted,
+              "observation changed speculative acceptance");
+      if (mtp)
+        Require(x.drafted > 0, "logprob fixture must execute drafts");
+      std::cout << "logprobs mtp=" << mtp << " temperature=" << temperature
+                << " tokens=" << generated << " drafted=" << x.drafted << '\n';
+    }
+  }
+}
+
 int main(int argc, char** argv) {
+  const bool logprobs_only =
+      argc == 6 && std::string_view(argv[5]) == "--logprobs-only";
   const bool execution_only =
       argc == 7 && std::string_view(argv[5]) == "--execution-only";
   std::uint32_t execution_tokens = 4096;
@@ -1089,12 +1170,13 @@ int main(int argc, char** argv) {
       argc == 6 && std::string_view(argv[5]) == "--cache-only";
   const bool eos_only = argc == 6 && std::string_view(argv[5]) == "--eos-only";
   if ((argc != 5 && !batch_only && !prefill_only && !sampling_only &&
-       !cache_only && !eos_only && !execution_only) ||
+       !cache_only && !eos_only && !execution_only && !logprobs_only) ||
       std::string_view(argv[1]) != "--model" ||
       std::string_view(argv[3]) != "--mtp-model") {
     std::cerr << "Usage: session_test --model FIRST.gguf --mtp-model MTP.gguf "
                  "[--batch-only | --prefill-only | --sampling-only | "
-                 "--cache-only | --eos-only | --execution-only TOKENS]\n";
+                 "--cache-only | --eos-only | --logprobs-only | "
+                 "--execution-only TOKENS]\n";
     return 77;
   }
   if (execution_only) {
@@ -1116,6 +1198,11 @@ int main(int argc, char** argv) {
          .max_draft_tokens = 7},
         &error);
     Require(model != nullptr, error);
+    if (logprobs_only) {
+      CheckLogprobs(model);
+      CheckServingEos(model);
+      return 0;
+    }
     if (execution_only) {
       CheckExecutionModes(model, execution_tokens);
       return 0;

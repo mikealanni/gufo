@@ -66,6 +66,10 @@ struct ds4_dspark_sampler {
   // Accept an already-computed target argmax only when it is also the exact
   // request selection. A false result must leave sampler state unchanged.
   bool (*try_accept_argmax)(void* ctx, int token) = nullptr;
+  void (*observe)(void* ctx, const float* logits, uint32_t vocabulary_size,
+                  int token) = nullptr;
+  // Observation alone must preserve the legacy greedy replay and frontier.
+  bool unmodified_argmax = false;
 };
 
 struct ds4_session_dspark_batch_item {

@@ -544,10 +544,15 @@ bool Session::DecodeImpl(std::size_t max_tokens,
     return true;
   }
   const auto anchor = static_cast<std::int32_t>(sampler.Sample(logits_));
+  auto anchor_logprobs =
+      sampling::CollectLogprobs(logits_, anchor, sampler.config().logprobs);
   if (is_stop(anchor)) {
+    result->terminal_logprobs = std::move(anchor_logprobs);
     result->stop = true;
     return true;
   }
+  if (anchor_logprobs)
+    result->logprobs.push_back(std::move(*anchor_logprobs));
   const bool sampled = sampler.config().uses_random_sampling();
   const auto base = static_cast<std::uint32_t>(tokens_.size());
   std::vector<std::int32_t> chain{anchor};
@@ -760,6 +765,7 @@ bool Session::DecodeImpl(std::size_t max_tokens,
   std::uint32_t keep = 1;
   std::optional<std::int32_t> correction;
   if (speculative) {
+    std::optional<std::int32_t> stop_token;
     std::vector<std::int32_t> greedy;
     // A sampled session used to download a full vocabulary row per draft.
     // The candidate path returns each row's exact post-penalty top-k
@@ -792,6 +798,7 @@ bool Session::DecodeImpl(std::size_t max_tokens,
       if (gpu_greedy) {
         const std::int32_t prediction = greedy[keep - 1];
         if (is_stop(prediction)) {
+          stop_token = prediction;
           result->stop = true;
           break;
         }
@@ -819,6 +826,7 @@ bool Session::DecodeImpl(std::size_t max_tokens,
                       proposals[keep - 1], sampler);
         const auto token = static_cast<std::int32_t>(verified.token);
         if (is_stop(token)) {
+          stop_token = token;
           result->stop = true;
           break;
         }
@@ -834,12 +842,36 @@ bool Session::DecodeImpl(std::size_t max_tokens,
           std::span<const float>(verify_logits_)
               .subspan(static_cast<std::size_t>(keep - 1) * vocab, vocab);
       const auto decision =
-          qfn::VerifyDraft(row, chain[keep], sampler, is_stop);
+          qfn::VerifyDraft(row, chain[keep], sampler, [&](auto token) {
+            if (!is_stop(token))
+              return false;
+            stop_token = token;
+            return true;
+          });
       if (decision != qfn::DraftDecision::kAccept) {
         result->stop = decision == qfn::DraftDecision::kStop;
         break;
       }
       ++keep;
+    }
+    if (sampler.config().logprobs) {
+      // Capture committed target rows while this verification is current.
+      const auto rows = keep - 1 + (stop_token ? 1 : 0);
+      std::vector<float> raw(static_cast<std::size_t>(rows) * vocab);
+      if (rows && !exec.ReadLogitRows(0, rows, raw.data())) {
+        AssignError(error_msg, "verification logprob readback failed");
+        return false;
+      }
+      for (std::uint32_t i = 0; i < rows; ++i) {
+        const bool terminal = i + 1 == keep;
+        auto score = sampling::CollectLogprobs(
+            std::span(raw).subspan(static_cast<std::size_t>(i) * vocab, vocab),
+            terminal ? *stop_token : chain[i + 1], sampler.config().logprobs);
+        if (terminal)
+          result->terminal_logprobs = std::move(score);
+        else
+          result->logprobs.push_back(std::move(*score));
+      }
     }
     if (keep < k && !exec.Rollback(*session_, keep, error_msg)) {
       return false;

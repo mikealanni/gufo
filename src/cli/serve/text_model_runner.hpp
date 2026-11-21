@@ -180,6 +180,7 @@ struct TextDecodeSelection {
   bool stop{false};
   TextRunnerToken token{0};
   std::string piece;
+  std::optional<sampling::TokenLogprobs> logprobs;
 };
 
 struct TextDecodeStep {
@@ -195,6 +196,7 @@ struct TextDecodeStep {
   std::size_t suffix_draft_tokens{0};
   std::size_t suffix_accepted_tokens{0};
   bool stop{false};
+  std::optional<sampling::TokenLogprobs> terminal_logprobs;
   /// Execution actually used for this request, including model-owned subgroup
   /// dispatch. A runner's advertised maximum is not evidence of batching.
   TextExecutionPlan execution_plan{};

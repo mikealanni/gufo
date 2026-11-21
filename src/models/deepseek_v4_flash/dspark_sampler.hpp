@@ -26,15 +26,20 @@ class DsparkSamplerBridge {
 public:
   explicit DsparkSamplerBridge(const sampling::SamplerState& sampler)
       : working_(sampler),
-        hook_{.ctx = this,
-              .sample = &Sample,
-              .accept = &Accept,
-              .propose = UseStochastic(sampler.config()) ? &Propose : nullptr,
-              .verify = UseStochastic(sampler.config()) ? &Verify : nullptr,
-              .try_accept_argmax = sampler.config().temperature == 0.F &&
-                                           !sampler.config().penalties_enabled()
-                                       ? &TryAcceptArgmax
-                                       : nullptr} {}
+        hook_{
+            .ctx = this,
+            .sample = &Sample,
+            .accept = &Accept,
+            .propose = UseStochastic(sampler.config()) ? &Propose : nullptr,
+            .verify = UseStochastic(sampler.config()) ? &Verify : nullptr,
+            .try_accept_argmax = !sampler.config().logprobs &&
+                                         sampler.config().temperature == 0.F &&
+                                         !sampler.config().penalties_enabled()
+                                     ? &TryAcceptArgmax
+                                     : nullptr,
+            .observe = sampler.config().logprobs ? &Observe : nullptr,
+            .unmodified_argmax = sampler.config().can_use_unmodified_argmax()} {
+  }
 
   DsparkSamplerBridge(const DsparkSamplerBridge&) = delete;
   DsparkSamplerBridge& operator=(const DsparkSamplerBridge&) = delete;
@@ -42,7 +47,18 @@ public:
   [[nodiscard]] const ds4_dspark_sampler* hook() const { return &hook_; }
   [[nodiscard]] std::uint64_t rng_state() const { return working_.rng_state(); }
 
+  [[nodiscard]] const std::vector<sampling::TokenLogprobs>& logprobs() const {
+    return logprobs_;
+  }
+
 private:
+  static void Observe(void* ctx, const float* logits, std::uint32_t size,
+                      int token) {
+    auto& self = *static_cast<DsparkSamplerBridge*>(ctx);
+    if (auto value = sampling::CollectLogprobs({logits, size}, token,
+                                               self.working_.config().logprobs))
+      self.logprobs_.push_back(std::move(*value));
+  }
   static bool UseStochastic(const sampling::SamplingConfig& config) {
     return config.uses_random_sampling() &&
            (config.top_p < 1.F || (config.top_k > 0 && config.top_k <= 256));
@@ -148,6 +164,7 @@ private:
                    "p=%.6f q=%.6f\n",
                    row, proposal.confidence, token == proposal.token,
                    target.probability(proposal.token), proposal.probability);
+    Observe(ctx, logits, vocabulary_size, token);
     self.working_.Accept(token);
     return static_cast<int>(token);
   }
@@ -157,6 +174,7 @@ private:
     auto& working = static_cast<DsparkSamplerBridge*>(ctx)->working_;
     const auto token =
         working.Sample(std::span<const float>(logits, vocabulary_size));
+    Observe(ctx, logits, vocabulary_size, token);
     working.Accept(token);
     return static_cast<int>(token);
   }
@@ -176,6 +194,7 @@ private:
   }
 
   sampling::SamplerState working_;
+  std::vector<sampling::TokenLogprobs> logprobs_;
   std::array<Proposal, 16> proposals_{};
   ds4_dspark_sampler hook_;
 };

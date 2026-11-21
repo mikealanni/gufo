@@ -239,9 +239,13 @@ static int session_dspark_anchor(ds4_session* session,
   if (sampler == nullptr) {
     return ds4_sample_argmax(session->logits.get(), (uint32_t)vocabulary_size);
   }
-  const int pending = session->dspark_state.pending_anchor;
+  const int pending = sampler->unmodified_argmax
+                          ? -1
+                          : session->dspark_state.pending_anchor;
   session->dspark_state.pending_anchor = -1;
   if (pending >= 0) {
+    if (sampler->observe)
+      sampler->observe(sampler->ctx, session->logits.get(), vocabulary_size, pending);
     if (sampler->accept) sampler->accept(sampler->ctx, pending);
     return pending;
   }
@@ -739,7 +743,8 @@ static uint32_t session_dspark_accept_prefix(
         (stop_at_eos && ds4_token_is_stop(session->engine, drawn))) {
       // EOS is a completed draw, but must not enter the reusable checkpoint.
       // Emit it as the next anchor without drawing again.
-      session->dspark_state.pending_anchor = drawn;
+      if (!sampler->unmodified_argmax)
+        session->dspark_state.pending_anchor = drawn;
       return accepted;
     }
     accepted++;
@@ -763,7 +768,7 @@ static int session_dspark_finish_verified(
     session->checkpoint_valid = false;
     return 1;
   }
-  const bool sampled = sampler != nullptr;
+  const bool sampled = sampler != nullptr && !sampler->unmodified_argmax;
   uint32_t positional_accepted = 0;
   for (uint32_t i = 1; i < drafted; ++i) {
     if (row_tops[i - 1u] == drafts[i])

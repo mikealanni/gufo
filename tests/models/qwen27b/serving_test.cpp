@@ -1,6 +1,8 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -46,6 +48,111 @@ void ExpectStableGpuMemory(std::size_t before, std::size_t after) {
   constexpr std::size_t tolerance = 16ULL * 1024ULL * 1024ULL;
   Expect(after + tolerance >= before,
          "request cleanup leaked more than 16 MiB of GPU memory");
+}
+
+void CheckLogprobs(const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
+                   const char* draft_path) {
+  std::string error;
+  auto reference = gufo::hip::QwenGpuExecutor::Create(model, &error, 256);
+  Expect(reference != nullptr, error);
+  const std::string prompt =
+      "Continue this list: red blue green red blue green red blue green";
+  const auto input = model->GetTokenizer().Encode(prompt);
+  for (const bool speculative : {false, true}) {
+    if (speculative && draft_path == nullptr)
+      continue;
+    gufo::server::TextSpeculativeConfig mode;
+    if (speculative) {
+      mode.backend = gufo::server::TextSpeculativeBackend::kDFlash;
+      mode.draft_model_path = draft_path;
+    }
+    gufo::server::InferenceBackend backend;
+    Expect(backend.load(model, &error, 256, 2, {.decode_active_tokens = 8},
+                        {.max_pending_requests_per_client = 2}, mode, {},
+                        {.capacity_bytes = std::size_t{1} << 30}),
+           error);
+    for (const float temperature : {0.F, 0.7F}) {
+      gufo::sampling::SamplingConfig config;
+      config.temperature = temperature;
+      config.top_k = 20;
+      config.seed = 73;
+      const auto plain =
+          backend.start_complete(prompt, 32, config, {}, false, true)->Wait();
+      Expect(plain.logprobs.empty(), "disabled requests collected logprobs");
+      config.logprobs = 5;
+      const auto actual =
+          backend.start_complete(prompt, 32, config, {}, false, true)->Wait();
+      Expect(actual.cache_hit && actual.tokens == plain.tokens &&
+                 actual.draft_tokens == plain.draft_tokens &&
+                 actual.draft_accepted_tokens == plain.draft_accepted_tokens,
+             "logprobs changed cached tokens or speculative acceptance");
+      Expect(actual.tokens.size() == 32 && actual.logprobs.size() == 32,
+             "logprobs must cover every generated token");
+      if (speculative)
+        Expect(actual.draft_tokens > 0, "logprob fixture must execute drafts");
+      reference->Reset();
+      (void)reference->ForwardPromptBatch(input);
+      double maximum_error = 0;
+      for (std::size_t index = 0; index < actual.tokens.size(); ++index) {
+        const auto logits = reference->CopyLastLogits();
+        Expect(
+            !logits.empty() &&
+                std::ranges::all_of(
+                    logits, [](float value) { return std::isfinite(value); }),
+            "reference logits must be finite and nonempty");
+        const double maximum = *std::max_element(logits.begin(), logits.end());
+        double sum = 0;
+        for (const float value : logits)
+          sum += std::exp(double(value) - maximum);
+        const auto& entries = actual.logprobs[index].entries;
+        Expect(!entries.empty() && entries.front().id == actual.tokens[index],
+               "logprob records lost sampled-token alignment");
+        for (const auto& entry : entries) {
+          Expect(static_cast<std::size_t>(entry.id) < logits.size() &&
+                     std::isfinite(entry.logprob),
+                 "invalid logprob token or nonfinite probability");
+          const double expected =
+              double(logits[entry.id]) - maximum - std::log(sum);
+          maximum_error =
+              std::max(maximum_error, std::abs(entry.logprob - expected));
+        }
+        (void)reference->ForwardToken(actual.tokens[index],
+                                      input.size() + index);
+      }
+      Expect(
+          maximum_error < 1e-5,
+          "logprobs disagree with independent teacher-forced target logits: " +
+              std::to_string(maximum_error));
+      // Two cached requests share execution but retain private observation
+      // settings. Neither may change the other's selected token sequence.
+      const auto observed =
+          backend.start_complete(prompt, 32, config, {}, false, true);
+      config.logprobs.reset();
+      const auto disabled =
+          backend.start_complete(prompt, 32, config, {}, false, true);
+      const auto replay = observed->Wait();
+      const auto peer = disabled->Wait();
+      Expect(replay.tokens == actual.tokens && peer.tokens == plain.tokens &&
+                 peer.logprobs.empty() && replay.logprobs.size() == 32,
+             "concurrent requests changed tokens or mixed logprob settings");
+      for (std::size_t i = 0; i < actual.logprobs.size(); ++i) {
+        const auto& a = actual.logprobs[i].entries;
+        const auto& b = replay.logprobs[i].entries;
+        Expect(a.size() == b.size(), "cached replay changed candidate count");
+        for (std::size_t j = 0; j < a.size(); ++j)
+          Expect(a[j].id == b[j].id &&
+                     std::abs(a[j].logprob - b[j].logprob) < 1e-5,
+                 "concurrent cached replay changed logprobs");
+      }
+      std::cout << "logprobs dflash2=" << speculative
+                << " temperature=" << temperature
+                << " tokens=32 drafted=" << actual.draft_tokens
+                << " accepted=" << actual.draft_accepted_tokens
+                << " max_error=" << maximum_error
+                << " physical_width=" << replay.physical_execution_width << '\n'
+                << std::flush;
+    }
+  }
 }
 
 void CheckSamplingStrategies(
@@ -421,6 +528,7 @@ int main(int argc, const char* const* argv) {
     bool sampling_only = false;
     bool cache_only = false;
     bool continuation_only = false;
+    bool logprobs_only = false;
     auto sampling_policy = gufo::speculative::DFlashDraftPolicy::kAdaptive;
     for (int index = 2; index < argc; ++index) {
       const std::string_view argument = argv[index];
@@ -432,6 +540,8 @@ int main(int argc, const char* const* argv) {
         run_full_suite = cache_only = true;
       } else if (argument == "--continuation-only") {
         continuation_only = true;
+      } else if (argument == "--logprobs-only") {
+        logprobs_only = true;
       } else if (argument == "--fixed") {
         sampling_policy = gufo::speculative::DFlashDraftPolicy::kFixed;
       } else if (argument.starts_with("--")) {
@@ -453,6 +563,11 @@ int main(int argc, const char* const* argv) {
     Expect(model != nullptr, error);
     Expect(model->GetWeightRegionCount() == reader->GetMappedRegions().size(),
            "every mapped GGUF shard must have one shared GPU region");
+
+    if (logprobs_only) {
+      CheckLogprobs(model, draft_model_path);
+      return 0;
+    }
 
     if (continuation_only ||
         (run_full_suite && draft_model_path != nullptr && !sampling_only)) {

@@ -591,7 +591,8 @@ request limits, cancellation, cache accounting and completion state.
 
 `POST /v1/responses` accepts `model`, `input` as text or message arrays,
 `instructions`, `max_output_tokens`, `stream`, `reasoning.effort`,
-`text.format`, `tools`, `tool_choice`, `parallel_tool_calls`, and the shared
+`text.format`, `tools`, `tool_choice`, `parallel_tool_calls`, `include`,
+`top_logprobs`, and the shared
 sampling controls. Message content supports
 `input_text` and `input_image` with an `image_url` (HTTPS or a data URL).
 Image uploads accept PNG, JPEG and WebP. Base64 data URLs also accept
@@ -611,8 +612,10 @@ functions are rejected. Mid-conversation `system` and `developer` message
 items are accepted as in Chat Completions. Standard Responses request fields
 with
 no native effect are accepted and ignored so conforming clients interoperate
-(for example Codex): `include`, `reasoning.summary`, `text.verbosity`,
+(for example Codex): `reasoning.summary`, `text.verbosity`,
 `client_metadata` and `prompt_cache_key`.
+`include: ["message.output_text.logprobs"]` enables generated-token scores;
+other string entries in `include` are accepted without native effect.
 `store` and `background` must be false when present; server-side conversations
 and `previous_response_id` remain unsupported.
 
@@ -841,8 +844,79 @@ labelled executed model state. Stops must be nonempty, at most 4 KiB each and
 Nullable Chat Completions defaults retain server settings, including sampling
 and token limits. `logprobs: false`, empty `logit_bias`,
 `response_format: {"type":"text"}` and `modalities: ["text"]` are accepted.
-Actual log probabilities, token biases and audio output remain unsupported
-and return explicit errors.
+Token biases and audio output remain unsupported and return explicit errors.
+
+### Generated-token log probabilities
+
+Chat Completions accepts `logprobs: true` and an optional `top_logprobs`
+integer from 0 to 20 (default 0). Each choice returns `logprobs.content`,
+with `token`, `logprob`, the original token `bytes`, and `top_logprobs` for tokens contributing
+to message content. Streaming choices carry the same metadata beside `delta`.
+
+Raw Completions accepts an integer `logprobs` from 0 to 20. Its choices
+return parallel `tokens`, `token_logprobs`, `top_logprobs`, and `text_offset`
+arrays. Offsets count Unicode characters and continue across streaming chunks.
+Zero requests only the selected token. Omitted/null settings disable collection;
+Chat also accepts `false`. Positive Chat `top_logprobs` requires `logprobs: true`.
+
+Responses accepts `include: ["message.output_text.logprobs"]` with optional
+`top_logprobs` from 0 to 20 (omitted/null defaults to 0). It returns scores on
+each `output_text` content part and on streaming `response.output_text.delta`
+and `response.output_text.done` events. Content parts include UTF-8 `bytes`;
+text events carry `token`, `logprob`, and `top_logprobs`. Without the include
+entry, collection stays disabled even when `top_logprobs` is set.
+
+Chat Completions and Responses score tokens contributing to visible output
+text. Reasoning,
+tool arguments, hidden framing, and terminal stop tokens receive no text
+scores. A token spanning visible text and hidden framing is reported once,
+with its original token spelling, on the first text span it contributes to.
+Tokens sharing a split UTF-8 character are retained together when that
+character is emitted. Buffered results and completed streaming content parts
+carry the same scores.
+
+```json
+{"model":"gufo","input":"Hello","include":["message.output_text.logprobs"],"top_logprobs":3}
+```
+
+Chat and Responses return the K most probable alternatives in descending
+order, including the selected token only when it ranks in that set. Raw
+Completions includes the selected token in its probability map.
+Values use the target
+model's raw full-vocabulary log-softmax, before temperature, penalties,
+constraints, or sampling filters. Speculative tokens use their target verifier
+rows, including residual corrections. Values below -9999 are serialized as
+-9999. Raw Completions includes sampled stop/control tokens. The bytes of a
+single token can be a fragment of a UTF-8 character.
+Existing usage accounting is unchanged.
+
+Collection adds vocabulary transfers and CPU reduction only when requested.
+Metadata counts toward streaming buffer limits but not `--max-output-bytes`,
+which bounds generated text; `max_tokens` bounds its size. Prompt logprobs,
+full-vocabulary output and token-ID extensions are not supported. For example:
+
+```json
+{"model":"gufo","messages":[{"role":"user","content":"Hello"}],"logprobs":true,"top_logprobs":3}
+```
+
+A buffered Chat choice contains metadata like this (with `top_logprobs: 0`):
+
+```json
+{"index":0,"message":{"role":"assistant","content":"Hi"},"logprobs":{"content":[{"token":"Hi","logprob":-0.5,"bytes":[72,105],"top_logprobs":[]}]},"finish_reason":"length"}
+```
+
+For streaming Completions:
+
+```json
+{"model":"gufo","prompt":"Hello","logprobs":3,"stream":true}
+```
+
+Each SSE payload's choice carries the arrays alongside its text, for example
+with `logprobs: 0`:
+
+```json
+{"index":0,"text":"Hi","logprobs":{"tokens":["Hi"],"token_logprobs":[-0.5],"top_logprobs":[{"Hi":-0.5}],"text_offset":[0]},"finish_reason":null}
+```
 
 ### Structured output
 
@@ -935,9 +1009,9 @@ Return an OpenAI-style error object:
 ```json
 {
   "error": {
-    "message": "Unsupported field: logprobs",
+    "message": "Unsupported field: logit_bias",
     "type": "invalid_request_error",
-    "param": "logprobs",
+    "param": "logit_bias",
     "code": "unsupported_parameter"
   }
 }

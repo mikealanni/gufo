@@ -1470,7 +1470,101 @@ void TestPersistentVerifierSnapshotRoundTrip() {
 
 }  // namespace
 
+void TestSpeculativeLogprobs() {
+  using namespace gufo::speculative;
+  bool saw_accept = false, saw_reject = false, saw_bonus = false;
+  for (const int mode : {0, 1, 2}) {
+    for (const float temperature : {0.F, 0.7F}) {
+      for (const unsigned budget : {1U, 3U}) {
+        for (const std::int64_t seed : {3, 17, 101}) {
+          const auto run = [&](bool collect) {
+            SampledTargetExecutor target({-INFINITY, 0.4F, 0.2F}, true);
+            SpeculativeOptions options;
+            options.max_draft_tokens = options.initial_draft_tokens = 2;
+            options.enable_adaptive_draft_length = false;
+            options.use_batched_verification = mode != 0;
+            SpeculativeVerifier verifier(
+                target, std::make_unique<BinarySampledDraftBackend>(0.1F, 0.9F),
+                options);
+            const std::vector<TokenId> prompt{0};
+            const auto current = verifier.Prime(prompt);
+            const std::vector<TokenId> sequence{0, current};
+            gufo::sampling::SamplingConfig config;
+            config.temperature = temperature;
+            config.seed = seed;
+            if (collect)
+              config.logprobs = 2;
+            gufo::sampling::SamplerState sampler(config, sequence);
+            SpeculativeVerifier::StepRequest request{
+                verifier, sequence, 1, current, 99, budget, sampler};
+            SpeculativeVerifier::StepResult result;
+            if (mode == 2) {
+              SampledTargetExecutor peer_target({0.F, -INFINITY, -INFINITY},
+                                                true);
+              SpeculativeVerifier peer(
+                  peer_target,
+                  std::make_unique<BinarySampledDraftBackend>(0.1F, 0.9F),
+                  options);
+              const auto peer_current = peer.Prime(prompt);
+              const std::vector<TokenId> peer_sequence{0, peer_current};
+              gufo::sampling::SamplerState peer_sampler(config, peer_sequence);
+              const std::array requests{
+                  request, SpeculativeVerifier::StepRequest{
+                               peer, peer_sequence, 1, peer_current, 99, budget,
+                               peer_sampler}};
+              auto results = SpeculativeVerifier::VerifyBatch(requests);
+              result = std::move(results.front());
+              if (collect)
+                for (const auto& values : results.back().logprobs)
+                  Expect(values.selected.token == 0 &&
+                             values.selected.logprob == 0,
+                         "concurrent target rows remain request-owned");
+              Expect(target.LastBatchSize() == 2 ||
+                         peer_target.LastBatchSize() == 2,
+                     "logprob fixture must execute concurrent verification");
+            } else {
+              result = verifier.VerifyStep(sequence, 1, current, 99, budget,
+                                           sampler);
+            }
+            if (collect) {
+              saw_accept |= result.accepted_count > 0;
+              saw_reject |= result.accepted_count < result.draft_count;
+              saw_bonus |= result.draft_count > 0 &&
+                           result.accepted_count == result.draft_count;
+              Expect(result.logprobs.size() == result.emitted_tokens.size(),
+                     "one logprob per accepted or replacement token");
+              const double z =
+                  std::log(std::exp(double(0.4F)) + std::exp(double(0.2F)));
+              for (std::size_t i = 0; i < result.logprobs.size(); ++i) {
+                const auto& value = result.logprobs[i].selected;
+                Expect(value.token == result.emitted_tokens[i],
+                       "speculative metadata follows token order");
+                const double expected =
+                    (value.token == 1 ? double(0.4F) : double(0.2F)) - z;
+                Expect(std::abs(value.logprob - expected) < 1e-12,
+                       "target raw probability, not draft or residual "
+                       "probability");
+              }
+            } else {
+              Expect(result.logprobs.empty(),
+                     "disabled speculative observation is empty");
+            }
+            return std::tuple(result.emitted_tokens, sampler.rng_state(),
+                              result.accepted_count);
+          };
+          Expect(run(false) == run(true),
+                 "logprobs preserve speculative tokens, RNG and acceptance");
+        }
+      }
+    }
+  }
+  Expect(saw_accept && saw_reject && saw_bonus,
+         "logprob fixtures must cover acceptance, rejection and target bonus "
+         "tokens");
+}
+
 int main() {
+  TestSpeculativeLogprobs();
   TestSpeculativeDraftBackendInterface();
   TestSpeculativeStats();
   TestStopTokensFollowTargetVocabulary();

@@ -1,8 +1,10 @@
 #include "src/core/sampling.hpp"
 
 #include <bit>
+#include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -243,7 +245,79 @@ void TestCompactTargetContract() {
 
 }  // namespace
 
+void TestRawLogprobs() {
+  using gufo::sampling::CollectLogprobs;
+  const std::vector<float> logits{1000, 999, 998, -1000};
+  const auto result = CollectLogprobs(logits, 3, 2);
+  const double denominator = std::log(1.0 + std::exp(-1.0) + std::exp(-2.0));
+  Expect(std::abs(result->selected.logprob - (-2000.0 - denominator)) < 1e-12,
+         "stable log-softmax retains very unlikely selected tokens");
+  Expect(result->top.size() == 2 && result->top[0].token == 0 &&
+             result->top[1].token == 1,
+         "alternatives come from the complete raw vocabulary");
+  Expect(!CollectLogprobs({}, 999, std::nullopt),
+         "disabled collection does no work");
+  Expect(CollectLogprobs(logits, 0, 0)->top.empty(),
+         "zero requests selected token only");
+  const auto tied = CollectLogprobs(std::vector<float>{0, 0, 0}, 2, 20);
+  Expect(tied->top.size() == 3 && tied->top[0].token == 0 &&
+             std::abs(tied->selected.logprob + std::log(3.0)) < 1e-12,
+         "ties have deterministic token order and exact normalization");
+  const auto twenty = CollectLogprobs(std::vector<float>(32, 0), 31, 20);
+  Expect(twenty->top.size() == 20 && twenty->top.back().token == 19 &&
+             twenty->selected.token == 31,
+         "twenty alternatives retain an independently selected token");
+  const std::vector<std::string> pieces{"prose", "{", "}", ""};
+  auto binding = std::make_shared<TokenConstraint>();
+  binding->grammar = JsonConstraint::Object();
+  binding->vocabulary = std::make_shared<ConstraintVocabulary>(
+      pieces.size(), [&](std::uint32_t i) {
+        return ConstraintVocabulary::Piece{pieces[i], i == 3};
+      });
+  SamplingConfig constrained;
+  constrained.constraint = binding;
+  constrained.logprobs = 2;
+  SamplerState grammar(constrained);
+  const auto selected = grammar.Sample(logits);
+  const auto raw = CollectLogprobs(logits, selected, constrained.logprobs);
+  Expect(selected == 1 && raw->top[0].token == 0 &&
+             std::abs(raw->selected.logprob + 1 + denominator) < 1e-12,
+         "grammar masks change selection but not raw probabilities");
+  for (const float temperature : {0.F, 0.7F}) {
+    SamplingConfig config;
+    config.temperature = temperature;
+    config.top_k = 2;
+    config.presence_penalty = 0.5;
+    config.seed = 42;
+    SamplerState plain(config);
+    config.logprobs = 2;
+    SamplerState observed(config);
+    for (int i = 0; i < 16; ++i) {
+      const auto a = plain.Sample(logits), b = observed.Sample(logits);
+      const auto probabilities = CollectLogprobs(logits, b, config.logprobs);
+      Expect(a == b && plain.rng_state() == observed.rng_state(),
+             "observation preserves selection and RNG");
+      Expect(std::abs(probabilities->top[0].logprob + denominator) < 1e-12,
+             "raw logprobs ignore temperature, truncation and penalties");
+      plain.Accept(a);
+      observed.Accept(b);
+    }
+  }
+  for (const auto invalid :
+       {std::vector<float>{INFINITY}, std::vector<float>{NAN},
+        std::vector<float>{-INFINITY}}) {
+    bool failed = false;
+    try {
+      (void)CollectLogprobs(invalid, 0, 0);
+    } catch (const std::runtime_error&) {
+      failed = true;
+    }
+    Expect(failed, "invalid raw distributions fail explicitly");
+  }
+}
+
 int main() {
+  TestRawLogprobs();
   TestReasoningBudgetForcesTheEnd();
   TestEarlyEndAndNoBudget();
   TestReasoningBudgetMatchesLlamaCpp();

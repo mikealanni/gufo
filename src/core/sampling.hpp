@@ -35,6 +35,8 @@ struct ReasoningBudget {
 /// Filters run in this order: penalties, temperature, top-k, top-p, min-p.
 /// The defaults preserve Gufo's existing greedy decoding behavior.
 struct SamplingConfig {
+  /// Observational raw target log probabilities; null disables collection.
+  std::optional<std::uint32_t> logprobs;
   float temperature{0.0F};
   std::int32_t top_k{0};
   float top_p{1.0F};
@@ -75,6 +77,21 @@ struct Probability {
   TokenId token{0};
   double value{0.0};
 };
+
+struct TokenLogprob {
+  TokenId token{0};
+  double logprob{0};
+};
+
+struct TokenLogprobs {
+  TokenLogprob selected;
+  std::vector<TokenLogprob> top;
+};
+
+/// Full-vocabulary log-softmax before any sampling transformations.
+[[nodiscard]] std::optional<TokenLogprobs> CollectLogprobs(
+    std::span<const float> logits, TokenId selected,
+    std::optional<std::uint32_t> count);
 
 /// A normalized, post-filter sampling distribution.
 class SamplingDistribution {

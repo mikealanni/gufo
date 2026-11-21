@@ -209,9 +209,19 @@ public:
       result.finish_reason = FinishReason::kStopSequence;
       result.stop_sequence = forced_stop_sequence;
     }
+    if (sampling.logprobs) {
+      gufo::server::DecodedLogprobs probabilities;
+      probabilities.source_bytes = result.text.size();
+      probabilities.entries.push_back({3, result.text, -3.0});
+      if (*sampling.logprobs > 0)
+        probabilities.entries.push_back({1, "alternative", -0.5});
+      result.logprobs.push_back(std::move(probabilities));
+    }
     if (token && failure != 8) {
       std::this_thread::sleep_for(token_delay);
-      (void)token(result.text);
+      (void)token(gufo::server::TokenPiece(
+          result.text,
+          result.logprobs.empty() ? nullptr : &result.logprobs.front()));
     }
     if (failure == 6)
       throw std::runtime_error("context exceeded");
@@ -3040,6 +3050,76 @@ void TestRawCompletionCachePrompt() {
   }
 }
 
+void TestResponsesLogprobsOptions() {
+  RunningServer server;
+  for (const bool stream : {false, true}) {
+    for (const auto* count : {"null", "0", "3", "20"}) {
+      const auto response = server.Post(
+          "/v1/responses",
+          std::string(
+              R"({"input":"hello","include":["message.output_text.logprobs"],"top_logprobs":)") +
+              count + R"(,"stream":)" + (stream ? "true}" : "false}"));
+      ExpectStatus(response, 200);
+      const auto requested =
+          std::string_view(count) == "null" ? 0 : std::stoi(count);
+      assert(server.backend->LastCall().sampling.logprobs == requested);
+      assert(response.find(R"("token":"ok")") != std::string::npos);
+      assert(response.find(R"("logprob":-3)") != std::string::npos);
+      assert(response.find(R"("bytes":[111,107])") != std::string::npos);
+    }
+  }
+  for (const auto* options :
+       {R"("top_logprobs":-1)", R"("top_logprobs":21)", R"("top_logprobs":1.5)",
+        R"("top_logprobs":true)", R"("top_logprobs":"3")", R"("include":[1])",
+        R"("include":"message.output_text.logprobs")", R"("logprobs":true)"}) {
+    const auto before = server.backend->calls.load();
+    ExpectStatus(
+        server.Post("/v1/responses",
+                    std::string(R"({"input":"hello",)") + options + "}"),
+        400);
+    assert(server.backend->calls == before);
+  }
+  for (const auto* options :
+       {R"("include":null)", R"("include":[])", R"("top_logprobs":3)",
+        R"("include":["reasoning.encrypted_content"] )"}) {
+    ExpectStatus(
+        server.Post("/v1/responses",
+                    std::string(R"({"input":"hello",)") + options + "}"),
+        200);
+    assert(!server.backend->LastCall().sampling.logprobs);
+  }
+}
+
+void TestRawCompletionLogprobs() {
+  RunningServer server;
+  for (const bool stream : {false, true}) {
+    for (const int count : {0, 1, 20}) {
+      const auto response = server.Post(
+          "/v1/completions", std::string(R"({"prompt":"hello","logprobs":)") +
+                                 std::to_string(count) + R"(,"stream":)" +
+                                 (stream ? "true}" : "false}"));
+      ExpectStatus(response, 200);
+      assert(response.find(R"("tokens":["ok"])") != std::string::npos);
+      assert(response.find(R"("token_logprobs":[-3])") != std::string::npos);
+      assert(response.find(R"("text_offset":[0])") != std::string::npos);
+      assert(response.find(
+                 count ? R"("top_logprobs":[{"ok":-3,"alternative":-0.5}])"
+                       : R"("top_logprobs":[{"ok":-3}])") != std::string::npos);
+    }
+  }
+  for (const auto* value : {"true", "false", "-1", "21", "1.5", "\"1\""}) {
+    const auto before = server.backend->calls.load();
+    ExpectStatus(server.Post("/v1/completions",
+                             std::string(R"({"prompt":"hello","logprobs":)") +
+                                 value + "}"),
+                 400);
+    assert(server.backend->calls == before);
+  }
+  ExpectStatus(
+      server.Post("/v1/completions", R"({"prompt":"hello","logprobs":null})"),
+      200);
+}
+
 void TestRawCompletionPromptProgress() {
   RunningServer server;
   server.backend->progress = {
@@ -3100,6 +3180,8 @@ int main() {
   TestGenerationFailureLogsCause();
   TestDeviceLoss();
   TestDeviceLossWhileWriterBlocked();
+  TestRawCompletionLogprobs();
+  TestResponsesLogprobsOptions();
   TestRawCompletionPromptProgress();
   TestRawCompletionCachePrompt();
   TestCompatibilityStopSequences();

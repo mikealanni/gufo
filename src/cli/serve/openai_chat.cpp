@@ -20,12 +20,14 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/quote_tracker.hpp"
 #include "src/cli/serve/response_format.hpp"
+#include "src/cli/serve/responses_logprobs.hpp"
 #include "src/cli/serve/sampling_request.hpp"
 #include "src/cli/serve/stop_sequences.hpp"
 #include "src/core/image.hpp"
@@ -90,7 +92,40 @@ struct ParsedGeneration {
   std::string reasoning_content;
   std::vector<ParsedToolCall> tool_calls;
   bool hide_tool_markup{false};
+  std::vector<TextSourceSpan> text_spans;
 };
+
+void AppendTextSpans(std::vector<TextSourceSpan>& output,
+                     std::span<const TextSourceSpan> source, std::size_t offset,
+                     std::size_t size) {
+  for (const auto& span : source) {
+    if (offset >= span.size) {
+      offset -= span.size;
+      continue;
+    }
+    const auto count = std::min(size, span.size - offset);
+    if (count)
+      output.push_back({span.begin + offset, count});
+    size -= count;
+    if (!size)
+      break;
+    offset = 0;
+  }
+}
+
+void SetParsedText(ParsedGeneration& parsed, std::string_view text,
+                   std::string_view source, bool track) {
+  parsed.text = std::string(text);
+  parsed.text_spans.clear();
+  if (track && !text.empty())
+    parsed.text_spans.push_back(
+        {static_cast<std::size_t>(text.data() - source.data()), text.size()});
+}
+
+void RebaseTextSpans(ParsedGeneration& parsed, std::size_t offset) {
+  for (auto& span : parsed.text_spans)
+    span.begin += offset;
+}
 
 constexpr std::array<std::string_view, 7> kToolMarkers{
     tokenization::QwenToolSyntax::kCallOpen,
@@ -1171,13 +1206,12 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
                  "request field 'ignore_eos' is not supported on this endpoint",
                  "unsupported_field");
   }
-  for (const std::string_view unsupported :
-       {"logprobs", "top_logprobs", "modalities", "audio"}) {
+  if (const auto error = ParseLogprobs(body, true, &output->sampling))
+    return Error(400, "Bad Request", error->message, error->code.c_str());
+  for (const std::string_view unsupported : {"modalities", "audio"}) {
     if (const auto* value = body.find(std::string(unsupported));
         value != nullptr && !value->is_null()) {
-      if ((unsupported == "logprobs" && value->is_bool() &&
-           !value->as_bool()) ||
-          (unsupported == "modalities" && value->is_array() &&
+      if ((unsupported == "modalities" && value->is_array() &&
            value->size() == 1 && value->items().front().is_string() &&
            value->items().front().str() == "text"))
         continue;
@@ -1944,7 +1978,7 @@ ParsedGeneration ParseGeneration(
     std::span<const tokenization::ChatTool> tools,
     ChatRequest::ToolChoice choice, bool enforce_required,
     ToolMarkerSet markers, ToolCloserSet closers, QuoteTracker& quotes,
-    bool partial = false) {
+    bool partial = false, bool track_text = false) {
   quotes.Reset(raw);
   ParsedGeneration parsed;
   std::string_view content = raw;
@@ -1979,12 +2013,13 @@ ParsedGeneration ParseGeneration(
       }
       reasoning_call_context = content;
       unfinished_reasoning_quote = quotes.UnclosedAt(marker);
-      parsed.text = std::string(content.substr(marker));
+      SetParsedText(parsed, content.substr(marker), raw, track_text);
     } else {
       parsed.reasoning_content =
           std::string(Trim(content.substr(0, think_end)));
       content.remove_prefix(think_end + kThinkEnd.size());
-      parsed.text = std::string(AfterReasoningSeparator(content, markers));
+      SetParsedText(parsed, AfterReasoningSeparator(content, markers), raw,
+                    track_text);
     }
   } else if (initial_output_state ==
              TextGenerationBackend::InitialOutputState::kAuto) {
@@ -2010,28 +2045,38 @@ ParsedGeneration ParseGeneration(
             content.substr(think_end + kThinkEnd.size());
         remaining = AfterReasoningSeparator(remaining, markers);
         if (think_start > 0) {
-          parsed.text = std::string(content.substr(0, think_start)) +
-                        std::string(remaining);
+          SetParsedText(parsed, content.substr(0, think_start), raw,
+                        track_text);
+          parsed.text += remaining;
+          if (track_text && !remaining.empty())
+            parsed.text_spans.push_back(
+                {static_cast<std::size_t>(remaining.data() - raw.data()),
+                 remaining.size()});
         } else {
-          parsed.text = std::string(remaining);
+          SetParsedText(parsed, remaining, raw, track_text);
         }
       } else {
         const auto remaining = content.substr(think_content_start);
         const auto marker = tool_marker(remaining);
         parsed.reasoning_content =
             std::string(Trim(remaining.substr(0, marker)));
-        parsed.text = std::string(content.substr(0, think_start));
+        SetParsedText(parsed, content.substr(0, think_start), raw, track_text);
         if (marker != std::string_view::npos) {
           reasoning_call_context = remaining;
           unfinished_reasoning_quote = quotes.UnclosedAt(marker);
           parsed.text += remaining.substr(marker);
+          if (track_text)
+            parsed.text_spans.push_back(
+                {static_cast<std::size_t>(remaining.data() - raw.data()) +
+                     marker,
+                 remaining.size() - marker});
         }
       }
     } else {
-      parsed.text = std::string(content);
+      SetParsedText(parsed, content, raw, track_text);
     }
   } else {
-    parsed.text = std::string(content);
+    SetParsedText(parsed, content, raw, track_text);
   }
 
   quotes.Reset(parsed.text);
@@ -2065,9 +2110,14 @@ ParsedGeneration ParseGeneration(
         parsed = ParseGeneration(
             reasoning_call_context.substr(end + kThinkEnd.size()),
             TextGenerationBackend::InitialOutputState::kContent, tools, choice,
-            enforce_required, markers, closers, quotes, partial);
+            enforce_required, markers, closers, quotes, partial, track_text);
+        RebaseTextSpans(parsed,
+                        static_cast<std::size_t>(reasoning_call_context.data() -
+                                                 raw.data()) +
+                            end + kThinkEnd.size());
       } else {
         parsed.text.clear();
+        parsed.text_spans.clear();
       }
       parsed.reasoning_content =
           std::string(reasoning_call_context.substr(0, end));
@@ -2083,11 +2133,19 @@ ParsedGeneration ParseGeneration(
       // Text outside complete envelopes is content. Framing echoed directly
       // after a call is removed, as for Qwen calls (#383).
       const std::string full = std::move(parsed.text);
-      std::string text(ContentBefore(full, 0, marker, closers, quotes, tools));
+      const auto old_spans = std::move(parsed.text_spans);
+      std::string text;
+      const auto append = [&](std::string_view part) {
+        text += part;
+        if (!part.empty())
+          AppendTextSpans(parsed.text_spans, old_spans,
+                          part.data() - full.data(), part.size());
+      };
+      append(ContentBefore(full, 0, marker, closers, quotes, tools));
       std::size_t cursor = marker;
       for (const auto& [begin, end] : spans) {
-        text += ContentBefore(full, cursor, marker + begin, closers, quotes,
-                              tools, cursor > marker);
+        append(ContentBefore(full, cursor, marker + begin, closers, quotes,
+                             tools, cursor > marker));
         cursor = marker + end;
       }
       if (!spans.empty()) {
@@ -2097,8 +2155,8 @@ ParsedGeneration ParseGeneration(
           if (const auto held =
                   HeldMarkerPrefix(full, full.size(), markers, quotes))
             unfinished = full.size() - held;
-        text += ContentBefore(full, cursor, unfinished, closers, quotes, tools,
-                              true);
+        append(ContentBefore(full, cursor, unfinished, closers, quotes, tools,
+                             true));
       }
       parsed.text = std::move(text);
       parsed.hide_tool_markup = true;
@@ -2107,8 +2165,14 @@ ParsedGeneration ParseGeneration(
     // No marker: the text is content, but the framing it carries still goes.
     // The streamed response drops it as the turn ends, and both transports
     // must report the same content.
-    parsed.text = std::string(ContentBefore(parsed.text, 0, parsed.text.size(),
-                                            closers, quotes, tools));
+    const auto part = ContentBefore(parsed.text, 0, parsed.text.size(), closers,
+                                    quotes, tools);
+    std::vector<TextSourceSpan> spans;
+    if (!part.empty())
+      AppendTextSpans(spans, parsed.text_spans,
+                      part.data() - parsed.text.data(), part.size());
+    parsed.text = std::string(part);
+    parsed.text_spans = std::move(spans);
   }
   if (enforce_required && choice == ChatRequest::ToolChoice::kRequired &&
       parsed.tool_calls.empty())
@@ -2122,8 +2186,9 @@ ParsedGeneration ParseStructuredGeneration(
     std::span<const tokenization::ChatTool> tools,
     ChatRequest::ToolChoice choice, bool enforce_required, bool tool_only,
     ToolMarkerSet markers, ToolCloserSet closers, QuoteTracker& quotes,
-    bool partial = false) {
+    bool partial = false, bool track_text = false) {
   ParsedGeneration parsed;
+  const auto source = raw;
   if (initial == TextGenerationBackend::InitialOutputState::kAuto) {
     const auto leading = raw.find_first_not_of(" \t\r\n");
     if (leading != std::string_view::npos &&
@@ -2163,7 +2228,9 @@ ParsedGeneration ParseStructuredGeneration(
           tokenization::QwenToolSyntax::kCallOpen)) {
     auto native = ParseGeneration(
         content, TextGenerationBackend::InitialOutputState::kContent, tools,
-        choice, enforce_required, markers, closers, quotes, partial);
+        choice, enforce_required, markers, closers, quotes, partial,
+        track_text);
+    RebaseTextSpans(native, content.data() - source.data());
     native.reasoning_content = std::move(parsed.reasoning_content);
     return native;
   }
@@ -2186,10 +2253,17 @@ ParsedGeneration ParseStructuredGeneration(
     ParseQwenCalls(content, tools, &call.tool_calls,
                    tool_only ? &spans : nullptr, false, partial);
     if (tool_only) {
+      const auto append = [&](std::string_view part) {
+        call.text += part;
+        if (track_text && !part.empty())
+          call.text_spans.push_back(
+              {static_cast<std::size_t>(part.data() - source.data()),
+               part.size()});
+      };
       std::size_t cursor = 0;
       for (const auto& [begin, end] : spans) {
-        call.text += ContentBefore(content, cursor, begin, closers, quotes,
-                                   tools, cursor > 0);
+        append(ContentBefore(content, cursor, begin, closers, quotes, tools,
+                             cursor > 0));
         cursor = end;
       }
       const auto tail = content.substr(cursor);
@@ -2209,13 +2283,13 @@ ParsedGeneration ParseStructuredGeneration(
                                    : std::min(cursor + limit, content.size());
       // The model repeats the framing of the call it just made; that echo is
       // markup, not prose the client should replay on the next turn (#383).
-      call.text += ContentBefore(content, cursor, stop, closers, quotes, tools,
-                                 cursor > 0);
+      append(ContentBefore(content, cursor, stop, closers, quotes, tools,
+                           cursor > 0));
     }
     if (call.tool_calls.empty() && marker != std::string_view::npos &&
         quotes.UnclosedAt(marker) &&
         choice != ChatRequest::ToolChoice::kRequired) {
-      parsed.text = std::string(raw);
+      SetParsedText(parsed, raw, source, track_text);
       return parsed;
     }
     call.hide_tool_markup = true;
@@ -2234,9 +2308,11 @@ ParsedGeneration ParseStructuredGeneration(
   // A constrained turn that produced no call is still reported without
   // framing: the streamed response drops it as the turn ends, and both
   // transports must report the same content.
-  parsed.text = tool_only ? std::string(ContentBefore(raw, 0, raw.size(),
-                                                      closers, quotes, tools))
-                          : std::string(raw);
+  SetParsedText(parsed,
+                tool_only
+                    ? ContentBefore(raw, 0, raw.size(), closers, quotes, tools)
+                    : raw,
+                source, track_text);
   return parsed;
 }
 
@@ -2350,12 +2426,15 @@ json::Value BaseChunk(std::string_view id, long long created,
 
 json::Value ChoiceChunk(std::string_view id, long long created,
                         std::string_view model, json::Value delta,
-                        const char* finish_reason = nullptr) {
+                        const char* finish_reason = nullptr,
+                        const json::Value* logprobs = nullptr) {
   json::Value chunk = BaseChunk(id, created, model);
   json::Value choices = json::Value::array();
   json::Value choice = json::Value::object();
   choice["index"] = 0;
   choice["delta"] = std::move(delta);
+  if (logprobs)
+    choice["logprobs"] = *logprobs;
   if (finish_reason == nullptr) {
     choice["finish_reason"] = json::Value();
   } else {
@@ -2369,7 +2448,8 @@ json::Value ChoiceChunk(std::string_view id, long long created,
 class StreamingTextFilter {
 public:
   using EmitCallback =
-      std::function<bool(std::string_view piece, bool is_reasoning)>;
+      std::function<bool(std::string_view piece, bool is_reasoning,
+                         std::span<const TextSourceSpan> source)>;
 
   StreamingTextFilter(
       TextGenerationBackend::InitialOutputState initial_output_state,
@@ -2522,7 +2602,7 @@ public:
             recognize_tools_
                 ? ContentBefore(raw_, offset, found, closers_, quotes_, tools_)
                 : std::string_view(pending_).substr(0, marker);
-        if (!prose.empty() && !Emit(prose, false)) {
+        if (!prose.empty() && !Emit(prose, false, prose.data() - raw_.data())) {
           return false;
         }
         hidden_ = pending_.substr(marker);
@@ -2540,7 +2620,7 @@ public:
                          pending_.size())
               : 0;
       const std::size_t ready = pending_.size() - held;
-      if (ready > 0 && !Emit(pending_.substr(0, ready), false)) {
+      if (ready > 0 && !Emit(pending_.substr(0, ready), false, offset)) {
         return false;
       }
       pending_.erase(0, ready);
@@ -2551,19 +2631,25 @@ public:
   }
 
   bool Finish(bool hide_tool_markup, std::string_view content = {},
-              std::string_view reasoning = {}) {
+              std::string_view reasoning = {},
+              std::span<const TextSourceSpan> content_spans = {}) {
+    const auto emit_content = [&](std::size_t offset) {
+      std::vector<TextSourceSpan> spans;
+      AppendTextSpans(spans, content_spans, offset, content.size() - offset);
+      return EmitMapped(content.substr(offset), false, spans);
+    };
     if (tool_mode_ && state_ == State::kThinking) {
       const auto tail = reasoning.substr(
           std::min(emitted_reasoning_bytes_, reasoning.size()));
       return (tail.empty() || Emit(tail, true)) &&
-             (content.empty() || Emit(content, false));
+             (content.empty() || emit_content(0));
     }
     if (tool_only_ && tool_mode_ && hide_tool_markup) {
       // The prefix was streamed before the first call. Preserve prose between
       // or after complete calls without exposing their markup or partial calls.
       const auto offset = std::min(emitted_content_bytes_, content.size());
       const auto tail = content.substr(offset);
-      return tail.empty() || Emit(tail, false);
+      return tail.empty() || emit_content(offset);
     }
     if (raw_content_ && !structured_started_ && hide_tool_markup) {
       pending_.clear();
@@ -2579,7 +2665,7 @@ public:
                                               closers_, quotes_, tools_)
                               : std::string_view(pending_);
         const bool is_reasoning = (state_ == State::kThinking);
-        const bool emitted = Emit(text, is_reasoning);
+        const bool emitted = Emit(text, is_reasoning, offset);
         pending_.clear();
         if (!emitted) {
           return false;
@@ -2588,7 +2674,7 @@ public:
       return true;
     }
     if (!hide_tool_markup && !hidden_.empty()) {
-      return Emit(hidden_, false);
+      return Emit(hidden_, false, raw_.size() - hidden_.size());
     }
     return true;
   }
@@ -2603,8 +2689,18 @@ public:
   }
 
 private:
-  bool Emit(std::string_view piece, bool reasoning) {
-    if (!emit_piece_(piece, reasoning))
+  bool Emit(std::string_view piece, bool reasoning,
+            std::size_t offset = std::string_view::npos) {
+    const TextSourceSpan span{offset, piece.size()};
+    return EmitMapped(piece, reasoning,
+                      offset == std::string_view::npos
+                          ? std::span<const TextSourceSpan>{}
+                          : std::span(&span, 1));
+  }
+
+  bool EmitMapped(std::string_view piece, bool reasoning,
+                  std::span<const TextSourceSpan> source) {
+    if (!emit_piece_(piece, reasoning, source))
       return false;
     if (reasoning)
       emitted_reasoning_bytes_ += piece.size();
@@ -2620,7 +2716,7 @@ private:
       if (start != std::string::npos) {
         const auto prose =
             ContentBefore(raw_, offset, found, closers_, quotes_, tools_);
-        if (!prose.empty() && !Emit(prose, false)) {
+        if (!prose.empty() && !Emit(prose, false, prose.data() - raw_.data())) {
           return false;
         }
         emitted_content_bytes_ += prose.size();
@@ -2638,7 +2734,7 @@ private:
       if (ready) {
         const auto text = ContentBefore(raw_, offset, offset + ready, closers_,
                                         quotes_, tools_);
-        if (!text.empty() && !Emit(text, false)) {
+        if (!text.empty() && !Emit(text, false, text.data() - raw_.data())) {
           return false;
         }
         emitted_content_bytes_ += text.size();
@@ -2658,8 +2754,9 @@ private:
         return true;
       }
     }
+    const auto offset = pending_offset();
     auto text = std::exchange(pending_, {});
-    return text.empty() || Emit(text, false);
+    return text.empty() || Emit(text, false, offset);
   }
   enum class State : std::uint8_t {
     kInitial,
@@ -2764,7 +2861,7 @@ ParsedGeneration StreamingGeneration(
     const StreamingTextFilter& filter, const ChatRequest& chat,
     TextGenerationBackend::InitialOutputState initial, ToolMarkerSet markers,
     ToolCloserSet closers, QuoteTracker& quotes, bool enforce_required,
-    bool partial = false) {
+    bool partial = false, bool track_text = false) {
   // Native grammars establish argument framing before the value completes.
   // Recovery from unconstrained/JSON fallback text still requires a full call.
   partial = partial && markers.size() <= 2;
@@ -2773,10 +2870,10 @@ ParsedGeneration StreamingGeneration(
                    filter.raw(), initial, chat.tools, chat.tool_choice,
                    enforce_required,
                    chat.constrained_tools && !chat.response_format, markers,
-                   closers, quotes, partial)
+                   closers, quotes, partial, track_text)
              : ParseGeneration(filter.raw(), initial, chat.tools,
                                chat.tool_choice, enforce_required, markers,
-                               closers, quotes, partial);
+                               closers, quotes, partial, track_text);
 }
 
 // Responses uses semantic SSE events, rather than Chat Completions chunks.
@@ -2830,7 +2927,13 @@ public:
     return Emit(std::move(event));
   }
 
-  bool Append(std::string_view text, bool reasoning) {
+  void SetLogprobs(std::optional<std::uint32_t> count) {
+    if (count)
+      response_["top_logprobs"] = static_cast<int>(*count);
+  }
+
+  bool Append(std::string_view text, bool reasoning,
+              json::Value logprobs = json::Value::array()) {
     if (text.empty())
       return true;
     if (!CloseTool("incomplete"))
@@ -2852,6 +2955,7 @@ public:
       if (!Emit(std::move(added)))
         return false;
       text_.clear();
+      logprobs_ = json::Value::array();
       auto part = PartEvent(reasoning ? "response.reasoning_summary_part.added"
                                       : "response.content_part.added");
       part["part"] = Part();
@@ -2862,8 +2966,11 @@ public:
     auto delta = PartEvent(reasoning ? "response.reasoning_summary_text.delta"
                                      : "response.output_text.delta");
     delta["delta"] = std::string(text);
-    if (!reasoning)
-      delta["logprobs"] = json::Value::array();
+    if (!reasoning) {
+      for (const auto& entry : logprobs.items())
+        logprobs_.push_back(entry);
+      delta["logprobs"] = ResponsesStreamLogprobs(logprobs);
+    }
     return Emit(std::move(delta));
   }
 
@@ -2974,7 +3081,7 @@ private:
     part["text"] = text_;
     if (!reasoning_) {
       part["annotations"] = json::Value::array();
-      part["logprobs"] = json::Value::array();
+      part["logprobs"] = logprobs_;
     }
     return part;
   }
@@ -2986,7 +3093,7 @@ private:
                                      : "response.output_text.done");
     done["text"] = text_;
     if (!reasoning_)
-      done["logprobs"] = json::Value::array();
+      done["logprobs"] = ResponsesStreamLogprobs(logprobs_);
     if (!Emit(std::move(done)))
       return false;
     auto part = Part();
@@ -3031,6 +3138,7 @@ private:
   json::Value tool_;
   std::string tool_arguments_;
   std::string text_;
+  json::Value logprobs_ = json::Value::array();
   std::size_t sequence_{0};
   std::size_t output_index_{0};
   bool active_{false};
@@ -3172,6 +3280,7 @@ HttpResponse NonStreamingResponse(
   const auto format = generation->ToolFormat();
   const auto markers = ToolMarkers(format);
   const auto closers = ToolClosers(format);
+  auto content_logprobs = json::Value::array();
   const auto parse = [&](const TextGenerationBackend::Result& round,
                          const ChatRequest& chat,
                          TextGenerationBackend::InitialOutputState state) {
@@ -3180,13 +3289,29 @@ HttpResponse NonStreamingResponse(
     QuoteTracker quotes;
     const bool stopped =
         round.finish_reason == TextGenerationBackend::FinishReason::kStop;
-    return chat.response_format || chat.constrained_tools
-               ? ParseStructuredGeneration(
-                     decoded, state, chat.tools, chat.tool_choice, stopped,
-                     chat.constrained_tools && !chat.response_format, markers,
-                     closers, quotes)
-               : ParseGeneration(decoded, state, chat.tools, chat.tool_choice,
-                                 stopped, markers, closers, quotes);
+    auto parsed =
+        chat.response_format || chat.constrained_tools
+            ? ParseStructuredGeneration(
+                  decoded, state, chat.tools, chat.tool_choice, stopped,
+                  chat.constrained_tools && !chat.response_format, markers,
+                  closers, quotes, false, request.sampling.logprobs.has_value())
+            : ParseGeneration(decoded, state, chat.tools, chat.tool_choice,
+                              stopped, markers, closers, quotes, false,
+                              request.sampling.logprobs.has_value());
+    if (request.sampling.logprobs) {
+      VisibleLogprobs probabilities(*request.sampling.logprobs);
+      std::string_view remaining(round.text);
+      for (const auto& token : round.logprobs) {
+        const auto piece = remaining.substr(0, token.source_bytes);
+        probabilities.Push({piece, &token});
+        remaining.remove_prefix(piece.size());
+      }
+      probabilities.Push(remaining, true);
+      auto visible = probabilities.Take(parsed.text_spans);
+      for (const auto& entry : visible.items())
+        content_logprobs.push_back(entry);
+    }
+    return parsed;
   };
   ParsedGeneration generated =
       parse(result, request.chat, initial_output_state);
@@ -3237,6 +3362,8 @@ HttpResponse NonStreamingResponse(
   if (!generated.tool_calls.empty()) {
     message["tool_calls"] = ToolCallsJson(generated.tool_calls);
   }
+  if (request.sampling.logprobs)
+    choice["logprobs"]["content"] = std::move(content_logprobs);
   choice["message"] = std::move(message);
   choice["finish_reason"] = FinishReason(result, !generated.tool_calls.empty());
   choices.push_back(std::move(choice));
@@ -3308,10 +3435,14 @@ HttpResponse StreamingResponse(
               return;
             }
             for (;;) {
+              std::optional<VisibleLogprobs> probabilities;
+              if (request.sampling.logprobs)
+                probabilities.emplace(*request.sampling.logprobs);
               QuoteTracker quotes;
               StreamingTextFilter filter(
                   round_state,
-                  [&](std::string_view text, bool is_reasoning) {
+                  [&](std::string_view text, bool is_reasoning,
+                      std::span<const TextSourceSpan> source) {
                     if (text.empty()) {
                       return true;
                     }
@@ -3321,8 +3452,12 @@ HttpResponse StreamingResponse(
                     } else {
                       delta["content"] = std::string(text);
                     }
-                    connected = writer(
-                        Sse(ChoiceChunk(id, created, model, std::move(delta))));
+                    json::Value scores;
+                    if (probabilities && !is_reasoning)
+                      scores["content"] = probabilities->Take(source);
+                    connected = writer(Sse(ChoiceChunk(
+                        id, created, model, std::move(delta), nullptr,
+                        scores.is_null() ? nullptr : &scores)));
                     return connected;
                   },
                   request.chat.response_format != nullptr,
@@ -3366,8 +3501,10 @@ HttpResponse StreamingResponse(
 
               try {
                 auto result = active_generation->Wait(
-                    [&](std::string_view piece) {
-                      if (!begin() || !filter.Push(piece))
+                    [&](const TokenPiece& piece) {
+                      if (probabilities)
+                        probabilities->Push(piece);
+                      if (!begin() || !filter.Push(piece.text))
                         return false;
                       return !filter.in_tools() || markers.size() > 2 ||
                              tools.Update(StreamingGeneration(
@@ -3392,6 +3529,8 @@ HttpResponse StreamingResponse(
                 }
                 if (!begin())
                   return;
+                if (probabilities)
+                  probabilities->Push("", true);
                 if (!filter.Push({}, true))
                   return;
 
@@ -3498,9 +3637,10 @@ constexpr std::size_t kJevPreMaxPromptBytes = 512;
 std::optional<HttpResponse> TryJevPreRoute(const ParsedChatRequest& parsed,
                                            TextGenerationBackend& backend) {
   const auto& chat = parsed.chat;
-  if (!chat.tools.empty() || chat.response_format != nullptr ||
-      chat.constrained_tools || !chat.forced_tool_name.empty() ||
-      !chat.stop_sequences.empty() || chat.return_progress) {
+  if (parsed.sampling.logprobs || !chat.tools.empty() ||
+      chat.response_format != nullptr || chat.constrained_tools ||
+      !chat.forced_tool_name.empty() || !chat.stop_sequences.empty() ||
+      chat.return_progress) {
     return std::nullopt;
   }
   if (chat.messages.size() != 1)
@@ -4200,17 +4340,25 @@ HttpResponse CreateCompatibilityResponse(
     const ChatRequest& chat, std::size_t max_tokens,
     const sampling::SamplingConfig& sampling, bool stream) {
   const auto initial = backend.initial_output_state(chat);
+  const bool observe =
+      std::is_same_v<Output, ResponsesOutput> && sampling.logprobs.has_value();
   auto generation = backend.start_chat(chat, max_tokens, sampling,
-                                       request.is_cancelled, stream);
+                                       request.is_cancelled, stream || observe);
   const auto format = generation->ToolFormat();
   const auto markers = ToolMarkers(format);
   const auto closers = ToolClosers(format);
   auto stream_log = std::make_shared<HttpResponse::StreamLog>();
   auto timing = std::make_shared<std::string>();
   const auto run = [generation, initial, chat, markers, closers,
-                    model = backend.model_id(), stream_log,
+                    model = backend.model_id(), stream_log, observe,
+                    count = sampling.logprobs,
                     timing](const HttpResponse::BodyWriter& writer) {
     Output output(model, writer, chat);
+    std::optional<VisibleLogprobs> probabilities;
+    if (observe)
+      probabilities.emplace(*count);
+    if constexpr (std::is_same_v<Output, ResponsesOutput>)
+      output.SetLogprobs(count);
     bool started = false;
     const auto begin = [&] {
       if (started)
@@ -4226,8 +4374,18 @@ HttpResponse CreateCompatibilityResponse(
     QuoteTracker quotes;
     StreamingTextFilter filter(
         initial,
-        [&](std::string_view piece, bool reasoning) {
-          if (output.Append(piece, reasoning))
+        [&](std::string_view piece, bool reasoning,
+            std::span<const TextSourceSpan> source) {
+          bool connected;
+          if constexpr (std::is_same_v<Output, ResponsesOutput>) {
+            connected = output.Append(piece, reasoning,
+                                      probabilities && !reasoning
+                                          ? probabilities->Take(source)
+                                          : json::Value::array());
+          } else {
+            connected = output.Append(piece, reasoning);
+          }
+          if (connected)
             return true;
           generation->Cancel();
           return false;
@@ -4252,18 +4410,21 @@ HttpResponse CreateCompatibilityResponse(
             };
       }
       const auto result =
-          writer ? generation->Wait(
-                       [&](std::string_view piece) {
-                         if (!begin() || !filter.Push(piece))
-                           return false;
-                         return !filter.in_tools() || markers.size() > 2 ||
-                                tools.Update(StreamingGeneration(
-                                                 filter, chat, initial, markers,
-                                                 closers, quotes, false, true)
-                                                 .tool_calls);
-                       },
-                       on_progress, begin)
-                 : generation->Wait();
+          (writer || observe)
+              ? generation->Wait(
+                    [&](const TokenPiece& piece) {
+                      if (probabilities)
+                        probabilities->Push(piece);
+                      if (!begin() || !filter.Push(piece.text))
+                        return false;
+                      return !filter.in_tools() || markers.size() > 2 ||
+                             tools.Update(StreamingGeneration(
+                                              filter, chat, initial, markers,
+                                              closers, quotes, false, true)
+                                              .tool_calls);
+                    },
+                    on_progress, begin)
+              : generation->Wait();
       stream_log->details = GenerationLogDetails(result);
       RecordServerMetrics(result);
       if (!writer) {
@@ -4278,22 +4439,25 @@ HttpResponse CreateCompatibilityResponse(
         return json::Value();
       if (!begin())
         return json::Value();
-      if (!writer)
+      if (!writer && !observe)
         filter.Push(result.text);
+      if (probabilities)
+        probabilities->Push(TokenPiece(""), true);
       if (!filter.Push({}, true)) {
         generation->Cancel();
         return json::Value();
       }
       const bool interrupted =
           result.finish_reason != TextGenerationBackend::FinishReason::kStop;
-      const auto generated = StreamingGeneration(filter, chat, initial, markers,
-                                                 closers, quotes, !interrupted);
+      const auto generated =
+          StreamingGeneration(filter, chat, initial, markers, closers, quotes,
+                              !interrupted, false, observe);
       if (!tools.Finish(generated.tool_calls, interrupted)) {
         generation->Cancel();
         return json::Value();
       }
       if (!filter.Finish(generated.hide_tool_markup, generated.text,
-                         generated.reasoning_content)) {
+                         generated.reasoning_content, generated.text_spans)) {
         generation->Cancel();
         return json::Value();
       }
