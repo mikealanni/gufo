@@ -29,6 +29,8 @@ void ReleaseCommittedPages(void* base, std::size_t) noexcept {
   }
 }
 
+void DropFilePageCache(const char*) noexcept {}
+
 void* AllocateHugePageBuffer(std::size_t) noexcept {
   return nullptr;
 }

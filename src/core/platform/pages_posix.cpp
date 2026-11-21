@@ -1,3 +1,4 @@
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -150,6 +151,16 @@ void VisitMappedChunks(
   if (const auto error = failure.load(); error != 0)
     throw std::system_error(error, std::generic_category(),
                             "cannot read mapped Qwen weights");
+}
+
+void DropFilePageCache(const char* path) noexcept {
+  if (path == nullptr || path[0] == '\0')
+    return;
+  const int fd = ::open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0)
+    return;
+  (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+  ::close(fd);
 }
 
 void* AllocateHugePageBuffer(std::size_t bytes) noexcept {
