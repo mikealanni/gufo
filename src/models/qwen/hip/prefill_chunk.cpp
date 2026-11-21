@@ -1,5 +1,6 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 

@@ -22,6 +22,13 @@ struct SharedTempMapping {
 /// runtime stays with the caller.
 void* CommitZeroedPages(std::size_t bytes) noexcept;
 
+/// Reserves `bytes` of anonymous memory backed by transparent huge pages where
+/// the kernel grants them and touches it, like the clone of a mapped weight
+/// region. GPU reads of registered memory are markedly faster on huge pages
+/// than on 4 KiB ones. Returns nullptr on failure or when unsupported; pair
+/// with ReleaseCommittedPages().
+void* AllocateHugePageBuffer(std::size_t bytes) noexcept;
+
 /// Releases memory obtained from CommitZeroedPages() or
 /// CloneMappedWeightsToAnonymousPages(). `bytes` must match the commit call.
 void ReleaseCommittedPages(void* base, std::size_t bytes) noexcept;

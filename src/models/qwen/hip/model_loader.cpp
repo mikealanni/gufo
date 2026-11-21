@@ -222,6 +222,7 @@ void ReleaseWeightRegions(std::vector<QwenGpuWeightRegion>& regions) noexcept {
     std::span<models::QwenTensorRef* const> tensors,
     std::vector<QwenGpuWeightRegion>& weight_regions, std::string* error_msg) {
   constexpr std::size_t kAlign = 256;
+  constexpr std::size_t kHugePage = 2ULL << 20;
   std::vector<std::size_t> offsets(tensors.size(), 0);
   std::size_t total = 0;
   for (std::size_t i = 0; i < tensors.size(); ++i) {
@@ -230,7 +231,10 @@ void ReleaseWeightRegions(std::vector<QwenGpuWeightRegion>& regions) noexcept {
   }
   if (total == 0)
     return true;
-  void* host_copy = platform::CommitZeroedPages(total);
+  total = (total + kHugePage - 1) / kHugePage * kHugePage;
+  void* host_copy = platform::AllocateHugePageBuffer(total);
+  if (host_copy == nullptr)
+    host_copy = platform::CommitZeroedPages(total);
   if (host_copy == nullptr) {
     if (error_msg != nullptr)
       *error_msg = "Failed to allocate packed GGUF tensors";
@@ -425,8 +429,8 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
   std::unique_ptr<Iu4Weights> iu4;
   if (const char* path = std::getenv("GUFO_IU4_ARTIFACT");
       path != nullptr && std::getenv("GUFO_IU4_KEEP_GGUF") == nullptr &&
-      !weights_opt->config.IsMoe() &&
-      weights_opt->config.num_layers == 64 && !weights_opt->mtp.has_value()) {
+      !weights_opt->config.IsMoe() && weights_opt->config.num_layers == 64 &&
+      !weights_opt->mtp.has_value()) {
     auto loaded = std::make_unique<Iu4Weights>();
     std::string iu4_error;
     if (loaded->Load(path, weights_opt->config.num_layers, &iu4_error)) {

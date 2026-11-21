@@ -29,6 +29,10 @@ void ReleaseCommittedPages(void* base, std::size_t) noexcept {
   }
 }
 
+void* AllocateHugePageBuffer(std::size_t) noexcept {
+  return nullptr;
+}
+
 void* CloneMappedWeightsToAnonymousPages(const void*, std::size_t) {
   return nullptr;
 }

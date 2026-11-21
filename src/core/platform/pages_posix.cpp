@@ -152,6 +152,17 @@ void VisitMappedChunks(
                             "cannot read mapped Qwen weights");
 }
 
+void* AllocateHugePageBuffer(std::size_t bytes) noexcept {
+  if (bytes == 0)
+    return nullptr;
+  void* base = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (base == MAP_FAILED)
+    return nullptr;
+  (void)madvise(base, bytes, MADV_HUGEPAGE);
+  return base;
+}
+
 void* CloneMappedWeightsToAnonymousPages(const void* source_data,
                                          std::size_t bytes) {
   if (source_data == nullptr || bytes == 0) {
