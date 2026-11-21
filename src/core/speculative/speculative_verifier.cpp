@@ -875,6 +875,10 @@ std::vector<SpeculativeVerifier::StepResult> SpeculativeVerifier::VerifyBatch(
     }
     auto& step =
         prepared.emplace_back(verifier.PrepareStep(request, true, true));
+    // Sessions verified together keep to eight rows each.
+    if (requests.size() > 1)
+      step.max_draft_tokens = std::min(
+          step.max_draft_tokens, DFlashLengthController::kMaxCohortDraftTokens);
     prepared_indices.push_back(index);
     if (step.max_draft_tokens > 0) {
       auto& sampler = step.sampled ? *step.working_sampler : request.sampler;
@@ -924,6 +928,8 @@ std::vector<SpeculativeVerifier::StepResult> SpeculativeVerifier::VerifyBatch(
       // Small surviving groups cannot amortize another target pass.
       if (indices.size() < 4)
         step.chunk_limit = std::numeric_limits<std::size_t>::max();
+      if (indices.size() > 1)
+        step.chunk_limit = std::min<std::size_t>(step.chunk_limit, 8);
       const auto index = prepared_indices[prepared_index];
       const auto tokens = std::span<const tokenization::TokenId>(step.inputs)
                               .subspan(step.verified_rows);
