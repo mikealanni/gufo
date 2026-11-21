@@ -22,6 +22,28 @@ __device__ __forceinline__ void ChunkDot(const uint4 w,
                                          std::uint32_t tokens,
                                          float (&acc)[T]) {
   const std::uint32_t words[4] = {w.x, w.y, w.z, w.w};
+  if constexpr (T == 1) {
+    // Single token: no per-token index math, one serial accumulation chain.
+    float a0 = acc[0];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float4 a = *reinterpret_cast<const float4*>(x + 8 * j);
+      const float4 b = *reinterpret_cast<const float4*>(x + 8 * j + 4);
+      const std::uint32_t v = words[j];
+      a0 += static_cast<float>(static_cast<int>(v << 28) >> 28) * a.x;
+      a0 += static_cast<float>(static_cast<int>(v << 24) >> 28) * a.y;
+      a0 += static_cast<float>(static_cast<int>(v << 20) >> 28) * a.z;
+      a0 += static_cast<float>(static_cast<int>(v << 16) >> 28) * a.w;
+      a0 += static_cast<float>(static_cast<int>(v << 12) >> 28) * b.x;
+      a0 += static_cast<float>(static_cast<int>(v << 8) >> 28) * b.y;
+      a0 += static_cast<float>(static_cast<int>(v << 4) >> 28) * b.z;
+      a0 += static_cast<float>(static_cast<int>(v) >> 28) * b.w;
+    }
+    acc[0] = a0;
+    (void)token_stride;
+    (void)tokens;
+    return;
+  }
 #pragma unroll
   for (int j = 0; j < 4; ++j) {
     const std::uint32_t v = words[j];
