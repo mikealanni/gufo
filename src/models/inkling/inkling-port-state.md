@@ -38,6 +38,22 @@ looped 3x -> 5.4B effective active; 24 physical layers, middle core looped).
 - Weights: download `Inkling-2-Mini-UD-Q4_K_XL.gguf` (the Q4_K_XL the user picked;
   imatrix-calibrated, mean KLD vs UD-Q8_K_XL 0.0107, same top token 98.0%).
 
+## Status snapshot (port resumed)
+
+- CPU reference (`src/models/inkling/reference.cpp`) is mid-write: helpers,
+  `Loaded` (dequant/matvec), `Mix` exist; `RunLayer` / `Evaluate` still pending;
+  `DeqNvfp4Row` needs the row count from tensor `dimensions` (no `rowspan_of`).
+- Upstream oracle (`/tmp/opencode/llamacpp`, build `/tmp/opencode/lcmake`) patched:
+  `llama_model_inkling2_loop::load_arch_hparams` now derives
+  `n_phys = hparams.n_layer() - (n_passes - 1) * (core_end - core_start)`, so
+  `block_count = 48` is read as loop slots (n_phys = 24 physical).
+- GGUF re-emitted with `general.architecture = "inkling2_loop"` and
+  `inkling2.*` -> `inkling2_loop.*` keys:
+  `/tmp/opencode/Inkling-2-Mini-UD-Q4_K_XL-looparch.gguf` (17 GB).
+  Expect: `llama cli --model .../Inkling-2-Mini-UD-Q4_K_XL-looparch.gguf -n 2 -f ...`
+  should now load as the looped Inkling-2 model.
+- Gufo `core::GgmlType` lacks `kNVFP4 = 40` (add enum + ToString) for expert tensors.
+
 ## Open questions / next steps (skill default order)
 
 1. CPU reference (`src/models/inkling/reference.cpp`) + config parser.
