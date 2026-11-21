@@ -1093,6 +1093,10 @@ public:
                 .batched_multi_token_decode_max_width =
                     speculative_enabled ? MaximumDecodeBatchWidth() : 0,
                 .prefix_reuse = true,
+                // Checkpoints on whole NPU-paired calls keep every prefill
+                // pass paired instead of ending each segment on a lone chunk.
+                .prefill_grid_tokens =
+                    model_->NpuFfn() != nullptr ? 8192u : 2048u,
             },
         .persistence = persistence_,
     };
