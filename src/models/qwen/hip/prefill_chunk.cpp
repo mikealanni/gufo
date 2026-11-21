@@ -139,12 +139,15 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
   const auto attention_workspace =
       arena_.GetScratchView(arena_.GetMaxBatch()).ffn;
   const std::size_t target_layer_count = arena_.GetTargetLayerCapture().size();
+  // A paired chunk keeps its own capture buffer: both are in flight at once.
+  PromptHiddenBuffer& capture_buffer =
+      bank == 1 ? h_prompt_hidden_spare_ : h_prompt_hidden_;
   if (capture_prompt_hidden_ && prompt_hidden_sink_) {
-    h_prompt_hidden_.Clear();
+    capture_buffer.Clear();
   }
-  const std::size_t prompt_capture_offset = h_prompt_hidden_.Size();
+  const std::size_t prompt_capture_offset = capture_buffer.Size();
   if (capture_prompt_hidden_ && target_layer_count > 0) {
-    h_prompt_hidden_.Resize(prompt_capture_offset +
+    capture_buffer.Resize(prompt_capture_offset +
                             batch_size * target_layer_count * hidden_size);
   }
 
@@ -1161,7 +1164,7 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
     if (capture_prompt_hidden_) {
       if (const auto tap_index = arena_.GetTargetLayerCaptureIndex(l);
           tap_index.has_value()) {
-        float* destination = h_prompt_hidden_.Data() + prompt_capture_offset +
+        float* destination = capture_buffer.Data() + prompt_capture_offset +
                              (*tap_index * hidden_size);
         HIP_CHECK(hipMemcpy2DAsync(
             destination, target_layer_count * hidden_size * sizeof(float),
@@ -1179,17 +1182,17 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
 
   if (capture_prompt_hidden_) {
     if (target_layer_count == 0) {
-      const std::size_t old_size = h_prompt_hidden_.Size();
+      const std::size_t old_size = capture_buffer.Size();
       const std::size_t chunk_elements = batch_size * hidden_size;
-      h_prompt_hidden_.Resize(old_size + chunk_elements);
-      HIP_CHECK(hipMemcpyAsync(h_prompt_hidden_.Data() + old_size,
+      capture_buffer.Resize(old_size + chunk_elements);
+      HIP_CHECK(hipMemcpyAsync(capture_buffer.Data() + old_size,
                                scratch.decode.hidden.data(),
                                chunk_elements * sizeof(float),
                                hipMemcpyDeviceToHost, arena_.stream));
     }
     HIP_CHECK(hipStreamSynchronize(arena_.stream));
     if (prompt_hidden_sink_) {
-      prompt_hidden_sink_(h_prompt_hidden_.View(), prompt_sink_row_,
+      prompt_hidden_sink_(capture_buffer.View(), prompt_sink_row_,
                           batch_size);
       prompt_sink_row_ += batch_size;
     }

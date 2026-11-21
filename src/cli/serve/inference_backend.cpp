@@ -1258,7 +1258,7 @@ public:
       throw std::logic_error("Qwen prefill has no remaining input");
     }
     max_input_tokens = std::min<std::size_t>(
-        max_input_tokens, qwen.executor().GetMaxPromptBatch());
+        max_input_tokens, qwen.executor().GetMaxPromptCall());
     if (max_input_tokens != 0 && offset != 0 &&
         qwen.ResumeGeneratedToken(prompt[offset],
                                   offset + 1 == prompt.size())) {

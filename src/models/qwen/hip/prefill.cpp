@@ -1,6 +1,7 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <thread>
@@ -38,6 +39,16 @@ void QwenGpuExecutor::PrefillLayerCheckpoint(std::uint32_t layer) {
   HIP_CHECK(status);
 }
 
+std::size_t QwenGpuExecutor::GetMaxPromptCall() {
+  const std::size_t batch = arena_.GetMaxBatch();
+  const char* lockstep_env = std::getenv("GUFO_QWEN_LOCKSTEP");
+  QwenNpuFfn* const npu_ffn = model_->NpuFfn();
+  const bool pairs = npu_ffn != nullptr && npu_ffn->Tokens() == batch &&
+                     arena_.SecondBank() != nullptr &&
+                     (lockstep_env == nullptr || lockstep_env[0] != '0');
+  return pairs ? 2 * batch : batch;
+}
+
 tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
     std::span<const tokenization::TokenId> prompt_tokens,
     std::uint32_t start_pos, bool compute_logits) {
@@ -57,6 +68,9 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
     if (prompt_hidden_sink_) {
       h_prompt_hidden_.Reserve(std::size_t{GetMaxPromptBatch()} * row,
                                std::size_t{GetMaxPromptBatch()} * row);
+      h_prompt_hidden_spare_.Clear();
+      h_prompt_hidden_spare_.Reserve(std::size_t{GetMaxPromptBatch()} * row,
+                                     std::size_t{GetMaxPromptBatch()} * row);
     } else {
       // Pinned up to one prompt batch (the serve path's largest call); a
       // longer prompt from a non-serve caller captures into pageable memory.
@@ -77,7 +91,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
   const char* lockstep_env = std::getenv("GUFO_QWEN_LOCKSTEP");
   QwenNpuFfn* const npu_ffn = model_->NpuFfn();
   const bool lockstep = npu_ffn != nullptr && npu_ffn->Tokens() == max_batch &&
-                        !capture_prompt_hidden_ &&
+                        (!capture_prompt_hidden_ || prompt_hidden_sink_) &&
                         vision_input_.rope() == nullptr &&
                         (lockstep_env == nullptr || lockstep_env[0] != '0');
 

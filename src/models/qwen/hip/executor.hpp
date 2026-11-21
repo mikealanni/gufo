@@ -661,6 +661,9 @@ public:
   /// Copies the final-layer hidden state from the most recent forward pass.
   [[nodiscard]] std::span<const float> CopyLastHidden();
 
+  /// Tokens one prompt call may carry: two chunks when the NPU lockstep pair
+  /// can overlap them, else one.
+  [[nodiscard]] std::size_t GetMaxPromptCall();
   [[nodiscard]] std::uint32_t GetMaxPromptBatch() const noexcept {
     return arena_.GetMaxBatch();
   }
@@ -758,6 +761,7 @@ private:
   models::qwen::vision::DeviceInput vision_input_;
   std::vector<float> h_logits_;
   PromptHiddenBuffer h_prompt_hidden_;
+  PromptHiddenBuffer h_prompt_hidden_spare_;
   std::vector<float> h_verification_hidden_;
   std::vector<float> h_verification_logits_;
   std::vector<float> h_last_hidden_;
