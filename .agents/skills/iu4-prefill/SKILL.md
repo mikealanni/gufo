@@ -219,6 +219,19 @@ Lessons (each cost a wrong number):
   artifact it measures the weight difference too: base 0.008 rmse / cosine
   0.99999, int4 0.515 / 0.989, int4 + NPU 0.627 / 0.986, top-1 matches.
 
+## Long context (16k-256k): what moved 128k from 608 to ~1000 tok/s
+
+Numbers (27B, int4 + NPU, bench mode on, single runs; dense attention / sparse attention on packed K,V):
+16k 1219/1203, 32k 1056/1103, 64k 840/1054, 128k 608/1019, 256k 389/955.
+
+- Dense fp16 WMMA attention is at ~27 TFLOPS, ~60% of the real-data ceiling, and grows with depth (25% of time at 32k). More NPU FFN slices, per-layer slice splits and extra qkv/down slices at depth all lowered speed (the NPU is already ~70% busy at 32k).
+- Lockstep pairing (two banks, pairs from 5000 tokens) is worth +15% at 16k and +13% at 32k; keep it on.
+- The sparse kernel (GUFO_QWEN_SPARSE_ATTN, sink 2 / local 32 / top 256 blocks of 64, min_context 8192) was at ~12 TFLOPS only because it read strided K and unpacked V. The fix that mattered: reuse the dense path's PackAttentionHeads (head-major K, WMMA-ordered V, FFN scratch as workspace, head groups when it does not fit, `list_kv_base` for the block list of a group) and instantiate SparseWmmaCausalAttention with kHeadMajor=true. Attention 157 -> 67 ms per layer-chunk at 64k; pack plus selection are ~2% at 128k. Selected 64-key blocks are 16-aligned so the packed tiles gather directly.
+- After the fix at 128k the int4 GEMMs are ~51% and sparse attention ~25%: depth is nearly free, further gains need GEMM or NPU share, not attention.
+- NPU attention was gated and deferred: 27B is 24 q / 4 kv heads, head_dim 256 (the wp10 attnp kernel is 16/4/128, so a new kernel), probe ~3.2 TFLOPS vs GPU 27, so an exact KV-group split gives only ~+2.5% at 32k and +6% at 128k.
+- Measuring: never run two GPU jobs at once (a stray process gave 759 and 623 at 128k/256k; clean reruns gave 1019 and 955). `prof.py show --passes 250` splits the warm-up and timed prefill; the bench runs the full prefill twice.
+- Sparse is approximate: keep it opt-in until the NLL mean over many samples and top-1 agreement at 32k+ pass (see the integration plan for the result).
+
 ## Decode and speculation
 
 Decode is unchanged: it reads the base GGUF and the existing decode kernels.
