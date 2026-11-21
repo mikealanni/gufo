@@ -81,7 +81,13 @@ void LaunchIu4Gemv(const void* tiles, const std::uint16_t* weight_scales,
                    const float* x, float* out, bool accumulate,
                    std::size_t padded_rows, std::size_t valid_rows,
                    std::size_t k, hipStream_t stream, std::size_t tokens = 1,
-                   void* x16_scratch = nullptr);
+                   void* x16_scratch = nullptr, bool x16_ready = false);
+
+// Converts up to 16 rotated activation rows to the fp16 layout the matrix-core
+// GEMV reads, once for every projection that shares them; pass x16_ready to
+// LaunchIu4Gemv afterwards.
+void LaunchIu4PrepareX16(const float* x, void* x16, std::size_t tokens,
+                         std::size_t k, hipStream_t stream);
 
 // NPU glue for the SwiGLU product when the NPU also takes down columns: the
 // leading `columns` columns exist only as FP16 (from the NPU), the rest only as

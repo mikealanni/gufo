@@ -62,6 +62,8 @@ struct Iu4Ctx {
   const Iu4Weights* w{nullptr};
   float* x{nullptr};
   void* x16{nullptr};
+  // The fp16 copy of x for the matrix-core GEMV is current.
+  mutable bool x16_ready{false};
 };
 
 constexpr std::size_t kIu4MaxRows = 64;
@@ -98,17 +100,25 @@ Iu4Ctx MakeIu4Ctx(const QwenGpuModel& model, const core::ModelConfig& config,
   return ctx;
 }
 
+void Iu4PrepareX16(const Iu4Ctx& c, std::size_t rows, std::size_t k,
+                   hipStream_t stream) {
+  c.x16_ready = rows > 4 && rows <= 16;
+  if (c.x16_ready)
+    LaunchIu4PrepareX16(c.x, c.x16, rows, k, stream);
+}
+
 void Iu4Rotate(const Iu4Ctx& c, const float* in, const float* awq,
                std::size_t k, bool remap, std::size_t rows,
                hipStream_t stream) {
   LaunchIu4Quantize(in, awq, c.w->signs(), remap, rows, rows, k, nullptr,
                     nullptr, stream, c.x);
+  Iu4PrepareX16(c, rows, k, stream);
 }
 
 void Iu4Proj(const Iu4Ctx& c, const Iu4Projection& p, float* out,
              std::size_t rows, hipStream_t stream) {
   LaunchIu4Gemv(p.tiles, p.scales, c.x, out, false, p.padded_rows, p.rows,
-                p.cols, stream, rows, c.x16);
+                p.cols, stream, rows, c.x16, c.x16_ready);
 }
 
 void Iu4Ffn(const Iu4Ctx& c, std::uint32_t layer,
@@ -124,6 +134,7 @@ void Iu4Ffn(const Iu4Ctx& c, std::uint32_t layer,
   LaunchIu4SwiGluQuantize(scratch.ffn.gate.data(), scratch.ffn.up.data(),
                           nullptr, nullptr, 0, down.awq, c.w->signs(), rows,
                           rows, down.cols, nullptr, nullptr, stream, c.x);
+  Iu4PrepareX16(c, rows, down.cols, stream);
   Iu4Proj(c, down, scratch.ffn.out.data(), rows, stream);
 }
 

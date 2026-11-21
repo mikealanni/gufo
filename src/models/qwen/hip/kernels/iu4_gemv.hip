@@ -272,19 +272,30 @@ void Launch(const void* tiles, const std::uint16_t* weight_scales,
 
 }  // namespace
 
+void LaunchIu4PrepareX16(const float* x, void* x16, std::size_t tokens,
+                         std::size_t k, hipStream_t stream) {
+  const std::size_t words = tokens * k / 8;
+  Iu4PrepareX16Kernel<<<static_cast<unsigned>((words + 255) / 256), 256, 0,
+                        stream>>>(x, static_cast<__half*>(x16), words);
+}
+
 void LaunchIu4Gemv(const void* tiles, const std::uint16_t* weight_scales,
                    const float* x, float* out, bool accumulate,
                    std::size_t padded_rows, std::size_t valid_rows,
-                   std::size_t k, hipStream_t stream, std::size_t tokens, void* x16) {
+                   std::size_t k, hipStream_t stream, std::size_t tokens,
+                   void* x16, bool x16_ready) {
   // Chunks of up to 16 tokens; each chunk reads the weights once.
   for (std::size_t first = 0; first < tokens; first += 16) {
     const std::size_t n = tokens - first < 16 ? tokens - first : 16;
     const float* xc = x + first * k;
     float* oc = out + first * valid_rows;
     if (n > 4 && x16 != nullptr) {
-      const std::size_t words = n * k / 8;
-      Iu4PrepareX16Kernel<<<static_cast<unsigned>((words + 255) / 256), 256, 0,
-                            stream>>>(xc, static_cast<__half*>(x16), words);
+      if (!(x16_ready && tokens <= 16)) {
+        const std::size_t words = n * k / 8;
+        Iu4PrepareX16Kernel<<<static_cast<unsigned>((words + 255) / 256), 256,
+                              0, stream>>>(xc, static_cast<__half*>(x16),
+                                           words);
+      }
       Iu4GemvWmmaKernel<<<dim3(static_cast<unsigned>((padded_rows / 16 + 3) /
                                                      4)),
                           256, 0, stream>>>(
