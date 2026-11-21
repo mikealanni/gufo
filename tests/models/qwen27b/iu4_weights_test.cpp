@@ -136,8 +136,9 @@ void CheckProjection(const std::uint8_t* base, std::size_t size,
   if (failures != 0)
     return;
   const std::size_t rows = p.rows, cols = p.cols, groups = cols / 128;
-  std::vector<std::uint8_t> tiles(rows * cols / 2);
-  std::vector<std::uint16_t> scales(rows * groups);
+  const std::size_t stored = p.padded_rows;  // layout rows (zero padded)
+  std::vector<std::uint8_t> tiles(stored * cols / 2);
+  std::vector<std::uint16_t> scales(stored * groups);
   CHECK(hipMemcpy(tiles.data(), p.tiles, tiles.size(), hipMemcpyDeviceToHost) ==
             hipSuccess,
         "copy tiles");
@@ -151,6 +152,9 @@ void CheckProjection(const std::uint8_t* base, std::size_t size,
     state ^= state << 17;
     return state;
   };
+  for (std::size_t row = rows; row < stored; row += 7)
+    for (std::size_t g = 0; g < groups; g += 5)
+      CHECK(scales[g * stored + row] == 0, "padding scale %zu %zu", row, g);
   std::size_t checked = 0;
   for (int s = 0; s < 4000; ++s) {
     const std::size_t row = next() % rows, g = next() % groups;
@@ -160,10 +164,10 @@ void CheckProjection(const std::uint8_t* base, std::size_t size,
         base + e.offset + (src_row * (cols / 256) + g / 2) * 136;
     const std::uint16_t sc_bits =
         *reinterpret_cast<const std::uint16_t*>(block + 4 * (g & 1));
-    CHECK(scales[g * rows + row] == sc_bits, "scale %zu %zu", row, g);
+    CHECK(scales[g * stored + row] == sc_bits, "scale %zu %zu", row, g);
     const std::uint8_t src = block[8 + 64 * (g & 1) + byte];
     const std::size_t q = byte / 16, within = byte % 16;
-    const std::size_t dst = (((g * (rows / 16) + row / 16) * 4 + q) * 256) +
+    const std::size_t dst = (((g * (stored / 16) + row / 16) * 4 + q) * 256) +
                             (row % 16) * 16 + within;
     const std::uint8_t got = tiles[dst];
     CHECK(got == (src ^ 0x88), "payload %zu %zu %zu: %02x vs %02x", row, g,

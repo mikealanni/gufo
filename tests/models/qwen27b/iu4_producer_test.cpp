@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -235,6 +236,157 @@ int main() {
     hipFree(dx);
     hipFree(dscale);
     hipFree(dtile);
+  }
+  // SwiGLU fused into the quantizer, with the leading columns from an FP16
+  // buffer (the NPU case) and without.
+  for (const std::size_t npu_cols : {std::size_t{0}, std::size_t{4096}}) {
+    const auto& p = weights.Find(0, gufo::hip::Iu4Role::kFfnDown);
+    const std::size_t K = p.cols, ge = K / 128;
+    std::vector<float> a(K), gate(kTokens * K), up(kTokens * K);
+    hipMemcpy(a.data(), p.awq, K * 4, hipMemcpyDeviceToHost);
+    for (auto& v : gate)
+      v = static_cast<float>((uniform() - 0.5) * 6.0);
+    for (auto& v : up)
+      v = static_cast<float>(uniform() * 2.0 - 1.0);
+    std::vector<unsigned short> half_bits(kTokens * K, 0);
+    std::vector<double> pre(kPadded * K, 0.0);
+    const auto to_half = [](float f) {
+      // round to nearest even through the device-independent bit trick
+      std::uint32_t x;
+      std::memcpy(&x, &f, 4);
+      const std::uint32_t sign = (x >> 16) & 0x8000u;
+      int exp = static_cast<int>((x >> 23) & 0xff) - 127 + 15;
+      std::uint32_t man = x & 0x7fffffu;
+      if (exp <= 0)
+        return static_cast<unsigned short>(sign);
+      if (exp >= 31)
+        return static_cast<unsigned short>(sign | 0x7bffu);
+      std::uint32_t h = (static_cast<std::uint32_t>(exp) << 10) | (man >> 13);
+      if ((man & 0x1fffu) > 0x1000u || ((man & 0x1fffu) == 0x1000u && (h & 1)))
+        ++h;
+      return static_cast<unsigned short>(sign | h);
+    };
+    const auto from_half = [](unsigned short h) {
+      const int exp = (h >> 10) & 31, man = h & 1023;
+      const float v =
+          exp == 0 ? std::ldexp(static_cast<float>(man), -24)
+                   : std::ldexp(static_cast<float>(man | 1024), exp - 25);
+      return (h & 0x8000) ? -v : v;
+    };
+    for (std::size_t t = 0; t < kTokens; ++t)
+      for (std::size_t k = 0; k < K; ++k) {
+        const double g = gate[t * K + k], u = up[t * K + k];
+        const double act = g / (1.0 + std::exp(-g)) * u;
+        double val = act;
+        if (k < npu_cols) {
+          half_bits[t * K + k] = to_half(static_cast<float>(act));
+          val = from_half(half_bits[t * K + k]);
+        }
+        pre[t * K + k] = val / a[k];
+      }
+    float *dg, *du, *dscale;
+    unsigned short* dh;
+    std::uint8_t* dtile;
+    const std::size_t tb = (kPadded / 16) * ge * 1024;
+    hipMalloc(&dg, gate.size() * 4);
+    hipMalloc(&du, up.size() * 4);
+    hipMalloc(&dh, half_bits.size() * 2);
+    hipMalloc(&dscale, ge * kPadded * 4);
+    hipMalloc(&dtile, tb);
+    hipMemcpy(dg, gate.data(), gate.size() * 4, hipMemcpyHostToDevice);
+    hipMemcpy(du, up.data(), up.size() * 4, hipMemcpyHostToDevice);
+    hipMemcpy(dh, half_bits.data(), half_bits.size() * 2,
+              hipMemcpyHostToDevice);
+    hipMemset(dtile, 0xAB, tb);
+    hipMemset(dscale, 0xFF, ge * kPadded * 4);
+    gufo::hip::LaunchIu4SwiGluQuantize(dg, du, dh, npu_cols, p.awq,
+                                       weights.signs(), kTokens, kPadded, K,
+                                       dtile, dscale, nullptr);
+    CHECK(hipDeviceSynchronize() == hipSuccess, "swiglu producer failed");
+    std::vector<std::uint8_t> ht(tb);
+    std::vector<float> hs(ge * kPadded);
+    hipMemcpy(ht.data(), dtile, tb, hipMemcpyDeviceToHost);
+    hipMemcpy(hs.data(), dscale, hs.size() * 4, hipMemcpyDeviceToHost);
+    CompareToHost(npu_cols ? "swiglu fused (npu cols)" : "swiglu fused", ht, hs,
+                  pre, signs, kTokens, kPadded, K);
+    hipFree(dg);
+    hipFree(du);
+    hipFree(dh);
+    hipFree(dscale);
+    hipFree(dtile);
+  }
+
+  // Gated DeltaNet epilogue fused into the out projection quantizer.
+  {
+    const auto& p = weights.Find(0, gufo::hip::Iu4Role::kSsmOut);
+    const std::size_t K = p.cols, ge = K / 128;
+    std::vector<float> a(K), raw(kTokens * K), z(kTokens * K), nw(128);
+    hipMemcpy(a.data(), p.awq, K * 4, hipMemcpyDeviceToHost);
+    for (auto& v : raw)
+      v = static_cast<float>(std::sqrt(-2 * std::log(uniform() + 1e-12)) *
+                             std::cos(6.283185307179586 * uniform()));
+    for (auto& v : z)
+      v = static_cast<float>((uniform() - 0.5) * 6.0);
+    for (auto& w : nw)
+      w = static_cast<float>(0.5 + uniform());
+    std::vector<double> pre(kPadded * K, 0.0);
+    for (std::size_t t = 0; t < kTokens; ++t)
+      for (std::size_t head = 0; head < K / 128; ++head) {
+        double ss = 0.0;
+        for (int i = 0; i < 128; ++i)
+          ss += static_cast<double>(raw[t * K + head * 128 + i]) *
+                raw[t * K + head * 128 + i];
+        const double inv = 1.0 / std::sqrt(ss / 128.0 + 1e-6);
+        // artifact head h reads engine head (h % 3) * 16 + h / 3
+        const std::size_t eng = (head % 3) * 16 + head / 3;
+        for (int i = 0; i < 128; ++i) {
+          const double zz = z[t * K + eng * 128 + i];
+          const double xx = raw[t * K + eng * 128 + i];
+          pre[t * K + head * 128 + i] = xx * inv * nw[i] *
+                                        (zz / (1.0 + std::exp(-zz))) /
+                                        a[head * 128 + i];
+        }
+      }
+    // The kernel normalizes each engine head, so recompute with the engine
+    // head's own statistics: inv must come from the head that is read.
+    for (std::size_t t = 0; t < kTokens; ++t)
+      for (std::size_t head = 0; head < K / 128; ++head) {
+        const std::size_t eng = (head % 3) * 16 + head / 3;
+        double ss = 0.0;
+        for (int i = 0; i < 128; ++i)
+          ss += static_cast<double>(raw[t * K + eng * 128 + i]) *
+                raw[t * K + eng * 128 + i];
+        const double inv = 1.0 / std::sqrt(ss / 128.0 + 1e-6);
+        for (int i = 0; i < 128; ++i) {
+          const double zz = z[t * K + eng * 128 + i];
+          pre[t * K + head * 128 + i] = raw[t * K + eng * 128 + i] * inv *
+                                        nw[i] * (zz / (1.0 + std::exp(-zz))) /
+                                        a[head * 128 + i];
+        }
+      }
+    float *dr, *dz, *dn, *dscale;
+    std::uint8_t* dtile;
+    const std::size_t tb = (kPadded / 16) * ge * 1024;
+    hipMalloc(&dr, raw.size() * 4);
+    hipMalloc(&dz, z.size() * 4);
+    hipMalloc(&dn, 128 * 4);
+    hipMalloc(&dscale, ge * kPadded * 4);
+    hipMalloc(&dtile, tb);
+    hipMemcpy(dr, raw.data(), raw.size() * 4, hipMemcpyHostToDevice);
+    hipMemcpy(dz, z.data(), z.size() * 4, hipMemcpyHostToDevice);
+    hipMemcpy(dn, nw.data(), 128 * 4, hipMemcpyHostToDevice);
+    hipMemset(dtile, 0xAB, tb);
+    hipMemset(dscale, 0xFF, ge * kPadded * 4);
+    gufo::hip::LaunchIu4PostNormGateQuantize(dr, dn, dz, p.awq, weights.signs(),
+                                             kTokens, kPadded, K, dtile, dscale,
+                                             nullptr);
+    CHECK(hipDeviceSynchronize() == hipSuccess, "post-norm producer failed");
+    std::vector<std::uint8_t> ht(tb);
+    std::vector<float> hs(ge * kPadded);
+    hipMemcpy(ht.data(), dtile, tb, hipMemcpyDeviceToHost);
+    hipMemcpy(hs.data(), dscale, hs.size() * 4, hipMemcpyDeviceToHost);
+    CompareToHost("post-norm gate fused", ht, hs, pre, signs, kTokens, kPadded,
+                  K);
   }
   if (failures != 0) {
     std::printf("%d failures\n", failures);

@@ -249,9 +249,12 @@ bool Iu4Weights::Load(const std::string& path, std::uint32_t layers,
 
     Iu4Projection p;
     p.rows = static_cast<std::uint32_t>(rows);
+    const std::size_t padded_rows = rows < 128 ? 128 : rows;
+    p.padded_rows = static_cast<std::uint32_t>(padded_rows);
     p.cols = static_cast<std::uint32_t>(cols);
-    const std::size_t tile_bytes = rows * cols / 2;
-    const std::size_t scale_bytes = rows * (cols / 128) * sizeof(std::uint16_t);
+    const std::size_t tile_bytes = padded_rows * cols / 2;
+    const std::size_t scale_bytes =
+        padded_rows * (cols / 128) * sizeof(std::uint16_t);
     if (hipMalloc(&p.tiles, tile_bytes) != hipSuccess ||
         hipMalloc(reinterpret_cast<void**>(&p.scales), scale_bytes) !=
             hipSuccess) {
@@ -260,8 +263,12 @@ bool Iu4Weights::Load(const std::string& path, std::uint32_t layers,
       return Fail(error, "device allocation failed for " + name);
     }
     device_bytes_ += tile_bytes + scale_bytes;
-    LaunchIu4RepackWeights(d_blocks, p.tiles, p.scales, d_bad, rows, cols,
-                           perm_start, perm_chunk, stream);
+    if (padded_rows != rows) {
+      (void)hipMemsetAsync(p.tiles, 0, tile_bytes, stream);
+      (void)hipMemsetAsync(p.scales, 0, scale_bytes, stream);
+    }
+    LaunchIu4RepackWeights(d_blocks, p.tiles, p.scales, d_bad, rows,
+                           padded_rows, cols, perm_start, perm_chunk, stream);
     if (!awq_name.empty()) {
       const auto ait = index.find(awq_name);
       if (ait == index.end() || ait->second.length != cols * 2 ||

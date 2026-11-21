@@ -207,15 +207,9 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
   }
   const auto iu4_gemm = [&](const Iu4Projection& p, float* output,
                             bool accumulate, std::size_t row_begin = 0) {
-    if (Iu4GemmSupported(p.rows, p.cols)) {
-      LaunchIu4Gemm(p.tiles, p.scales, iu4_tiles_[bank], iu4_scales_[bank],
-                    output, accumulate, p.rows, row_begin, batch_size,
-                    iu4_padded, p.cols, arena_.stream);
-    } else {
-      LaunchIu4GemmSmall(p.tiles, p.scales, iu4_tiles_[bank], iu4_scales_[bank],
-                         output, accumulate, p.rows, batch_size, iu4_padded,
-                         p.cols, arena_.stream);
-    }
+    LaunchIu4Gemm(p.tiles, p.scales, iu4_tiles_[bank], iu4_scales_[bank],
+                  output, accumulate, p.padded_rows, row_begin, batch_size,
+                  iu4_padded, p.cols, arena_.stream, p.rows, p.rows);
   };
   const auto iu4_quantize = [&](const float* x, const float* awq, std::size_t k,
                                 bool remap_gdn_heads) {
@@ -767,6 +761,13 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
                                       config.SsmValueSize()),
           arena_.d_ssm_kq_scales != nullptr &&
               arena_.d_ssm_alpha_beta != nullptr);
+      // The int4 quantizer of the out projection takes the raw recurrence
+      // output and applies the per-head norm and gate itself, unless the NPU
+      // takes ssm_out columns and needs the gated FP32 row.
+      const bool iu4_fused_post_norm =
+          iu4 && ssm_row_split &&
+          !(npu_ffn != nullptr && npu_ffn->Accepts(batch_size) &&
+            npu_ffn->SsmOutColumns(l) != 0);
       if (ssm_row_split) {
         LaunchBatchedSSMConvRecurrenceRowSplit(
             arena_.d_ssm_qkv, static_cast<const float*>(layer.ssm_conv1d.data),
@@ -782,7 +783,8 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
             config.ssm_state_size, config.SsmValueSize(), arena_.stream,
             arena_.GetRecurrentStateStorage(),
             ((half_prefill && !iu4) || npu_ssm) ? arena_.d_scratch_bf16
-                                                : nullptr);
+                                                : nullptr,
+            iu4_fused_post_norm);
       } else {
         LaunchBatchedSSMConvRecurrence(
             arena_.d_ssm_qkv, static_cast<const float*>(layer.ssm_conv1d.data),
@@ -817,9 +819,17 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
                                      ssm_inner_size, arena_.stream);
       }
       if (iu4) {
-        iu4_quantize(arena_.d_ssm_out,
-                     iu4_weights->Find(l, Iu4Role::kSsmOut).awq, ssm_inner_size,
-                     true);
+        if (iu4_fused_post_norm) {
+          LaunchIu4PostNormGateQuantize(
+              arena_.d_ssm_out, static_cast<const float*>(layer.ssm_norm.data),
+              arena_.d_ssm_gate, iu4_weights->Find(l, Iu4Role::kSsmOut).awq,
+              iu4_weights->signs(), batch_size, iu4_padded, ssm_inner_size,
+              iu4_tiles_[bank], iu4_scales_[bank], arena_.stream);
+        } else {
+          iu4_quantize(arena_.d_ssm_out,
+                       iu4_weights->Find(l, Iu4Role::kSsmOut).awq,
+                       ssm_inner_size, true);
+        }
         std::uint32_t npu_ssm_out = 0;
         if (npu_ffn != nullptr && npu_ffn->Accepts(batch_size) &&
             npu_ffn->SsmOutColumns(l) != 0) {
@@ -971,9 +981,6 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
                    false, npu_columns);
           iu4_gemm(iu4_weights->Find(l, Iu4Role::kFfnUp), arena_.d_ffn_up,
                    false, npu_columns);
-          LaunchBatchedSwiGLUActivation(
-              arena_.d_ffn_gate, arena_.d_ffn_up, arena_.d_ffn_act, nullptr,
-              batch_size * intermediate_size, arena_.stream);
           if (npu_columns != 0) {
             npu_ffn->Finish(l, bank, iu4_npu_half_[bank], intermediate_size,
                             arena_.stream);
@@ -981,19 +988,32 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
           const bool npu_down_wanted = npu_ffn != nullptr &&
                                        npu_ffn->Accepts(batch_size) &&
                                        npu_ffn->DownColumns(l) != 0;
-          if (npu_columns != 0) {
-            LaunchIu4HalfColumnsToF32(arena_.d_ffn_act, iu4_npu_half_[bank],
-                                      batch_size, intermediate_size,
-                                      npu_columns, arena_.stream);
+          if (!npu_down_wanted) {
+            // SwiGLU runs inside the quantizer; the NPU columns come in as the
+            // FP16 product the NPU produced.
+            LaunchIu4SwiGluQuantize(
+                arena_.d_ffn_gate, arena_.d_ffn_up, iu4_npu_half_[bank],
+                npu_columns, iu4_weights->Find(l, Iu4Role::kFfnDown).awq,
+                iu4_weights->signs(), batch_size, iu4_padded, intermediate_size,
+                iu4_tiles_[bank], iu4_scales_[bank], arena_.stream);
+          } else {
+            LaunchBatchedSwiGLUActivation(
+                arena_.d_ffn_gate, arena_.d_ffn_up, arena_.d_ffn_act, nullptr,
+                batch_size * intermediate_size, arena_.stream);
+            if (npu_columns != 0) {
+              LaunchIu4HalfColumnsToF32(arena_.d_ffn_act, iu4_npu_half_[bank],
+                                        batch_size, intermediate_size,
+                                        npu_columns, arena_.stream);
+            }
+            if (npu_down_wanted) {
+              LaunchIu4F32ColumnsToHalf(arena_.d_ffn_act, iu4_npu_half_[bank],
+                                        batch_size, intermediate_size,
+                                        npu_columns, arena_.stream);
+            }
+            iu4_quantize(arena_.d_ffn_act,
+                         iu4_weights->Find(l, Iu4Role::kFfnDown).awq,
+                         intermediate_size, false);
           }
-          if (npu_down_wanted) {
-            LaunchIu4F32ColumnsToHalf(arena_.d_ffn_act, iu4_npu_half_[bank],
-                                      batch_size, intermediate_size,
-                                      npu_columns, arena_.stream);
-          }
-          iu4_quantize(arena_.d_ffn_act,
-                       iu4_weights->Find(l, Iu4Role::kFfnDown).awq,
-                       intermediate_size, false);
         } else if (half_prefill) {
           // The NPU takes the leading columns of a full 4096-token chunk when
           // the pair kernel can compute the remainder; its runs are queued

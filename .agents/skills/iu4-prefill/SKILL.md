@@ -25,11 +25,12 @@ GLM-5.3 follow. Read `docs/plans/iu4-prefill.md` (kernel experiments) and
 
 ## Result on 27B (release build, bench mode on, GPU only)
 
-pp2048 693 -> 1090 tok/s, pp8192 646 -> 1013, pp16384 624 -> 957 (GPU only), and
-with the NPU 1118 at pp8192 / 1036 at pp16384 (the old base + NPU was 801 / 764).
+pp2048 690 -> 1206 tok/s, pp8192 645 -> 1112, pp16384 622 -> 1045 (GPU only), and
+with the NPU 1287 at pp8192 / 1196 at pp16384 (the old base + NPU was 801 / 764;
+the NPU is a lone-chunk no-op, pp2048 1211).
 Decode unchanged (still the base GGUF, 12.5 tok/s plain). Next-token NLL over 240 samples (2048-token contexts of
 `~/ppl_corpus.txt`): 1.0215 base, 1.0205 int4, difference -0.001 +- 0.036,
-top-1 agreement 92%. The NPU adds about +10% on top for prompts of 5000+ tokens (see NPU below).
+top-1 agreement 92%. The NPU adds about +15% on top for prompts of 5000+ tokens (see NPU below).
 
 ## Hardware facts that matter
 
@@ -142,6 +143,31 @@ CPU or GPU (no clock effect). The fold costs about 6 TOPS and cannot shrink
 exactly (three VALU ops per output element per group; gfx11 has no packed fp32
 fma; fp16 packing loses exactness).
 
+## GPU-side fusions (what the profile showed)
+
+A profile of the first int4 path (rocprofv3 through `tools/prof/prof.py run`,
+pp4096) put 62% in the int4 GEMM and 38% (about 23 ms per 4096-token layer) in
+everything else; that second part decides how much room the NPU has. Fused
+into the quantizers, each checked against a double precision host model in
+`iu4_producer_test`, bit-identical to the unfused path where both exist:
+- SwiGLU into the down-input quantizer (`LaunchIu4SwiGluQuantize`; reads the NPU
+  FP16 columns directly): saved the 3.9 ms SwiGLU kernel and a pass over the
+  activation.
+- Gated DeltaNet post-norm gate into the out-projection quantizer
+  (`LaunchIu4PostNormGateQuantize`, with `skip_post_norm` on the row-split
+  recurrence launcher; falls back when the NPU takes ssm_out columns).
+- The 48-row GDN a/b gates on the WMMA GEMM by storing them padded to 128 zero
+  rows (`Iu4Projection::padded_rows`, `valid_rows`/`out_ld` on the GEMM) instead
+  of a scalar kernel at 1.1 ms per call.
+Together +12% GPU only (pp8192 1013 -> 1112; pp2048 1090 -> 1206). Remaining
+non-GEMM time per layer: DeltaNet recurrence 4.2 ms, attention (full layers),
+conv1d 0.8 ms, quantize/norm producers about 1 ms each, QK-norm+RoPE+KV write.
+Warning for quality tests: per-sample NLL on this pipeline is chaotic at the 1-2
+nat level for 1-ulp changes (swapping `g/(1+e^-g)` for `g*(1/(1+e^-g))` moved
+one sample from 0.08 to 2.38). Only means over >= 100 samples are meaningful;
+verify a kernel change with a host model and a byte comparison against the old
+path, not with a 12-sample NLL.
+
 ## NPU (27B) - works, +10% at pp8192, FFN gate/up only
 
 All NPU sites work on the int4 path (qkv/gate, o, ssm_out, gate/up, down): the
@@ -171,12 +197,15 @@ Lessons (each cost a wrong number):
   Adding qkv, gate, ssm_out, down or attention slices on top lowers throughput
   (down 827, qkv 952, ssm_out 1100) because the NPU queue is already full and
   those outputs are needed immediately or use another K (3.7 ms context switch).
-  The loader sets 14 FFN slices and 0 elsewhere (explicit env still wins).
+  The loader sets 10 FFN slices and 0 elsewhere (explicit env still wins). After
+  the GPU fusions below the optimum moved from 14 to 10-11 slices: re-sweep the
+  slice count after any GPU-side speedup (FFN slices at pp8192 with the fused GPU
+  path: 8 1281, 10 1313, 11 1334/1277, 12 1314, 14 1241).
 - Glue cost matters: converting the whole [tokens x 17408] activation per layer
   between FP16 and FP32 cost more than a slice gained; convert only the NPU
   strip.
-- Result (release, bench mode on, GPU base 646 at pp8192): base + NPU 801, int4
-  GPU 1013, int4 + NPU 1118 (pp16384: 624 / 764 / 957 / 1036). Ideal overlap of
+- Result (release, bench mode on, GPU base 645 at pp8192): base + NPU 801, int4
+  GPU 1112, int4 + NPU 1287 (pp16384: 622 / 764 / 1045 / 1196). Ideal overlap of
   a 20-TOPS NPU on a 75-TOPS GPU is about +27% (about 1290); the gap is the
   NPU's 42% utilisation of its bfp16 peak and the paired schedule.
 - Next NPU lever is the NPU kernel itself: it computes in bfp16 (9 bits per

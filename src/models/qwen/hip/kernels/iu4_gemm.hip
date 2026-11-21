@@ -41,7 +41,7 @@ __device__ __forceinline__ void Iu4GemmBody(
     const std::uint8_t* __restrict__ pw, const std::uint16_t* __restrict__ psc,
     const std::uint8_t* __restrict__ qs, const float* __restrict__ dsT,
     float* __restrict__ out, int M, int N, int Npad, int K, int row_begin,
-    int group, char* lds) {
+    int group, int out_ld, int valid_rows, char* lds) {
   const int tid = threadIdx.x;
   const int wave = __builtin_amdgcn_readfirstlane(tid >> 5);
   const int lane = tid & 31;
@@ -230,7 +230,10 @@ __device__ __forceinline__ void Iu4GemmBody(
       if (t >= N)
         continue;
       for (int b = 0; b < 2; ++b) {
-        float* dst = out + (size_t)t * M + f0 + wf * 32 + b * 16 + lr;
+        const int f = f0 + wf * 32 + b * 16 + lr;
+        if (f >= valid_rows)
+          continue;
+        float* dst = out + (size_t)t * out_ld + f;
         if (kAdd)
           *dst += sum[a][b][j];
         else
@@ -245,55 +248,15 @@ __global__ void __launch_bounds__(256)
                   const std::uint16_t* __restrict__ psc,
                   const std::uint8_t* __restrict__ qs,
                   const float* __restrict__ dsT, float* __restrict__ out, int M,
-                  int N, int Npad, int K, int row_begin, int group) {
+                  int N, int Npad, int K, int row_begin, int group, int out_ld,
+                  int valid_rows) {
   __shared__ __attribute__((aligned(16))) char lds[kLdsBytes];
   if ((threadIdx.x >> 7) & 1)
     Iu4GemmBody<kAdd, true>(pw, psc, qs, dsT, out, M, N, Npad, K, row_begin,
-                            group, lds);
+                            group, out_ld, valid_rows, lds);
   else
     Iu4GemmBody<kAdd, false>(pw, psc, qs, dsT, out, M, N, Npad, K, row_begin,
-                             group, lds);
-}
-
-// Scalar fallback for projections too small for the WMMA tile (the 48 row GDN
-// a/b gates): one thread per output element, integer dot products group by
-// group.
-template<bool kAdd>
-__global__ void Iu4GemmSmallKernel(const std::uint8_t* __restrict__ pw,
-                                   const std::uint16_t* __restrict__ psc,
-                                   const std::uint8_t* __restrict__ qs,
-                                   const float* __restrict__ dsT,
-                                   float* __restrict__ out, int M, int N,
-                                   int Npad, int K) {
-  const int f = threadIdx.x % M;
-  const int t = blockIdx.x * (blockDim.x / M) + threadIdx.x / M;
-  if (t >= N)
-    return;
-  const int E = K >> 7;
-  float acc = 0.0f;
-  for (int e = 0; e < E; ++e) {
-    int dot = 0;
-    for (int b = 0; b < 64; ++b) {
-      const int q = b >> 4, within = b & 15;
-      const std::uint8_t wbyte =
-          pw[(((size_t)e * (M >> 4) + (f >> 4)) * 4 + q) * 256 + (f & 15) * 16 +
-             within];
-      const int chunk = b >> 3, w8 = b & 7;
-      const std::uint8_t abyte =
-          qs[((size_t)(t >> 4) * E + e) * 1024 +
-             ((chunk & 1) * 16 + (t & 15)) * 32 + (chunk >> 1) * 8 + w8];
-      const int w0 = (int)(wbyte & 15), w1 = (int)(wbyte >> 4);
-      const int a0 = (int)(abyte & 15), a1 = (int)(abyte >> 4);
-      dot += ((w0 ^ 8) - 8) * ((a0 ^ 8) - 8) + ((w1 ^ 8) - 8) * ((a1 ^ 8) - 8);
-    }
-    acc += dsT[(size_t)e * Npad + t] *
-           __half2float(__ushort_as_half(psc[(size_t)e * M + f])) * (float)dot;
-  }
-  float* dst = out + (size_t)t * M + f;
-  if (kAdd)
-    *dst += acc;
-  else
-    *dst = acc;
+                             group, out_ld, valid_rows, lds);
 }
 
 }  // namespace
@@ -306,40 +269,23 @@ void LaunchIu4Gemm(const void* tiles, const std::uint16_t* weight_scales,
                    const std::uint8_t* act_tiles, const float* act_scales,
                    float* out, bool accumulate, std::size_t rows,
                    std::size_t row_begin, std::size_t n, std::size_t padded_n,
-                   std::size_t k, hipStream_t stream) {
+                   std::size_t k, hipStream_t stream, std::size_t out_ld,
+                   std::size_t valid_rows) {
   const std::size_t tiles_n = (rows - row_begin) / kFeatureTile;
   const int group = tiles_n % 4 == 0 ? 4 : tiles_n % 2 == 0 ? 2 : 1;
   const unsigned blocks =
       static_cast<unsigned>(tiles_n * (padded_n / kTokenTile));
   const auto* pw = static_cast<const std::uint8_t*>(tiles);
+  const int ld = static_cast<int>(out_ld != 0 ? out_ld : rows);
+  const int valid = static_cast<int>(valid_rows != 0 ? valid_rows : rows);
   if (accumulate)
     Iu4GemmKernel<true><<<blocks, 256, 0, stream>>>(
         pw, weight_scales, act_tiles, act_scales, out, (int)rows, (int)n,
-        (int)padded_n, (int)k, (int)row_begin, group);
+        (int)padded_n, (int)k, (int)row_begin, group, ld, valid);
   else
     Iu4GemmKernel<false><<<blocks, 256, 0, stream>>>(
         pw, weight_scales, act_tiles, act_scales, out, (int)rows, (int)n,
-        (int)padded_n, (int)k, (int)row_begin, group);
-}
-
-void LaunchIu4GemmSmall(const void* tiles, const std::uint16_t* weight_scales,
-                        const std::uint8_t* act_tiles, const float* act_scales,
-                        float* out, bool accumulate, std::size_t rows,
-                        std::size_t n, std::size_t padded_n, std::size_t k,
-                        hipStream_t stream) {
-  const int per_block = 256 / static_cast<int>(rows);
-  const unsigned blocks =
-      static_cast<unsigned>((n + per_block - 1) / per_block);
-  const unsigned threads = static_cast<unsigned>(per_block * rows);
-  const auto* pw = static_cast<const std::uint8_t*>(tiles);
-  if (accumulate)
-    Iu4GemmSmallKernel<true><<<blocks, threads, 0, stream>>>(
-        pw, weight_scales, act_tiles, act_scales, out, (int)rows, (int)n,
-        (int)padded_n, (int)k);
-  else
-    Iu4GemmSmallKernel<false><<<blocks, threads, 0, stream>>>(
-        pw, weight_scales, act_tiles, act_scales, out, (int)rows, (int)n,
-        (int)padded_n, (int)k);
+        (int)padded_n, (int)k, (int)row_begin, group, ld, valid);
 }
 
 }  // namespace gufo::hip

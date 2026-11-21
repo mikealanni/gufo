@@ -421,9 +421,10 @@ Iu4Weights* QwenGpuModel::Iu4() const {
     // With the int4 GEMM the GPU is about 3.5 times faster than the NPU per
     // column, so only the FFN gate/up columns (same K as the rest, finished
     // behind the paired chunk's GPU work) pay for their hand-off; every other
-    // NPU site ends up on the critical path. Measured at pp8192: 14 FFN slices
-    // 1152 tok/s, any other slice setting lower. Explicit settings still win.
-    setenv("GUFO_QWEN_NPU_FFN_SLICES", "14", 0);
+    // NPU site ends up on the critical path. Measured at pp8192: 10 FFN slices
+    // about 1320 tok/s, any other slice setting lower. Explicit settings still
+    // win.
+    setenv("GUFO_QWEN_NPU_FFN_SLICES", "10", 0);
     setenv("GUFO_QWEN_NPU_QKV_SLICES", "0", 0);
     setenv("GUFO_QWEN_NPU_GATE_SLICES", "0", 0);
     setenv("GUFO_QWEN_NPU_DOWN_SLICES", "0", 0);

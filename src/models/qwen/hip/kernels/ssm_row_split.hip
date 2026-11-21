@@ -382,7 +382,8 @@ void LaunchBatchedSSMConvRecurrenceRowSplit(
     float* alpha_beta, std::uint32_t layer_idx, std::size_t batch_size,
     std::size_t qkv_size, std::uint32_t num_key_heads, std::uint32_t num_heads,
     std::uint32_t key_dim, std::uint32_t val_dim, hipStream_t stream,
-    QwenRecurrentStateStorage state_storage, void* fp16_out) {
+    QwenRecurrentStateStorage state_storage, void* fp16_out,
+    bool skip_post_norm) {
   if (!IsDeltaNetRowSplitSupported(key_dim, val_dim)) {
     throw std::invalid_argument(
         "row-split Qwen recurrent state requires 128x128 matrices");
@@ -456,7 +457,11 @@ void LaunchBatchedSSMConvRecurrenceRowSplit(
   }
 
   // Emit the activation consumed by ssm_out directly. Other callers retain the
-  // FP32 in-place epilogue.
+  // FP32 in-place epilogue. The int4 path normalizes and gates inside its own
+  // quantizer and takes the raw recurrence output.
+  if (skip_post_norm) {
+    return;
+  }
   if (fp16_out != nullptr) {
     BatchedSSMPostNormGateFp16Kernel<<<(ab_count + 7) / 8, 256, 0, stream>>>(
         out_buf, ssm_norm, gate, static_cast<__half*>(fp16_out), ab_count);

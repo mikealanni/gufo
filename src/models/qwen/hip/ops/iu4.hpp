@@ -26,9 +26,9 @@ inline constexpr std::size_t kIu4BlockBytes = 136;
 void LaunchIu4RepackWeights(const void* blocks, void* tiles,
                             std::uint16_t* scales,
                             unsigned long long* bad_zero_points,
-                            std::size_t rows, std::size_t cols,
-                            std::uint32_t perm_start, std::uint32_t perm_chunk,
-                            hipStream_t stream);
+                            std::size_t rows, std::size_t padded_rows,
+                            std::size_t cols, std::uint32_t perm_start,
+                            std::uint32_t perm_chunk, hipStream_t stream);
 
 // Rotation sign vectors the artifact was built with: 256 signs for the pre
 // butterfly diagonal followed by 256 for the post butterfly diagonal.
@@ -57,31 +57,49 @@ bool Iu4GemmSupported(std::size_t rows, std::size_t cols);
 // act_scales come from the activation producers with padded_n a multiple of
 // 128; the weights come from LaunchIu4RepackWeights. out is token-major
 // [n x rows]; the columns below row_begin are not touched (the NPU computes
-// them). row_begin and rows must be multiples of 128.
+// them). row_begin and rows must be multiples of 128. Projections with fewer
+// rows are stored padded with zero rows to 128: pass the padded count as rows,
+// the logical count as valid_rows and the real row pitch as out_ld (zero means
+// rows).
 void LaunchIu4Gemm(const void* tiles, const std::uint16_t* weight_scales,
                    const std::uint8_t* act_tiles, const float* act_scales,
                    float* out, bool accumulate, std::size_t rows,
                    std::size_t row_begin, std::size_t n, std::size_t padded_n,
-                   std::size_t k, hipStream_t stream);
+                   std::size_t k, hipStream_t stream, std::size_t out_ld = 0,
+                   std::size_t valid_rows = 0);
 
-// Scalar fallback for projections that fail Iu4GemmSupported (rows at most 256
-// and a divisor of 256): same inputs and outputs as LaunchIu4Gemm.
-void LaunchIu4GemmSmall(const void* tiles, const std::uint16_t* weight_scales,
-                        const std::uint8_t* act_tiles, const float* act_scales,
-                        float* out, bool accumulate, std::size_t rows,
-                        std::size_t n, std::size_t padded_n, std::size_t k,
-                        hipStream_t stream);
-
-// NPU glue for the SwiGLU product: the leading `columns` columns exist only as
-// FP16 (from the NPU), the rest only as FP32 (from the GPU). The first call
-// completes the FP32 matrix; the second builds the FP16 matrix the NPU reads
-// for the down projection.
+// NPU glue for the SwiGLU product when the NPU also takes down columns: the
+// leading `columns` columns exist only as FP16 (from the NPU), the rest only as
+// FP32 (from the GPU). The first call completes the FP32 matrix; the second
+// builds the FP16 matrix the NPU reads for the down projection.
 void LaunchIu4HalfColumnsToF32(float* act_f32, const void* act_f16,
                                std::size_t rows, std::size_t ld,
                                std::size_t columns, hipStream_t stream);
 void LaunchIu4F32ColumnsToHalf(const float* act_f32, void* act_f16,
                                std::size_t rows, std::size_t ld,
                                std::size_t first, hipStream_t stream);
+
+// SwiGLU fused into the quantizer for the down projection input: the row is
+// silu(gate) * up for columns from npu_columns on and the FP16 SwiGLU product
+// of the NPU (npu_half, row pitch k) below that. Same output layout as the
+// others.
+void LaunchIu4SwiGluQuantize(const float* gate, const float* up,
+                             const void* npu_half, std::size_t npu_columns,
+                             const float* awq, const float* signs,
+                             std::size_t n, std::size_t padded_n, std::size_t k,
+                             std::uint8_t* tiles, float* scales,
+                             hipStream_t stream);
+
+// Gated DeltaNet epilogue fused into the quantizer of the out projection: per
+// (token, head) RMSNorm of `raw` with `ssm_norm`, times silu(gate), through the
+// artifact head order (see LaunchIu4Quantize), then awq divide, rotate,
+// quantize.
+void LaunchIu4PostNormGateQuantize(const float* raw, const float* ssm_norm,
+                                   const float* gate, const float* awq,
+                                   const float* signs, std::size_t n,
+                                   std::size_t padded_n, std::size_t inner,
+                                   std::uint8_t* tiles, float* scales,
+                                   hipStream_t stream);
 
 // Quantize-only activation producer for rows that are already normalized:
 // divide by awq (null for none), rotate, quantize, same output layout as

@@ -22,8 +22,8 @@ __global__ void Iu4RepackKernel(const std::uint8_t* __restrict__ blocks,
                                 std::uint8_t* __restrict__ tiles,
                                 std::uint16_t* __restrict__ scales,
                                 unsigned long long* __restrict__ bad,
-                                std::uint32_t rows, std::uint32_t groups,
-                                std::uint32_t perm_start,
+                                std::uint32_t rows, std::uint32_t padded_rows,
+                                std::uint32_t groups, std::uint32_t perm_start,
                                 std::uint32_t perm_chunk) {
   const std::size_t idx = (std::size_t)blockIdx.x * blockDim.x + threadIdx.x;
   const std::size_t total = (std::size_t)groups * rows * 4;
@@ -42,7 +42,7 @@ __global__ void Iu4RepackKernel(const std::uint8_t* __restrict__ blocks,
     std::uint16_t sc, zp;
     __builtin_memcpy(&sc, src + 4 * half, 2);
     __builtin_memcpy(&zp, src + 4 * half + 2, 2);
-    scales[(std::size_t)e * rows + row] = sc;
+    scales[(std::size_t)e * padded_rows + row] = sc;
     const float fs = __half2float(__ushort_as_half(sc));
     const float fz = __half2float(__ushort_as_half(zp));
     if (fabsf(fz + 8.0f * fs) > 1e-3f * fabsf(8.0f * fs) + 1e-12f)
@@ -55,7 +55,7 @@ __global__ void Iu4RepackKernel(const std::uint8_t* __restrict__ blocks,
   v.z ^= 0x88888888u;
   v.w ^= 0x88888888u;
   const std::size_t dst =
-      (((std::size_t)e * (rows >> 4) + (row >> 4)) * 4 + q) * 256 +
+      (((std::size_t)e * (padded_rows >> 4) + (row >> 4)) * 4 + q) * 256 +
       (row & 15) * 16;
   __builtin_memcpy(tiles + dst, &v, 16);
 }
@@ -258,6 +258,99 @@ __global__ void Iu4F32ColumnsToHalfKernel(const float* __restrict__ f32,
   f16[r * ld + c] = __float2half(f32[r * ld + c]);
 }
 
+__device__ __forceinline__ float Reduce16Sum(float v) {
+  for (int o = 8; o > 0; o >>= 1)
+    v += __shfl_xor(v, o);
+  return v;
+}
+
+// SwiGLU product silu(gate) * up fused into the quantizer. Columns below
+// npu_columns come from the NPU as FP16 (already the SwiGLU product).
+__global__ void __launch_bounds__(256) Iu4SwiGluQuantizeKernel(
+    const float* __restrict__ gate, const float* __restrict__ up,
+    const __half* __restrict__ npu_half, std::uint32_t npu_columns,
+    const float* __restrict__ awq, const float* __restrict__ signs,
+    std::uint32_t n, std::uint32_t padded_n, std::uint32_t k,
+    std::uint8_t* __restrict__ tiles, float* __restrict__ scales) {
+  const std::uint32_t lane = threadIdx.x & 31;
+  const std::uint32_t gid = blockIdx.x * 8 + (threadIdx.x >> 5);
+  const std::uint32_t groups256 = k >> 8;
+  if (gid >= padded_n * groups256)
+    return;
+  const std::uint32_t token = gid / groups256, g = gid % groups256;
+  const bool live = token < n;
+  float v[8];
+  if (live) {
+    const std::uint32_t pos = g * 256 + lane * 8;
+    const std::size_t base = (std::size_t)token * k + pos;
+    if (pos < npu_columns) {
+#pragma unroll
+      for (int i = 0; i < 8; ++i)
+        v[i] = __half2float(npu_half[base + i]);
+    } else {
+      const float4 g0 = *reinterpret_cast<const float4*>(gate + base);
+      const float4 g1 = *reinterpret_cast<const float4*>(gate + base + 4);
+      const float4 u0 = *reinterpret_cast<const float4*>(up + base);
+      const float4 u1 = *reinterpret_cast<const float4*>(up + base + 4);
+      const float gv[8] = {g0.x, g0.y, g0.z, g0.w, g1.x, g1.y, g1.z, g1.w};
+      const float uv[8] = {u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w};
+#pragma unroll
+      for (int i = 0; i < 8; ++i)
+        v[i] = (gv[i] / (1.0f + expf(-gv[i]))) * uv[i];
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+      v[i] /= awq[pos + i];
+  }
+  RotateQuantizeStore(v, live, signs, lane, g, token, padded_n, k >> 7, tiles,
+                      scales);
+}
+
+// Gated DeltaNet output: per (token, head) RMSNorm over the 128 value dims with
+// the head-shared ssm_norm weight, times silu(z), fused into the quantizer of
+// the out projection. A wave handles one 256 group of the artifact-order row,
+// two heads; artifact head h reads engine head (h % 3) * 16 + h / 3.
+__global__ void __launch_bounds__(256) Iu4PostNormGateQuantizeKernel(
+    const float* __restrict__ raw, const float* __restrict__ ssm_norm,
+    const float* __restrict__ gate, const float* __restrict__ awq,
+    const float* __restrict__ signs, std::uint32_t n, std::uint32_t padded_n,
+    std::uint32_t inner, std::uint8_t* __restrict__ tiles,
+    float* __restrict__ scales) {
+  const std::uint32_t lane = threadIdx.x & 31;
+  const std::uint32_t gid = blockIdx.x * 8 + (threadIdx.x >> 5);
+  const std::uint32_t groups256 = inner >> 8;
+  if (gid >= padded_n * groups256)
+    return;
+  const std::uint32_t token = gid / groups256, g = gid % groups256;
+  const bool live = token < n;
+  float v[8];
+  if (live) {
+    const std::uint32_t pos = g * 256 + lane * 8;  // artifact order
+    const std::uint32_t head = pos >> 7, within = pos & 127;
+    const std::size_t src =
+        (std::size_t)token * inner + EngineHead(head) * 128 + within;
+    const float4 x0 = *reinterpret_cast<const float4*>(raw + src);
+    const float4 x1 = *reinterpret_cast<const float4*>(raw + src + 4);
+    const float4 z0 = *reinterpret_cast<const float4*>(gate + src);
+    const float4 z1 = *reinterpret_cast<const float4*>(gate + src + 4);
+    const float xv[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+    const float zv[8] = {z0.x, z0.y, z0.z, z0.w, z1.x, z1.y, z1.z, z1.w};
+    float sq = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+      sq += xv[i] * xv[i];
+    sq = Reduce16Sum(sq);  // the 16 lanes of this head
+    const float inv_rms = rsqrtf(sq / 128.0f + 1e-6f);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const float silu = zv[i] / (1.0f + expf(-zv[i]));
+      v[i] = xv[i] * inv_rms * ssm_norm[within + i] * silu / awq[pos + i];
+    }
+  }
+  RotateQuantizeStore(v, live, signs, lane, g, token, padded_n, inner >> 7,
+                      tiles, scales);
+}
+
 }  // namespace
 
 void LaunchIu4HalfColumnsToF32(float* act_f32, const void* act_f16,
@@ -312,18 +405,48 @@ void LaunchIu4Quantize(const float* x, const float* awq, const float* signs,
       remap_gdn_heads ? 1u : 0u, tiles, scales);
 }
 
+void LaunchIu4SwiGluQuantize(const float* gate, const float* up,
+                             const void* npu_half, std::size_t npu_columns,
+                             const float* awq, const float* signs,
+                             std::size_t n, std::size_t padded_n, std::size_t k,
+                             std::uint8_t* tiles, float* scales,
+                             hipStream_t stream) {
+  const std::size_t waves = padded_n * (k >> 8);
+  Iu4SwiGluQuantizeKernel<<<static_cast<unsigned>((waves + 7) / 8), 256, 0,
+                            stream>>>(
+      gate, up, static_cast<const __half*>(npu_half),
+      static_cast<std::uint32_t>(npu_columns), awq, signs,
+      static_cast<std::uint32_t>(n), static_cast<std::uint32_t>(padded_n),
+      static_cast<std::uint32_t>(k), tiles, scales);
+}
+
+void LaunchIu4PostNormGateQuantize(const float* raw, const float* ssm_norm,
+                                   const float* gate, const float* awq,
+                                   const float* signs, std::size_t n,
+                                   std::size_t padded_n, std::size_t inner,
+                                   std::uint8_t* tiles, float* scales,
+                                   hipStream_t stream) {
+  const std::size_t waves = padded_n * (inner >> 8);
+  Iu4PostNormGateQuantizeKernel<<<static_cast<unsigned>((waves + 7) / 8), 256,
+                                  0, stream>>>(
+      raw, ssm_norm, gate, awq, signs, static_cast<std::uint32_t>(n),
+      static_cast<std::uint32_t>(padded_n), static_cast<std::uint32_t>(inner),
+      tiles, scales);
+}
+
 void LaunchIu4RepackWeights(const void* blocks, void* tiles,
                             std::uint16_t* scales,
                             unsigned long long* bad_zero_points,
-                            std::size_t rows, std::size_t cols,
-                            std::uint32_t perm_start, std::uint32_t perm_chunk,
-                            hipStream_t stream) {
+                            std::size_t rows, std::size_t padded_rows,
+                            std::size_t cols, std::uint32_t perm_start,
+                            std::uint32_t perm_chunk, hipStream_t stream) {
   const std::uint32_t groups = static_cast<std::uint32_t>(cols >> 7);
   const std::size_t total = (std::size_t)groups * rows * 4;
   Iu4RepackKernel<<<(total + 255) / 256, 256, 0, stream>>>(
       static_cast<const std::uint8_t*>(blocks),
       static_cast<std::uint8_t*>(tiles), scales, bad_zero_points,
-      static_cast<std::uint32_t>(rows), groups, perm_start, perm_chunk);
+      static_cast<std::uint32_t>(rows), static_cast<std::uint32_t>(padded_rows),
+      groups, perm_start, perm_chunk);
 }
 
 }  // namespace gufo::hip

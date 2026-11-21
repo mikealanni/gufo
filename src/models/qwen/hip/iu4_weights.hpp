@@ -36,6 +36,9 @@ struct Iu4Projection {
   std::uint16_t* scales{nullptr};
   float* awq{nullptr};
   std::uint32_t rows{0};
+  // Rows of the stored layout: rows rounded up to a whole 128-feature tile, the
+  // extra rows zero (the 48-row GDN gates).
+  std::uint32_t padded_rows{0};
   std::uint32_t cols{0};
   [[nodiscard]] bool valid() const noexcept { return tiles != nullptr; }
 };

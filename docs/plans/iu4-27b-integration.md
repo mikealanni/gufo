@@ -89,3 +89,11 @@ pp8192, release build, bench mode on: base GPU 646, base + NPU 801, int4 GPU
 on the NPU is the best split; see the iu4-prefill skill for the sweep, the
 per-bank scratch requirement of the lockstep pair, and the NPU kernel
 opportunity.
+
+## GPU fusions and NPU retune (2026-11-20, later)
+
+SwiGLU and the GDN post-norm gate fused into the quantizers, the a/b gates on
+the WMMA GEMM: int4 GPU pp2048 1206, pp8192 1112, pp16384 1045. With the NPU
+retuned to 10 FFN gate/up slices: pp2048 1211 (lone chunk, NPU unused), pp8192
+1287, pp16384 1196. Base GPU 690 / 645 / 622 and base + NPU 721 / 801 / 764 for
+reference.
