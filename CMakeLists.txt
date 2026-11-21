@@ -74,6 +74,9 @@ endif()
 add_subdirectory(src/models/flint)
 add_subdirectory(src/models/laguna)
 
+# Inkling 2 — looped hybrid MoE text model (CPU reference plus ROCm engine).
+add_subdirectory(src/models/inkling)
+
 # Qwen3.8-Flash-Next — model-private CPU reference plus ROCm runtime.
 add_subdirectory(src/models/qwen38_flash_next)
 
