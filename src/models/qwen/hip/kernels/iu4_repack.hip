@@ -1,6 +1,8 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include <type_traits>
+
 #include "src/models/qwen/hip/ops/iu4.hpp"
 
 namespace gufo::hip {
@@ -60,10 +62,22 @@ __global__ void Iu4RepackKernel(const std::uint8_t* __restrict__ blocks,
   __builtin_memcpy(tiles + dst, &v, 16);
 }
 
+// Lane xor within a row of 16 as a DPP operand (strides 1 to 8); stride 16 and
+// up cross rows and go through the generic shuffle.
+template<int kMask>
+__device__ __forceinline__ float XorLanes(float v) {
+  if constexpr (kMask < 16)
+    return __int_as_float(__builtin_amdgcn_mov_dpp(
+        __float_as_int(v), 0x160 | kMask, 0xF, 0xF, false));
+  else
+    return __shfl_xor(v, kMask);
+}
+
 __device__ __forceinline__ float Reduce16Max(float v) {
-  for (int o = 8; o > 0; o >>= 1)
-    v = fmaxf(v, __shfl_xor(v, o));
-  return v;
+  v = fmaxf(v, XorLanes<8>(v));
+  v = fmaxf(v, XorLanes<4>(v));
+  v = fmaxf(v, XorLanes<2>(v));
+  return fmaxf(v, XorLanes<1>(v));
 }
 
 // Rotates the 8 values of this lane (already divided by awq, not yet multiplied
@@ -88,15 +102,20 @@ __device__ __forceinline__ void RotateQuantizeStore(
           v[i] = a + b;
           v[i + st] = a - b;
         }
-#pragma unroll
-    for (int m = 1; m < 32; m <<= 1) {
+    const auto stage = [&](auto mask_tag) {
+      constexpr int m = decltype(mask_tag)::value;
       const bool hi = (lane & m) != 0;
 #pragma unroll
       for (int i = 0; i < 8; ++i) {
-        const float o = __shfl_xor(v[i], m);
+        const float o = XorLanes<m>(v[i]);
         v[i] = hi ? (o - v[i]) : (v[i] + o);
       }
-    }
+    };
+    stage(std::integral_constant<int, 1>{});
+    stage(std::integral_constant<int, 2>{});
+    stage(std::integral_constant<int, 4>{});
+    stage(std::integral_constant<int, 8>{});
+    stage(std::integral_constant<int, 16>{});
 #pragma unroll
     for (int i = 0; i < 8; ++i)
       v[i] *= 0.0625f * signs[256 + lane * 8 + i];
@@ -135,7 +154,8 @@ __global__ void __launch_bounds__(1024) Iu4NormQuantizeKernel(
     const float* __restrict__ x, const float* __restrict__ norm_weight,
     const float* __restrict__ awq, const float* __restrict__ signs, float eps,
     std::uint32_t n, std::uint32_t padded_n, std::uint32_t k,
-    std::uint8_t* __restrict__ tiles, float* __restrict__ scales) {
+    std::uint8_t* __restrict__ tiles, float* __restrict__ scales,
+    __half* __restrict__ half_out) {
   __shared__ float partial[32];
   const std::uint32_t token = blockIdx.x;
   const std::uint32_t wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -174,6 +194,8 @@ __global__ void __launch_bounds__(1024) Iu4NormQuantizeKernel(
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
       float w = v[i] * inv_rms * norm_weight[kk + i];
+      if (half_out != nullptr)
+        half_out[(std::size_t)token * k + kk + i] = __float2half(w);
       if (awq != nullptr)
         w /= awq[kk + i];
       v[i] = w;
@@ -259,19 +281,26 @@ __global__ void Iu4F32ColumnsToHalfKernel(const float* __restrict__ f32,
 }
 
 __device__ __forceinline__ float Reduce16Sum(float v) {
-  for (int o = 8; o > 0; o >>= 1)
-    v += __shfl_xor(v, o);
-  return v;
+  v += XorLanes<8>(v);
+  v += XorLanes<4>(v);
+  v += XorLanes<2>(v);
+  return v + XorLanes<1>(v);
 }
 
 // SwiGLU product silu(gate) * up fused into the quantizer. Columns below
-// npu_columns come from the NPU as FP16 (already the SwiGLU product).
+// npu_columns come from the NPU: as FP16 when the stream source is empty, else
+// decoded straight from the block-float output streams.
+__device__ __forceinline__ float SiluOf(float x) {
+  return x / (1.0f + expf(-x));
+}
+
 __global__ void __launch_bounds__(256) Iu4SwiGluQuantizeKernel(
     const float* __restrict__ gate, const float* __restrict__ up,
-    const __half* __restrict__ npu_half, std::uint32_t npu_columns,
-    const float* __restrict__ awq, const float* __restrict__ signs,
-    std::uint32_t n, std::uint32_t padded_n, std::uint32_t k,
-    std::uint8_t* __restrict__ tiles, float* __restrict__ scales) {
+    const __half* __restrict__ npu_half, Iu4NpuSwigluSource source,
+    std::uint32_t npu_columns, const float* __restrict__ awq,
+    const float* __restrict__ signs, std::uint32_t n, std::uint32_t padded_n,
+    std::uint32_t k, std::uint8_t* __restrict__ tiles,
+    float* __restrict__ scales) {
   const std::uint32_t lane = threadIdx.x & 31;
   const std::uint32_t gid = blockIdx.x * 8 + (threadIdx.x >> 5);
   const std::uint32_t groups256 = k >> 8;
@@ -283,7 +312,29 @@ __global__ void __launch_bounds__(256) Iu4SwiGluQuantizeKernel(
   if (live) {
     const std::uint32_t pos = g * 256 + lane * 8;
     const std::size_t base = (std::size_t)token * k + pos;
-    if (pos < npu_columns) {
+    if (pos < npu_columns && source.slices != 0) {
+      // Stream layout: tile (512 token rows x 128 columns) of 8192 groups, a
+      // group being 8 consecutive columns of one token (9 bytes).
+      const std::uint32_t slice = pos >> 10, c = pos & 1023;
+      const std::uint32_t tile_row = token >> 9, r_in = token & 511;
+      const std::uint32_t tile_col = c >> 7, c_in = c & 127;
+      const std::uint32_t gi = (r_in & 7) | (((c_in >> 3) & 1) << 3) |
+                               (((r_in >> 3) & 1) << 4) | ((c_in >> 4) << 5) |
+                               ((r_in >> 4) << 8);
+      const std::size_t group =
+          ((std::size_t)tile_row * 8 + tile_col) * 8192 + gi;
+      const std::uint8_t* pg =
+          static_cast<const std::uint8_t*>(source.gate[slice]) + group * 9;
+      const std::uint8_t* pu =
+          static_cast<const std::uint8_t*>(source.up[slice]) + group * 9;
+      const float mg = ldexpf(1.0f, static_cast<int>(pg[0]) - 127) / 64.0f;
+      const float mu = ldexpf(1.0f, static_cast<int>(pu[0]) - 127) / 64.0f;
+#pragma unroll
+      for (int i = 0; i < 8; ++i)
+        v[i] = SiluOf(static_cast<float>(static_cast<std::int8_t>(pg[1 + i])) *
+                      mg) *
+               (static_cast<float>(static_cast<std::int8_t>(pu[1 + i])) * mu);
+    } else if (pos < npu_columns) {
 #pragma unroll
       for (int i = 0; i < 8; ++i)
         v[i] = __half2float(npu_half[base + i]);
@@ -296,7 +347,7 @@ __global__ void __launch_bounds__(256) Iu4SwiGluQuantizeKernel(
       const float uv[8] = {u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w};
 #pragma unroll
       for (int i = 0; i < 8; ++i)
-        v[i] = (gv[i] / (1.0f + expf(-gv[i]))) * uv[i];
+        v[i] = SiluOf(gv[i]) * uv[i];
     }
 #pragma unroll
     for (int i = 0; i < 8; ++i)
@@ -386,12 +437,12 @@ void LaunchIu4NormQuantize(const float* x, const float* norm_weight,
                            const float* awq, const float* signs, float eps,
                            std::size_t n, std::size_t padded_n, std::size_t k,
                            std::uint8_t* tiles, float* scales,
-                           hipStream_t stream) {
+                           hipStream_t stream, void* half_out) {
   Iu4NormQuantizeKernel<<<static_cast<unsigned>(padded_n),
                           static_cast<unsigned>(32 * (k >> 8)), 0, stream>>>(
       x, norm_weight, awq, signs, eps, static_cast<std::uint32_t>(n),
       static_cast<std::uint32_t>(padded_n), static_cast<std::uint32_t>(k),
-      tiles, scales);
+      tiles, scales, static_cast<__half*>(half_out));
 }
 
 void LaunchIu4Quantize(const float* x, const float* awq, const float* signs,
@@ -405,16 +456,18 @@ void LaunchIu4Quantize(const float* x, const float* awq, const float* signs,
       remap_gdn_heads ? 1u : 0u, tiles, scales);
 }
 
-void LaunchIu4SwiGluQuantize(const float* gate, const float* up,
-                             const void* npu_half, std::size_t npu_columns,
-                             const float* awq, const float* signs,
-                             std::size_t n, std::size_t padded_n, std::size_t k,
-                             std::uint8_t* tiles, float* scales,
-                             hipStream_t stream) {
+void LaunchIu4SwiGluQuantize(
+    const float* gate, const float* up, const void* npu_half,
+    const Iu4NpuSwigluSource* npu_source, std::size_t npu_columns,
+    const float* awq, const float* signs, std::size_t n, std::size_t padded_n,
+    std::size_t k, std::uint8_t* tiles, float* scales, hipStream_t stream) {
   const std::size_t waves = padded_n * (k >> 8);
+  Iu4NpuSwigluSource source;
+  if (npu_source != nullptr)
+    source = *npu_source;
   Iu4SwiGluQuantizeKernel<<<static_cast<unsigned>((waves + 7) / 8), 256, 0,
                             stream>>>(
-      gate, up, static_cast<const __half*>(npu_half),
+      gate, up, static_cast<const __half*>(npu_half), source,
       static_cast<std::uint32_t>(npu_columns), awq, signs,
       static_cast<std::uint32_t>(n), static_cast<std::uint32_t>(padded_n),
       static_cast<std::uint32_t>(k), tiles, scales);

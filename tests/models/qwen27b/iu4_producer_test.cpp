@@ -299,7 +299,7 @@ int main() {
               hipMemcpyHostToDevice);
     hipMemset(dtile, 0xAB, tb);
     hipMemset(dscale, 0xFF, ge * kPadded * 4);
-    gufo::hip::LaunchIu4SwiGluQuantize(dg, du, dh, npu_cols, p.awq,
+    gufo::hip::LaunchIu4SwiGluQuantize(dg, du, dh, nullptr, npu_cols, p.awq,
                                        weights.signs(), kTokens, kPadded, K,
                                        dtile, dscale, nullptr);
     CHECK(hipDeviceSynchronize() == hipSuccess, "swiglu producer failed");

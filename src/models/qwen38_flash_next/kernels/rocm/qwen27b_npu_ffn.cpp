@@ -318,8 +318,31 @@ public:
   void SetRows(std::uint32_t rows) noexcept override { rows_ = rows; }
   void SetPaired(bool paired) noexcept override { paired_ = paired; }
   bool Paired() const noexcept override { return paired_; }
+
+  bool FfnStreams(std::uint32_t layer, int bank, hipStream_t stream,
+                  hip::Iu4NpuSwigluSource* out) override {
+    Slot& slot = slots_[bank];
+    npu_->Wait(stream, slot.ticket);
+    const std::uint32_t used = FfnUsed(layer);
+    if (used > hip::kIu4NpuMaxSlices) {
+      return false;
+    }
+    out->slices = used;
+    for (std::uint32_t i = 0; i < used; ++i) {
+      out->gate[i] = npu_->Staged(stream, slot.c[i]);
+      out->up[i] = npu_->Staged(stream, slot.c[used + i]);
+    }
+    return true;
+  }
+
+  void ReleaseFfnStreams(int, hipStream_t stream) override {
+    // The shared buffers are free once the consumer's kernels have read them.
+    hipLaunchHostFunc(
+        stream, [](void* self) { Release(static_cast<Qwen27bNpuFfn*>(self)); },
+        this);
+  }
   std::uint32_t Columns(std::uint32_t layer) const noexcept override {
-    return layer < columns_.size() ? FfnUsed() * kSliceColumns : 0;
+    return layer < columns_.size() ? FfnUsed(layer) * kSliceColumns : 0;
   }
 
   bool Begin(std::uint32_t layer, int bank, const void* normed,
@@ -331,7 +354,7 @@ public:
     NpuEncodeActivations(static_cast<const __half*>(normed), hidden_, rows_,
                          hidden_, 0, hidden_, npu_->Device(slot.a), stream);
     const auto& full = b_[layer];
-    const std::uint32_t used = FfnUsed();
+    const std::uint32_t used = FfnUsed(layer);
     std::vector<int> b(full.begin(), full.begin() + used);
     b.insert(b.end(), full.begin() + slices_, full.begin() + slices_ + used);
     if (!npu_->Submit(stream, slot.a, b.data(), slot.c.data(),
@@ -345,10 +368,9 @@ public:
 
   void Finish(std::uint32_t layer, int bank, void* out, std::size_t ld,
               hipStream_t stream) override {
-    (void)layer;
     Slot& slot = slots_[bank];
     npu_->Wait(stream, slot.ticket);
-    const std::uint32_t used = FfnUsed();
+    const std::uint32_t used = FfnUsed(layer);
     for (std::uint32_t i = 0; i < used; ++i) {
       NpuSwiglu(npu_->Staged(stream, slot.c[i]),
                 npu_->Staged(stream, slot.c[used + i]), nullptr, nullptr,
@@ -506,7 +528,7 @@ private:
   }
   /// A lone chunk cannot hide the NPU's wait behind a partner's GPU work, so
   /// it hands the FFN one slice less than a paired chunk does.
-  [[nodiscard]] std::uint32_t FfnUsed() const noexcept {
+  [[nodiscard]] std::uint32_t FfnUsed(std::uint32_t) const noexcept {
     return Used(slices_ > 1 && !paired_ ? slices_ - 1 : slices_);
   }
   [[nodiscard]] std::uint32_t Scaled(std::uint32_t columns) const noexcept {

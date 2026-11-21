@@ -41,12 +41,14 @@ void FillIu4RotationSigns(float* host_signs_512);
 // tile-major layout the int4 GEMM reads: tokens in tiles of 16, for every 128
 // group a 1024-byte block holding 16 lanes x 32 bytes, and scales stored
 // [group][padded token]. Rows from n to padded_n are written as zero codes with
-// scale zero so the GEMM can run on a multiple of 128 tokens.
+// scale zero so the GEMM can run on a multiple of 128 tokens. When half_out is
+// set the normalized, pre-awq row is also written there as FP16 (row pitch k),
+// the input the NPU reads.
 void LaunchIu4NormQuantize(const float* x, const float* norm_weight,
                            const float* awq, const float* signs, float eps,
                            std::size_t n, std::size_t padded_n, std::size_t k,
                            std::uint8_t* tiles, float* scales,
-                           hipStream_t stream);
+                           hipStream_t stream, void* half_out = nullptr);
 
 // True when the int4 GEMM can run a projection of this shape: rows must be a
 // multiple of 128 (one feature tile) and cols a multiple of 256.
@@ -79,16 +81,26 @@ void LaunchIu4F32ColumnsToHalf(const float* act_f32, void* act_f16,
                                std::size_t rows, std::size_t ld,
                                std::size_t first, hipStream_t stream);
 
+// Gate and up outputs of the NPU's leading FFN slices in its block-float stream
+// layout (9 bytes per group of 8 columns: shared exponent, 8 int8 mantissas;
+// 512 x 128 tiles of 2 x 2 super blocks of 8 x 8 blocks; 1024 columns per
+// slice). The SwiGLU quantizer decodes these directly.
+inline constexpr std::uint32_t kIu4NpuMaxSlices = 16;
+struct Iu4NpuSwigluSource {
+  const void* gate[kIu4NpuMaxSlices];
+  const void* up[kIu4NpuMaxSlices];
+  std::uint32_t slices{0};
+};
+
 // SwiGLU fused into the quantizer for the down projection input: the row is
 // silu(gate) * up for columns from npu_columns on and the FP16 SwiGLU product
 // of the NPU (npu_half, row pitch k) below that. Same output layout as the
 // others.
-void LaunchIu4SwiGluQuantize(const float* gate, const float* up,
-                             const void* npu_half, std::size_t npu_columns,
-                             const float* awq, const float* signs,
-                             std::size_t n, std::size_t padded_n, std::size_t k,
-                             std::uint8_t* tiles, float* scales,
-                             hipStream_t stream);
+void LaunchIu4SwiGluQuantize(
+    const float* gate, const float* up, const void* npu_half,
+    const Iu4NpuSwigluSource* npu_source, std::size_t npu_columns,
+    const float* awq, const float* signs, std::size_t n, std::size_t padded_n,
+    std::size_t k, std::uint8_t* tiles, float* scales, hipStream_t stream);
 
 // Gated DeltaNet epilogue fused into the quantizer of the out projection: per
 // (token, head) RMSNorm of `raw` with `ssm_norm`, times silu(gate), through the

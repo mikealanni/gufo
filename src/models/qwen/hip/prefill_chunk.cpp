@@ -382,6 +382,10 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
 
     // Pre-layer RMSNorm (generates BF16 into d_scratch_bf16 directly)
     if (iu4) {
+      const bool npu_wants_half =
+          npu_ffn != nullptr && npu_ffn->Accepts(batch_size) &&
+          (npu_ffn->QkvColumns(l) != 0 ||
+           (!layer.is_full_attention && npu_ffn->GateColumns(l) != 0));
       LaunchIu4NormQuantize(
           arena_.d_hidden, static_cast<const float*>(layer.attn_norm.data),
           iu4_weights
@@ -389,15 +393,8 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
                                                 : Iu4Role::kSsmQkv)
               .awq,
           iu4_weights->signs(), eps, batch_size, iu4_padded, hidden_size,
-          iu4_tiles_[bank], iu4_scales_[bank], arena_.stream);
-      if (npu_ffn != nullptr && npu_ffn->Accepts(batch_size) &&
-          (npu_ffn->QkvColumns(l) != 0 ||
-           (!layer.is_full_attention && npu_ffn->GateColumns(l) != 0))) {
-        LaunchBatchedRMSNormFp16(
-            arena_.d_hidden, nullptr,
-            static_cast<const float*>(layer.attn_norm.data), nullptr,
-            arena_.d_scratch_bf16, batch_size, hidden_size, eps, arena_.stream);
-      }
+          iu4_tiles_[bank], iu4_scales_[bank], arena_.stream,
+          npu_wants_half ? arena_.d_scratch_bf16 : nullptr);
     } else if (half_prefill) {
       LaunchBatchedRMSNormFp16(arena_.d_hidden, nullptr,
                                static_cast<const float*>(layer.attn_norm.data),
@@ -884,18 +881,15 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
     }
 
     if (iu4) {
+      const bool npu_wants_half = npu_ffn != nullptr &&
+                                  npu_ffn->Accepts(batch_size) &&
+                                  npu_ffn->Columns(l) != 0;
       LaunchIu4NormQuantize(
           arena_.d_hidden, static_cast<const float*>(layer.ffn_norm.data),
           iu4_weights->Find(l, Iu4Role::kFfnGate).awq, iu4_weights->signs(),
           eps, batch_size, iu4_padded, hidden_size, iu4_tiles_[bank],
-          iu4_scales_[bank], arena_.stream);
-      if (npu_ffn != nullptr && npu_ffn->Accepts(batch_size) &&
-          npu_ffn->Columns(l) != 0) {
-        LaunchBatchedRMSNormFp16(arena_.d_hidden, nullptr,
-                                 static_cast<const float*>(layer.ffn_norm.data),
-                                 nullptr, arena_.d_scratch_bf16, batch_size,
-                                 hidden_size, eps, arena_.stream);
-      }
+          iu4_scales_[bank], arena_.stream,
+          npu_wants_half ? arena_.d_scratch_bf16 : nullptr);
     } else if (half_prefill) {
       LaunchBatchedRMSNormFp16(output_hidden, nullptr,
                                static_cast<const float*>(layer.ffn_norm.data),
@@ -981,21 +975,31 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
                    false, npu_columns);
           iu4_gemm(iu4_weights->Find(l, Iu4Role::kFfnUp), arena_.d_ffn_up,
                    false, npu_columns);
-          if (npu_columns != 0) {
-            npu_ffn->Finish(l, bank, iu4_npu_half_[bank], intermediate_size,
-                            arena_.stream);
-          }
           const bool npu_down_wanted = npu_ffn != nullptr &&
                                        npu_ffn->Accepts(batch_size) &&
                                        npu_ffn->DownColumns(l) != 0;
+          // The quantizer decodes the NPU's output streams itself when the
+          // implementation hands them out and down stays on the GPU.
+          Iu4NpuSwigluSource streams;
+          const bool have_streams =
+              npu_columns != 0 && !npu_down_wanted &&
+              npu_ffn->FfnStreams(l, bank, arena_.stream, &streams);
+          if (npu_columns != 0 && !have_streams) {
+            npu_ffn->Finish(l, bank, iu4_npu_half_[bank], intermediate_size,
+                            arena_.stream);
+          }
           if (!npu_down_wanted) {
             // SwiGLU runs inside the quantizer; the NPU columns come in as the
-            // FP16 product the NPU produced.
+            // product the NPU produced.
             LaunchIu4SwiGluQuantize(
                 arena_.d_ffn_gate, arena_.d_ffn_up, iu4_npu_half_[bank],
-                npu_columns, iu4_weights->Find(l, Iu4Role::kFfnDown).awq,
+                have_streams ? &streams : nullptr, npu_columns,
+                iu4_weights->Find(l, Iu4Role::kFfnDown).awq,
                 iu4_weights->signs(), batch_size, iu4_padded, intermediate_size,
                 iu4_tiles_[bank], iu4_scales_[bank], arena_.stream);
+            if (have_streams) {
+              npu_ffn->ReleaseFfnStreams(bank, arena_.stream);
+            }
           } else {
             LaunchBatchedSwiGLUActivation(
                 arena_.d_ffn_gate, arena_.d_ffn_up, arena_.d_ffn_act, nullptr,

@@ -10,6 +10,8 @@
 #include <memory>
 #include <string>
 
+#include "src/models/qwen/hip/ops/iu4.hpp"
+
 namespace gufo::models {
 struct QwenModelWeights;
 }
@@ -34,6 +36,15 @@ public:
   virtual void SetPaired(bool paired) noexcept = 0;
   /// True while a lockstep pair of chunks is in flight.
   [[nodiscard]] virtual bool Paired() const noexcept { return false; }
+  /// Waits for the NPU's gate/up slices of `layer` and hands out their raw
+  /// output streams for a consumer that decodes them itself (instead of
+  /// Finish). The consumer's kernels must be followed by ReleaseFfnStreams.
+  /// False when the implementation cannot.
+  [[nodiscard]] virtual bool FfnStreams(std::uint32_t, int, hipStream_t,
+                                        Iu4NpuSwigluSource*) {
+    return false;
+  }
+  virtual void ReleaseFfnStreams(int, hipStream_t) {}
   /// Leading FFN columns the NPU computes for `layer`; 0 when the layer stays
   /// on the GPU.
   [[nodiscard]] virtual std::uint32_t Columns(
