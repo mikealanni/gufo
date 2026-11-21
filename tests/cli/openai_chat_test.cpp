@@ -2892,7 +2892,7 @@ void TestStrictToolSchema() {
     request["tool_choice"] =
         gufo::json::parse(R"({"type":"function","function":{"name":"f"}})");
     const auto response =
-        gufo::server::HandleOpenAiChat(Request(request.dump()), backend);
+        gufo::server::HandleOpenAiChat(Request(request.dump()), backend, true);
     std::string output = response.body;
     std::string content;
     std::vector<std::string> scored;
@@ -6936,7 +6936,7 @@ void TestLogprobs() {
       body["stream"] = stream;
       body["top_logprobs"] = static_cast<int>(count);
       const auto response =
-          gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+          gufo::server::HandleOpenAiChat(Request(body.dump()), backend, true);
       Expect(response.status == 200, "logprobs request accepted");
       std::vector<Value> entries;
       const auto collect = [&](const Value& payload) {
@@ -6994,7 +6994,7 @@ void TestLogprobs() {
         body["tools"] = gufo::json::parse(
             R"([{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}])");
       const auto response =
-          gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+          gufo::server::HandleOpenAiChat(Request(body.dump()), backend, true);
       Expect(response.status == 200, "parsed logprob request accepted");
       std::vector<std::string> tokens;
       std::string wire;

@@ -10,7 +10,12 @@ namespace gufo::server {
 /// consume scheduler-published token pieces from HttpResponse::streaming_body;
 /// socket writes never own or execute model state.
 HttpResponse HandleOpenAiChat(const HttpRequest& request,
-                              TextGenerationBackend& backend);
+                              TextGenerationBackend& backend,
+                              bool allow_logprobs = false);
+
+/// Apply the server's permission after each API has parsed its score selector.
+std::optional<HttpResponse> CheckLogprobsAllowed(
+    const sampling::SamplingConfig& sampling, bool allow_logprobs);
 
 /// Responses nests output schema under text.format and effort under reasoning.
 /// Shared controls stay validated as in Chat Completions, but the Responses

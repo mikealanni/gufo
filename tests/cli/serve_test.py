@@ -68,6 +68,10 @@ def main():
     assert "8589934592" in help_text
     assert "0 = auto, at most the disk budget and 1/8 available RAM" in help_text
     assert "--log-progress" in help_text
+    assert "--allow-logprobs" in help_text
+    check(["serve", "llm", "--allow-logprobs", "--model", "missing.gguf"], 1,
+          "Error loading model")
+    check(["serve", "asr", "--allow-logprobs"], 2, "Unknown option")
 
     # Verbosity must change the output, not merely parse. The config line is
     # emitted at the debug tier before the model file is opened, so these all

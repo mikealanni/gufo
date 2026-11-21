@@ -4525,8 +4525,19 @@ HttpResponse CreateAnthropicMessage(const HttpRequest& request,
       request, backend, chat, max_tokens, sampling, stream);
 }
 
+std::optional<HttpResponse> CheckLogprobsAllowed(
+    const sampling::SamplingConfig& sampling, bool allow_logprobs) {
+  if (sampling.logprobs && !allow_logprobs)
+    return Error(
+        400, "Bad Request",
+        "generated-token logprobs require --allow-logprobs on the server",
+        "logprobs_disabled");
+  return std::nullopt;
+}
+
 HttpResponse HandleOpenAiChat(const HttpRequest& request,
-                              TextGenerationBackend& backend) {
+                              TextGenerationBackend& backend,
+                              bool allow_logprobs) {
   ParsedChatRequest parsed;
   const auto defaults = backend.sampling_defaults();
   parsed.max_tokens = defaults.max_tokens;
@@ -4534,6 +4545,8 @@ HttpResponse HandleOpenAiChat(const HttpRequest& request,
   if (auto error = ParseRequest(request, backend, &parsed); error.has_value()) {
     return std::move(*error);
   }
+  if (auto error = CheckLogprobsAllowed(parsed.sampling, allow_logprobs))
+    return std::move(*error);
   parsed.is_cancelled = request.is_cancelled;
   if (auto pre = TryJevPreRoute(parsed, backend); pre.has_value())
     return std::move(*pre);

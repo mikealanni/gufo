@@ -614,8 +614,9 @@ with
 no native effect are accepted and ignored so conforming clients interoperate
 (for example Codex): `reasoning.summary`, `text.verbosity`,
 `client_metadata` and `prompt_cache_key`.
-`include: ["message.output_text.logprobs"]` enables generated-token scores;
-other string entries in `include` are accepted without native effect.
+With `gufo serve llm --allow-logprobs`, the `message.output_text.logprobs`
+include selector requests generated-token scores. Other string entries in
+`include` are accepted without native effect.
 `store` and `background` must be false when present; server-side conversations
 and `previous_response_id` remain unsupported.
 
@@ -847,6 +848,15 @@ and token limits. `logprobs: false`, empty `logit_bias`,
 Token biases and audio output remain unsupported and return explicit errors.
 
 ### Generated-token log probabilities
+
+Start the text server with `gufo serve llm --model MODEL.gguf --allow-logprobs`
+to let clients request scores. The flag defaults to off. A score request on
+Chat Completions, Completions or Responses then returns HTTP 400 with code
+`logprobs_disabled` before generation starts, including for streaming requests.
+The text model entry in `GET /v1/models` reports the setting in
+`capabilities.logprobs`. With the flag enabled, collection still requires a
+per-request selector. Computing the chosen probability normalizes the full
+vocabulary and alternatives add ranking and response bytes.
 
 Chat Completions accepts `logprobs: true` and an optional `top_logprobs`
 integer from 0 to 20 (default 0). Each choice returns `logprobs.content`,

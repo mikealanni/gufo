@@ -3064,8 +3064,63 @@ void TestRawCompletionCachePrompt() {
   }
 }
 
+void TestLogprobsStartupPolicy() {
+  assert(!gufo::server::HttpServerOptions{}.allow_logprobs);
+  for (bool allow : {false, true}) {
+    RunningServer server({.allow_logprobs = allow});
+    const auto catalog = server.Send("GET /v1/models HTTP/1.1\r\n\r\n");
+    ExpectStatus(catalog, 200);
+    const auto models =
+        gufo::json::parse(catalog.substr(catalog.find("\r\n\r\n") + 4));
+    const auto& model = models.find("data")->items().front();
+    assert(model.find("capabilities")->find("logprobs")->as_bool() == allow);
+
+    struct Endpoint {
+      const char* path;
+      const char* input;
+      const char* selected;
+      const char* skipped;
+    };
+    for (const Endpoint endpoint :
+         {Endpoint{
+              "/v1/chat/completions",
+              R"({"model":"test","messages":[{"role":"user","content":"hi"}]})",
+              R"({"logprobs":true})", R"({"logprobs":false})"},
+          Endpoint{"/v1/completions", R"({"prompt":"hi"})", R"({"logprobs":0})",
+                   R"({"logprobs":null})"},
+          Endpoint{"/v1/responses", R"({"input":"hi"})",
+                   R"({"include":["message.output_text.logprobs"]})",
+                   R"({"include":[],"top_logprobs":3})"}}) {
+      for (const bool stream : {false, true}) {
+        for (const auto& [fields, requested] :
+             {std::pair{"{}", false}, std::pair{endpoint.skipped, false},
+              std::pair{endpoint.selected, true}}) {
+          auto body = gufo::json::parse(endpoint.input);
+          const auto options = gufo::json::parse(fields);
+          for (const auto& [key, value] : options.members())
+            body[key] = value;
+          body["stream"] = stream;
+          const auto before = server.backend->calls.load();
+          const auto response = server.Post(endpoint.path, body.dump());
+          if (requested && !allow) {
+            ExpectStatus(response, 400);
+            assert(response.find(R"("code":"logprobs_disabled")") !=
+                   std::string::npos);
+            assert(response.find("--allow-logprobs") != std::string::npos);
+            assert(server.backend->calls == before);
+          } else {
+            ExpectStatus(response, 200);
+            assert(server.backend->LastCall().sampling.logprobs.has_value() ==
+                   requested);
+          }
+        }
+      }
+    }
+  }
+}
+
 void TestResponsesLogprobsOptions() {
-  RunningServer server;
+  RunningServer server({.allow_logprobs = true});
   for (const bool stream : {false, true}) {
     for (const auto* count : {"null", "0", "3", "20"}) {
       const auto response = server.Post(
@@ -3105,7 +3160,7 @@ void TestResponsesLogprobsOptions() {
 }
 
 void TestRawCompletionLogprobs() {
-  RunningServer server;
+  RunningServer server({.allow_logprobs = true});
   for (const bool stream : {false, true}) {
     for (const int count : {0, 1, 20}) {
       const auto response = server.Post(
@@ -3224,6 +3279,7 @@ int main() {
   TestDeviceLoss();
   TestDeviceLossWhileWriterBlocked();
   TestRawCompletionLogprobs();
+  TestLogprobsStartupPolicy();
   TestResponsesLogprobsOptions();
   TestRawCompletionPromptProgress();
   TestRawCompletionCachePrompt();
