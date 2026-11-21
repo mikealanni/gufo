@@ -424,7 +424,8 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
   // it loads, those tensors are left out of the resident GGUF copy.
   std::unique_ptr<Iu4Weights> iu4;
   if (const char* path = std::getenv("GUFO_IU4_ARTIFACT");
-      path != nullptr && !weights_opt->config.IsMoe() &&
+      path != nullptr && std::getenv("GUFO_IU4_KEEP_GGUF") == nullptr &&
+      !weights_opt->config.IsMoe() &&
       weights_opt->config.num_layers == 64 && !weights_opt->mtp.has_value()) {
     auto loaded = std::make_unique<Iu4Weights>();
     std::string iu4_error;
