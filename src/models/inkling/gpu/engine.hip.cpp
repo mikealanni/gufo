@@ -22,7 +22,7 @@ constexpr int kTokenTile = 8;
 constexpr int kMaxStates = 8;
 constexpr int kConvTaps = 4;
 constexpr int kHistory = 3;
-constexpr int kMaxBatch = 512;
+constexpr int kMaxBatch = 2048;
 constexpr int kWmmaMinTokens = 32;
 constexpr float kMixEps = 1e-6F;
 constexpr int kTypeF32 = 0;
@@ -270,46 +270,75 @@ __global__ void Conv(const float* cur, const float* w, const float* dyn,
     hist[c * kHistory + k] = win[k];
 }
 
+__global__ void ConvT(const float* cur, const float* w, const float* dyn, int heads, const float* hist, float* out, int ch) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= ch) return;
+  const int t = blockIdx.y;
+  const int per = dyn != nullptr ? ch / heads : ch;
+  float win[kConvTaps];
+  for (int j = 0; j < kConvTaps; ++j) {
+    const int src = t - (kHistory - j);
+    win[j] = src >= 0 ? cur[static_cast<std::size_t>(src) * ch + c] : hist[c * kHistory + (src + kHistory)];
+  }
+  float o = 0.0F;
+  for (int j = 0; j < kConvTaps; ++j) o += w[c * kConvTaps + j] * win[j];
+  if (dyn != nullptr) {
+    const float* d = dyn + static_cast<std::size_t>(t) * heads * kConvTaps + (c / per) * kConvTaps;
+    for (int lag = 0; lag < kConvTaps; ++lag) o += d[lag] * win[kHistory - lag];
+  }
+  out[static_cast<std::size_t>(t) * ch + c] = (win[kHistory] + o) * rsqrtf(static_cast<float>((dyn != nullptr ? 2 : 1) * kConvTaps + 1));
+}
+
+__global__ void ConvHist(const float* cur, float* hist, int ch, int n) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= ch) return;
+  float nh[kHistory];
+  for (int k = 0; k < kHistory; ++k) {
+    const int src = n - kHistory + k;
+    nh[k] = src >= 0 ? cur[static_cast<std::size_t>(src) * ch + c] : hist[c * kHistory + src + kHistory];
+  }
+  for (int k = 0; k < kHistory; ++k) hist[c * kHistory + k] = nh[k];
+}
+
 struct StatePtrs {
   const float* p[kMaxStates];
   int count;
 };
 
-// states = rms(blocks..., cur); out[q][t] = softmax(states . query[q] /
-// sqrt(h)) mixture of normalized states
-__global__ void Mix(StatePtrs blocks, const float* cur, const float* query,
-                    int nq, int h, int n, float* out) {
-  __shared__ float red[256];
+// states = rms(blocks..., cur); out[q][t] = softmax(states . query[q] / sqrt(h)) mixture of normalized states
+__global__ void Mix(StatePtrs blocks, const float* cur, const float* query, int nq, int h, int n, float* out) {
+  __shared__ float red[256][5];
   __shared__ float inv[kMaxStates];
   __shared__ float score[4][kMaxStates];
   const int t = blockIdx.x;
   const int ns = blocks.count + 1;
   const float* st[kMaxStates];
-  for (int s = 0; s < blocks.count; ++s)
-    st[s] = blocks.p[s] + static_cast<std::size_t>(t) * h;
+  for (int s = 0; s < blocks.count; ++s) st[s] = blocks.p[s] + static_cast<std::size_t>(t) * h;
   st[blocks.count] = cur + static_cast<std::size_t>(t) * h;
   for (int s = 0; s < ns; ++s) {
-    float a = 0.0F;
-    for (int i = threadIdx.x; i < h; i += blockDim.x)
-      a += st[s][i] * st[s][i];
-    a = BlockSum(a, red);
-    if (threadIdx.x == 0)
-      inv[s] = rsqrtf(a / static_cast<float>(h) + kMixEps);
+    float acc[5] = {};
+    for (int i = threadIdx.x; i < h; i += blockDim.x) {
+      const float v = st[s][i];
+      acc[0] += v * v;
+      for (int q = 0; q < nq; ++q) acc[1 + q] += v * query[q * h + i];
+    }
+    for (int k = 0; k < 5; ++k) red[threadIdx.x][k] = acc[k];
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (threadIdx.x < stride) {
+        for (int k = 0; k < 5; ++k) red[threadIdx.x][k] += red[threadIdx.x + stride][k];
+      }
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+      inv[s] = rsqrtf(red[0][0] / static_cast<float>(h) + kMixEps);
+      for (int q = 0; q < nq; ++q) score[q][s] = red[0][1 + q] * inv[s] * rsqrtf(static_cast<float>(h));
+    }
     __syncthreads();
   }
   for (int q = 0; q < nq; ++q) {
-    for (int s = 0; s < ns; ++s) {
-      float a = 0.0F;
-      for (int i = threadIdx.x; i < h; i += blockDim.x)
-        a += st[s][i] * query[q * h + i];
-      a = BlockSum(a, red);
-      if (threadIdx.x == 0)
-        score[q][s] = a * inv[s] * rsqrtf(static_cast<float>(h));
-      __syncthreads();
-    }
     float mx = -1e30F;
-    for (int s = 0; s < ns; ++s)
-      mx = fmaxf(mx, score[q][s]);
+    for (int s = 0; s < ns; ++s) mx = fmaxf(mx, score[q][s]);
     float e[kMaxStates];
     float den = 0.0F;
     for (int s = 0; s < ns; ++s) {
@@ -318,11 +347,9 @@ __global__ void Mix(StatePtrs blocks, const float* cur, const float* query,
     }
     for (int i = threadIdx.x; i < h; i += blockDim.x) {
       float a = 0.0F;
-      for (int s = 0; s < ns; ++s)
-        a += e[s] / den * st[s][i] * inv[s];
+      for (int s = 0; s < ns; ++s) a += e[s] / den * st[s][i] * inv[s];
       out[(static_cast<std::size_t>(q) * n + t) * h + i] = a;
     }
-    __syncthreads();
   }
 }
 
@@ -1107,6 +1134,11 @@ struct Session::Impl {
   }
   void Convolve(const float* in_, const Tensor& w, const float* dyn, int heads,
                 float* hist, float* out, int ch, int n) {
+    if (n >= kWmmaMinTokens) {
+      ConvT<<<dim3((ch + 127) / 128, n), 128, 0, stream>>>(in_, static_cast<const float*>(w.dev), dyn, heads, hist, out, ch);
+      ConvHist<<<(ch + 127) / 128, 128, 0, stream>>>(in_, hist, ch, n);
+      return;
+    }
     Conv<<<(ch + 127) / 128, 128, 0, stream>>>(
         in_, static_cast<const float*>(w.dev), dyn, heads, hist, out, ch, n);
   }
