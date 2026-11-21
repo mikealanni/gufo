@@ -36,7 +36,10 @@ enum class DFlashDraftPolicy : std::uint32_t { kFixed, kAdaptive };
 // as the true stopping point.
 class DFlashLengthController {
 public:
-  static constexpr std::uint32_t kMaxDraftTokens = 7;
+  // One request may verify a wide block; cohorts of several requests keep to
+  // seven drafts, the widest their cost tables cover.
+  static constexpr std::uint32_t kMaxDraftTokens = 15;
+  static constexpr std::uint32_t kMaxCohortDraftTokens = 7;
 
   DFlashLengthController(DFlashDraftPolicy policy, std::uint32_t limit,
                          bool q8_target = false)
@@ -49,7 +52,9 @@ public:
   [[nodiscard]] std::uint32_t Choose(
       std::uint32_t budget, std::uint32_t position = 0,
       std::size_t greedy_batch_size = 1) const noexcept {
-    const auto cap = std::min(budget, limit_);
+    auto cap = std::min(budget, limit_);
+    if (greedy_batch_size > 1)
+      cap = std::min(cap, kMaxCohortDraftTokens);
     if (policy_ == DFlashDraftPolicy::kFixed || cap == 0)
       return cap;
     // Preserve the full-acceptance probe at C5-C8. Extrapolating attention
@@ -73,33 +78,33 @@ public:
     std::uint32_t best_length = 1;
     const float context_scale =
         static_cast<float>(position > 2048 ? position - 2048 : 0) / 30720.0F;
-    const auto* relative_costs = &kQ4RelativeCost;
+    std::span<const float> relative_costs = kQ4RelativeCost;
     float context_multiplier = 1.0F;
     switch (greedy_batch_size) {
       case 2:
-        relative_costs = &kQ4PairedRelativeCost;
+        relative_costs = kQ4PairedRelativeCost;
         context_multiplier = 1.92F;
         break;
       // A finishing request does not make the remaining weight reads cheap.
       // Use the next measured capacity for odd cohorts too.
       case 3:
       case 4:
-        relative_costs = &kQ4FourRequestRelativeCost;
+        relative_costs = kQ4FourRequestRelativeCost;
         context_multiplier = 3.20F;
         break;
       case 5:
       case 6:
-        relative_costs = &kQ4SixRequestRelativeCost;
+        relative_costs = kQ4SixRequestRelativeCost;
         context_multiplier = 3.50F;
         break;
       case 7:
       case 8:
-        relative_costs = &kQ4EightRequestRelativeCost;
+        relative_costs = kQ4EightRequestRelativeCost;
         context_multiplier = 4.42F;
         break;
     }
     if (q8_target_ && greedy_batch_size == 4) {
-      relative_costs = &kQ8FourRequestRelativeCost;
+      relative_costs = kQ8FourRequestRelativeCost;
       context_multiplier = 4.0F * 100.0F / 170.66F;
     }
     const float attention_cost_scale = context_scale * context_multiplier;
@@ -109,7 +114,7 @@ public:
       const float cost =
           q8_target_ && greedy_batch_size != 4
               ? 1.0F + 0.02F * static_cast<float>(length)
-              : (*relative_costs)[length - 1] +
+              : relative_costs[length - 1] +
                     attention_cost_scale * kQ4ContextCost[length - 1];
       const float score = expected_tokens / cost;
       if (score > best_score) {
@@ -159,7 +164,7 @@ public:
       default:
         return std::nullopt;
     }
-    std::uint32_t cap = kMaxDraftTokens;
+    std::uint32_t cap = kMaxCohortDraftTokens;
     std::array<double, 8> probabilities{};
     double attention_cost_scale = 0.0;
     bool full_tile = true;
@@ -253,48 +258,51 @@ public:
 private:
   // Q8 C2 complete cycles cost 158/161/161/172/178/211/187 ms.
   // The fourteen-row verification at six drafts is slower than sixteen rows.
-  static constexpr std::array<float, kMaxDraftTokens> kQ8PairedRelativeCost{
-      1.0F, 1.015F, 1.020F, 1.089F, 1.127F, 1.333F, 1.182F};
+  static constexpr std::array<float, kMaxCohortDraftTokens>
+      kQ8PairedRelativeCost{1.0F,   1.015F, 1.020F, 1.089F,
+                            1.127F, 1.333F, 1.182F};
   // Q8_K_XL C4 complete cycles cost 171/181/197/327/325/357/316 ms.
   // Four through six drafts split verification into separate launches;
   // seven fills two adjacent sixteen-row groups and reuses their weights.
   // The same attention geometry uses the measured absolute per-request
   // context delta below, normalized to this cohort's one-draft cycle.
-  static constexpr std::array<float, kMaxDraftTokens>
+  static constexpr std::array<float, kMaxCohortDraftTokens>
       kQ8FourRequestRelativeCost{1.0F,   1.06F,  1.153F, 1.914F,
                                  1.907F, 2.089F, 1.853F};
   // C6 complete cycles cost 189/333/334/405/445/474/455 ms.
   // A short twelve-row tile avoids the wider target projection launches.
-  static constexpr std::array<float, kMaxDraftTokens> kQ8SixRequestRelativeCost{
-      1.0F, 1.760F, 1.763F, 2.141F, 2.352F, 2.505F, 2.404F};
+  static constexpr std::array<float, kMaxCohortDraftTokens>
+      kQ8SixRequestRelativeCost{1.0F,   1.760F, 1.763F, 2.141F,
+                                2.352F, 2.505F, 2.404F};
   // C8 complete cycles cost 209/337/326/467/457/596/589 ms for 1–7 drafts.
   // Ragged 24/40/56-row projections cost more than their adjacent full tiles.
   // These selector-to-selector spans include target verification, context
   // injection, the next draft and host acceptance work.
-  static constexpr std::array<float, kMaxDraftTokens>
+  static constexpr std::array<float, kMaxCohortDraftTokens>
       kQ8EightRequestRelativeCost{1.0F,   1.610F, 1.561F, 2.231F,
                                   2.183F, 2.850F, 2.813F};
   static constexpr std::array<float, kMaxDraftTokens> kQ4RelativeCost{
-      1.0F, 1.02F, 1.045F, 1.08F, 1.14F, 1.20F, 1.29F};
+      1.0F,  1.02F, 1.045F, 1.08F, 1.14F, 1.20F, 1.29F, 1.32F,
+      1.35F, 1.38F, 1.41F,  1.43F, 1.46F, 1.49F, 1.51F};
   // Two greedy requests verify 4–16 rows together. Crossing eight rows has a
   // large projection cost that the C1 estimate misses. Complete-cycle release
   // controls normalize to 104 ms at one draft; the paired context multiplier
   // is 2 * 100 / 104, using the existing per-request attention calibration.
-  static constexpr std::array<float, kMaxDraftTokens> kQ4PairedRelativeCost{
-      1.0F, 1.04F, 1.10F, 1.48F, 1.45F, 1.50F, 1.50F};
+  static constexpr std::array<float, kMaxCohortDraftTokens>
+      kQ4PairedRelativeCost{1.0F, 1.04F, 1.10F, 1.48F, 1.45F, 1.50F, 1.50F};
   // Four-request cycles cross another projection cliff above sixteen rows.
   // One fixed-width profile per point gives 125/163/167/246/265/286/289 ms.
   // The context multiplier is 4 * 100 / 125.
-  static constexpr std::array<float, kMaxDraftTokens>
+  static constexpr std::array<float, kMaxCohortDraftTokens>
       kQ4FourRequestRelativeCost{1.0F,  1.30F, 1.33F, 1.97F,
                                  2.12F, 2.29F, 2.32F};
   // Six requests verify 12–48 rows. Measured complete cycles cost
   // 171/247/273/323/378/416/423 ms; the context multiplier is 6 * 100 / 171.
-  static constexpr std::array<float, kMaxDraftTokens> kQ4SixRequestRelativeCost{
-      1.0F, 1.44F, 1.59F, 1.89F, 2.21F, 2.43F, 2.47F};
+  static constexpr std::array<float, kMaxCohortDraftTokens>
+      kQ4SixRequestRelativeCost{1.0F, 1.44F, 1.59F, 1.89F, 2.21F, 2.43F, 2.47F};
   // Eight requests verify 16–64 rows. Measured complete cycles cost
   // 181/276/304/400/430/523/558 ms; the context multiplier is 8 * 100 / 181.
-  static constexpr std::array<float, kMaxDraftTokens>
+  static constexpr std::array<float, kMaxCohortDraftTokens>
       kQ4EightRequestRelativeCost{1.0F,  1.52F, 1.68F, 2.21F,
                                   2.38F, 2.89F, 3.08F};
   // Extra cost from 2K to 32K for the target's 16 full-attention layers,
@@ -303,7 +311,8 @@ private:
   // the actual row-tile boundaries. Position is deterministic on replay;
   // request timings and sampled proposals never enter the decision.
   static constexpr std::array<float, kMaxDraftTokens> kQ4ContextCost{
-      0.11F, 0.14F, 0.21F, 0.23F, 0.25F, 0.31F, 0.35F};
+      0.11F, 0.14F, 0.21F, 0.23F, 0.25F, 0.31F, 0.35F, 0.37F,
+      0.39F, 0.41F, 0.43F, 0.45F, 0.47F, 0.49F, 0.51F};
   DFlashDraftPolicy policy_;
   std::uint32_t limit_;
   bool q8_target_;

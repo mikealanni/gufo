@@ -276,3 +276,19 @@ The tile-major prefill layout is also a good decode layout, so one weight copy s
 6. Hook behind the weight-type routing, then qualify: unit tests, chain test,
    NLL tool against the model's default quant, then pp/tg at depth with bench
    mode on. Update this skill and the plan doc with every new finding.
+
+## DFlash2 block 16 (2026-11-21)
+
+hipfire runs the DFlash2 draft with a runtime block of 16 (trained at 8) and
+accepts about 13 tokens per window on code; gufo capped drafts at 7. Widening
+needed three things: the draft GGUF block_size raised to 16 at load
+(GUFO_DFLASH_BLOCK=8 restores 8), the length controller's single-request cost
+tables extended to 15 (cohorts of several requests stay at 7), and the draft's
+own GEMMs for 9-16 rows on the fp32 small-batch route
+(BatchedQuantGEMVKernel<bf16> cost 83 ms per window; the small-batch route
+about 9 ms). Their merge-sort prompt: 90 -> 126 tok/s, hipfire measured 134.5
+on this box; prose and long explanations unchanged, code 67 -> 79. Greedy output
+is byte-identical to block 8. Profile with rocprofv3 on `gufo prompt` (never
+wrap serve); per-step GPU time: verify GEMV 64 ms, draft 9 ms, other 6 ms, idle 8.
+Run hipfire itself for a fair comparison: HIPFIRE_HOME and HIPFIRE_MODELS_DIR under
+/mnt/raid0/hipfire-eval, `hipfire bench qwen3.8-27b.mq4-xts --prompt-file ... --spec dflash`.

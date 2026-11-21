@@ -481,6 +481,19 @@ public:
       throw std::runtime_error("Failed to create GPU session: " + error);
     }
     if (drafts.Enabled()) {
+      // The DFlash block sets its own draft width, wider than the shared
+      // --draft-tokens bound that the other drafters keep.
+      auto verifier_options = speculative_options;
+      if (drafts.dflash != nullptr) {
+        verifier_options.max_draft_tokens =
+            std::max(speculative_options.max_draft_tokens,
+                     std::min<std::uint32_t>(
+                         drafts.dflash->GetDFlashConfig().block_size - 1U,
+                         speculative::DFlashLengthController::kMaxDraftTokens));
+        verifier_options.initial_draft_tokens =
+            std::max(verifier_options.initial_draft_tokens,
+                     verifier_options.max_draft_tokens);
+      }
       std::unique_ptr<hip::QwenDFlashGpuDraftBackend> dflash_backend;
       if (drafts.dflash != nullptr) {
         dflash_backend = hip::QwenDFlashGpuDraftBackend::Create(
@@ -502,7 +515,9 @@ public:
             drafts.mtp,
             hip::QwenMtpGpuDraftConfig{
                 .max_context = max_context,
-                .max_draft_tokens = speculative_options.max_draft_tokens,
+                .max_draft_tokens = std::min<std::uint32_t>(
+                    speculative_options.max_draft_tokens,
+                    speculative::DFlashLengthController::kMaxCohortDraftTokens),
                 .vision_input = &executor_->VisionInput(),
             },
             &error);
@@ -525,7 +540,7 @@ public:
       }
       draft_backend_ = draft_backend.get();
       verifier_ = std::make_unique<speculative::SpeculativeVerifier>(
-          *executor_, std::move(draft_backend), speculative_options);
+          *executor_, std::move(draft_backend), verifier_options);
     }
   }
 

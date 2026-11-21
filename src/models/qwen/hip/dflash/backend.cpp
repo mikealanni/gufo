@@ -216,9 +216,10 @@ std::unique_ptr<QwenDFlashGpuDraftBackend> QwenDFlashGpuDraftBackend::Create(
     }
     return nullptr;
   }
-  config.max_draft_tokens = std::min(
-      {config.max_draft_tokens, model->GetDFlashConfig().block_size - 1U,
-       speculative::DFlashLengthController::kMaxDraftTokens});
+  // The block sets the draft width; --draft-tokens bounds the other drafters.
+  config.max_draft_tokens =
+      std::min({model->GetDFlashConfig().block_size - 1U,
+                speculative::DFlashLengthController::kMaxDraftTokens});
   auto executor = QwenDFlashGpuExecutor::Create(std::move(model),
                                                 config.max_context, error_msg);
   if (executor == nullptr) {

@@ -297,8 +297,12 @@ QwenDFlashGpuExecutor::ForwardBlockBatch(
       if (requests[previous].executor == executor)
         throw std::invalid_argument("DFlash2 block batch repeats a session");
     }
-    counts[index] = std::min({request.draft_count, draft.block_size - 1U,
-                              executor->max_context_ - request.position - 1U});
+    counts[index] = std::min(
+        {request.draft_count, draft.block_size - 1U,
+         requests.size() > 1
+             ? speculative::DFlashLengthController::kMaxCohortDraftTokens
+             : speculative::DFlashLengthController::kMaxDraftTokens,
+         executor->max_context_ - request.position - 1U});
     if (request.temperature > 0.0F && request.uniforms.size() < counts[index])
       throw std::invalid_argument(
           "DFlash2 block batch is missing sampling draws");

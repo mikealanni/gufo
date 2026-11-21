@@ -468,7 +468,7 @@ void QwenDFlashGpuExecutor::RunBlockGemm(const models::QwenTensorRef& weight,
     // whole block and needs no BF16 activation round trip. It also beat the
     // matrix-core W8A8 route once the shared kernel read activations as float4
     // (11.3 vs 12.2 ms per draft block), so there is one route here.
-    if (batch_size <= kDFlashMaxSharedBatch) {
+    if (batch_size <= 16) {
       LaunchBatchedQuantGEMMFp32(weight.type, weight.data, input, output,
                                  batch_size, output_size, input_size, stream_);
       return;
