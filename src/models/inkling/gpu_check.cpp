@@ -12,7 +12,10 @@
 
 int main(int argc, char** argv) {
   constexpr int kTop = 5;
-  constexpr std::uint32_t kContext = 8192;
+  const std::uint32_t kContext =
+      std::getenv("INKLING_CTX") != nullptr
+          ? static_cast<std::uint32_t>(std::atoi(std::getenv("INKLING_CTX")))
+          : 8192U;
   if (argc >= 3 && std::string(argv[2]) == "--text") {
     constexpr int kGenerate = 64;
     std::string err;

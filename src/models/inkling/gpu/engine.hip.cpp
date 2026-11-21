@@ -384,8 +384,10 @@ __global__ void Control(float* cur, const float* msg, const float* gain,
 }
 
 __global__ void StoreKv(const float* k, const float* v, __half* kc, __half* vc,
-                        int dim, const int* pos0) {
-  const std::size_t dst = static_cast<std::size_t>(*pos0 + blockIdx.x) * dim;
+                        int dim, const int* pos0, int ring) {
+  const int row = *pos0 + blockIdx.x;
+  const std::size_t dst =
+      static_cast<std::size_t>(ring > 0 ? row % ring : row) * dim;
   for (int i = threadIdx.x; i < dim; i += blockDim.x) {
     kc[dst + i] =
         __float2half(k[static_cast<std::size_t>(blockIdx.x) * dim + i]);
@@ -395,7 +397,7 @@ __global__ void StoreKv(const float* k, const float* v, __half* kc, __half* vc,
 }
 
 struct AttnArgs {
-  int nh, nkv, hd, nrel, extent, window;
+  int nh, nkv, hd, nrel, extent, window, ring;
   const int* pos0;
   float scale;
 };
@@ -421,7 +423,9 @@ __global__ void Attention(AttnArgs a, const float* q, const float* r,
   const int kvdim = a.nkv * a.hd;
   float mx = 0.0F;
   for (int j = first + threadIdx.x; j <= pos; j += blockDim.x) {
-    const __half* kj = kc + static_cast<std::size_t>(j) * kvdim + g * a.hd;
+    const __half* kj =
+        kc + static_cast<std::size_t>(a.ring > 0 ? j % a.ring : j) * kvdim +
+        g * a.hd;
     float d = 0.0F;
     for (int i = 0; i < a.hd; ++i)
       d += qh[i] * __half2float(kj[i]);
@@ -455,8 +459,11 @@ __global__ void Attention(AttnArgs a, const float* q, const float* r,
   for (int d = threadIdx.x; d < a.hd; d += blockDim.x) {
     float o = 0.0F;
     for (int j = first; j <= pos; ++j)
-      o += sc[j - first] *
-           __half2float(vc[static_cast<std::size_t>(j) * kvdim + g * a.hd + d]);
+      o +=
+          sc[j - first] *
+          __half2float(
+              vc[static_cast<std::size_t>(a.ring > 0 ? j % a.ring : j) * kvdim +
+                 g * a.hd + d]);
     out[(static_cast<std::size_t>(t) * a.nh + h) * a.hd + d] = o / den;
   }
 }
@@ -827,10 +834,10 @@ __global__ void __launch_bounds__(128)
       const int half = tid & 1;
       const int j = kb + key;
       const bool ok = j <= qmax_pos;
+      const std::size_t jr = a.ring > 0 ? j % a.ring : j;
       const uint4* ks = reinterpret_cast<const uint4*>(
-          kc + static_cast<std::size_t>(j) * kvdim + g * kFlashHd + half * 64);
-      const __half* vs =
-          vc + static_cast<std::size_t>(j) * kvdim + g * kFlashHd + half * 64;
+          kc + jr * kvdim + g * kFlashHd + half * 64);
+      const __half* vs = vc + jr * kvdim + g * kFlashHd + half * 64;
       uint4* kd = reinterpret_cast<uint4*>(&Ks[key][half * 64]);
       for (int i = 0; i < 8; ++i)
         kd[i] = ok ? ks[i] : make_uint4(0, 0, 0, 0);
@@ -1024,6 +1031,7 @@ struct Session::Impl {
   struct Slot {
     __half* k{nullptr};
     __half* v{nullptr};
+    int ring{0};
     float* hist_k{nullptr};
     float* hist_v{nullptr};
     float* hist_attn{nullptr};
@@ -1280,13 +1288,14 @@ struct Session::Impl {
                                       c.log_scale_alpha);
     }
     Dense(m->T(m->P(p, "attn_sink_proj.weight")), in[0], h, sink, nh, n);
-    StoreKv<<<n, 256, 0, stream>>>(k, v, sl.k, sl.v, nkv * hd, d_pos);
+    StoreKv<<<n, 256, 0, stream>>>(k, v, sl.k, sl.v, nkv * hd, d_pos, sl.ring);
     AttnArgs aa{nh,
                 nkv,
                 hd,
                 nrel,
                 static_cast<int>(c.relative_extent),
                 swa ? static_cast<int>(c.sliding_window) : 0,
+                sl.ring,
                 d_pos,
                 1.0F / std::sqrt(static_cast<float>(hd))};
     const int span =
@@ -1556,10 +1565,13 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
   const std::size_t b = kMaxBatch;
   i.slots.resize(c.num_layers);
   for (auto& sl : i.slots) {
-    sl.k = static_cast<__half*>(
-        i.AllocBytes(static_cast<std::size_t>(max_context) * kv * 2));
-    sl.v = static_cast<__half*>(
-        i.AllocBytes(static_cast<std::size_t>(max_context) * kv * 2));
+    const std::size_t slot_index = &sl - i.slots.data();
+    const std::size_t ring_rows = c.sliding_window + kMaxBatch;
+    const bool use_ring = c.is_swa[slot_index] && max_context > ring_rows;
+    sl.ring = use_ring ? static_cast<int>(ring_rows) : 0;
+    const std::size_t rows = use_ring ? ring_rows : max_context;
+    sl.k = static_cast<__half*>(i.AllocBytes(rows * kv * 2));
+    sl.v = static_cast<__half*>(i.AllocBytes(rows * kv * 2));
     sl.hist_k = static_cast<float*>(i.AllocBytes(kv * kHistory * 4));
     sl.hist_v = static_cast<float*>(i.AllocBytes(kv * kHistory * 4));
     sl.hist_attn = static_cast<float*>(i.AllocBytes(h * kHistory * 4));
