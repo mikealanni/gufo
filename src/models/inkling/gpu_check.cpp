@@ -1,5 +1,7 @@
 #include <algorithm>
 #include <chrono>
+#include <fstream>
+#include <sstream>
 #include <cstdio>
 #include <cstdlib>
 #include <numeric>
@@ -79,17 +81,35 @@ int main(int argc, char** argv) {
     constexpr int kBenchToken = 1000;
     const int n = std::atoi(env);
     session->Reset();
-    std::vector<std::int32_t> prompt(n, kBenchToken);
+    std::vector<std::int32_t> prompt;
+    if (const char* file = std::getenv("INKLING_BENCH_FILE")) {
+      std::string err;
+      auto reader = gufo::core::GgufReader::OpenFile(argv[1], &err);
+      auto tok = gufo::tokenization::QwenTokenizer::CreateFromGguf(*reader, &err);
+      std::ifstream in(file);
+      std::stringstream ss;
+      ss << in.rdbuf();
+      const auto ids = tok->Encode(ss.str(), {});
+      for (int i = 0; i < n; ++i) prompt.push_back(static_cast<std::int32_t>(ids[static_cast<std::size_t>(i) % ids.size()]));
+    } else {
+      prompt.assign(n, kBenchToken);
+    }
     const auto t0 = std::chrono::steady_clock::now();
-    (void)session->Append(prompt, &error);
+    if (!session->Append(prompt, &error)) {
+      std::fprintf(stderr, "bench prefill failed: %s\n", error.c_str());
+      return 1;
+    }
     const auto t1 = std::chrono::steady_clock::now();
     for (int i = 0; i < kDecode; ++i) {
-      const std::int32_t one = kBenchToken;
-      (void)session->Append(std::span(&one, 1), &error);
+      const auto logits = session->Logits();
+      const auto best = static_cast<std::int32_t>(std::max_element(logits.begin(), logits.end()) - logits.begin());
+      if (!session->Append(std::span(&best, 1), &error)) {
+        std::fprintf(stderr, "bench decode failed: %s\n", error.c_str());
+        return 1;
+      }
     }
     const auto t2 = std::chrono::steady_clock::now();
-    std::printf("pp %d: %.1f tok/s, tg: %.2f tok/s\n", n,
-                n / std::chrono::duration<double>(t1 - t0).count(),
+    std::printf("pp %d: %.1f tok/s, tg: %.2f tok/s\n", n, n / std::chrono::duration<double>(t1 - t0).count(),
                 kDecode / std::chrono::duration<double>(t2 - t1).count());
   }
   return 0;

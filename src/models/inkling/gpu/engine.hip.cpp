@@ -6,11 +6,13 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
 namespace gufo::models::inkling::gpu {
 namespace {
@@ -771,6 +773,7 @@ constexpr int kKStride = 136;
 constexpr int kVStride = 72;
 constexpr int kPStride = 72;
 constexpr int kFlashHd = 128;
+constexpr int kSplitKeys = 2048;
 constexpr int kFlashRel = 16;
 constexpr float kNegInf = -1e30F;
 
@@ -779,7 +782,8 @@ constexpr float kNegInf = -1e30F;
 __global__ void __launch_bounds__(128)
     FlashRel(AttnArgs a, const float* q, const float* r, const float* sink,
              const __half* kc, const __half* vc, const float* bias, float* out,
-             int n) {
+             int n, int nsplit, int split_keys, float* pm, float* pl,
+             float* po) {
   __shared__ __half Ks[kFlashK][kKStride];
   __shared__ __half Vt[kFlashHd][kVStride];
   __shared__ __half Ps[kFlashQ][kPStride];
@@ -821,13 +825,20 @@ __global__ void __launch_bounds__(128)
   V8f o[8] = {};
   float m[8];
   float l[8];
+  const int split = blockIdx.z;
   for (int i = 0; i < 8; ++i) {
-    m[i] = 0.0F;
-    l[i] = 1.0F / 16.0F;  // zero sink counted once after the 16-lane sum
+    // the zero sink logit belongs to split 0 only (counted once after the 16-lane sum)
+    m[i] = split == 0 ? 0.0F : kNegInf;
+    l[i] = split == 0 ? 1.0F / 16.0F : 0.0F;
   }
   const int kfirst_pos = a.window > 0 ? max(0, qmin_pos - a.window + 1) : 0;
-  for (int kb = (kfirst_pos / kFlashK) * kFlashK; kb <= qmax_pos;
-       kb += kFlashK) {
+  int kb_begin = (kfirst_pos / kFlashK) * kFlashK;
+  int kb_end = qmax_pos;
+  if (nsplit > 1) {
+    kb_begin = max(kb_begin, split * split_keys);
+    kb_end = min(kb_end, (split + 1) * split_keys - 1);
+  }
+  for (int kb = kb_begin; kb <= kb_end; kb += kFlashK) {
     __syncthreads();
     {
       const int key = tid >> 1;
@@ -918,10 +929,32 @@ __global__ void __launch_bounds__(128)
     const int t = q0 + wave * 16 + 2 * i + (lane >> 4);
     if (t >= n)
       continue;
+    if (nsplit > 1) {
+      const std::size_t part = (static_cast<std::size_t>(t) * a.nh + h) * nsplit + split;
+      if ((lane & 15) == 0) {
+        pm[part] = m[i];
+        pl[part] = ls;
+      }
+      for (int ni = 0; ni < 8; ++ni) po[part * kFlashHd + ni * 16 + (lane & 15)] = o[ni][i];
+      continue;
+    }
     for (int ni = 0; ni < 8; ++ni) {
       out[(static_cast<std::size_t>(t) * a.nh + h) * kFlashHd + ni * 16 +
           (lane & 15)] = o[ni][i] / ls;
     }
+  }
+}
+
+__global__ void FlashCombine(const float* pm, const float* pl, const float* po, float* out, int nh, int nsplit) {
+  const std::size_t base = (static_cast<std::size_t>(blockIdx.x) * nh + blockIdx.y) * nsplit;
+  float mx = kNegInf;
+  for (int s = 0; s < nsplit; ++s) mx = fmaxf(mx, pm[base + s]);
+  float den = 0.0F;
+  for (int s = 0; s < nsplit; ++s) den += expf(pm[base + s] - mx) * pl[base + s];
+  for (int d = threadIdx.x; d < kFlashHd; d += blockDim.x) {
+    float acc = 0.0F;
+    for (int s = 0; s < nsplit; ++s) acc += expf(pm[base + s] - mx) * po[(base + s) * kFlashHd + d];
+    out[(static_cast<std::size_t>(blockIdx.x) * nh + blockIdx.y) * kFlashHd + d] = acc / den;
   }
 }
 
@@ -1052,6 +1085,7 @@ struct Session::Impl {
       *moe{nullptr}, *prelude{nullptr}, *bank_out{nullptr}, *d_logits{nullptr};
   int *sorted{nullptr}, *tiles{nullptr};
   __half *xh{nullptr}, *act16{nullptr};
+  float *split_m{nullptr}, *split_l{nullptr}, *split_o{nullptr};
   int *ids{nullptr}, *xrow{nullptr}, *xrow_token{nullptr}, *xrow_item{nullptr},
       *d_pos{nullptr};
   hipStream_t stream{nullptr};
@@ -1094,6 +1128,10 @@ struct Session::Impl {
         static_cast<std::uint64_t>(nrows) <= w.rows) {
       const std::size_t xcount = static_cast<std::size_t>(n) * w.cols;
       ToHalf<<<(xcount + 255) / 256, 256, 0, stream>>>(xin, xh, xcount);
+      if (w.type == kTypeQ8 && ldx == w.cols && std::getenv("INKLING_SHARED_DENSE") != nullptr &&
+          gufo::models::qwen38_flash_next::rocm::DenseF16Gemm(w.dev, xh, yout, n, nrows, w.cols, stream)) {
+        return;
+      }
       WmmaArgs wa{static_cast<const unsigned char*>(w.dev),
                   w.row_bytes,
                   static_cast<int>(w.cols),
@@ -1300,11 +1338,13 @@ struct Session::Impl {
                 1.0F / std::sqrt(static_cast<float>(hd))};
     const int span =
         swa ? static_cast<int>(c.sliding_window) : static_cast<int>(ctx);
-    if (n >= kWmmaMinTokens && hd == kFlashHd && nrel == kFlashRel) {
-      FlashRel<<<dim3((n + kFlashQ - 1) / kFlashQ, nh), 128, 0, stream>>>(
-          aa, q, r, sink, sl.k, sl.v,
-          static_cast<const float*>(m->T(m->P(p, "attn_rel_bias.weight")).dev),
-          att, n);
+    if (hd == kFlashHd && nrel == kFlashRel) {
+      const float* bias_w = static_cast<const float*>(m->T(m->P(p, "attn_rel_bias.weight")).dev);
+      const bool split = n < kWmmaMinTokens && !swa && ctx > kSplitKeys;
+      const int nsplit = split ? static_cast<int>((ctx + kSplitKeys - 1) / kSplitKeys) : 1;
+      FlashRel<<<dim3((n + kFlashQ - 1) / kFlashQ, nh, nsplit), 128, 0, stream>>>(
+          aa, q, r, sink, sl.k, sl.v, bias_w, att, n, nsplit, kSplitKeys, split_m, split_l, split_o);
+      if (nsplit > 1) FlashCombine<<<dim3(n, nh), 128, 0, stream>>>(split_m, split_l, split_o, att, nh, nsplit);
     } else {
       Attention<<<dim3(nh, n), kThreads, (span + 1) * sizeof(float), stream>>>(
           aa, q, r, sink, sl.k, sl.v,
@@ -1612,6 +1652,12 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
   i.bank_out = i.Alloc(b * h);
   i.d_logits = i.Alloc(c.vocab_padded);
   i.d_pos = static_cast<int*>(i.AllocBytes(4));
+  {
+    const std::size_t splits = (max_context + kSplitKeys - 1) / kSplitKeys;
+    i.split_m = i.Alloc(kWmmaMinTokens * c.num_heads * splits);
+    i.split_l = i.Alloc(kWmmaMinTokens * c.num_heads * splits);
+    i.split_o = i.Alloc(kWmmaMinTokens * c.num_heads * splits * kFlashHd);
+  }
   i.xh = static_cast<__half*>(
       i.AllocBytes(b * std::max<std::size_t>(qd, 2 * h) * 2));
   i.act16 =
