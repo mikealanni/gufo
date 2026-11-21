@@ -270,34 +270,45 @@ __global__ void Conv(const float* cur, const float* w, const float* dyn,
     hist[c * kHistory + k] = win[k];
 }
 
-__global__ void ConvT(const float* cur, const float* w, const float* dyn, int heads, const float* hist, float* out, int ch) {
+__global__ void ConvT(const float* cur, const float* w, const float* dyn,
+                      int heads, const float* hist, float* out, int ch) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
-  if (c >= ch) return;
+  if (c >= ch)
+    return;
   const int t = blockIdx.y;
   const int per = dyn != nullptr ? ch / heads : ch;
   float win[kConvTaps];
   for (int j = 0; j < kConvTaps; ++j) {
     const int src = t - (kHistory - j);
-    win[j] = src >= 0 ? cur[static_cast<std::size_t>(src) * ch + c] : hist[c * kHistory + (src + kHistory)];
+    win[j] = src >= 0 ? cur[static_cast<std::size_t>(src) * ch + c]
+                      : hist[c * kHistory + (src + kHistory)];
   }
   float o = 0.0F;
-  for (int j = 0; j < kConvTaps; ++j) o += w[c * kConvTaps + j] * win[j];
+  for (int j = 0; j < kConvTaps; ++j)
+    o += w[c * kConvTaps + j] * win[j];
   if (dyn != nullptr) {
-    const float* d = dyn + static_cast<std::size_t>(t) * heads * kConvTaps + (c / per) * kConvTaps;
-    for (int lag = 0; lag < kConvTaps; ++lag) o += d[lag] * win[kHistory - lag];
+    const float* d = dyn + static_cast<std::size_t>(t) * heads * kConvTaps +
+                     (c / per) * kConvTaps;
+    for (int lag = 0; lag < kConvTaps; ++lag)
+      o += d[lag] * win[kHistory - lag];
   }
-  out[static_cast<std::size_t>(t) * ch + c] = (win[kHistory] + o) * rsqrtf(static_cast<float>((dyn != nullptr ? 2 : 1) * kConvTaps + 1));
+  out[static_cast<std::size_t>(t) * ch + c] =
+      (win[kHistory] + o) *
+      rsqrtf(static_cast<float>((dyn != nullptr ? 2 : 1) * kConvTaps + 1));
 }
 
 __global__ void ConvHist(const float* cur, float* hist, int ch, int n) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
-  if (c >= ch) return;
+  if (c >= ch)
+    return;
   float nh[kHistory];
   for (int k = 0; k < kHistory; ++k) {
     const int src = n - kHistory + k;
-    nh[k] = src >= 0 ? cur[static_cast<std::size_t>(src) * ch + c] : hist[c * kHistory + src + kHistory];
+    nh[k] = src >= 0 ? cur[static_cast<std::size_t>(src) * ch + c]
+                     : hist[c * kHistory + src + kHistory];
   }
-  for (int k = 0; k < kHistory; ++k) hist[c * kHistory + k] = nh[k];
+  for (int k = 0; k < kHistory; ++k)
+    hist[c * kHistory + k] = nh[k];
 }
 
 struct StatePtrs {
@@ -305,40 +316,48 @@ struct StatePtrs {
   int count;
 };
 
-// states = rms(blocks..., cur); out[q][t] = softmax(states . query[q] / sqrt(h)) mixture of normalized states
-__global__ void Mix(StatePtrs blocks, const float* cur, const float* query, int nq, int h, int n, float* out) {
+// states = rms(blocks..., cur); out[q][t] = softmax(states . query[q] /
+// sqrt(h)) mixture of normalized states
+__global__ void Mix(StatePtrs blocks, const float* cur, const float* query,
+                    int nq, int h, int n, float* out) {
   __shared__ float red[256][5];
   __shared__ float inv[kMaxStates];
   __shared__ float score[4][kMaxStates];
   const int t = blockIdx.x;
   const int ns = blocks.count + 1;
   const float* st[kMaxStates];
-  for (int s = 0; s < blocks.count; ++s) st[s] = blocks.p[s] + static_cast<std::size_t>(t) * h;
+  for (int s = 0; s < blocks.count; ++s)
+    st[s] = blocks.p[s] + static_cast<std::size_t>(t) * h;
   st[blocks.count] = cur + static_cast<std::size_t>(t) * h;
   for (int s = 0; s < ns; ++s) {
     float acc[5] = {};
     for (int i = threadIdx.x; i < h; i += blockDim.x) {
       const float v = st[s][i];
       acc[0] += v * v;
-      for (int q = 0; q < nq; ++q) acc[1 + q] += v * query[q * h + i];
+      for (int q = 0; q < nq; ++q)
+        acc[1 + q] += v * query[q * h + i];
     }
-    for (int k = 0; k < 5; ++k) red[threadIdx.x][k] = acc[k];
+    for (int k = 0; k < 5; ++k)
+      red[threadIdx.x][k] = acc[k];
     __syncthreads();
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
       if (threadIdx.x < stride) {
-        for (int k = 0; k < 5; ++k) red[threadIdx.x][k] += red[threadIdx.x + stride][k];
+        for (int k = 0; k < 5; ++k)
+          red[threadIdx.x][k] += red[threadIdx.x + stride][k];
       }
       __syncthreads();
     }
     if (threadIdx.x == 0) {
       inv[s] = rsqrtf(red[0][0] / static_cast<float>(h) + kMixEps);
-      for (int q = 0; q < nq; ++q) score[q][s] = red[0][1 + q] * inv[s] * rsqrtf(static_cast<float>(h));
+      for (int q = 0; q < nq; ++q)
+        score[q][s] = red[0][1 + q] * inv[s] * rsqrtf(static_cast<float>(h));
     }
     __syncthreads();
   }
   for (int q = 0; q < nq; ++q) {
     float mx = -1e30F;
-    for (int s = 0; s < ns; ++s) mx = fmaxf(mx, score[q][s]);
+    for (int s = 0; s < ns; ++s)
+      mx = fmaxf(mx, score[q][s]);
     float e[kMaxStates];
     float den = 0.0F;
     for (int s = 0; s < ns; ++s) {
@@ -347,7 +366,8 @@ __global__ void Mix(StatePtrs blocks, const float* cur, const float* query, int 
     }
     for (int i = threadIdx.x; i < h; i += blockDim.x) {
       float a = 0.0F;
-      for (int s = 0; s < ns; ++s) a += e[s] / den * st[s][i] * inv[s];
+      for (int s = 0; s < ns; ++s)
+        a += e[s] / den * st[s][i] * inv[s];
       out[(static_cast<std::size_t>(q) * n + t) * h + i] = a;
     }
   }
@@ -522,17 +542,21 @@ __global__ void Situ(const float* gu, const int* group, const float* scale,
 }
 
 __global__ void ToHalf(const float* x, __half* y, std::size_t count) {
-  const std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i < count) y[i] = __float2half(x[i]);
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < count)
+    y[i] = __float2half(x[i]);
 }
 
-__global__ void SituHalf(const float* gu, const int* group, const float* scale, __half* act, int ff, float beta, float lb) {
+__global__ void SituHalf(const float* gu, const int* group, const float* scale,
+                         __half* act, int ff, float beta, float lb) {
   const int item = blockIdx.x;
   const float s = scale != nullptr ? scale[group[item]] : 1.0F;
   for (int j = threadIdx.x; j < ff; j += blockDim.x) {
     const float g = gu[static_cast<std::size_t>(item) * 2 * ff + j] * s;
     const float u = gu[static_cast<std::size_t>(item) * 2 * ff + ff + j] * s;
-    act[static_cast<std::size_t>(item) * ff + j] = __float2half(beta * tanhf(g / beta) * Sigmoid(g) * lb * tanhf(u / lb));
+    act[static_cast<std::size_t>(item) * ff + j] =
+        __float2half(beta * tanhf(g / beta) * Sigmoid(g) * lb * tanhf(u / lb));
   }
 }
 
@@ -640,7 +664,9 @@ __global__ void __launch_bounds__(kWmmaThreads) WmmaGemm(WmmaArgs a) {
   const int lh = tid & 1;
   const int item =
       lr < cnt ? (a.sorted != nullptr ? a.sorted[start + lr] : start + lr) : -1;
-  const __half* xr = item >= 0 ? a.x + static_cast<std::size_t>(item / a.a_div) * a.cols : nullptr;
+  const __half* xr =
+      item >= 0 ? a.x + static_cast<std::size_t>(item / a.a_div) * a.cols
+                : nullptr;
   const unsigned char* wr =
       a.w + (static_cast<std::size_t>(expert) * a.rows + n0 + lr) * a.row_bytes;
   V8f acc[2][2] = {};
@@ -1051,7 +1077,17 @@ struct Session::Impl {
         static_cast<std::uint64_t>(nrows) <= w.rows) {
       const std::size_t xcount = static_cast<std::size_t>(n) * w.cols;
       ToHalf<<<(xcount + 255) / 256, 256, 0, stream>>>(xin, xh, xcount);
-      WmmaArgs wa{static_cast<const unsigned char*>(w.dev), w.row_bytes, static_cast<int>(w.cols), nrows, xh, 1, yout, nullptr, nullptr, nullptr, n};
+      WmmaArgs wa{static_cast<const unsigned char*>(w.dev),
+                  w.row_bytes,
+                  static_cast<int>(w.cols),
+                  nrows,
+                  xh,
+                  1,
+                  yout,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  n};
       const dim3 wg(nrows / kTileN, (n + kTileM - 1) / kTileM);
       if (ldx == w.cols) {
         switch (w.type) {
@@ -1135,7 +1171,8 @@ struct Session::Impl {
   void Convolve(const float* in_, const Tensor& w, const float* dyn, int heads,
                 float* hist, float* out, int ch, int n) {
     if (n >= kWmmaMinTokens) {
-      ConvT<<<dim3((ch + 127) / 128, n), 128, 0, stream>>>(in_, static_cast<const float*>(w.dev), dyn, heads, hist, out, ch);
+      ConvT<<<dim3((ch + 127) / 128, n), 128, 0, stream>>>(
+          in_, static_cast<const float*>(w.dev), dyn, heads, hist, out, ch);
       ConvHist<<<(ch + 127) / 128, 128, 0, stream>>>(in_, hist, ch, n);
       return;
     }
@@ -1310,9 +1347,30 @@ struct Session::Impl {
                                         max_tiles);
       const Tensor& wgu = m->T(m->P(p, "ffn_gate_up_exps.weight"));
       const Tensor& wdn = m->T(m->P(p, "ffn_down_exps.weight"));
-      ToHalf<<<(static_cast<std::size_t>(n) * h + 255) / 256, 256, 0, stream>>>(x, xh, static_cast<std::size_t>(n) * h);
-      WmmaArgs a1{static_cast<const unsigned char*>(wgu.dev), wgu.row_bytes, static_cast<int>(wgu.cols), 2 * ff, xh, nu, gu, nullptr, tiles, sorted, n};
-      WmmaArgs a2{static_cast<const unsigned char*>(wdn.dev), wdn.row_bytes, static_cast<int>(wdn.cols), h, act16, 1, y, s_dn, tiles, sorted, n};
+      ToHalf<<<(static_cast<std::size_t>(n) * h + 255) / 256, 256, 0, stream>>>(
+          x, xh, static_cast<std::size_t>(n) * h);
+      WmmaArgs a1{static_cast<const unsigned char*>(wgu.dev),
+                  wgu.row_bytes,
+                  static_cast<int>(wgu.cols),
+                  2 * ff,
+                  xh,
+                  nu,
+                  gu,
+                  nullptr,
+                  tiles,
+                  sorted,
+                  n};
+      WmmaArgs a2{static_cast<const unsigned char*>(wdn.dev),
+                  wdn.row_bytes,
+                  static_cast<int>(wdn.cols),
+                  h,
+                  act16,
+                  1,
+                  y,
+                  s_dn,
+                  tiles,
+                  sorted,
+                  n};
       const dim3 g1(2 * ff / kTileN, max_tiles);
       const dim3 g2(h / kTileN, max_tiles);
       if (wgu.type == kTypeNvfp4) {
@@ -1321,7 +1379,7 @@ struct Session::Impl {
         WmmaGemm<kTypeQ8><<<g1, kWmmaThreads, 0, stream>>>(a1);
       }
       SituHalf<<<items, 256, 0, stream>>>(gu, ids, s_gu, act16, ff, c.situ_beta,
-                                      c.situ_linear_beta);
+                                          c.situ_linear_beta);
       if (wdn.type == kTypeNvfp4) {
         WmmaGemm<kTypeNvfp4><<<g2, kWmmaThreads, 0, stream>>>(a2);
       } else {
@@ -1529,8 +1587,10 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
   i.bank_out = i.Alloc(b * h);
   i.d_logits = i.Alloc(c.vocab_padded);
   i.d_pos = static_cast<int*>(i.AllocBytes(4));
-  i.xh = static_cast<__half*>(i.AllocBytes(b * std::max<std::size_t>(qd, 2 * h) * 2));
-  i.act16 = static_cast<__half*>(i.AllocBytes(b * c.expert_used * c.expert_ff * 2));
+  i.xh = static_cast<__half*>(
+      i.AllocBytes(b * std::max<std::size_t>(qd, 2 * h) * 2));
+  i.act16 =
+      static_cast<__half*>(i.AllocBytes(b * c.expert_used * c.expert_ff * 2));
   i.sorted = static_cast<int*>(i.AllocBytes(b * c.expert_used * 4));
   i.tiles = static_cast<int*>(
       i.AllocBytes((b * c.expert_used / kTileM + c.expert_count) * 3 * 4));

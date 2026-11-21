@@ -6,11 +6,42 @@
 #include <string>
 #include <vector>
 
+#include "src/core/gguf_reader.hpp"
 #include "src/models/inkling/gpu/engine.hpp"
+#include "src/models/qwen/tokenizer.hpp"
 
 int main(int argc, char** argv) {
   constexpr int kTop = 5;
   constexpr std::uint32_t kContext = 8192;
+  if (argc >= 3 && std::string(argv[2]) == "--text") {
+    constexpr int kGenerate = 64;
+    std::string err;
+    auto reader = gufo::core::GgufReader::OpenFile(argv[1], &err);
+    auto tok = gufo::tokenization::QwenTokenizer::CreateFromGguf(*reader, &err);
+    if (!tok) {
+      std::fprintf(stderr, "tokenizer failed: %s\n", err.c_str());
+      return 1;
+    }
+    auto model = gufo::models::inkling::gpu::Model::Load(argv[1], &err);
+    auto session = model->CreateSession(kContext, &err);
+    const auto ids =
+        tok->Encode(argc > 3 ? argv[3] : "The capital of France is", {});
+    std::vector<std::int32_t> in(ids.begin(), ids.end());
+    std::printf("prompt tokens: %zu\n", in.size());
+    (void)session->Append(in, &err);
+    for (int i = 0; i < kGenerate; ++i) {
+      const auto logits = session->Logits();
+      const auto best = static_cast<std::int32_t>(
+          std::max_element(logits.begin(), logits.end()) - logits.begin());
+      std::printf("%s", tok->DecodeTokenCopy(
+                               static_cast<gufo::tokenization::TokenId>(best))
+                            .c_str());
+      std::fflush(stdout);
+      (void)session->Append(std::span(&best, 1), &err);
+    }
+    std::printf("\n");
+    return 0;
+  }
   if (argc < 3)
     return 2;
   std::string error;

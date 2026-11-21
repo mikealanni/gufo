@@ -417,6 +417,8 @@ std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromGguf(
       tokenizer->pre_tokenizer_ = PreTokenizer::kGlm4;
     } else if (*pre == "laguna") {
       tokenizer->pre_tokenizer_ = PreTokenizer::kLaguna;
+    } else if (*pre == "inkling2") {
+      tokenizer->pre_tokenizer_ = PreTokenizer::kInkling2;
     } else if (*pre == "minicpm5") {
       // MiniCPM5's tokenizer.json regex (llama.cpp's
       // LLAMA_VOCAB_PRE_TYPE_MINICPM5) is byte-for-byte the same
@@ -708,6 +710,14 @@ std::vector<TokenId> QwenTokenizer::LagunaEncodeText(
   return tokens;
 }
 
+std::vector<TokenId> QwenTokenizer::Inkling2EncodeText(
+    std::string_view text) const {
+  // llama.cpp `inkling2` (GPT-4o family) tokenizer.json split pattern.
+  static constexpr char kPattern[] =
+      R"([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
+  return RegexEncodeText(text, kPattern, false);
+}
+
 std::vector<TokenId> QwenTokenizer::RegexEncodeText(std::string_view text,
                                                     const char* pattern,
                                                     bool ignore_merges) const {
@@ -781,6 +791,9 @@ std::vector<TokenId> QwenTokenizer::BpeEncodeText(std::string_view text) const {
   }
   if (pre_tokenizer_ == PreTokenizer::kLaguna) {
     return LagunaEncodeText(text);
+  }
+  if (pre_tokenizer_ == PreTokenizer::kInkling2) {
+    return Inkling2EncodeText(text);
   }
   if (pre_tokenizer_ != PreTokenizer::kQwen35) {
     return BpeMergeChunk(text);
