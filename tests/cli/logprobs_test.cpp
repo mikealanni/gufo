@@ -25,9 +25,19 @@ int main() {
   const auto chat = ChatLogprobs(sequence, 1);
   assert(chat.find("content")->items()[1].find("bytes")->dump() == "[169]");
   assert(chat.find("content")->items()[0].find("top_logprobs")->size() == 1);
-  const auto completion = CompletionLogprobs(sequence, 7);
+  std::size_t offset = 7;
+  const auto completion = CompletionLogprobs(sequence, offset);
   assert(completion.find("text_offset")->dump() == "[7,7]");
+  assert(offset == 8);
   assert(UnicodeLength("aé🙂") == 3);
+  // The legacy response keys alternatives by spelling. The selected ID
+  // takes precedence, then the highest-ranked alternative for each spelling.
+  const DecodedLogprobs collisions{
+      {{5, "", -3.0}, {1, "", -0.1}, {2, "A", -1.0}, {3, "A", -2.0}}, 1};
+  const auto legacy = CompletionLogprobs(std::span(&collisions, 1));
+  const auto& by_spelling = legacy.find("top_logprobs")->items().front();
+  assert(by_spelling.find("")->as_double() == -3.0);
+  assert(by_spelling.find("A")->as_double() == -1.0);
   // vLLM keeps the selected token in completion maps even with zero requested
   // alternatives; very negative values use OpenAI's JSON-safe sentinel.
   const DecodedLogprobs unlikely{{{9, "x", -INFINITY}}, 1};

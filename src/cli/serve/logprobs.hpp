@@ -185,7 +185,7 @@ inline std::size_t UnicodeLength(std::string_view text) {
 }
 
 inline json::Value CompletionLogprobs(std::span<const DecodedLogprobs> tokens,
-                                      std::size_t offset = 0) {
+                                      std::size_t& offset) {
   auto result = json::Value::object();
   for (const auto* name :
        {"tokens", "token_logprobs", "top_logprobs", "text_offset"})
@@ -197,11 +197,19 @@ inline json::Value CompletionLogprobs(std::span<const DecodedLogprobs> tokens,
     result["text_offset"].push_back(offset);
     offset += UnicodeLength(selected.token);
     auto top = json::Value::object();
+    // The map can represent only one value per spelling. Entries are
+    // selected-first, followed by alternatives in descending probability.
     for (const auto& entry : token.entries)
-      top[entry.token] = std::max(entry.logprob, -9999.0);
+      if (!top.contains(entry.token))
+        top[entry.token] = std::max(entry.logprob, -9999.0);
     result["top_logprobs"].push_back(std::move(top));
   }
   return result;
+}
+
+inline json::Value CompletionLogprobs(std::span<const DecodedLogprobs> tokens) {
+  std::size_t offset = 0;
+  return CompletionLogprobs(tokens, offset);
 }
 
 /// A range in the UTF-8-normalized, unfiltered model output.

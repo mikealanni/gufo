@@ -856,6 +856,9 @@ to message content. Streaming choices carry the same metadata beside `delta`.
 Raw Completions accepts an integer `logprobs` from 0 to 20. Its choices
 return parallel `tokens`, `token_logprobs`, `top_logprobs`, and `text_offset`
 arrays. Offsets count Unicode characters and continue across streaming chunks.
+When multiple token IDs have the same decoded spelling, the legacy map keeps
+the chosen token's score for its spelling and the highest-ranked alternative
+for each other spelling.
 Zero requests only the selected token. Omitted/null settings disable collection;
 Chat also accepts `false`. Positive Chat `top_logprobs` requires `logprobs: true`.
 

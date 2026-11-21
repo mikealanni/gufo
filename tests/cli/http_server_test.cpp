@@ -28,6 +28,7 @@
 
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/trace.hpp"
+#include "src/core/json.hpp"
 
 namespace {
 
@@ -209,6 +210,18 @@ public:
       result.finish_reason = FinishReason::kStopSequence;
       result.stop_sequence = forced_stop_sequence;
     }
+    if (sampling.logprobs && !scored_pieces.empty()) {
+      result.text.clear();
+      result.completion_tokens = scored_pieces.size();
+      for (const auto& [emitted, spelling] : scored_pieces) {
+        result.text += emitted;
+        result.logprobs.push_back({{{3, spelling, -3.0}}, spelling.size()});
+        if (token)
+          (void)token(
+              gufo::server::TokenPiece(emitted, &result.logprobs.back()));
+      }
+      return result;
+    }
     if (sampling.logprobs) {
       gufo::server::DecodedLogprobs probabilities;
       probabilities.source_bytes = result.text.size();
@@ -249,6 +262,7 @@ public:
   std::atomic<bool> last_ignore_eos{false};
   std::atomic<bool> last_cache_prompt{true};
   std::vector<PromptProgress> progress;
+  std::vector<std::pair<std::string, std::string>> scored_pieces;
   // Report a scheduler admission before generation, as the HIP backend does.
   std::atomic<bool> admit{false};
   std::chrono::milliseconds token_delay{0};
@@ -3118,6 +3132,35 @@ void TestRawCompletionLogprobs() {
   ExpectStatus(
       server.Post("/v1/completions", R"({"prompt":"hello","logprobs":null})"),
       200);
+  // Filtered text can be held across pieces and UTF-8 can finish in a later
+  // token. Both transports count characters in the same reported token list.
+  const auto offsets = [&](const std::string& expected) {
+    const auto body = R"({"prompt":"hello","logprobs":0,"stream":)";
+    const auto buffered =
+        server.Post("/v1/completions", std::string(body) + "false}");
+    ExpectStatus(buffered, 200);
+    assert(buffered.find("\"text_offset\":" + expected) != std::string::npos);
+    const auto streamed =
+        server.Post("/v1/completions", std::string(body) + "true}");
+    ExpectStatus(streamed, 200);
+    auto actual = gufo::json::Value::array();
+    std::istringstream lines(ChunkedBody(streamed));
+    for (std::string line; std::getline(lines, line);) {
+      if (!line.starts_with("data: {"))
+        continue;
+      const auto frame = gufo::json::parse(line.substr(6));
+      for (const auto& choice : frame.find("choices")->items())
+        if (const auto* values = choice.find("logprobs");
+            values && !values->is_null())
+          for (const auto& start : values->find("text_offset")->items())
+            actual.push_back(start);
+    }
+    assert(actual.dump() == expected);
+  };
+  server.backend->scored_pieces = {{"", "a"}, {"ac", "c"}};
+  offsets("[0,1]");
+  server.backend->scored_pieces = {{"A\xc3", ""}, {"\xa9", "Aé"}};
+  offsets("[0,0]");
 }
 
 void TestRawCompletionPromptProgress() {

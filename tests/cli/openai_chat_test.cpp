@@ -2884,18 +2884,27 @@ void TestStrictToolSchema() {
     for (char byte : call)
       backend.pieces.emplace_back(1, byte);
     backend.pieces.emplace_back(" After f.");
-    body["stream"] = stream;
-    body["tool_choice"] =
+    for (unsigned i = 0; i < backend.pieces.size(); ++i)
+      backend.logprob_pieces.push_back({{{i, backend.pieces[i], -1.0}}});
+    auto request = body;
+    request["logprobs"] = true;
+    request["stream"] = stream;
+    request["tool_choice"] =
         gufo::json::parse(R"({"type":"function","function":{"name":"f"}})");
     const auto response =
-        gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+        gufo::server::HandleOpenAiChat(Request(request.dump()), backend);
     std::string output = response.body;
     std::string content;
+    std::vector<std::string> scored;
     const auto collect = [&](const gufo::json::Value& event) {
       for (const auto& choice : event.find("choices")->items()) {
         const auto* message = choice.find(stream ? "delta" : "message");
         if (message)
           content += message->member_str("content");
+        const auto* scores = choice.find("logprobs");
+        if (scores && !scores->is_null())
+          for (const auto& token : scores->find("content")->items())
+            scored.push_back(token.member_str("token"));
       }
     };
     if (response.streaming_body)
@@ -2907,6 +2916,8 @@ void TestStrictToolSchema() {
       });
     else
       collect(gufo::json::parse(response.body));
+    Expect(scored == std::vector<std::string>{"Calling f. ", " After f."},
+           "content before and after a native tool call retains its scores");
     Expect(response.status == 200 && backend.last_request.constrained_tools &&
                !backend.last_request.response_format &&
                !backend.last_request.parallel_tool_calls &&

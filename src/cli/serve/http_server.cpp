@@ -1040,7 +1040,6 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                         pending_logprobs = CompletionLogprobs(
                             std::span(piece.logprobs, 1), text_offset);
                       const auto text = decoder.Push(piece.text, false);
-                      text_offset += UnicodeLength(text);
                       connected = write_chunk(text, {});
                       return connected;
                     },

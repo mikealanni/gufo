@@ -3537,13 +3537,14 @@ HttpResponse StreamingResponse(
                 const bool interrupted =
                     result.finish_reason !=
                     TextGenerationBackend::FinishReason::kStop;
-                const auto generated =
-                    StreamingGeneration(filter, request.chat, round_state,
-                                        markers, closers, quotes, !interrupted);
+                const auto generated = StreamingGeneration(
+                    filter, request.chat, round_state, markers, closers, quotes,
+                    !interrupted, false, probabilities && filter.in_tools());
                 if (!tools.Finish(generated.tool_calls, interrupted))
                   return;
                 if (!filter.Finish(generated.hide_tool_markup, generated.text,
-                                   generated.reasoning_content)) {
+                                   generated.reasoning_content,
+                                   generated.text_spans)) {
                   return;
                 }
                 if (auto next = JevFinishContinuation(
