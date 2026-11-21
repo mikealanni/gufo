@@ -494,6 +494,21 @@ __global__ void Situ(const float* gu, const int* group, const float* scale,
   }
 }
 
+__global__ void ToHalf(const float* x, __half* y, std::size_t count) {
+  const std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < count) y[i] = __float2half(x[i]);
+}
+
+__global__ void SituHalf(const float* gu, const int* group, const float* scale, __half* act, int ff, float beta, float lb) {
+  const int item = blockIdx.x;
+  const float s = scale != nullptr ? scale[group[item]] : 1.0F;
+  for (int j = threadIdx.x; j < ff; j += blockDim.x) {
+    const float g = gu[static_cast<std::size_t>(item) * 2 * ff + j] * s;
+    const float u = gu[static_cast<std::size_t>(item) * 2 * ff + ff + j] * s;
+    act[static_cast<std::size_t>(item) * ff + j] = __float2half(beta * tanhf(g / beta) * Sigmoid(g) * lb * tanhf(u / lb));
+  }
+}
+
 __global__ void Combine(const float* y, const float* wts, float* out, int nu,
                         int h) {
   for (int i = threadIdx.x; i < h; i += blockDim.x) {
@@ -524,7 +539,7 @@ struct WmmaArgs {
   std::size_t row_bytes;
   int cols;
   int rows;
-  const float* x;
+  const __half* x;
   int a_div;
   float* y;
   const float* scale;
@@ -598,28 +613,21 @@ __global__ void __launch_bounds__(kWmmaThreads) WmmaGemm(WmmaArgs a) {
   const int lh = tid & 1;
   const int item =
       lr < cnt ? (a.sorted != nullptr ? a.sorted[start + lr] : start + lr) : -1;
-  const float* xr =
-      item >= 0 ? a.x + static_cast<std::size_t>(item / a.a_div) * a.cols
-                : nullptr;
+  const __half* xr = item >= 0 ? a.x + static_cast<std::size_t>(item / a.a_div) * a.cols : nullptr;
   const unsigned char* wr =
       a.w + (static_cast<std::size_t>(expert) * a.rows + n0 + lr) * a.row_bytes;
   V8f acc[2][2] = {};
   const int wm = wave >> 1;
   const int wn = wave & 1;
   for (int k0 = 0; k0 < a.cols; k0 += 32) {
-    __half* ad = &As[lr][lh * 16];
+    uint4* ad = reinterpret_cast<uint4*>(&As[lr][lh * 16]);
     if (xr != nullptr) {
-      const float4* x4 = reinterpret_cast<const float4*>(xr + k0 + lh * 16);
-      for (int i = 0; i < 4; ++i) {
-        const float4 v = x4[i];
-        ad[4 * i] = __float2half(v.x);
-        ad[4 * i + 1] = __float2half(v.y);
-        ad[4 * i + 2] = __float2half(v.z);
-        ad[4 * i + 3] = __float2half(v.w);
-      }
+      const uint4* xs = reinterpret_cast<const uint4*>(xr + k0 + lh * 16);
+      ad[0] = xs[0];
+      ad[1] = xs[1];
     } else {
-      for (int i = 0; i < 16; ++i)
-        ad[i] = __float2half(0.0F);
+      ad[0] = make_uint4(0, 0, 0, 0);
+      ad[1] = make_uint4(0, 0, 0, 0);
     }
     LoadB16<TY>(wr, k0 + lh * 16, &Bs[lr][lh * 16]);
     __syncthreads();
@@ -975,6 +983,7 @@ struct Session::Impl {
       *router{nullptr}, *wts{nullptr}, *gu{nullptr}, *act{nullptr}, *y{nullptr},
       *moe{nullptr}, *prelude{nullptr}, *bank_out{nullptr}, *d_logits{nullptr};
   int *sorted{nullptr}, *tiles{nullptr};
+  __half *xh{nullptr}, *act16{nullptr};
   int *ids{nullptr}, *xrow{nullptr}, *xrow_token{nullptr}, *xrow_item{nullptr},
       *d_pos{nullptr};
   hipStream_t stream{nullptr};
@@ -1013,17 +1022,9 @@ struct Session::Impl {
     if (n >= kWmmaMinTokens && nrows % kTileN == 0 &&
         ldy == static_cast<std::size_t>(nrows) &&
         static_cast<std::uint64_t>(nrows) <= w.rows) {
-      WmmaArgs wa{static_cast<const unsigned char*>(w.dev),
-                  w.row_bytes,
-                  static_cast<int>(w.cols),
-                  nrows,
-                  xin,
-                  1,
-                  yout,
-                  nullptr,
-                  nullptr,
-                  nullptr,
-                  n};
+      const std::size_t xcount = static_cast<std::size_t>(n) * w.cols;
+      ToHalf<<<(xcount + 255) / 256, 256, 0, stream>>>(xin, xh, xcount);
+      WmmaArgs wa{static_cast<const unsigned char*>(w.dev), w.row_bytes, static_cast<int>(w.cols), nrows, xh, 1, yout, nullptr, nullptr, nullptr, n};
       const dim3 wg(nrows / kTileN, (n + kTileM - 1) / kTileM);
       if (ldx == w.cols) {
         switch (w.type) {
@@ -1277,28 +1278,9 @@ struct Session::Impl {
                                         max_tiles);
       const Tensor& wgu = m->T(m->P(p, "ffn_gate_up_exps.weight"));
       const Tensor& wdn = m->T(m->P(p, "ffn_down_exps.weight"));
-      WmmaArgs a1{static_cast<const unsigned char*>(wgu.dev),
-                  wgu.row_bytes,
-                  static_cast<int>(wgu.cols),
-                  2 * ff,
-                  x,
-                  nu,
-                  gu,
-                  nullptr,
-                  tiles,
-                  sorted,
-                  n};
-      WmmaArgs a2{static_cast<const unsigned char*>(wdn.dev),
-                  wdn.row_bytes,
-                  static_cast<int>(wdn.cols),
-                  h,
-                  act,
-                  1,
-                  y,
-                  s_dn,
-                  tiles,
-                  sorted,
-                  n};
+      ToHalf<<<(static_cast<std::size_t>(n) * h + 255) / 256, 256, 0, stream>>>(x, xh, static_cast<std::size_t>(n) * h);
+      WmmaArgs a1{static_cast<const unsigned char*>(wgu.dev), wgu.row_bytes, static_cast<int>(wgu.cols), 2 * ff, xh, nu, gu, nullptr, tiles, sorted, n};
+      WmmaArgs a2{static_cast<const unsigned char*>(wdn.dev), wdn.row_bytes, static_cast<int>(wdn.cols), h, act16, 1, y, s_dn, tiles, sorted, n};
       const dim3 g1(2 * ff / kTileN, max_tiles);
       const dim3 g2(h / kTileN, max_tiles);
       if (wgu.type == kTypeNvfp4) {
@@ -1306,7 +1288,7 @@ struct Session::Impl {
       } else {
         WmmaGemm<kTypeQ8><<<g1, kWmmaThreads, 0, stream>>>(a1);
       }
-      Situ<<<items, 256, 0, stream>>>(gu, ids, s_gu, act, ff, c.situ_beta,
+      SituHalf<<<items, 256, 0, stream>>>(gu, ids, s_gu, act16, ff, c.situ_beta,
                                       c.situ_linear_beta);
       if (wdn.type == kTypeNvfp4) {
         WmmaGemm<kTypeNvfp4><<<g2, kWmmaThreads, 0, stream>>>(a2);
@@ -1515,6 +1497,8 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
   i.bank_out = i.Alloc(b * h);
   i.d_logits = i.Alloc(c.vocab_padded);
   i.d_pos = static_cast<int*>(i.AllocBytes(4));
+  i.xh = static_cast<__half*>(i.AllocBytes(b * std::max<std::size_t>(qd, 2 * h) * 2));
+  i.act16 = static_cast<__half*>(i.AllocBytes(b * c.expert_used * c.expert_ff * 2));
   i.sorted = static_cast<int*>(i.AllocBytes(b * c.expert_used * 4));
   i.tiles = static_cast<int*>(
       i.AllocBytes((b * c.expert_used / kTileM + c.expert_count) * 3 * 4));
