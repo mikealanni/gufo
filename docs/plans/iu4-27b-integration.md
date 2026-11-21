@@ -97,3 +97,19 @@ the WMMA GEMM: int4 GPU pp2048 1206, pp8192 1112, pp16384 1045. With the NPU
 retuned to 10 FFN gate/up slices: pp2048 1211 (lone chunk, NPU unused), pp8192
 1287, pp16384 1196. Base GPU 690 / 645 / 622 and base + NPU 721 / 801 / 764 for
 reference.
+
+## Long-context results (int4 + NPU, release, bench mode on, single runs)
+
+| pp | dense | lockstep off | sparse attn |
+|---|---|---|---|
+| 16384 | 1219 | 1057 | 1040 |
+| 32768 | 1056 | 937 | 884 |
+| 65536 | 840 | | 805 |
+| 131072 | 608 | | 751 |
+| 262144 | 389 | | 713 |
+
+Lockstep pairing is worth +15% at 16k and +13% at 32k and stays on. Beyond 32k the
+time is attention (dense WMMA attention at ~27 TFLOPS, near the real-data fp16
+ceiling), so more NPU FFN slices do not help. Remaining levers: NPU attention
+(exact, uses the idle NPU), a faster sparse kernel (approximate, currently 12 TFLOPS),
+int4 QK attention (approximate).
