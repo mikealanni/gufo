@@ -1,6 +1,7 @@
 #ifndef GUFO_MODELS_INKLING_GPU_ENGINE_HPP_
 #define GUFO_MODELS_INKLING_GPU_ENGINE_HPP_
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -25,6 +26,7 @@ public:
   [[nodiscard]] std::span<const float> Logits() const noexcept;
   [[nodiscard]] std::uint32_t Position() const noexcept;
   void Reset() noexcept;
+  [[nodiscard]] std::size_t AllocatedBytes() const noexcept;
 
 private:
   friend class Model;
@@ -44,6 +46,7 @@ public:
   [[nodiscard]] std::unique_ptr<Session> CreateSession(
       std::uint32_t max_context, std::string* error_msg = nullptr);
   [[nodiscard]] const Config& config() const noexcept;
+  [[nodiscard]] std::size_t ResidentBytes() const noexcept;
 
 private:
   Model() = default;

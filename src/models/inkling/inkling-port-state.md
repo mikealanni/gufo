@@ -77,6 +77,16 @@ looped 3x -> 5.4B effective active; 24 physical layers, middle core looped).
   Remaining levers: fuse the small kernels (-25% time), LDS double buffer / direct-to-register
   B fragments, NPU offload of dense + shared parts, then drafter for decode.
 
+## Serve (2026-11-21)
+
+- `gufo serve llm -m <gguf>` dispatches on `inkling2` (runner cloned from Laguna: no snapshot/fork,
+  thinking effort header, sampling preset temp 1 / top_p 1 / top_k 0). `~/run-gufo.sh` kind `inkling`
+  (backup `~/run-gufo.sh.bak-inkling`). curl chat completion works: reasoning then answer, 30.6 tok/s decode,
+  prompt 103 tok/s on a 28-token prompt.
+- Known gaps: control tokens (`<|content_thinking|>`, `<|end_message|>`) are returned as plain text,
+  no reasoning-split; no snapshots/disk cache; tools unsupported; KV is full FP16 for all 48 slots
+  (393 KB/token), so default context 16k.
+
 ## Open questions / next steps (skill default order)
 
 1. CPU reference (`src/models/inkling/reference.cpp`) + config parser.

@@ -933,6 +933,7 @@ struct ModelState {
   std::uint32_t n_phys{0};
   std::unordered_map<std::string, Tensor> tensors;
   std::vector<void*> allocations;
+  std::size_t resident_bytes{0};
   ~ModelState() {
     for (void* p : allocations)
       (void)hipFree(p);
@@ -1000,6 +1001,7 @@ std::shared_ptr<Model> Model::Load(const std::string& path,
     HIP_OK(hipMalloc(&t.dev, info.size_bytes));
     HIP_OK(hipMemcpy(t.dev, info.data, info.size_bytes, hipMemcpyHostToDevice));
     state->allocations.push_back(t.dev);
+    state->resident_bytes += info.size_bytes;
     state->tensors.emplace(std::string(info.name), t);
   }
   auto model = std::shared_ptr<Model>(new Model());
@@ -1009,6 +1011,10 @@ std::shared_ptr<Model> Model::Load(const std::string& path,
 
 const Config& Model::config() const noexcept {
   return state_->config;
+}
+
+std::size_t Model::ResidentBytes() const noexcept {
+  return state_->resident_bytes;
 }
 
 struct Session::Impl {
@@ -1026,6 +1032,7 @@ struct Session::Impl {
   std::vector<Slot> slots;
   std::vector<void*> allocs;
   std::vector<float> logits;
+  std::size_t allocated_bytes{0};
   // scratch
   int* d_tokens{nullptr};
   float *cur{nullptr}, *tmp{nullptr}, *inp_sa{nullptr}, *in[3]{}, *q{nullptr},
@@ -1048,6 +1055,7 @@ struct Session::Impl {
   float* Alloc(std::size_t floats) {
     void* p = nullptr;
     HIP_OK(hipMalloc(&p, floats * sizeof(float)));
+    allocated_bytes += floats * sizeof(float);
     allocs.push_back(p);
     return static_cast<float*>(p);
   }
@@ -1055,6 +1063,7 @@ struct Session::Impl {
     void* p = nullptr;
     HIP_OK(hipMalloc(&p, bytes));
     HIP_OK(hipMemset(p, 0, bytes));
+    allocated_bytes += bytes;
     allocs.push_back(p);
     return p;
   }
@@ -1491,6 +1500,10 @@ struct Session::Impl {
         d_logits, c.vocab_unpadded, c.final_logit_softcapping);
   }
 };
+
+std::size_t Session::AllocatedBytes() const noexcept {
+  return impl_->allocated_bytes;
+}
 
 Session::Session() = default;
 Session::~Session() = default;
