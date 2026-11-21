@@ -644,6 +644,14 @@ public:
   void SetPromptHiddenCapture(
       bool enabled, std::span<const std::uint32_t> target_layer_ids = {});
 
+  /// With a sink, prefill captures one chunk at a time and hands it over
+  /// instead of keeping the whole prompt; null restores the full capture.
+  void SetPromptHiddenSink(
+      std::function<void(std::span<const float>, std::size_t, std::size_t)>
+          sink) {
+    prompt_hidden_sink_ = std::move(sink);
+  }
+
   /// Returns the flattened [prompt_tokens, hidden_size] capture from the most
   /// recent ForwardPromptBatch call.
   [[nodiscard]] std::span<const float> GetPromptHiddenStates() const noexcept {
@@ -761,6 +769,9 @@ private:
   GpuSamplingWorkspace sampling_workspace_;
   std::optional<tokenization::TokenId> next_token_;
   bool capture_prompt_hidden_{false};
+  std::function<void(std::span<const float>, std::size_t, std::size_t)>
+      prompt_hidden_sink_;
+  std::size_t prompt_sink_row_{0};
   bool replaying_ssm_state_{false};
   bool moe_warmed_{false};
 };

@@ -104,6 +104,11 @@ public:
     return executor_.GetPromptHiddenStates();
   }
 
+  bool SetPromptHiddenSink(PromptHiddenSink sink) override {
+    executor_.SetPromptHiddenSink(std::move(sink));
+    return true;
+  }
+
   std::span<const float> CopyLastHidden() override {
     return executor_.CopyLastHidden();
   }
@@ -1435,6 +1440,43 @@ std::vector<tokenization::TokenId> SpeculativeVerifier::Generate(
   return output_tokens;
 }
 
+std::optional<tokenization::TokenId> SpeculativeVerifier::ForwardPromptStreamed(
+    std::span<const tokenization::TokenId> tokens, std::uint32_t position,
+    bool compute_logits) {
+  bool failed = false;
+  const bool streaming = target_executor_->SetPromptHiddenSink(
+      [&](std::span<const float> rows, std::size_t first_row,
+          std::size_t count) {
+        if (failed || count == 0)
+          return;
+        const DraftTargetContext context{
+            .prompt_tokens = tokens.subspan(first_row, count),
+            .prompt_hidden_states = rows,
+            .hidden_size = rows.size() / count,
+            .first_token = 0,
+        };
+        const bool fresh = position == 0 && first_row == 0;
+        failed = fresh ? !Draft()->PrimeTargetContext(context)
+                       : !Draft()->AppendTargetContext(
+                             context, position +
+                                          static_cast<std::uint32_t>(first_row));
+      });
+  if (!streaming)
+    return std::nullopt;
+  tokenization::TokenId next = 0;
+  try {
+    next = target_executor_->ForwardPromptSuffix(tokens, position,
+                                                 compute_logits);
+  } catch (...) {
+    target_executor_->SetPromptHiddenSink({});
+    throw;
+  }
+  target_executor_->SetPromptHiddenSink({});
+  if (failed)
+    throw std::runtime_error("draft failed to take streamed prompt features");
+  return next;
+}
+
 tokenization::TokenId SpeculativeVerifier::ExtendPrompt(
     std::span<const tokenization::TokenId> tokens, std::uint32_t position,
     bool compute_logits) {
@@ -1447,6 +1489,12 @@ tokenization::TokenId SpeculativeVerifier::ExtendPrompt(
   target_executor_->SetPromptHiddenCapture(
       capture, capture ? Draft()->TargetHiddenLayerIds()
                        : std::span<const std::uint32_t>{});
+  if (capture) {
+    const auto streamed =
+        ForwardPromptStreamed(tokens, position, compute_logits);
+    if (streamed.has_value())
+      return *streamed;
+  }
   const auto next =
       target_executor_->ForwardPromptSuffix(tokens, position, compute_logits);
   if (capture) {
@@ -1478,6 +1526,11 @@ tokenization::TokenId SpeculativeVerifier::Prime(
                                     ? Draft()->TargetHiddenLayerIds()
                                     : std::span<const std::uint32_t>{};
   target_executor_->SetPromptHiddenCapture(capture_hidden, target_layer_ids);
+  if (capture_hidden) {
+    const auto streamed = ForwardPromptStreamed(prompt_tokens, 0, compute_logits);
+    if (streamed.has_value())
+      return *streamed;
+  }
   const tokenization::TokenId first_token =
       target_executor_->ForwardPromptSuffix(prompt_tokens, 0, compute_logits);
   if (capture_hidden) {

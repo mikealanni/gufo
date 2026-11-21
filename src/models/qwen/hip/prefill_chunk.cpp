@@ -139,6 +139,9 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
   const auto attention_workspace =
       arena_.GetScratchView(arena_.GetMaxBatch()).ffn;
   const std::size_t target_layer_count = arena_.GetTargetLayerCapture().size();
+  if (capture_prompt_hidden_ && prompt_hidden_sink_) {
+    h_prompt_hidden_.Clear();
+  }
   const std::size_t prompt_capture_offset = h_prompt_hidden_.Size();
   if (capture_prompt_hidden_ && target_layer_count > 0) {
     h_prompt_hidden_.Resize(prompt_capture_offset +
@@ -1185,6 +1188,11 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
                                hipMemcpyDeviceToHost, arena_.stream));
     }
     HIP_CHECK(hipStreamSynchronize(arena_.stream));
+    if (prompt_hidden_sink_) {
+      prompt_hidden_sink_(h_prompt_hidden_.View(), prompt_sink_row_,
+                          batch_size);
+      prompt_sink_row_ += batch_size;
+    }
   }
   last_hidden_offset_ = (batch_size - 1) * hidden_size;
 

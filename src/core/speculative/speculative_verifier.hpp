@@ -108,6 +108,15 @@ public:
       const noexcept {
     return {};
   }
+  /// Receives each prefill chunk's captured rows (`count` rows starting at
+  /// prompt row `first_row`) instead of retaining the whole prompt on the
+  /// host. Returns false when the target keeps the full capture.
+  using PromptHiddenSink = std::function<void(
+      std::span<const float> rows, std::size_t first_row, std::size_t count)>;
+  virtual bool SetPromptHiddenSink(PromptHiddenSink sink) {
+    (void)sink;
+    return false;
+  }
   [[nodiscard]] virtual std::span<const float> CopyLastHidden() { return {}; }
   [[nodiscard]] virtual std::span<const float> CopyLastLogits() { return {}; }
   [[nodiscard]] virtual std::span<const float> CopyVerificationLogits(
@@ -289,6 +298,13 @@ public:
   [[nodiscard]] tokenization::TokenId Prime(
       std::span<const tokenization::TokenId> prompt_tokens,
       bool compute_logits = true);
+  /// Primes or extends the draft chunk by chunk while the target prefills,
+  /// without holding the whole prompt's features on the host. Empty when the
+  /// target cannot stream.
+  [[nodiscard]] std::optional<tokenization::TokenId> ForwardPromptStreamed(
+      std::span<const tokenization::TokenId> tokens, std::uint32_t position,
+      bool compute_logits);
+
   [[nodiscard]] tokenization::TokenId ExtendPrompt(
       std::span<const tokenization::TokenId> tokens, std::uint32_t position,
       bool compute_logits = true);
