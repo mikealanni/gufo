@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -421,6 +422,21 @@ std::shared_ptr<const QwenDFlashGpuModel> QwenDFlashGpuModel::CreateImpl(
   std::size_t packed_bytes = 0;
   try {
     speculative::QwenDFlashWeights weights = *raw_weights;
+    {
+      // The selector and conv paths are length-generic, so a dense target
+      // verifies a wider block than the draft was trained with: code that it
+      // predicts well accepts most of sixteen. A MoE target reads more experts
+      // for sixteen rows and gains nothing. GUFO_DFLASH_BLOCK sets the width.
+      constexpr std::uint32_t kDenseRuntimeBlock = 16;
+      const char* wide = std::getenv("GUFO_DFLASH_BLOCK");
+      const bool dense =
+          target_model != nullptr && !target_model->GetConfig().IsMoe();
+      const auto requested = wide != nullptr
+                                 ? static_cast<std::uint32_t>(std::atoi(wide))
+                                 : (dense ? kDenseRuntimeBlock : 0U);
+      if (requested > weights.dflash_config.block_size)
+        weights.dflash_config.block_size = requested;
+    }
     for (const auto& region : dflash_reader->GetMappedRegions())
       core::PrefaultMappedRange(region.data, region.size);
 

@@ -320,18 +320,6 @@ std::optional<QwenDFlashWeights> QwenDFlashWeights::LoadFromGguf(
       !conv_kernel_size.has_value() && !selector_rank.has_value();
   df_cfg.is_v1 = is_v1;
   df_cfg.block_size = *block_size;
-  {
-    // The selector and conv paths are length-generic, so the draft runs a
-    // wider block than it was trained with: code that the target predicts
-    // well accepts most of sixteen. GUFO_DFLASH_BLOCK=8 keeps the trained one.
-    constexpr std::uint32_t kRuntimeBlock = 16;
-    const char* wide = std::getenv("GUFO_DFLASH_BLOCK");
-    const auto requested = wide != nullptr
-                               ? static_cast<std::uint32_t>(std::atoi(wide))
-                               : kRuntimeBlock;
-    if (requested > df_cfg.block_size)
-      df_cfg.block_size = requested;
-  }
   df_cfg.conv_kernel_size = conv_kernel_size.value_or(0);
   df_cfg.conv_group_size = conv_group_size.value_or(0);
   df_cfg.selector_rank = selector_rank.value_or(0);
