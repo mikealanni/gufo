@@ -48,11 +48,23 @@ looped 3x -> 5.4B effective active; 24 physical layers, middle core looped).
   `n_phys = hparams.n_layer() - (n_passes - 1) * (core_end - core_start)`, so
   `block_count = 48` is read as loop slots (n_phys = 24 physical).
 - GGUF re-emitted with `general.architecture = "inkling2_loop"` and
-  `inkling2.*` -> `inkling2_loop.*` keys:
-  `/tmp/opencode/Inkling-2-Mini-UD-Q4_K_XL-looparch.gguf` (17 GB).
-  Expect: `llama cli --model .../Inkling-2-Mini-UD-Q4_K_XL-looparch.gguf -n 2 -f ...`
-  should now load as the looped Inkling-2 model.
-- Gufo `core::GgmlType` lacks `kNVFP4 = 40` (add enum + ToString) for expert tensors.
+  `inkling2.*` -> `inkling2_loop.*` keys (+ `inkling2_loop.loop.count = 3`):
+  `/tmp/opencode/Inkling-2-Mini-UD-Q4_K_XL-looparch.gguf` (17 GB). Header and tensor
+  offsets verified consistent (data_start == src data_start 11978720; 734 tensors, 63 kvs).
+- Oracle (`/tmp/opencode/lcmake/bin/llama`) patched: `n_phys` derivation applied
+  (`block_count = 48` read as loop slots; physical layers blk.0..23).
+- Current blocker (oracle): re-emit key remap produces `blk.<n>.loop_*` tensor names,
+  upstream looped arch expects `blk.<n>.loop_{msg_query,q,k,v,ffn}_ctrl_*` naming;
+  last run progressed past file-bounds and hyperparameter checks, now stuck on
+  `check_tensor_dims: tensor 'blk.6.loop_msg_query.weight' not found`.
+
+## Resume checklist (next session)
+
+1. Fix loop tensor naming mismatch (re-emit script or upstream source patch).
+2. Rebuild oracle, run CPU baseline logits (`-n 2 -f inkling_kv.txt`).
+3. Finish Gufo `RunLayer` / `Evaluate`; fix `DeqNvfp4Row` row-count handling.
+4. Add NVFP4 dequant case to Gufo `Loaded::DequantizeRow`; register `reference.cpp`.
+5. Build Gufo, compare CPU reference against oracle; commit `gufo/src/core/gguf_reader.hpp` kNVFP4 change.
 
 ## Open questions / next steps (skill default order)
 
