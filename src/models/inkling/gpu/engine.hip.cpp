@@ -79,10 +79,12 @@ __device__ void Load32(const unsigned char* row, int chunk, float* w) {
     for (int s2 = 0; s2 < 2; ++s2) {
       const int s = hf * 2 + s2;
       const float d = Ue4m3(blk[s]);
-      const unsigned char* qs = blk + 4 + s * 8;
+      const unsigned int* qp = reinterpret_cast<const unsigned int*>(blk + 4 + s * 8);
+      const unsigned int u[2] = {qp[0], qp[1]};
       for (int j = 0; j < 8; ++j) {
-        w[s2 * 16 + j] = kE2m1[qs[j] & 15] * d;
-        w[s2 * 16 + 8 + j] = kE2m1[qs[j] >> 4] * d;
+        const unsigned int byte = (u[j >> 2] >> ((j & 3) * 8)) & 0xFF;
+        w[s2 * 16 + j] = kE2m1[byte & 15] * d;
+        w[s2 * 16 + 8 + j] = kE2m1[byte >> 4] * d;
       }
     }
   }
@@ -101,65 +103,63 @@ __device__ float BlockSum(float v, float* sh) {
   return r;
 }
 
-// Y[t][r] = W[r] . X[t], tokens batched kTokenTile per block.
-template<int TY>
-__global__ void GemmDense(const unsigned char* w, std::size_t row_bytes,
-                          int cols, int rows, const float* x, std::size_t ldx,
+// Y[t][r] = W[r] . X[t]; one wave per output row, kTokenTile tokens per launch row.
+template <int TY>
+__global__ void GemmDense(const unsigned char* w, std::size_t row_bytes, int cols, int rows, const float* x, std::size_t ldx,
                           float* y, std::size_t ldy, int n) {
-  __shared__ float red[kTokenTile][kThreads];
-  const int r = blockIdx.x;
+  const int lane = threadIdx.x % warpSize;
+  const int r = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
+  if (r >= rows) return;
   const int t0 = blockIdx.y * kTokenTile;
   const int tn = min(kTokenTile, n - t0);
   const unsigned char* row = w + static_cast<std::size_t>(r) * row_bytes;
   float acc[kTokenTile] = {};
   float wv[32];
-  for (int c = threadIdx.x; c < cols / 32; c += kThreads) {
+  for (int c = lane; c < cols / 32; c += warpSize) {
     Load32<TY>(row, c, wv);
     for (int t = 0; t < tn; ++t) {
-      const float* xp = x + (t0 + t) * ldx + c * 32;
+      const float4* x4 = reinterpret_cast<const float4*>(x + (t0 + t) * ldx + c * 32);
       float a = 0.0F;
-      for (int i = 0; i < 32; ++i)
-        a += wv[i] * xp[i];
+      for (int k = 0; k < 8; ++k) {
+        const float4 xv = x4[k];
+        a += wv[4 * k] * xv.x + wv[4 * k + 1] * xv.y + wv[4 * k + 2] * xv.z + wv[4 * k + 3] * xv.w;
+      }
       acc[t] += a;
     }
   }
-  for (int t = 0; t < kTokenTile; ++t)
-    red[t][threadIdx.x] = acc[t];
-  __syncthreads();
-  for (int s = kThreads / 2; s > 0; s >>= 1) {
-    if (threadIdx.x < s) {
-      for (int t = 0; t < kTokenTile; ++t)
-        red[t][threadIdx.x] += red[t][threadIdx.x + s];
-    }
-    __syncthreads();
+  for (int t = 0; t < tn; ++t) {
+    float a = acc[t];
+    for (int off = warpSize / 2; off > 0; off >>= 1) a += __shfl_down(a, off);
+    if (lane == 0) y[(t0 + t) * ldy + r] = a;
   }
-  if (threadIdx.x < tn)
-    y[(t0 + threadIdx.x) * ldy + r] = red[threadIdx.x][0];
 }
 
-// Item i: Y[i][r] = scale[g] * W[g*rows + r] . X[xrow[i]]
-template<int TY>
-__global__ void GemmRouted(const unsigned char* w, std::size_t row_bytes,
-                           int cols, int rows, const int* group,
-                           const int* xrow, const float* scale, const float* x,
-                           float* y) {
-  __shared__ float red[kThreads];
+constexpr int kRoutedWaves = 8;
+
+// Item i: Y[i][r] = scale[g] * W[g*rows + r] . X[xrow[i]]; one wave per output row.
+template <int TY>
+__global__ void GemmRouted(const unsigned char* w, std::size_t row_bytes, int cols, int rows, const int* group, const int* xrow,
+                           const float* scale, const float* x, float* y) {
+  const int lane = threadIdx.x % warpSize;
+  const int wave = threadIdx.x / warpSize;
+  const int r = blockIdx.x * (blockDim.x / warpSize) + wave;
+  if (r >= rows) return;
   const int i = blockIdx.y;
   const int g = group[i];
-  const unsigned char* row =
-      w + (static_cast<std::size_t>(g) * rows + blockIdx.x) * row_bytes;
+  const unsigned char* row = w + (static_cast<std::size_t>(g) * rows + r) * row_bytes;
   const float* xp = x + static_cast<std::size_t>(xrow[i]) * cols;
   float wv[32];
   float acc = 0.0F;
-  for (int c = threadIdx.x; c < cols / 32; c += kThreads) {
+  for (int c = lane; c < cols / 32; c += warpSize) {
     Load32<TY>(row, c, wv);
-    for (int k = 0; k < 32; ++k)
-      acc += wv[k] * xp[c * 32 + k];
+    const float4* x4 = reinterpret_cast<const float4*>(xp + c * 32);
+    for (int k = 0; k < 8; ++k) {
+      const float4 xv = x4[k];
+      acc += wv[4 * k] * xv.x + wv[4 * k + 1] * xv.y + wv[4 * k + 2] * xv.z + wv[4 * k + 3] * xv.w;
+    }
   }
-  const float s = BlockSum(acc, red);
-  if (threadIdx.x == 0)
-    y[static_cast<std::size_t>(i) * rows + blockIdx.x] =
-        s * (scale != nullptr ? scale[g] : 1.0F);
+  for (int off = warpSize / 2; off > 0; off >>= 1) acc += __shfl_down(acc, off);
+  if (lane == 0) y[static_cast<std::size_t>(i) * rows + r] = acc * (scale != nullptr ? scale[g] : 1.0F);
 }
 
 __global__ void EmbedQ8(const unsigned char* table, std::size_t row_bytes,
@@ -208,12 +208,12 @@ __global__ void Clip(float* x, const float* scale, int scale_rows, int dim,
     p[i] *= f;
 }
 
-__global__ void TauScale(float* x, int per_token, int pos0, float floor_v,
+__global__ void TauScale(float* x, int per_token, const int* pos0, float floor_v,
                          float alpha) {
   const float tau =
       1.0F +
       alpha * logf(fmaxf(1.0F,
-                         static_cast<float>(pos0 + blockIdx.x + 1) / floor_v));
+                         static_cast<float>(*pos0 + blockIdx.x + 1) / floor_v));
   for (int i = threadIdx.x; i < per_token; i += blockDim.x)
     x[static_cast<std::size_t>(blockIdx.x) * per_token + i] *= tau;
 }
@@ -319,8 +319,8 @@ __global__ void Control(float* cur, const float* msg, const float* gain,
 }
 
 __global__ void StoreKv(const float* k, const float* v, __half* kc, __half* vc,
-                        int dim, int pos0) {
-  const std::size_t dst = static_cast<std::size_t>(pos0 + blockIdx.x) * dim;
+                        int dim, const int* pos0) {
+  const std::size_t dst = static_cast<std::size_t>(*pos0 + blockIdx.x) * dim;
   for (int i = threadIdx.x; i < dim; i += blockDim.x) {
     kc[dst + i] =
         __float2half(k[static_cast<std::size_t>(blockIdx.x) * dim + i]);
@@ -330,7 +330,8 @@ __global__ void StoreKv(const float* k, const float* v, __half* kc, __half* vc,
 }
 
 struct AttnArgs {
-  int nh, nkv, hd, nrel, extent, window, pos0;
+  int nh, nkv, hd, nrel, extent, window;
+  const int* pos0;
   float scale;
 };
 
@@ -343,7 +344,7 @@ __global__ void Attention(AttnArgs a, const float* q, const float* r,
   __shared__ float rh[32];
   const int h = blockIdx.x;
   const int t = blockIdx.y;
-  const int pos = a.pos0 + t;
+  const int pos = *a.pos0 + t;
   const int g = h / (a.nh / a.nkv);
   const int first = a.window > 0 && pos + 1 > a.window ? pos + 1 - a.window : 0;
   const float* qh = q + (static_cast<std::size_t>(t) * a.nh + h) * a.hd;
@@ -609,7 +610,10 @@ struct Session::Impl {
       *cat{nullptr}, *low{nullptr}, *gain{nullptr}, *forget{nullptr},
       *router{nullptr}, *wts{nullptr}, *gu{nullptr}, *act{nullptr}, *y{nullptr},
       *moe{nullptr}, *prelude{nullptr}, *bank_out{nullptr}, *d_logits{nullptr};
-  int *ids{nullptr}, *xrow{nullptr};
+  int *ids{nullptr}, *xrow{nullptr}, *xrow_token{nullptr}, *xrow_item{nullptr}, *d_pos{nullptr};
+  hipStream_t stream{nullptr};
+  hipGraph_t graph{nullptr};
+  hipGraphExec_t graph_exec{nullptr};
   float* block_pool[16]{};
   int pool_used{0};
 
@@ -627,6 +631,9 @@ struct Session::Impl {
     return p;
   }
   ~Impl() {
+    if (graph_exec != nullptr) (void)hipGraphExecDestroy(graph_exec);
+    if (graph != nullptr) (void)hipGraphDestroy(graph);
+    if (stream != nullptr) (void)hipStreamDestroy(stream);
     for (void* p : allocs)
       (void)hipFree(p);
   }
@@ -634,19 +641,20 @@ struct Session::Impl {
   void Dense(const Tensor& w, const float* xin, std::size_t ldx, float* yout,
              std::size_t ldy, int n, int rows = -1) {
     const int nrows = rows < 0 ? static_cast<int>(w.rows) : rows;
-    const dim3 grid(nrows, (n + kTokenTile - 1) / kTokenTile);
+    const int rpb = kThreads * 2 / 32;
+    const dim3 grid((nrows + rpb - 1) / rpb, (n + kTokenTile - 1) / kTokenTile);
     const auto* wp = static_cast<const unsigned char*>(w.dev);
     switch (w.type) {
       case kTypeF32:
-        GemmDense<kTypeF32><<<grid, kThreads>>>(wp, w.row_bytes, w.cols, nrows,
+        GemmDense<kTypeF32><<<grid, kThreads * 2, 0, stream>>>(wp, w.row_bytes, w.cols, nrows,
                                                 xin, ldx, yout, ldy, n);
         break;
       case kTypeBf16:
-        GemmDense<kTypeBf16><<<grid, kThreads>>>(wp, w.row_bytes, w.cols, nrows,
+        GemmDense<kTypeBf16><<<grid, kThreads * 2, 0, stream>>>(wp, w.row_bytes, w.cols, nrows,
                                                  xin, ldx, yout, ldy, n);
         break;
       case kTypeQ8:
-        GemmDense<kTypeQ8><<<grid, kThreads>>>(wp, w.row_bytes, w.cols, nrows,
+        GemmDense<kTypeQ8><<<grid, kThreads * 2, 0, stream>>>(wp, w.row_bytes, w.cols, nrows,
                                                xin, ldx, yout, ldy, n);
         break;
       default:
@@ -655,20 +663,21 @@ struct Session::Impl {
   }
   void Routed(const Tensor& w, int rows, int items, const float* scale,
               const float* xin, float* yout) {
-    const dim3 grid(rows, items);
+    const int rpb = kThreads * 2 / 32;
+    const dim3 grid((rows + rpb - 1) / rpb, items);
     const auto* wp = static_cast<const unsigned char*>(w.dev);
     if (w.type == kTypeNvfp4) {
-      GemmRouted<kTypeNvfp4><<<grid, kThreads>>>(
+      GemmRouted<kTypeNvfp4><<<grid, kThreads * 2, 0, stream>>>(
           wp, w.row_bytes, w.cols, rows, ids_flat, xrow, scale, xin, yout);
     } else {
-      GemmRouted<kTypeQ8><<<grid, kThreads>>>(wp, w.row_bytes, w.cols, rows,
+      GemmRouted<kTypeQ8><<<grid, kThreads * 2, 0, stream>>>(wp, w.row_bytes, w.cols, rows,
                                               ids_flat, xrow, scale, xin, yout);
     }
   }
   int* ids_flat{nullptr};
   void RmsRows(const float* in_, const float* w, float* out, int rows, int dim,
                std::size_t ld_in, std::size_t ld_out) {
-    Rms<<<rows, 256>>>(in_, w, out, dim, ld_in, ld_out, m->config.rms_eps);
+    Rms<<<rows, 256, 0, stream>>>(in_, w, out, dim, ld_in, ld_out, m->config.rms_eps);
   }
   void Mixer(const std::vector<const float*>& blocks, const float* cur_,
              const float* query, int nq, int n, float* out) {
@@ -676,7 +685,7 @@ struct Session::Impl {
     sp.count = static_cast<int>(blocks.size());
     for (std::size_t i = 0; i < blocks.size(); ++i)
       sp.p[i] = blocks[i];
-    Mix<<<n, 256>>>(sp, cur_, query, nq,
+    Mix<<<n, 256, 0, stream>>>(sp, cur_, query, nq,
                     static_cast<int>(m->config.hidden_size), n, out);
   }
   void ControlStep(float* cur_, const float* message, std::uint32_t phys,
@@ -692,11 +701,11 @@ struct Session::Impl {
           n);
     Dense(m->T(base + "forget.weight"), low, m->config.loop_gate_rank, forget,
           h, n);
-    Control<<<n, 256>>>(cur_, message, gain, forget, h);
+    Control<<<n, 256, 0, stream>>>(cur_, message, gain, forget, h);
   }
   void Convolve(const float* in_, const Tensor& w, const float* dyn, int heads,
                 float* hist, float* out, int ch, int n) {
-    Conv<<<(ch + 127) / 128, 128>>>(in_, static_cast<const float*>(w.dev), dyn,
+    Conv<<<(ch + 127) / 128, 128, 0, stream>>>(in_, static_cast<const float*>(w.dev), dyn,
                                     heads, hist, out, ch, n);
   }
   float* Pool() { return block_pool[pool_used++]; }
@@ -711,9 +720,9 @@ struct Session::Impl {
     const bool swa = c.is_swa[slot];
     Slot& sl = slots[slot];
     const std::size_t nh_ = static_cast<std::size_t>(n) * h;
-    HIP_OK(hipMemcpyAsync(inp_sa, cur, nh_ * 4, hipMemcpyDeviceToDevice));
+    HIP_OK(hipMemcpyAsync(inp_sa, cur, nh_ * 4, hipMemcpyDeviceToDevice, stream));
     for (int j = 0; j < 3; ++j)
-      HIP_OK(hipMemcpyAsync(in[j], cur, nh_ * 4, hipMemcpyDeviceToDevice));
+      HIP_OK(hipMemcpyAsync(in[j], cur, nh_ * 4, hipMemcpyDeviceToDevice, stream));
     if (m->Has(m->P(p, "attn_res_query.weight"))) {
       const int nq = swa ? 1 : 3;
       Mixer(
@@ -722,7 +731,7 @@ struct Session::Impl {
           nq, n, mixed);
       for (int j = 0; j < 3; ++j) {
         HIP_OK(hipMemcpyAsync(in[j], mixed + (swa ? 0 : j) * nh_, nh_ * 4,
-                              hipMemcpyDeviceToDevice));
+                              hipMemcpyDeviceToDevice, stream));
       }
     }
     if (msgs_ != nullptr) {
@@ -738,8 +747,8 @@ struct Session::Impl {
           RmsRows(in[j], w, in[j], n, h, h, h);
       } else {
         RmsRows(in[0], w, in[0], n, h, h, h);
-        HIP_OK(hipMemcpyAsync(in[1], in[0], nh_ * 4, hipMemcpyDeviceToDevice));
-        HIP_OK(hipMemcpyAsync(in[2], in[0], nh_ * 4, hipMemcpyDeviceToDevice));
+        HIP_OK(hipMemcpyAsync(in[1], in[0], nh_ * 4, hipMemcpyDeviceToDevice, stream));
+        HIP_OK(hipMemcpyAsync(in[2], in[0], nh_ * 4, hipMemcpyDeviceToDevice, stream));
       }
     } else {
       static const char* const kN[3] = {"attn_q_inp_norm.weight",
@@ -769,53 +778,52 @@ struct Session::Impl {
     Convolve(v, m->T(m->P(p, "attn_v_conv.weight")), dv, nkv, sl.hist_v, vtmp,
              nkv * hd, n);
     HIP_OK(hipMemcpyAsync(v, vtmp, static_cast<std::size_t>(n) * nkv * hd * 4,
-                          hipMemcpyDeviceToDevice));
-    Clip<<<n * nh, 128>>>(
+                          hipMemcpyDeviceToDevice, stream));
+    Clip<<<n * nh, 128, 0, stream>>>(
         q, static_cast<const float*>(m->T(m->P(p, "attn_q_clip.weight")).dev),
         nh, hd, c.qk_clip);
-    Clip<<<n * nkv, 128>>>(k, nullptr, 1, hd, c.qk_clip);
+    Clip<<<n * nkv, 128, 0, stream>>>(k, nullptr, 1, hd, c.qk_clip);
     RmsRows(v, nullptr, v, n * nkv, hd, hd, hd);
-    Clip<<<n * nh, 128>>>(
+    Clip<<<n * nh, 128, 0, stream>>>(
         r, static_cast<const float*>(m->T(m->P(p, "attn_rel_clip.weight")).dev),
         nh, nrel, c.relative_clip);
     if (!swa) {
-      TauScale<<<n, 256>>>(q, nh * hd, position,
+      TauScale<<<n, 256, 0, stream>>>(q, nh * hd, d_pos,
                            static_cast<float>(c.log_scale_floor),
                            c.log_scale_alpha);
-      TauScale<<<n, 256>>>(r, nh * nrel, position,
+      TauScale<<<n, 256, 0, stream>>>(r, nh * nrel, d_pos,
                            static_cast<float>(c.log_scale_floor),
                            c.log_scale_alpha);
     }
     Dense(m->T(m->P(p, "attn_sink_proj.weight")), in[0], h, sink, nh, n);
-    StoreKv<<<n, 256>>>(k, v, sl.k, sl.v, nkv * hd, position);
+    StoreKv<<<n, 256, 0, stream>>>(k, v, sl.k, sl.v, nkv * hd, d_pos);
     AttnArgs aa{nh,
                 nkv,
                 hd,
                 nrel,
                 static_cast<int>(c.relative_extent),
                 swa ? static_cast<int>(c.sliding_window) : 0,
-                static_cast<int>(position),
+                d_pos,
                 1.0F / std::sqrt(static_cast<float>(hd))};
-    const int span = swa ? std::min<int>(position + n, c.sliding_window)
-                         : static_cast<int>(position) + n;
-    Attention<<<dim3(nh, n), kThreads, (span + 1) * sizeof(float)>>>(
+    const int span = swa ? static_cast<int>(c.sliding_window) : static_cast<int>(ctx);
+    Attention<<<dim3(nh, n), kThreads, (span + 1) * sizeof(float), stream>>>(
         aa, q, r, sink, sl.k, sl.v,
         static_cast<const float*>(m->T(m->P(p, "attn_rel_bias.weight")).dev),
         att);
     Dense(m->T(m->P(p, "attn_gate.weight")), in[0], h, gate, nh * hd, n);
-    SigmoidMul<<<(n * nh * hd + 255) / 256, 256>>>(
+    SigmoidMul<<<(n * nh * hd + 255) / 256, 256, 0, stream>>>(
         att, gate, static_cast<std::size_t>(n) * nh * hd);
     Dense(m->T(m->P(p, "attn_output.weight")), att, nh * hd, o, h, n);
     Convolve(o, m->T(m->P(p, "attn_post_conv.weight")), nullptr, 1,
              sl.hist_attn, cur, h, n);
     if (ip % c.attn_res_block_size == 0) {
       float* b = Pool();
-      HIP_OK(hipMemcpyAsync(b, inp_sa, nh_ * 4, hipMemcpyDeviceToDevice));
+      HIP_OK(hipMemcpyAsync(b, inp_sa, nh_ * 4, hipMemcpyDeviceToDevice, stream));
       blocks.push_back(b);
     } else {
-      AddInto<<<(n * h + 255) / 256, 256>>>(cur, inp_sa, nh_);
+      AddInto<<<(n * h + 255) / 256, 256, 0, stream>>>(cur, inp_sa, nh_);
     }
-    HIP_OK(hipMemcpyAsync(ffn_inp, cur, nh_ * 4, hipMemcpyDeviceToDevice));
+    HIP_OK(hipMemcpyAsync(ffn_inp, cur, nh_ * 4, hipMemcpyDeviceToDevice, stream));
     Mixer(blocks, cur,
           static_cast<const float*>(m->T(m->P(p, "ffn_res_query.weight")).dev),
           1, n, x);
@@ -826,7 +834,7 @@ struct Session::Impl {
     Moe(p, n);
     Convolve(moe, m->T(m->P(p, "ffn_post_conv.weight")), nullptr, 1,
              sl.hist_ffn, cur, h, n);
-    AddInto<<<(n * h + 255) / 256, 256>>>(cur, ffn_inp, nh_);
+    AddInto<<<(n * h + 255) / 256, 256, 0, stream>>>(cur, ffn_inp, nh_);
   }
 
   void Moe(std::uint32_t p, int n) {
@@ -834,7 +842,7 @@ struct Session::Impl {
     const int h = c.hidden_size, ne = c.expert_count, nu = c.expert_used,
               ff = c.expert_ff;
     Dense(m->T(m->P(p, "ffn_gate_inp.weight")), x, h, router, ne, n);
-    Route<<<n, 256>>>(
+    Route<<<n, 256, 0, stream>>>(
         router,
         static_cast<const float*>(m->T(m->P(p, "exp_probs_b.bias")).dev), ne,
         nu, c.expert_weights_scale, ids, wts);
@@ -848,33 +856,45 @@ struct Session::Impl {
                                   m->T(m->P(p, "ffn_down_exps.scale")).dev)
                             : nullptr;
     const int items = n * nu;
-    SetXrow(n, nu, false);
+    xrow = xrow_token;
     Routed(m->T(m->P(p, "ffn_gate_up_exps.weight")), 2 * ff, items, nullptr, x,
            gu);
-    Situ<<<items, 256>>>(gu, ids, s_gu, act, ff, c.situ_beta,
+    Situ<<<items, 256, 0, stream>>>(gu, ids, s_gu, act, ff, c.situ_beta,
                          c.situ_linear_beta);
-    SetXrow(n, nu, true);
+    xrow = xrow_item;
     Routed(m->T(m->P(p, "ffn_down_exps.weight")), h, items, s_dn, act, y);
-    Combine<<<n, 256>>>(y, wts, moe, nu, h);
-  }
-
-  void SetXrow(int n, int nu, bool per_item) {
-    static std::vector<int> host;
-    host.resize(static_cast<std::size_t>(n) * nu);
-    for (int i = 0; i < n * nu; ++i)
-      host[i] = per_item ? i : i / nu;
-    HIP_OK(
-        hipMemcpy(xrow, host.data(), host.size() * 4, hipMemcpyHostToDevice));
+    Combine<<<n, 256, 0, stream>>>(y, wts, moe, nu, h);
   }
 
   void Forward(std::span<const std::int32_t> tokens) {
     const Config& c = m->config;
     const int n = static_cast<int>(tokens.size());
+    HIP_OK(hipMemcpy(d_tokens, tokens.data(), n * 4, hipMemcpyHostToDevice));
+    const int pos = static_cast<int>(position);
+    HIP_OK(hipMemcpy(d_pos, &pos, 4, hipMemcpyHostToDevice));
+    if (n == 1) {
+      if (graph_exec == nullptr) {
+        HIP_OK(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal));
+        Body(1);
+        HIP_OK(hipStreamEndCapture(stream, &graph));
+        HIP_OK(hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
+      }
+      HIP_OK(hipGraphLaunch(graph_exec, stream));
+    } else {
+      Body(n);
+    }
+    HIP_OK(hipStreamSynchronize(stream));
+    logits.resize(c.vocab_unpadded);
+    HIP_OK(hipMemcpy(logits.data(), d_logits, c.vocab_unpadded * 4, hipMemcpyDeviceToHost));
+    position += n;
+  }
+
+  void Body(int n) {
+    const Config& c = m->config;
     const int h = c.hidden_size;
     const std::size_t nh_ = static_cast<std::size_t>(n) * h;
-    HIP_OK(hipMemcpy(d_tokens, tokens.data(), n * 4, hipMemcpyHostToDevice));
     const Tensor& emb = m->T("token_embd.weight");
-    EmbedQ8<<<n, 256>>>(static_cast<const unsigned char*>(emb.dev),
+    EmbedQ8<<<n, 256, 0, stream>>>(static_cast<const unsigned char*>(emb.dev),
                         emb.row_bytes, d_tokens, cur, h);
     RmsRows(cur, static_cast<const float*>(m->T("token_embd_norm.weight").dev),
             cur, n, h, h, h);
@@ -883,14 +903,14 @@ struct Session::Impl {
     const std::uint32_t start = c.loop_core_start, end = c.loop_core_end;
     for (std::uint32_t il = 0; il < start; ++il)
       Layer(il, il, blocks, nullptr, n);
-    HIP_OK(hipMemcpyAsync(prelude, cur, nh_ * 4, hipMemcpyDeviceToDevice));
+    HIP_OK(hipMemcpyAsync(prelude, cur, nh_ * 4, hipMemcpyDeviceToDevice, stream));
     const std::vector<const float*> prelude_blocks = blocks;
     for (std::uint32_t pass = 0; pass < c.loop_num_loops; ++pass) {
       std::vector<const float*> bank;
       if (pass > 0) {
         bank.assign(blocks.begin() + prelude_blocks.size() + 1, blocks.end());
-        HIP_OK(hipMemcpyAsync(bank_out, cur, nh_ * 4, hipMemcpyDeviceToDevice));
-        HIP_OK(hipMemcpyAsync(cur, prelude, nh_ * 4, hipMemcpyDeviceToDevice));
+        HIP_OK(hipMemcpyAsync(bank_out, cur, nh_ * 4, hipMemcpyDeviceToDevice, stream));
+        HIP_OK(hipMemcpyAsync(cur, prelude, nh_ * 4, hipMemcpyDeviceToDevice, stream));
         blocks = prelude_blocks;
       }
       for (std::uint32_t ip = start; ip < end; ++ip) {
@@ -910,13 +930,13 @@ struct Session::Impl {
             static_cast<const float*>(m->T("loop_kv_res_query.weight").dev);
         float* mq = low;  // reuse as scratch: 4*h floats
         HIP_OK(hipMemcpyAsync(mq, res + 2 * cc * h, h * 4,
-                              hipMemcpyDeviceToDevice));
+                              hipMemcpyDeviceToDevice, stream));
         HIP_OK(hipMemcpyAsync(mq + h, kv + 2 * cc * h, h * 4,
-                              hipMemcpyDeviceToDevice));
+                              hipMemcpyDeviceToDevice, stream));
         HIP_OK(hipMemcpyAsync(mq + 2 * h, kv + (2 * cc + 1) * h, h * 4,
-                              hipMemcpyDeviceToDevice));
+                              hipMemcpyDeviceToDevice, stream));
         HIP_OK(hipMemcpyAsync(mq + 3 * h, res + (2 * cc + 1) * h, h * 4,
-                              hipMemcpyDeviceToDevice));
+                              hipMemcpyDeviceToDevice, stream));
         Mixer(bank, bank_out, mq, 4, n, msgs);
         Layer(il, ip, blocks, msgs, n);
       }
@@ -931,12 +951,8 @@ struct Session::Impl {
     const Tensor& out = m->T("output.weight");
     Dense(out, x + static_cast<std::size_t>(n - 1) * h, h, d_logits,
           c.vocab_unpadded, 1, static_cast<int>(c.vocab_unpadded));
-    Softcap<<<(c.vocab_unpadded + 255) / 256, 256>>>(d_logits, c.vocab_unpadded,
+    Softcap<<<(c.vocab_unpadded + 255) / 256, 256, 0, stream>>>(d_logits, c.vocab_unpadded,
                                                      c.final_logit_softcapping);
-    logits.resize(c.vocab_unpadded);
-    HIP_OK(hipMemcpy(logits.data(), d_logits, c.vocab_unpadded * 4,
-                     hipMemcpyDeviceToHost));
-    position += n;
   }
 };
 
@@ -1034,6 +1050,20 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
   i.prelude = i.Alloc(b * h);
   i.bank_out = i.Alloc(b * h);
   i.d_logits = i.Alloc(c.vocab_padded);
+  i.d_pos = static_cast<int*>(i.AllocBytes(4));
+  {
+    std::vector<int> tok(b * c.expert_used);
+    std::vector<int> item(b * c.expert_used);
+    for (std::size_t j = 0; j < tok.size(); ++j) {
+      tok[j] = static_cast<int>(j / c.expert_used);
+      item[j] = static_cast<int>(j);
+    }
+    i.xrow_token = static_cast<int*>(i.AllocBytes(tok.size() * 4));
+    i.xrow_item = static_cast<int*>(i.AllocBytes(item.size() * 4));
+    HIP_OK(hipMemcpy(i.xrow_token, tok.data(), tok.size() * 4, hipMemcpyHostToDevice));
+    HIP_OK(hipMemcpy(i.xrow_item, item.data(), item.size() * 4, hipMemcpyHostToDevice));
+  }
+  HIP_OK(hipStreamCreateWithFlags(&i.stream, hipStreamNonBlocking));
   i.ids = static_cast<int*>(i.AllocBytes(b * c.expert_used * 4));
   i.xrow = static_cast<int*>(i.AllocBytes(b * c.expert_used * 4));
   for (auto& p : i.block_pool)
