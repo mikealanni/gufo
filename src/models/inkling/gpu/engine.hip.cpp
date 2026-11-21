@@ -23,6 +23,7 @@ constexpr int kMaxStates = 8;
 constexpr int kConvTaps = 4;
 constexpr int kHistory = 3;
 constexpr int kMaxBatch = 512;
+constexpr int kWmmaMinTokens = 32;
 constexpr float kMixEps = 1e-6F;
 constexpr int kTypeF32 = 0;
 constexpr int kTypeBf16 = 1;
@@ -510,6 +511,170 @@ __global__ void Softcap(float* x, int count, float cap) {
     x[i] = cap * tanhf(x[i] / cap);
 }
 
+
+using V16h = __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
+using V8f = __attribute__((__vector_size__(8 * sizeof(float)))) float;
+
+constexpr int kTileM = 64;
+constexpr int kTileN = 64;
+constexpr int kLdsStride = 40;
+constexpr int kWmmaThreads = 128;
+
+struct WmmaArgs {
+  const unsigned char* w;
+  std::size_t row_bytes;
+  int cols;
+  int rows;
+  const float* x;
+  int a_div;
+  float* y;
+  const float* scale;
+  const int* tiles;
+  const int* sorted;
+  int n;
+};
+
+// 16 consecutive K elements [k0, k0 + 16) of one weight row as F16.
+template <int TY>
+__device__ void LoadB16(const unsigned char* row, int k0, __half* dst) {
+  if constexpr (TY == kTypeF32) {
+    const float* p = reinterpret_cast<const float*>(row) + k0;
+    for (int i = 0; i < 16; ++i) dst[i] = __float2half(p[i]);
+  } else if constexpr (TY == kTypeBf16) {
+    const unsigned short* p = reinterpret_cast<const unsigned short*>(row) + k0;
+    for (int i = 0; i < 16; ++i) dst[i] = __float2half(__uint_as_float(static_cast<unsigned>(p[i]) << 16));
+  } else if constexpr (TY == kTypeQ8) {
+    const unsigned char* b = row + (k0 >> 5) * 34;
+    const float d = __half2float(*reinterpret_cast<const __half*>(b));
+    const unsigned short* q = reinterpret_cast<const unsigned short*>(b + 2) + ((k0 & 31) >> 1);
+    for (int i = 0; i < 8; ++i) {
+      const unsigned short v = q[i];
+      dst[2 * i] = __float2half(d * static_cast<float>(static_cast<signed char>(v & 0xFF)));
+      dst[2 * i + 1] = __float2half(d * static_cast<float>(static_cast<signed char>(v >> 8)));
+    }
+  } else {
+    const unsigned char* blk = row + (k0 >> 6) * 36;
+    const int s = (k0 >> 4) & 3;
+    const float d = Ue4m3(blk[s]);
+    const unsigned int* qp = reinterpret_cast<const unsigned int*>(blk + 4 + s * 8);
+    const unsigned int u[2] = {qp[0], qp[1]};
+    for (int j = 0; j < 8; ++j) {
+      const unsigned int byte = (u[j >> 2] >> ((j & 3) * 8)) & 0xFF;
+      dst[j] = __float2half(kE2m1[byte & 15] * d);
+      dst[8 + j] = __float2half(kE2m1[byte >> 4] * d);
+    }
+  }
+}
+
+// Y[item][n] = scale[e] * sum_k X[item / a_div][k] * W[e*rows + n][k]; 64x64 tile per block, 4 waves of 32x32.
+template <int TY>
+__global__ void __launch_bounds__(kWmmaThreads) WmmaGemm(WmmaArgs a) {
+  __shared__ __half As[kTileM][kLdsStride];
+  __shared__ __half Bs[kTileN][kLdsStride];
+  const int tid = threadIdx.x;
+  const int wave = tid >> 5;
+  const int lane = tid & 31;
+  const int n0 = blockIdx.x * kTileN;
+  int expert = 0;
+  int start;
+  int cnt;
+  if (a.tiles != nullptr) {
+    expert = a.tiles[blockIdx.y * 3];
+    start = a.tiles[blockIdx.y * 3 + 1];
+    cnt = a.tiles[blockIdx.y * 3 + 2];
+  } else {
+    start = blockIdx.y * kTileM;
+    cnt = min(kTileM, a.n - start);
+  }
+  if (cnt <= 0) return;
+  const int lr = tid >> 1;
+  const int lh = tid & 1;
+  const int item = lr < cnt ? (a.sorted != nullptr ? a.sorted[start + lr] : start + lr) : -1;
+  const float* xr = item >= 0 ? a.x + static_cast<std::size_t>(item / a.a_div) * a.cols : nullptr;
+  const unsigned char* wr = a.w + (static_cast<std::size_t>(expert) * a.rows + n0 + lr) * a.row_bytes;
+  V8f acc[2][2] = {};
+  const int wm = wave >> 1;
+  const int wn = wave & 1;
+  for (int k0 = 0; k0 < a.cols; k0 += 32) {
+    __half* ad = &As[lr][lh * 16];
+    if (xr != nullptr) {
+      const float4* x4 = reinterpret_cast<const float4*>(xr + k0 + lh * 16);
+      for (int i = 0; i < 4; ++i) {
+        const float4 v = x4[i];
+        ad[4 * i] = __float2half(v.x);
+        ad[4 * i + 1] = __float2half(v.y);
+        ad[4 * i + 2] = __float2half(v.z);
+        ad[4 * i + 3] = __float2half(v.w);
+      }
+    } else {
+      for (int i = 0; i < 16; ++i) ad[i] = __float2half(0.0F);
+    }
+    LoadB16<TY>(wr, k0 + lh * 16, &Bs[lr][lh * 16]);
+    __syncthreads();
+    for (int kk = 0; kk < 2; ++kk) {
+      V16h af[2];
+      V16h bf[2];
+      for (int mi = 0; mi < 2; ++mi) {
+        const __half* p = &As[wm * 32 + mi * 16 + (lane & 15)][kk * 16];
+        for (int i = 0; i < 16; ++i) af[mi][i] = static_cast<_Float16>(__half2float(p[i]));
+      }
+      for (int ni = 0; ni < 2; ++ni) {
+        const __half* p = &Bs[wn * 32 + ni * 16 + (lane & 15)][kk * 16];
+        for (int i = 0; i < 16; ++i) bf[ni][i] = static_cast<_Float16>(__half2float(p[i]));
+      }
+      for (int mi = 0; mi < 2; ++mi) {
+        for (int ni = 0; ni < 2; ++ni) acc[mi][ni] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af[mi], bf[ni], acc[mi][ni]);
+      }
+    }
+    __syncthreads();
+  }
+  const float sc = a.scale != nullptr ? a.scale[expert] : 1.0F;
+  for (int mi = 0; mi < 2; ++mi) {
+    for (int ni = 0; ni < 2; ++ni) {
+      for (int i = 0; i < 8; ++i) {
+        const int m = wm * 32 + mi * 16 + 2 * i + (lane >> 4);
+        const int nn = n0 + wn * 32 + ni * 16 + (lane & 15);
+        if (m >= cnt) continue;
+        const int out_item = a.sorted != nullptr ? a.sorted[start + m] : start + m;
+        a.y[static_cast<std::size_t>(out_item) * a.rows + nn] = acc[mi][ni][i] * sc;
+      }
+    }
+  }
+}
+
+__global__ void SortItems(const int* ids, int items, int ne, int* sorted, int* tiles, int max_tiles) {
+  __shared__ int cnt[256];
+  __shared__ int start[256];
+  __shared__ int cursor[256];
+  for (int e = threadIdx.x; e < ne; e += blockDim.x) {
+    cnt[e] = 0;
+    cursor[e] = 0;
+  }
+  __syncthreads();
+  for (int i = threadIdx.x; i < items; i += blockDim.x) atomicAdd(&cnt[ids[i]], 1);
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    int s = 0;
+    int k = 0;
+    for (int e = 0; e < ne; ++e) {
+      start[e] = s;
+      for (int off = 0; off < cnt[e]; off += kTileM) {
+        tiles[3 * k] = e;
+        tiles[3 * k + 1] = s + off;
+        tiles[3 * k + 2] = min(kTileM, cnt[e] - off);
+        ++k;
+      }
+      s += cnt[e];
+    }
+    for (; k < max_tiles; ++k) tiles[3 * k + 2] = 0;
+  }
+  __syncthreads();
+  for (int i = threadIdx.x; i < items; i += blockDim.x) {
+    const int e = ids[i];
+    sorted[start[e] + atomicAdd(&cursor[e], 1)] = i;
+  }
+}
+
 struct Tensor {
   void* dev{nullptr};
   int type{kTypeF32};
@@ -627,6 +792,7 @@ struct Session::Impl {
       *cat{nullptr}, *low{nullptr}, *gain{nullptr}, *forget{nullptr},
       *router{nullptr}, *wts{nullptr}, *gu{nullptr}, *act{nullptr}, *y{nullptr},
       *moe{nullptr}, *prelude{nullptr}, *bank_out{nullptr}, *d_logits{nullptr};
+  int *sorted{nullptr}, *tiles{nullptr};
   int *ids{nullptr}, *xrow{nullptr}, *xrow_token{nullptr}, *xrow_item{nullptr},
       *d_pos{nullptr};
   hipStream_t stream{nullptr};
@@ -662,6 +828,18 @@ struct Session::Impl {
   void Dense(const Tensor& w, const float* xin, std::size_t ldx, float* yout,
              std::size_t ldy, int n, int rows = -1) {
     const int nrows = rows < 0 ? static_cast<int>(w.rows) : rows;
+    if (n >= kWmmaMinTokens && nrows % kTileN == 0 && ldy == static_cast<std::size_t>(nrows) && static_cast<std::uint64_t>(nrows) <= w.rows) {
+      WmmaArgs wa{static_cast<const unsigned char*>(w.dev), w.row_bytes, static_cast<int>(w.cols), nrows, xin, 1, yout, nullptr, nullptr, nullptr, n};
+      const dim3 wg(nrows / kTileN, (n + kTileM - 1) / kTileM);
+      if (ldx == w.cols) {
+        switch (w.type) {
+          case kTypeF32: WmmaGemm<kTypeF32><<<wg, kWmmaThreads, 0, stream>>>(wa); return;
+          case kTypeBf16: WmmaGemm<kTypeBf16><<<wg, kWmmaThreads, 0, stream>>>(wa); return;
+          case kTypeQ8: WmmaGemm<kTypeQ8><<<wg, kWmmaThreads, 0, stream>>>(wa); return;
+          default: break;
+        }
+      }
+    }
     const int rpb = kThreads * 2 / 32;
     const dim3 grid((nrows + rpb - 1) / rpb, (n + kTokenTile - 1) / kTokenTile);
     const auto* wp = static_cast<const unsigned char*>(w.dev);
@@ -885,6 +1063,29 @@ struct Session::Impl {
                                   m->T(m->P(p, "ffn_down_exps.scale")).dev)
                             : nullptr;
     const int items = n * nu;
+    if (n >= kWmmaMinTokens) {
+      const int max_tiles = items / kTileM + ne;
+      SortItems<<<1, 1024, 0, stream>>>(ids, items, ne, sorted, tiles, max_tiles);
+      const Tensor& wgu = m->T(m->P(p, "ffn_gate_up_exps.weight"));
+      const Tensor& wdn = m->T(m->P(p, "ffn_down_exps.weight"));
+      WmmaArgs a1{static_cast<const unsigned char*>(wgu.dev), wgu.row_bytes, static_cast<int>(wgu.cols), 2 * ff, x, nu, gu, nullptr, tiles, sorted, n};
+      WmmaArgs a2{static_cast<const unsigned char*>(wdn.dev), wdn.row_bytes, static_cast<int>(wdn.cols), h, act, 1, y, s_dn, tiles, sorted, n};
+      const dim3 g1(2 * ff / kTileN, max_tiles);
+      const dim3 g2(h / kTileN, max_tiles);
+      if (wgu.type == kTypeNvfp4) {
+        WmmaGemm<kTypeNvfp4><<<g1, kWmmaThreads, 0, stream>>>(a1);
+      } else {
+        WmmaGemm<kTypeQ8><<<g1, kWmmaThreads, 0, stream>>>(a1);
+      }
+      Situ<<<items, 256, 0, stream>>>(gu, ids, s_gu, act, ff, c.situ_beta, c.situ_linear_beta);
+      if (wdn.type == kTypeNvfp4) {
+        WmmaGemm<kTypeNvfp4><<<g2, kWmmaThreads, 0, stream>>>(a2);
+      } else {
+        WmmaGemm<kTypeQ8><<<g2, kWmmaThreads, 0, stream>>>(a2);
+      }
+      Combine<<<n, 256, 0, stream>>>(y, wts, moe, nu, h);
+      return;
+    }
     xrow = xrow_token;
     Routed(m->T(m->P(p, "ffn_gate_up_exps.weight")), 2 * ff, items, nullptr, x,
            gu);
@@ -1084,6 +1285,8 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
   i.bank_out = i.Alloc(b * h);
   i.d_logits = i.Alloc(c.vocab_padded);
   i.d_pos = static_cast<int*>(i.AllocBytes(4));
+  i.sorted = static_cast<int*>(i.AllocBytes(b * c.expert_used * 4));
+  i.tiles = static_cast<int*>(i.AllocBytes((b * c.expert_used / kTileM + c.expert_count) * 3 * 4));
   {
     std::vector<int> tok(b * c.expert_used);
     std::vector<int> item(b * c.expert_used);
