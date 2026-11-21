@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <numeric>
@@ -38,6 +39,23 @@ int main(int argc, char** argv) {
     for (int k = 0; k < kTop; ++k)
       std::printf(" %d(%.4f)", idx[k], logits[idx[k]]);
     std::printf("\n");
+  }
+  if (const char* env = std::getenv("INKLING_BENCH")) {
+    constexpr int kDecode = 32;
+    constexpr int kBenchToken = 1000;
+    const int n = std::atoi(env);
+    session->Reset();
+    std::vector<std::int32_t> prompt(n, kBenchToken);
+    const auto t0 = std::chrono::steady_clock::now();
+    (void)session->Append(prompt, &error);
+    const auto t1 = std::chrono::steady_clock::now();
+    for (int i = 0; i < kDecode; ++i) {
+      const std::int32_t one = kBenchToken;
+      (void)session->Append(std::span(&one, 1), &error);
+    }
+    const auto t2 = std::chrono::steady_clock::now();
+    std::printf("pp %d: %.1f tok/s, tg: %.2f tok/s\n", n, n / std::chrono::duration<double>(t1 - t0).count(),
+                kDecode / std::chrono::duration<double>(t2 - t1).count());
   }
   return 0;
 }
