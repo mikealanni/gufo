@@ -248,6 +248,16 @@ Remaining 27B steps: a decode GEMV for the mq4 format, then drop the base
 GGUF projections and the Q8 mirrors, then HumanEval-style code quality and long
 contexts.
 
+## Decode on the same weights (GUFO_IU4_DECODE=1)
+
+The tile-major prefill layout is also a good decode layout, so one weight copy serves both.
+- `LaunchIu4Gemv` (kernels/iu4_gemv.hip): lane = row, two of four 16-byte chunks of a 128 group; a workgroup is a 16-row tile (T <= 4, fp32 FMA on the rotated fp32 activation) or four tiles with the matrix cores (5..16 tokens). Reaches ~215 GB/s (DRAM bound) on the big projections; 16 tokens cost the same as 1.
+- Matrix-core path (W4A16): dequantize nibbles to fp16 exactly with the magic constant (0x6400 | n is 1024 + n, subtract 1032), WMMA f16 with the per-128 scale applied on the accumulator per group (applying it to the fp16 weight rounds badly: (1024+n)*sc loses the small result). The fp16 activation is permuted within each 8-wide word to nibble-pair order (0 4 1 5 2 6 3 7) by a tiny prepare kernel, so no shuffles are needed; the contraction is a plain sum. fp16 activation rounding gives ~4e-4 relative error (test tolerance 1.5e-3).
+- Producers take `rot_out`: the rotated fp32 row instead of int4 codes (n = padded_n = rows, tiles/scales null).
+- Wiring: decode_step.cpp (1 token), batched_decode.cpp ForwardTokenBatch and ForwardVerificationBatch (Iu4Ctx helpers). Prefill scratch (d_scratch_bf16, d_ffn_gate/up) is reused for x and the FFN intermediates.
+- Results (release, bench mode on): plain 12.5 -> 14.8 tok/s; DFlash2 40.7 / 62.9 -> 50.0 / 82.8 (depth 0 / 8192); MTP 14.1 -> 29.2 at depth 0.
+- Not done: the base GGUF projections are still registered (pinned) because the loader maps whole shard regions; dropping them needs per-tensor regions. Not needed for the 27B (32 GB total) but required for Flash-Next where the GGUF experts cannot coexist with the artifact experts: load only one expert copy.
+
 ## Checklist for the next model
 
 1. Artifact survey: shapes, per-projection awq, which tensors are mq4, which
