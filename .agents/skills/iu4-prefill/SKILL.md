@@ -190,13 +190,21 @@ Lessons (each cost a wrong number):
   artifact it measures the weight difference too: base 0.008 rmse / cosine
   0.99999, int4 0.515 / 0.989, int4 + NPU 0.627 / 0.986, top-1 matches.
 
-## Decode
+## Decode and speculation
 
-Unchanged: it reads the base GGUF and the existing decode kernels (12.3-12.5
-tok/s plain). The speculative drafts (MTP, DFlash2) keep working because chunks
-under 256 tokens take the old path. A decode GEMV for the mq4 format (and then
-dropping the base GGUF projections and the Q8 mirrors) is the remaining 27B
-step; then the quality gate on code (HumanEval) and long contexts.
+Decode is unchanged: it reads the base GGUF and the existing decode kernels.
+Speculative decode keeps working because chunks under 256 tokens take the old
+path (release build, bench mode on, `bench -p 2048 -n 128 -d 0,8192`):
+plain 12.45 / 12.11 tok/s (depth 0 / 8192), MTP 14.1 / 12.5 base and 14.1 / 12.0
+with int4 + NPU, DFlash2 40.0 / 67.0 base and 40.5 / 62.6 with int4 + NPU
+(acceptance on the synthetic bench prompt moves the depth-8192 number);
+pp2048 at depth 0 / 8192 goes 635-687 / 570-612 to 969-1096 / 840-933.
+Caveat: prefill now builds the KV cache and GDN state with the artifact weights
+while decode still uses the base GGUF weights (two different quantizations of
+one model). Qualify generation, not just prefill NLL, before making it default.
+Remaining 27B steps: a decode GEMV for the mq4 format, then drop the base
+GGUF projections and the Q8 mirrors, then HumanEval-style code quality and long
+contexts.
 
 ## Checklist for the next model
 
