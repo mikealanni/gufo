@@ -71,13 +71,16 @@ void LaunchIu4Gemm(const void* tiles, const std::uint16_t* weight_scales,
                    std::size_t k, hipStream_t stream, std::size_t out_ld = 0,
                    std::size_t valid_rows = 0);
 
-// Decode GEMV, one token: out[f] (+)= sum over K of the rotated int4 weights
+// Decode GEMV for `tokens` rows (x is [tokens][k], out [tokens][valid_rows],
+// weights read once per 16 tokens; more than four tokens use the matrix
+// cores when x16_scratch (16 x k halves) is given): out[f] (+)= sum over K of the rotated int4 weights
 // times the rotated fp32 activation x (producers: rotate-only variants).
 // Padded projections pass the padded row count and the logical valid_rows.
 void LaunchIu4Gemv(const void* tiles, const std::uint16_t* weight_scales,
                    const float* x, float* out, bool accumulate,
                    std::size_t padded_rows, std::size_t valid_rows,
-                   std::size_t k, hipStream_t stream);
+                   std::size_t k, hipStream_t stream, std::size_t tokens = 1,
+                   void* x16_scratch = nullptr);
 
 // NPU glue for the SwiGLU product when the NPU also takes down columns: the
 // leading `columns` columns exist only as FP16 (from the NPU), the rest only as

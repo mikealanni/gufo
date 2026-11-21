@@ -126,78 +126,87 @@ int main() {
       {"model.language_model.layers.0.linear_attn.out_proj.weight", 0,
        Iu4Role::kSsmOut},
   };
+  std::uint64_t state = 0x9E3779B97F4A7C15ull;
+  const auto next = [&]() {
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    return state;
+  };
   for (const Case& c : cases) {
     const auto& proj = weights.Find(c.layer, c.role);
     CHECK(proj.valid(), "%s missing", c.name);
     if (!proj.valid())
       continue;
     const std::size_t M = proj.rows, K = proj.cols, E = K / 128;
-    std::uint64_t state = 0x9E3779B97F4A7C15ull ^ (M * 31 + K);
-    const auto next = [&]() {
-      state ^= state << 13;
-      state ^= state >> 7;
-      state ^= state << 17;
-      return state;
-    };
-    std::vector<float> x(K);
-    for (auto& v : x)
-      v = (static_cast<int>(next() % 2001) - 1000) * 1e-3f;
-    float *d_x, *d_out;
-    hipMalloc(&d_x, K * 4);
-    hipMalloc(&d_out, proj.padded_rows * 4);
-    hipMemcpy(d_x, x.data(), K * 4, hipMemcpyHostToDevice);
-    std::vector<float> init(proj.padded_rows, 1.0f);
-    hipMemcpy(d_out, init.data(), init.size() * 4, hipMemcpyHostToDevice);
-    gufo::hip::LaunchIu4Gemv(proj.tiles, proj.scales, d_x, d_out, true,
-                             proj.padded_rows, M, K, nullptr);
-    CHECK(hipDeviceSynchronize() == hipSuccess, "%s kernel failed", c.name);
-    std::vector<float> got(proj.padded_rows);
-    hipMemcpy(got.data(), d_out, got.size() * 4, hipMemcpyDeviceToHost);
     const std::uint64_t woff = FindOffset(base, c.name);
-    double worst = 0.0, rms = 0.0;
-    int checked = 0;
-    for (int s = 0; s < 2000; ++s) {
-      const std::size_t f = next() % M;
-      double ref = 1.0;
-      for (std::size_t e = 0; e < E; ++e) {
-        const std::uint8_t* block = base + woff + (f * (K / 256) + e / 2) * 136;
-        const double sw = HalfToFloat(
-            *reinterpret_cast<const std::uint16_t*>(block + 4 * (e & 1)));
-        double dot = 0;
-        for (int i = 0; i < 128; ++i) {
-          const std::uint8_t byte = block[8 + 64 * (e & 1) + i / 2];
-          const int nib = (byte >> (4 * (i & 1))) & 15;
-          dot += (nib - 8) * static_cast<double>(x[e * 128 + i]);
+    for (const std::size_t T : {std::size_t{1}, std::size_t{3}, std::size_t{8},
+                                std::size_t{16}, std::size_t{21}}) {
+      std::vector<float> x(T * K);
+      for (auto& v : x)
+        v = (static_cast<int>(next() % 2001) - 1000) * 1e-3f;
+      float *d_x, *d_out;
+      void* d_x16;
+      (void)hipMalloc(&d_x16, 16 * K * 2);
+      (void)hipMalloc(&d_x, T * K * 4);
+      (void)hipMalloc(&d_out, T * M * 4);
+      (void)hipMemcpy(d_x, x.data(), T * K * 4, hipMemcpyHostToDevice);
+      std::vector<float> init(T * M, 1.0f);
+      (void)hipMemcpy(d_out, init.data(), init.size() * 4,
+                      hipMemcpyHostToDevice);
+      gufo::hip::LaunchIu4Gemv(proj.tiles, proj.scales, d_x, d_out, true,
+                               proj.padded_rows, M, K, nullptr, T, d_x16);
+      CHECK(hipDeviceSynchronize() == hipSuccess, "%s kernel failed", c.name);
+      std::vector<float> got(T * M);
+      (void)hipMemcpy(got.data(), d_out, got.size() * 4,
+                      hipMemcpyDeviceToHost);
+      double worst = 0.0, rms = 0.0;
+      int checked = 0;
+      for (int s = 0; s < 600; ++s) {
+        const std::size_t f = next() % M, t = (s < 100) ? T - 1 : next() % T;
+        double ref = 1.0;
+        for (std::size_t e = 0; e < E; ++e) {
+          const std::uint8_t* block =
+              base + woff + (f * (K / 256) + e / 2) * 136;
+          const double sw = HalfToFloat(
+              *reinterpret_cast<const std::uint16_t*>(block + 4 * (e & 1)));
+          double dot = 0;
+          for (int i = 0; i < 128; ++i) {
+            const std::uint8_t byte = block[8 + 64 * (e & 1) + i / 2];
+            const int nib = (byte >> (4 * (i & 1))) & 15;
+            dot += (nib - 8) * static_cast<double>(x[t * K + e * 128 + i]);
+          }
+          ref += sw * dot;
         }
-        ref += sw * dot;
+        worst = std::max(worst, std::fabs(got[t * M + f] - ref));
+        rms += ref * ref;
+        ++checked;
       }
-      worst = std::max(worst, std::fabs(got[f] - ref));
-      rms += ref * ref;
-      ++checked;
+      rms = std::sqrt(rms / checked);
+      CHECK(worst < (T > 4 ? 1.5e-3 : 1e-4) * rms + 1e-4, "error too large");
+      hipEvent_t a, b;
+      (void)hipEventCreate(&a);
+      (void)hipEventCreate(&b);
+      for (int w = 0; w < 5; ++w)
+        gufo::hip::LaunchIu4Gemv(proj.tiles, proj.scales, d_x, d_out, false,
+                                 proj.padded_rows, M, K, nullptr, T, d_x16);
+      (void)hipEventRecord(a);
+      for (int r = 0; r < 100; ++r)
+        gufo::hip::LaunchIu4Gemv(proj.tiles, proj.scales, d_x, d_out, false,
+                                 proj.padded_rows, M, K, nullptr, T, d_x16);
+      (void)hipEventRecord(b);
+      (void)hipEventSynchronize(b);
+      float ms;
+      (void)hipEventElapsedTime(&ms, a, b);
+      ms /= 100;
+      const double bytes = static_cast<double>(M) * K * 0.5 + M * E * 2.0;
+      std::printf("%-12.12s %s T=%2zu: err %.2e (rms %.2f), %.3f ms, %.0f GB/s\n",
+                  c.name + 24, "", T, worst, rms, ms,
+                  bytes / (ms * 1e-3) / 1e9);
+      (void)hipFree(d_x);
+      (void)hipFree(d_x16);
+      (void)hipFree(d_out);
     }
-    rms = std::sqrt(rms / checked);
-    std::printf("%s: worst abs err %.3e (rms output %.3f)\n", c.name, worst,
-                rms);
-    CHECK(worst < 1e-4 * rms + 1e-4, "error too large");
-    hipEvent_t a, b;
-    hipEventCreate(&a);
-    hipEventCreate(&b);
-    for (int w = 0; w < 10; ++w)
-      gufo::hip::LaunchIu4Gemv(proj.tiles, proj.scales, d_x, d_out, false,
-                               proj.padded_rows, M, K, nullptr);
-    hipEventRecord(a);
-    for (int r = 0; r < 200; ++r)
-      gufo::hip::LaunchIu4Gemv(proj.tiles, proj.scales, d_x, d_out, false,
-                               proj.padded_rows, M, K, nullptr);
-    hipEventRecord(b);
-    hipEventSynchronize(b);
-    float ms;
-    hipEventElapsedTime(&ms, a, b);
-    ms /= 200;
-    const double bytes = static_cast<double>(M) * K * 0.5 + M * E * 2.0;
-    std::printf("  %.3f ms, %.1f GB/s\n", ms, bytes / (ms * 1e-3) / 1e9);
-    hipFree(d_x);
-    hipFree(d_out);
   }
   if (failures != 0) {
     std::printf("%d failures\n", failures);
