@@ -87,6 +87,15 @@ looped 3x -> 5.4B effective active; 24 physical layers, middle core looped).
   no reasoning-split; no snapshots/disk cache; tools unsupported; KV is full FP16 for all 48 slots
   (393 KB/token), so default context 16k.
 
+## Serve (2026-11-21)
+
+- `gufo serve llm -m Inkling-2-Mini-UD-Q4_K_XL.gguf -c 8192 -p 8911` works end to end (InklingTextRunner,
+  no snapshot/fork yet). Chat template in `chat_template.cpp` (effort header + `<|message_model|>` opener).
+  First request: model thinks, then answers "The capital of France is Paris."; 31 tok/s decode via serve.
+- Open: control tokens (`<|content_thinking|>`, `<|end_message|>`, `<|message_model|>`, `<|content_text|>`) leak into
+  the content and generation does not stop at the final `<|end_message|>`; needs reasoning split + stop handling.
+  No `~/run-gufo.sh` KIND yet; no snapshots (RAM/disk cache), no tools.
+
 ## Open questions / next steps (skill default order)
 
 1. CPU reference (`src/models/inkling/reference.cpp`) + config parser.
