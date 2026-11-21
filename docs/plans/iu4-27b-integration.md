@@ -126,3 +126,7 @@ int4 QK attention (approximate).
 The sparse kernel now reads head-major K and WMMA-ordered V packed per layer by PackAttentionHeads (same pack as dense, FFN scratch workspace, head groups when it does not fit). Pack and block selection are ~2% of time at 128k. Attention goes 157 -> 67 ms per layer-chunk at 64k.
 
 int4 + NPU, GUFO_QWEN_SPARSE_ATTN=1, single runs: 16k 1203, 32k 1103, 64k 1054, 128k 1019, 256k 955 (dense: 1219, 1056, 840, 608, 389). Two earlier 128k/256k readings (759, 623) were disturbed by a concurrent process and discarded. Sparse stays opt-in until the long-context quality gate (NLL mean over >=100 samples, top-1 agreement) is run.
+
+### Sparse attention quality at 32k (int4 + NPU, 40 samples, seed 7, window 32768)
+
+Dense mean NLL 0.6972, sparse 0.6821, paired delta -0.0150 +- 0.0298 (se); median delta -1e-5; top-1 agreement dense vs sparse 0.975 (39/40); top-1 equals the true next token 0.800 dense vs 0.775 sparse. Worst single-sample increase +0.73 nats, best -0.51 (per-sample NLL is chaotic here). No measurable loss at 32k; 64k+ and a larger sample are still to run before sparse becomes the default.
