@@ -18,6 +18,7 @@
 
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/npu_gemm.hpp"
 
 namespace {
 std::string ReadFile(const char* path) {
@@ -42,6 +43,8 @@ int main(int argc, char** argv) {
                  argv[0]);
     return 2;
   }
+  // The NPU split (GUFO_NPU_DIR) needs the factory the CLI registers.
+  gufo::models::qwen38_flash_next::rocm::RegisterQwenNpuFfn();
   const std::size_t samples = std::strtoul(argv[3], nullptr, 10);
   const std::size_t length = std::strtoul(argv[4], nullptr, 10);
   std::uint64_t state = argc > 5 ? std::strtoull(argv[5], nullptr, 10) : 1;

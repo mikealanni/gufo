@@ -47,7 +47,7 @@ if (ENGINE_ENABLE_HIP)
   set_tests_properties(qwen27b_iu4_chain_test PROPERTIES ENVIRONMENT
     "GUFO_IU4_ARTIFACT=/mnt/raid0/hipfire-eval/models/qwen3.8-27b.mq4-xts")
   add_executable(qwen27b_prefill_nll prefill_nll_tool.cpp)
-  target_link_libraries(qwen27b_prefill_nll PRIVATE gufo_core hip::host gufo_cache)
+  target_link_libraries(qwen27b_prefill_nll PRIVATE gufo_core hip::host gufo_cache gufo_qwen38_flash_next)
   add_qwen27b_test(qwen27b_target_test target_test.cpp
     "gpu;hip;target;external-model")
   add_qwen27b_test(qwen_mtp_gpu_test mtp_test.cpp "gpu;hip;mtp;external-model")
