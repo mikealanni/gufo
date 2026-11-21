@@ -120,3 +120,9 @@ int4 QK attention (approximate).
 - Idle budget (GUFO_NPU_STATS at pp32768, lockstep): NPU worker ~43 ms per layer-chunk, ~22 s of a ~31 s run, so the NPU is ~70% busy and ~9 s idle.
 - Probe (gufo-attnp, final_attnp2.xclbin, hd128 16 heads): 5.35 ms at L=16128, 21.06 ms at L=65128, i.e. ~3.2 TFLOPS (rel err printed nan, unresolved).
 - Projection with an exact KV-group split: NPU share 3.2/(27+3.2) = 10.6% of attention, so about +2.5% at 32k and +6% at 128k. Not enough alone for 1250; a multi-day kernel for that gain is deferred, the sparse kernel (12 vs 27 TFLOPS) goes first.
+
+## Sparse attention on packed K/V (2026-11-20)
+
+The sparse kernel now reads head-major K and WMMA-ordered V packed per layer by PackAttentionHeads (same pack as dense, FFN scratch workspace, head groups when it does not fit). Pack and block selection are ~2% of time at 128k. Attention goes 157 -> 67 ms per layer-chunk at 64k.
+
+int4 + NPU, GUFO_QWEN_SPARSE_ATTN=1, single runs: 16k 1203, 32k 1103, 64k 1054, 128k 1019, 256k 955 (dense: 1219, 1056, 840, 608, 389). Two earlier 128k/256k readings (759, 623) were disturbed by a concurrent process and discarded. Sparse stays opt-in until the long-context quality gate (NLL mean over >=100 samples, top-1 agreement) is run.

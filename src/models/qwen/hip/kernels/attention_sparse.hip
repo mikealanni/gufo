@@ -16,6 +16,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <algorithm>
+#include <span>
 #include <type_traits>
 
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
@@ -63,7 +65,8 @@ __launch_bounds__(256, 2) __global__
                              float* __restrict__ out_context,
                              std::uint32_t start_pos, std::size_t batch_size,
                              const std::int32_t* __restrict__ block_lists,
-                             std::uint32_t list_stride) {
+                             std::uint32_t list_stride,
+                             std::uint32_t list_kv_base) {
   constexpr std::uint32_t kGqa = kQueryHeads / kKvHeads;
   constexpr std::uint32_t kAttnWidth = kQueryHeads * kHeadDim;
   constexpr std::uint32_t kKvWidth = kKvHeads * kHeadDim;
@@ -161,7 +164,7 @@ __launch_bounds__(256, 2) __global__
   // Entry 0 is the count; each block is four 16-key tiles.
   const std::int32_t* list =
       block_lists + ((static_cast<std::size_t>(blockIdx.x) * kKvHeads +
-                      kv_head) *
+                      list_kv_base + kv_head) *
                      list_stride);
   const std::uint32_t tile_count = static_cast<std::uint32_t>(list[0]) * 4u;
   const auto tile_key = [&](std::uint32_t t) {
@@ -729,7 +732,8 @@ static bool LaunchSparseGeometry(
     std::uint32_t start_pos, std::size_t batch_size, std::uint32_t max_context,
     std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t head_dim,
     const SparseAttentionConfig& config, hipStream_t stream,
-    float* split_k_scratch) {
+    float* split_k_scratch, std::span<float> packed_k_workspace,
+    std::span<float> packed_v_workspace) {
   if (head_dim != kHeadDim || batch_size == 0 || pooled_keys == nullptr ||
       block_lists == nullptr || max_context > kSelectMaxBlocks * kSparseBlockKeys ||
       start_pos + batch_size > max_context) {
@@ -769,11 +773,40 @@ static bool LaunchSparseGeometry(
           max_context, num_heads, num_kv_heads, head_dim, stream)) {
     return true;
   }
+  const std::size_t key_head_bytes =
+      static_cast<std::size_t>(end_pos) * kHeadDim * sizeof(__half);
+  const std::size_t value_head_bytes =
+      ((static_cast<std::size_t>(end_pos) + 15u) & ~std::size_t{15}) *
+      kHeadDim * sizeof(__half);
+  const auto heads_per_group = static_cast<std::uint32_t>(std::min(
+      {std::size_t{kKvHeads}, packed_k_workspace.size_bytes() / key_head_bytes,
+       packed_v_workspace.size_bytes() / value_head_bytes}));
+  if (batch_size >= 1024 && heads_per_group != 0) {
+    // Packed head-major K and WMMA-ordered V, as the dense kernel uses; the
+    // pack is memory bound and small next to the selected-block sweep.
+    auto* packed_k = reinterpret_cast<__half*>(packed_k_workspace.data());
+    auto* packed_v = reinterpret_cast<__half*>(packed_v_workspace.data());
+    for (std::uint32_t first = 0; first < kKvHeads; first += heads_per_group) {
+      const auto heads = std::min(heads_per_group, kKvHeads - first);
+      const std::size_t query_offset =
+          static_cast<std::size_t>(first) * kGqa * kHeadDim;
+      LaunchPackAttentionHeads(layer_k + first * kHeadDim,
+                               layer_v + first * kHeadDim, packed_k, packed_v,
+                               end_pos, kKvHeads, heads, stream);
+      SparseWmmaCausalAttention<kWmmaQueryRows, kWmmaKeys, true, kQueryHeads,
+                                kKvHeads>
+          <<<dim3(tiles, heads * (kGqa / kWmmaHeads)), 256, 0, stream>>>(
+              q + query_offset, gate ? gate + query_offset : nullptr, packed_k,
+              packed_v, out_context + query_offset, start_pos, batch_size,
+              block_lists, SparseAttentionListStride(config), first);
+    }
+    return true;
+  }
   SparseWmmaCausalAttention<kWmmaQueryRows, kWmmaKeys, false, kQueryHeads,
                             kKvHeads>
       <<<dim3(tiles, kKvHeads * (kGqa / kWmmaHeads)), 256, 0, stream>>>(
           q, gate, layer_k, layer_v, out_context, start_pos, batch_size,
-          block_lists, SparseAttentionListStride(config));
+          block_lists, SparseAttentionListStride(config), 0);
   return true;
 }
 
@@ -784,20 +817,21 @@ bool LaunchQwenSparseWmmaAttention(
     std::uint32_t start_pos, std::size_t batch_size, std::uint32_t max_context,
     std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t head_dim,
     const SparseAttentionConfig& config, hipStream_t stream,
-    float* split_k_scratch) {
+    float* split_k_scratch, std::span<float> packed_k_workspace,
+    std::span<float> packed_v_workspace) {
   if (num_heads == 24 && num_kv_heads == 4) {
     return LaunchSparseGeometry<24, 4>(
         q, gate, k_cache_f16, v_cache_f16, out_context, pooled_keys,
         block_lists, pooled_valid_end, layer_idx, start_pos, batch_size,
         max_context, num_heads, num_kv_heads, head_dim, config, stream,
-        split_k_scratch);
+        split_k_scratch, packed_k_workspace, packed_v_workspace);
   }
   if (num_heads == 16 && num_kv_heads == 2) {
     return LaunchSparseGeometry<16, 2>(
         q, gate, k_cache_f16, v_cache_f16, out_context, pooled_keys,
         block_lists, pooled_valid_end, layer_idx, start_pos, batch_size,
         max_context, num_heads, num_kv_heads, head_dim, config, stream,
-        split_k_scratch);
+        split_k_scratch, packed_k_workspace, packed_v_workspace);
   }
   return false;
 }

@@ -541,7 +541,8 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
               &arena_.sparse_pooled_end[attn_layer_idx], attn_layer_idx,
               start_pos, batch_size, arena_.GetMaxContext(),
               config.num_attention_heads, config.num_key_value_heads,
-              config.head_dim, arena_.sparse_config, arena_.stream);
+              config.head_dim, arena_.sparse_config, arena_.stream, nullptr,
+              attention_workspace.gate, attention_workspace.up);
       const bool wmma_attention =
           sparse_attention ||
           LaunchQwenWmmaAttention(

@@ -634,6 +634,20 @@ __global__ void PackAttentionHeads(const __half* keys, const __half* values,
   }
 }
 
+void LaunchPackAttentionHeads(const __half* keys, const __half* values,
+                              __half* packed_keys, __half* packed_values,
+                              std::uint32_t length, std::uint32_t kv_heads,
+                              std::uint32_t heads, hipStream_t stream) {
+  const dim3 grid(heads, (length + 15u) / 16u);
+  if (kv_heads == 4) {
+    PackAttentionHeads<4><<<grid, 256, 0, stream>>>(
+        keys, values, packed_keys, packed_values, length);
+  } else {
+    PackAttentionHeads<2><<<grid, 256, 0, stream>>>(
+        keys, values, packed_keys, packed_values, length);
+  }
+}
+
 template<std::uint32_t kQueryHeads, std::uint32_t kKvHeads>
 bool LaunchWmmaGeometry(
     const float* q, const float* k, const float* v, const float* gate,

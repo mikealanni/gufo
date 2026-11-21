@@ -180,7 +180,12 @@ struct SparseAttentionConfig {
     std::uint32_t start_pos, std::size_t batch_size, std::uint32_t max_context,
     std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t head_dim,
     const SparseAttentionConfig& config, hipStream_t stream = nullptr,
-    float* split_k_scratch = nullptr);
+    float* split_k_scratch = nullptr, std::span<float> packed_k_workspace = {},
+    std::span<float> packed_v_workspace = {});
+void LaunchPackAttentionHeads(const __half* keys, const __half* values,
+                              __half* packed_keys, __half* packed_values,
+                              std::uint32_t length, std::uint32_t kv_heads,
+                              std::uint32_t heads, hipStream_t stream);
 [[nodiscard]] bool LaunchQwenSparseDecodeAttention(
     const float* q, const float* gate, const void* k_cache_f16,
     const void* v_cache_f16, float* out_context, float* split_k_scratch,
