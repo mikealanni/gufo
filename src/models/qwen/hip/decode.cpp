@@ -59,9 +59,13 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
       candidate->layers() == config.num_layers &&
       arena_.d_scratch_bf16 != nullptr && arena_.d_ffn_gate != nullptr) {
     const char* v = std::getenv("GUFO_IU4_DECODE");
-    if (v != nullptr && v[0] == '1')
+    if (model_->ProjectionsDropped() || (v != nullptr && v[0] == '1'))
       iu4_decode = candidate;
   }
+  if (model_->ProjectionsDropped() && iu4_decode == nullptr)
+    throw std::runtime_error(
+        "the GGUF projections are not loaded and the int4 decode path cannot "
+        "run");
   auto graph_key = graph_key_;
   if (iu4_decode != nullptr)
     graph_key.workload_identity =

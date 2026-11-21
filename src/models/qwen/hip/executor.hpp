@@ -90,7 +90,8 @@ public:
                models::QwenModelWeights weights,
                std::shared_ptr<const tokenization::QwenTokenizer> tokenizer,
                std::vector<QwenGpuWeightRegion> weight_regions,
-               std::shared_ptr<models::qwen::vision::Encoder> vision = {});
+               std::shared_ptr<models::qwen::vision::Encoder> vision = {},
+               std::unique_ptr<Iu4Weights> iu4 = nullptr);
   ~QwenGpuModel();
 
   QwenGpuModel(const QwenGpuModel&) = delete;
@@ -126,6 +127,11 @@ public:
   /// Rotated 4-bit projections for the int4 prefill path, loaded on first use
   /// from the artifact named by GUFO_IU4_ARTIFACT; null when unset or invalid.
   [[nodiscard]] Iu4Weights* Iu4() const;
+  /// True when the dense projections of the GGUF were not loaded: the int4
+  /// artifact is then the only copy and every path must read it.
+  [[nodiscard]] bool ProjectionsDropped() const noexcept {
+    return projections_dropped_;
+  }
   /// Grouped-expert prefill for qwen35moe, or null when unavailable.
   [[nodiscard]] QwenMoePrefill* MoePrefill(std::uint32_t max_tokens) const;
   /// bf16 [hi, hi, lo] weights of the router and shared-expert gate rows of
@@ -146,6 +152,7 @@ private:
   mutable std::unique_ptr<QwenNpuFfn> npu_ffn_;
   mutable std::once_flag iu4_once_;
   mutable std::unique_ptr<Iu4Weights> iu4_;
+  bool projections_dropped_{false};
   mutable std::once_flag moe_prefill_once_;
   mutable std::unique_ptr<QwenMoePrefill> moe_prefill_;
   mutable std::vector<std::uint16_t*> router_split_;

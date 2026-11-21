@@ -158,8 +158,7 @@ int main() {
                                proj.padded_rows, M, K, nullptr, T, d_x16);
       CHECK(hipDeviceSynchronize() == hipSuccess, "%s kernel failed", c.name);
       std::vector<float> got(T * M);
-      (void)hipMemcpy(got.data(), d_out, got.size() * 4,
-                      hipMemcpyDeviceToHost);
+      (void)hipMemcpy(got.data(), d_out, got.size() * 4, hipMemcpyDeviceToHost);
       double worst = 0.0, rms = 0.0;
       int checked = 0;
       for (int s = 0; s < 600; ++s) {
@@ -200,9 +199,9 @@ int main() {
       (void)hipEventElapsedTime(&ms, a, b);
       ms /= 100;
       const double bytes = static_cast<double>(M) * K * 0.5 + M * E * 2.0;
-      std::printf("%-12.12s %s T=%2zu: err %.2e (rms %.2f), %.3f ms, %.0f GB/s\n",
-                  c.name + 24, "", T, worst, rms, ms,
-                  bytes / (ms * 1e-3) / 1e9);
+      std::printf(
+          "%-12.12s %s T=%2zu: err %.2e (rms %.2f), %.3f ms, %.0f GB/s\n",
+          c.name + 24, "", T, worst, rms, ms, bytes / (ms * 1e-3) / 1e9);
       (void)hipFree(d_x);
       (void)hipFree(d_x16);
       (void)hipFree(d_out);

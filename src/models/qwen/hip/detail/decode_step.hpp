@@ -27,13 +27,14 @@ void EmitDecodeRouteTelemetry(const models::QwenModelWeights& weights,
 /// `recurrent_state` is the pass's QwenGpuArena::BeginRecurrentWrite result;
 /// a captured graph bakes its pointers, so the graph key must carry
 /// QwenGpuArena::RecurrentIoIdentity.
-void ExecuteDecodeStep(
-    QwenGpuArena& arena, const models::QwenModelWeights& weights,
-    const QwenExecutionPolicy& policy, tokenization::TokenId token_id,
-    std::uint32_t pos, bool compute_logits,
-    QwenRecurrentStateIo recurrent_state,
-    models::qwen::vision::DeviceInput* image_input = nullptr,
-    const Iu4Weights* iu4 = nullptr);
+void ExecuteDecodeStep(QwenGpuArena& arena,
+                       const models::QwenModelWeights& weights,
+                       const QwenExecutionPolicy& policy,
+                       tokenization::TokenId token_id, std::uint32_t pos,
+                       bool compute_logits,
+                       QwenRecurrentStateIo recurrent_state,
+                       models::qwen::vision::DeviceInput* image_input = nullptr,
+                       const Iu4Weights* iu4 = nullptr);
 
 }  // namespace gufo::hip
 

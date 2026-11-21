@@ -73,9 +73,10 @@ void LaunchIu4Gemm(const void* tiles, const std::uint16_t* weight_scales,
 
 // Decode GEMV for `tokens` rows (x is [tokens][k], out [tokens][valid_rows],
 // weights read once per 16 tokens; more than four tokens use the matrix
-// cores when x16_scratch (16 x k halves) is given): out[f] (+)= sum over K of the rotated int4 weights
-// times the rotated fp32 activation x (producers: rotate-only variants).
-// Padded projections pass the padded row count and the logical valid_rows.
+// cores when x16_scratch (16 x k halves) is given): out[f] (+)= sum over K of
+// the rotated int4 weights times the rotated fp32 activation x (producers:
+// rotate-only variants). Padded projections pass the padded row count and the
+// logical valid_rows.
 void LaunchIu4Gemv(const void* tiles, const std::uint16_t* weight_scales,
                    const float* x, float* out, bool accumulate,
                    std::size_t padded_rows, std::size_t valid_rows,
@@ -108,12 +109,14 @@ struct Iu4NpuSwigluSource {
 // silu(gate) * up for columns from npu_columns on and the FP16 SwiGLU product
 // of the NPU (npu_half, row pitch k) below that. Same output layout as the
 // others.
-void LaunchIu4SwiGluQuantize(
-    const float* gate, const float* up, const void* npu_half,
-    const Iu4NpuSwigluSource* npu_source, std::size_t npu_columns,
-    const float* awq, const float* signs, std::size_t n, std::size_t padded_n,
-    std::size_t k, std::uint8_t* tiles, float* scales, hipStream_t stream,
-    float* rot_out = nullptr);
+void LaunchIu4SwiGluQuantize(const float* gate, const float* up,
+                             const void* npu_half,
+                             const Iu4NpuSwigluSource* npu_source,
+                             std::size_t npu_columns, const float* awq,
+                             const float* signs, std::size_t n,
+                             std::size_t padded_n, std::size_t k,
+                             std::uint8_t* tiles, float* scales,
+                             hipStream_t stream, float* rot_out = nullptr);
 
 // Gated DeltaNet epilogue fused into the quantizer of the out projection: per
 // (token, head) RMSNorm of `raw` with `ssm_norm`, times silu(gate), through the

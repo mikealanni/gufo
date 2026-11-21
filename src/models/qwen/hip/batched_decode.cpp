@@ -67,14 +67,16 @@ struct Iu4Ctx {
 constexpr std::size_t kIu4MaxRows = 64;
 constexpr std::size_t kIu4MaxK = 17408;
 
-Iu4Ctx MakeIu4Ctx(const Iu4Weights* weights,
-                  const core::ModelConfig& config,
-                  const QwenGpuArena& arena) {
+Iu4Ctx MakeIu4CtxImpl(const QwenGpuModel& model,
+                      const core::ModelConfig& config,
+                      const QwenGpuArena& arena) {
   Iu4Ctx ctx;
+  const Iu4Weights* weights = model.Iu4();
   const char* v = std::getenv("GUFO_IU4_DECODE");
-  if (weights == nullptr || v == nullptr || v[0] != '1' || config.IsMoe() ||
-      config.num_layers != 64 || weights->layers() != config.num_layers ||
-      arena.d_scratch_bf16 == nullptr)
+  const bool dropped = model.ProjectionsDropped();
+  if (weights == nullptr || ((v == nullptr || v[0] != '1') && !dropped) ||
+      config.IsMoe() || config.num_layers != 64 ||
+      weights->layers() != config.num_layers || arena.d_scratch_bf16 == nullptr)
     return ctx;
   constexpr std::size_t x_bytes = kIu4MaxRows * kIu4MaxK * sizeof(float);
   constexpr std::size_t x16_bytes = 16 * kIu4MaxK * sizeof(std::uint16_t);
@@ -83,6 +85,16 @@ Iu4Ctx MakeIu4Ctx(const Iu4Weights* weights,
   ctx.w = weights;
   ctx.x = static_cast<float*>(arena.d_scratch_bf16);
   ctx.x16 = static_cast<std::uint8_t*>(arena.d_scratch_bf16) + x_bytes;
+  return ctx;
+}
+
+Iu4Ctx MakeIu4Ctx(const QwenGpuModel& model, const core::ModelConfig& config,
+                  const QwenGpuArena& arena) {
+  const Iu4Ctx ctx = MakeIu4CtxImpl(model, config, arena);
+  if (model.ProjectionsDropped() && ctx.w == nullptr)
+    throw std::runtime_error(
+        "the GGUF projections are not loaded and the int4 batched decode path "
+        "cannot run");
   return ctx;
 }
 
@@ -332,7 +344,7 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
   const auto& config = weights.config;
   auto& arena = coordinator->arena_;
   const auto scratch = arena.GetScratchView(batch_size);
-  const Iu4Ctx iu4 = MakeIu4Ctx(coordinator->model_->Iu4(), config, arena);
+  const Iu4Ctx iu4 = MakeIu4Ctx(*coordinator->model_, config, arena);
   const std::size_t hidden_size = config.hidden_size;
   const std::size_t intermediate_size = config.intermediate_size;
   const std::size_t vocab_size = config.vocab_size;
@@ -680,7 +692,7 @@ QwenGpuExecutor::ForwardVerificationBatch(
     executor.h_verification_logits_.clear();
   }
   const auto scratch = arena_.GetScratchView(batch_size);
-  const Iu4Ctx iu4 = MakeIu4Ctx(coordinator.model_->Iu4(), config, arena_);
+  const Iu4Ctx iu4 = MakeIu4Ctx(*coordinator.model_, config, arena_);
   const std::size_t hidden_size = config.hidden_size;
   const std::size_t intermediate_size = config.intermediate_size;
   const std::size_t vocab_size = config.vocab_size;

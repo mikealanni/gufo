@@ -215,6 +215,69 @@ void ReleaseWeightRegions(std::vector<QwenGpuWeightRegion>& regions) noexcept {
   return true;
 }
 
+/// One resident region holding only the tensors the engine still reads from
+/// the GGUF. The dense projections live in the int4 artifact, so cloning the
+/// whole shard would hold a second, unused copy.
+[[nodiscard]] bool CreatePackedRegion(
+    std::span<models::QwenTensorRef* const> tensors,
+    std::vector<QwenGpuWeightRegion>& weight_regions, std::string* error_msg) {
+  constexpr std::size_t kAlign = 256;
+  std::vector<std::size_t> offsets(tensors.size(), 0);
+  std::size_t total = 0;
+  for (std::size_t i = 0; i < tensors.size(); ++i) {
+    offsets[i] = total;
+    total += (tensors[i]->EncodedSizeBytes() + kAlign - 1) / kAlign * kAlign;
+  }
+  if (total == 0)
+    return true;
+  void* host_copy = platform::CommitZeroedPages(total);
+  if (host_copy == nullptr) {
+    if (error_msg != nullptr)
+      *error_msg = "Failed to allocate packed GGUF tensors";
+    return false;
+  }
+  for (std::size_t i = 0; i < tensors.size(); ++i)
+    std::memcpy(static_cast<std::uint8_t*>(host_copy) + offsets[i],
+                tensors[i]->data, tensors[i]->EncodedSizeBytes());
+  void* device_data = nullptr;
+  bool owns_device = false;
+  if (hipHostRegister(host_copy, total,
+                      hipHostRegisterMapped | hipHostRegisterReadOnly) ==
+          hipSuccess &&
+      hipHostGetDevicePointer(&device_data, host_copy, 0) == hipSuccess) {
+    weight_regions.push_back({.host_data = nullptr,
+                              .device_data = device_data,
+                              .host_copy = host_copy,
+                              .size = total});
+  } else {
+    (void)hipHostUnregister(host_copy);
+    (void)hipGetLastError();
+    device_data = nullptr;
+    if (hipMalloc(&device_data, total) != hipSuccess ||
+        hipMemcpy(device_data, host_copy, total, hipMemcpyHostToDevice) !=
+            hipSuccess) {
+      platform::ReleaseCommittedPages(host_copy, total);
+      if (error_msg != nullptr)
+        *error_msg = "Failed to make packed GGUF tensors GPU-visible";
+      return false;
+    }
+    platform::ReleaseCommittedPages(host_copy, total);
+    owns_device = true;
+    weight_regions.push_back({.host_data = nullptr,
+                              .device_data = device_data,
+                              .host_copy = nullptr,
+                              .size = total,
+                              .owns_device_allocation = true});
+  }
+  (void)owns_device;
+  for (std::size_t i = 0; i < tensors.size(); ++i) {
+    tensors[i]->data =
+        static_cast<const std::uint8_t*>(device_data) + offsets[i];
+    tensors[i]->available_bytes = total - offsets[i];
+  }
+  return true;
+}
+
 [[nodiscard]] bool RemapTensor(
     models::QwenTensorRef& tensor,
     std::span<const QwenGpuWeightRegion> regions) noexcept {
@@ -240,6 +303,22 @@ void ReleaseWeightRegions(std::vector<QwenGpuWeightRegion>& regions) noexcept {
   return false;
 }
 
+void ApplyIu4NpuSlices() {
+  // With the int4 GEMM the GPU is about 3.5 times faster than the NPU per
+  // column, so only the FFN gate/up columns (same K as the rest, finished
+  // behind the paired chunk's GPU work) pay for their hand-off; every other
+  // NPU site ends up on the critical path. Measured at pp8192: 10 FFN slices
+  // about 1320 tok/s, any other slice setting lower. Explicit settings still
+  // win.
+  setenv("GUFO_QWEN_NPU_FFN_SLICES", "10", 0);
+  setenv("GUFO_QWEN_NPU_QKV_SLICES", "0", 0);
+  setenv("GUFO_QWEN_NPU_GATE_SLICES", "0", 0);
+  setenv("GUFO_QWEN_NPU_DOWN_SLICES", "0", 0);
+  setenv("GUFO_QWEN_NPU_SSM_OUT_SLICES", "0", 0);
+  setenv("GUFO_QWEN_NPU_ATTN_Q_SLICES", "0", 0);
+  setenv("GUFO_QWEN_NPU_ATTN_O_SLICES", "0", 0);
+}
+
 }  // namespace
 
 QwenGpuModel::QwenGpuModel(
@@ -247,12 +326,19 @@ QwenGpuModel::QwenGpuModel(
     models::QwenModelWeights weights,
     std::shared_ptr<const tokenization::QwenTokenizer> tokenizer,
     std::vector<QwenGpuWeightRegion> weight_regions,
-    std::shared_ptr<models::qwen::vision::Encoder> vision)
+    std::shared_ptr<models::qwen::vision::Encoder> vision,
+    std::unique_ptr<Iu4Weights> iu4)
     : reader_(std::move(reader)),
       weights_(std::move(weights)),
       tokenizer_(std::move(tokenizer)),
       weight_regions_(std::move(weight_regions)),
-      vision_(std::move(vision)) {}
+      vision_(std::move(vision)) {
+  if (iu4 != nullptr) {
+    iu4_ = std::move(iu4);
+    projections_dropped_ = true;
+    std::call_once(iu4_once_, [] {});
+  }
+}
 
 QwenGpuModel::~QwenGpuModel() {
   for (auto* buffer : router_split_) {
@@ -334,7 +420,59 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
   if (!tokenizer)
     return nullptr;
 
+  // The int4 artifact carries every dense projection of the 27B layers. When
+  // it loads, those tensors are left out of the resident GGUF copy.
+  std::unique_ptr<Iu4Weights> iu4;
+  if (const char* path = std::getenv("GUFO_IU4_ARTIFACT");
+      path != nullptr && !weights_opt->config.IsMoe() &&
+      weights_opt->config.num_layers == 64 && !weights_opt->mtp.has_value()) {
+    auto loaded = std::make_unique<Iu4Weights>();
+    std::string iu4_error;
+    if (loaded->Load(path, weights_opt->config.num_layers, &iu4_error)) {
+      iu4 = std::move(loaded);
+    } else {
+      std::fprintf(stderr, "int4 prefill off: %s\n", iu4_error.c_str());
+    }
+  }
+
   std::vector<QwenGpuWeightRegion> weight_regions;
+  const auto remap_packed = [&]() {
+    std::vector<models::QwenTensorRef*> kept;
+    const auto keep = [&](models::QwenTensorRef& t) {
+      if (!t.empty())
+        kept.push_back(&t);
+    };
+    keep(weights_opt->token_embd);
+    keep(weights_opt->output_norm);
+    keep(weights_opt->output);
+    for (auto& l : weights_opt->layers) {
+      for (auto* t :
+           {&l.attn_norm, &l.attn_q_norm, &l.attn_k_norm, &l.ssm_conv1d,
+            &l.ssm_a, &l.ssm_dt, &l.ssm_norm, &l.ffn_norm, &l.ffn_gate_inp,
+            &l.ffn_gate_exps, &l.ffn_up_exps, &l.ffn_down_exps,
+            &l.ffn_gate_shexp, &l.ffn_up_shexp, &l.ffn_down_shexp,
+            &l.ffn_gate_inp_shexp})
+        keep(*t);
+    }
+    return CreatePackedRegion(kept, weight_regions, error_msg);
+  };
+  if (iu4 != nullptr) {
+    if (!remap_packed())
+      return nullptr;
+    std::size_t kept_bytes = 0;
+    for (const auto& r : weight_regions)
+      kept_bytes += r.size;
+    std::fprintf(stderr,
+                 "int4 artifact is the only copy of the dense projections; "
+                 "GGUF tensors kept: %.2f GiB\n",
+                 static_cast<double>(kept_bytes) / (1ULL << 30));
+    ApplyIu4NpuSlices();
+    std::shared_ptr<const tokenization::QwenTokenizer> shared_tokenizer(
+        std::move(tokenizer));
+    return std::make_shared<const QwenGpuModel>(
+        std::move(reader), std::move(*weights_opt), std::move(shared_tokenizer),
+        std::move(weight_regions), std::move(vision), std::move(iu4));
+  }
   if (!CreateWeightRegions(*reader, weight_regions, error_msg)) {
     return nullptr;
   }
@@ -399,7 +537,45 @@ QwenNpuFfn* QwenGpuModel::NpuFfn() const {
     if (std::getenv("GUFO_NPU_DIR") == nullptr)
       return;
     std::string error;
-    npu_ffn_ = CreateQwenNpuFfn(weights_, &error);
+    if (!projections_dropped_) {
+      npu_ffn_ = CreateQwenNpuFfn(weights_, &error);
+    } else {
+      // The encoder reads the FFN gate/up tensors on the GPU. The resident
+      // GGUF copy no longer holds them, so give it temporary device copies
+      // taken from the file mapping and free them once it has encoded.
+      for (const char* name :
+           {"GUFO_QWEN_NPU_QKV_SLICES", "GUFO_QWEN_NPU_GATE_SLICES",
+            "GUFO_QWEN_NPU_DOWN_SLICES", "GUFO_QWEN_NPU_SSM_OUT_SLICES",
+            "GUFO_QWEN_NPU_ATTN_Q_SLICES", "GUFO_QWEN_NPU_ATTN_O_SLICES"})
+        setenv(name, "0", 1);
+      models::QwenModelWeights npu_weights = weights_;
+      std::vector<void*> temporary;
+      bool copied = true;
+      for (auto& layer : npu_weights.layers) {
+        for (auto* tensor : {&layer.ffn_gate, &layer.ffn_up}) {
+          void* device = nullptr;
+          const std::size_t bytes = tensor->EncodedSizeBytes();
+          if (tensor->empty() || hipMalloc(&device, bytes) != hipSuccess) {
+            copied = false;
+            break;
+          }
+          temporary.push_back(device);
+          if (hipMemcpy(device, tensor->data, bytes, hipMemcpyHostToDevice) !=
+              hipSuccess) {
+            copied = false;
+            break;
+          }
+          tensor->data = device;
+        }
+        if (!copied)
+          break;
+      }
+      if (copied)
+        npu_ffn_ = CreateQwenNpuFfn(npu_weights, &error);
+      (void)hipDeviceSynchronize();
+      for (void* pointer : temporary)
+        (void)hipFree(pointer);
+    }
     if (npu_ffn_ == nullptr && !error.empty())
       std::fprintf(stderr, "NPU off: %s\n", error.c_str());
   });
@@ -418,19 +594,7 @@ Iu4Weights* QwenGpuModel::Iu4() const {
       return;
     }
     iu4_ = std::move(loaded);
-    // With the int4 GEMM the GPU is about 3.5 times faster than the NPU per
-    // column, so only the FFN gate/up columns (same K as the rest, finished
-    // behind the paired chunk's GPU work) pay for their hand-off; every other
-    // NPU site ends up on the critical path. Measured at pp8192: 10 FFN slices
-    // about 1320 tok/s, any other slice setting lower. Explicit settings still
-    // win.
-    setenv("GUFO_QWEN_NPU_FFN_SLICES", "10", 0);
-    setenv("GUFO_QWEN_NPU_QKV_SLICES", "0", 0);
-    setenv("GUFO_QWEN_NPU_GATE_SLICES", "0", 0);
-    setenv("GUFO_QWEN_NPU_DOWN_SLICES", "0", 0);
-    setenv("GUFO_QWEN_NPU_SSM_OUT_SLICES", "0", 0);
-    setenv("GUFO_QWEN_NPU_ATTN_Q_SLICES", "0", 0);
-    setenv("GUFO_QWEN_NPU_ATTN_O_SLICES", "0", 0);
+    ApplyIu4NpuSlices();
   });
   return iu4_.get();
 }

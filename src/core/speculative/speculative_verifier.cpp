@@ -1458,15 +1458,15 @@ std::optional<tokenization::TokenId> SpeculativeVerifier::ForwardPromptStreamed(
         const bool fresh = position == 0 && first_row == 0;
         failed = fresh ? !Draft()->PrimeTargetContext(context)
                        : !Draft()->AppendTargetContext(
-                             context, position +
-                                          static_cast<std::uint32_t>(first_row));
+                             context,
+                             position + static_cast<std::uint32_t>(first_row));
       });
   if (!streaming)
     return std::nullopt;
   tokenization::TokenId next = 0;
   try {
-    next = target_executor_->ForwardPromptSuffix(tokens, position,
-                                                 compute_logits);
+    next =
+        target_executor_->ForwardPromptSuffix(tokens, position, compute_logits);
   } catch (...) {
     target_executor_->SetPromptHiddenSink({});
     throw;
@@ -1527,7 +1527,8 @@ tokenization::TokenId SpeculativeVerifier::Prime(
                                     : std::span<const std::uint32_t>{};
   target_executor_->SetPromptHiddenCapture(capture_hidden, target_layer_ids);
   if (capture_hidden) {
-    const auto streamed = ForwardPromptStreamed(prompt_tokens, 0, compute_logits);
+    const auto streamed =
+        ForwardPromptStreamed(prompt_tokens, 0, compute_logits);
     if (streamed.has_value())
       return *streamed;
   }

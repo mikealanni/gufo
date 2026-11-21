@@ -148,7 +148,7 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
   const std::size_t prompt_capture_offset = capture_buffer.Size();
   if (capture_prompt_hidden_ && target_layer_count > 0) {
     capture_buffer.Resize(prompt_capture_offset +
-                            batch_size * target_layer_count * hidden_size);
+                          batch_size * target_layer_count * hidden_size);
   }
 
   // 1. Copy prompt token IDs to GPU
@@ -172,7 +172,8 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
   // GUFO_IU4_ARTIFACT replace the fp16 GEMMs of the dense 27B layers. Every
   // projection's input is quantized by one of the iu4 producers; the NPU split
   // is off on this path.
-  constexpr std::size_t kIu4MinBatch = 256;
+  // With the GGUF projections dropped the int4 path serves every batch size.
+  const std::size_t kIu4MinBatch = model_->ProjectionsDropped() ? 1 : 256;
   Iu4Weights* const iu4_weights = model_->Iu4();
   const bool iu4 =
       iu4_weights != nullptr && batch_size >= kIu4MinBatch && !config.IsMoe() &&
@@ -1192,8 +1193,7 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
     }
     HIP_CHECK(hipStreamSynchronize(arena_.stream));
     if (prompt_hidden_sink_) {
-      prompt_hidden_sink_(capture_buffer.View(), prompt_sink_row_,
-                          batch_size);
+      prompt_hidden_sink_(capture_buffer.View(), prompt_sink_row_, batch_size);
       prompt_sink_row_ += batch_size;
     }
   }
