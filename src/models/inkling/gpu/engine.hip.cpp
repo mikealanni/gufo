@@ -177,6 +177,11 @@ __global__ void GemmDp4(const unsigned char* w, std::size_t row_bytes, int cols,
     return;
   const int i = blockIdx.y;
   const int g = group != nullptr ? group[i] : 0;
+  if (g < 0) {
+    if (lane == 0)
+      y[static_cast<std::size_t>(i) * rows + r] = 0.0F;
+    return;
+  }
   const int xr = xrow != nullptr ? xrow[i] : 0;
   const unsigned char* row =
       w + (static_cast<std::size_t>(g) * rows + r) * row_bytes;
@@ -960,7 +965,7 @@ __global__ void Concat2(const float* a, const float* b, float* out, int h) {
 // one block per token: sigmoid router, top-k on prob+bias, normalized scaled
 // weights
 __global__ void Route(const float* logits, const float* bias, int ne, int nu,
-                      float wscale, int* ids, float* wts) {
+                      float wscale, int* ids, float* wts, float prune = 0.0F) {
   __shared__ float sel[256];
   __shared__ float prob[256];
   __shared__ float best_v[256];
@@ -998,14 +1003,20 @@ __global__ void Route(const float* logits, const float* bias, int ne, int nu,
     sum += prob[win];
     __syncthreads();
   }
-  if (e < nu)
-    wts[t * nu + e] = wts[t * nu + e] / (sum + 1e-20F) * wscale;
+  if (e < nu) {
+    const float w = wts[t * nu + e] / (sum + 1e-20F) * wscale;
+    const bool drop = prune > 0.0F && w < prune * wscale;
+    wts[t * nu + e] = drop ? 0.0F : w;
+    if (drop)
+      ids[t * nu + e] = -1;
+  }
 }
 
 __global__ void Situ(const float* gu, const int* group, const float* scale,
                      float* act, int ff, float beta, float lb) {
   const int item = blockIdx.x;
-  const float s = scale != nullptr ? scale[group[item]] : 1.0F;
+  const float s =
+      scale != nullptr && group[item] >= 0 ? scale[group[item]] : 1.0F;
   for (int j = threadIdx.x; j < ff; j += blockDim.x) {
     const float g = gu[static_cast<std::size_t>(item) * 2 * ff + j] * s;
     const float u = gu[static_cast<std::size_t>(item) * 2 * ff + ff + j] * s;
@@ -1069,8 +1080,9 @@ __global__ void Combine(const float* y, const float* wts, float* out, int nu,
   for (int i = threadIdx.x; i < h; i += blockDim.x) {
     float a = 0.0F;
     for (int k = 0; k < nu; ++k) {
+      const int eid = ids != nullptr ? ids[blockIdx.x * nu + k] : 0;
       const float sc =
-          down_scale != nullptr ? down_scale[ids[blockIdx.x * nu + k]] : 1.0F;
+          down_scale != nullptr && eid >= 0 ? down_scale[eid] : 1.0F;
       a += wts[blockIdx.x * nu + k] * sc *
            y[(static_cast<std::size_t>(blockIdx.x) * nu + k) * h + i];
     }
@@ -3628,10 +3640,15 @@ struct Session::Impl : Scratch {
               ff = c.expert_ff;
     Dense(m->T(m->P(p, "ffn_gate_inp.weight")), x, h, router, ne, n, -1,
           xhx_in);
+    static const float prune_tau =
+        std::getenv("INKLING_PRUNE") != nullptr
+            ? static_cast<float>(std::atof(std::getenv("INKLING_PRUNE")))
+            : 0.0F;
     Route<<<n, 256, 0, stream>>>(
         router,
         static_cast<const float*>(m->T(m->P(p, "exp_probs_b.bias")).dev), ne,
-        nu, c.expert_weights_scale, ids, wts);
+        nu, c.expert_weights_scale, ids, wts,
+        n < kWmmaMinTokens ? prune_tau : 0.0F);
     ids_flat = ids;
     const float* s_gu = m->Has(m->P(p, "ffn_gate_up_exps.scale"))
                             ? static_cast<const float*>(

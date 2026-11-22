@@ -56,6 +56,43 @@ int main(int argc, char** argv) {
     std::printf("\n");
     return 0;
   }
+  if (argc >= 6 && std::string(argv[2]) == "--dwindows") {
+    // --dwindows <text file> <count> <len> <out.bin>: logits of the last 64
+    // tokens of each window through the few-row (decode/verify) path
+    std::string err;
+    auto reader = gufo::core::GgufReader::OpenFile(argv[1], &err);
+    auto tok = gufo::tokenization::QwenTokenizer::CreateFromGguf(*reader, &err);
+    std::ifstream in(argv[3]);
+    std::stringstream ss;
+    ss << in.rdbuf();
+    const auto ids = tok->Encode(ss.str(), {});
+    const int count = std::atoi(argv[4]);
+    const int len = std::atoi(argv[5]);
+    std::ofstream out(argv[6], std::ios::binary);
+    auto model = gufo::models::inkling::gpu::Model::Load(argv[1], &err);
+    auto session =
+        model->CreateSession(static_cast<std::uint32_t>(len) + 16, &err);
+    for (int w = 0; w < count; ++w) {
+      session->Reset();
+      std::vector<std::int32_t> win;
+      for (int i = 0; i < len; ++i)
+        win.push_back(static_cast<std::int32_t>(
+            ids[(static_cast<std::size_t>(w) * len + i) % ids.size()]));
+      (void)session->Append(
+          std::span<const std::int32_t>(win.data(), win.size() - 64), &err);
+      for (int b = 0; b < 8; ++b) {
+        (void)session->AppendAll(std::span<const std::int32_t>(
+                                     win.data() + win.size() - 64 + b * 8, 8),
+                                 &err);
+        for (std::uint32_t r = 0; r < 8; ++r) {
+          const auto l = session->Logits(r);
+          out.write(reinterpret_cast<const char*>(l.data()),
+                    static_cast<std::streamsize>(l.size() * sizeof(float)));
+        }
+      }
+    }
+    return 0;
+  }
   if (argc >= 6 && std::string(argv[2]) == "--windows") {
     // --windows <text file> <count> <len> <out.bin>: final-token logits of
     // count prose windows

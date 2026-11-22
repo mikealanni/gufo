@@ -254,3 +254,9 @@ looped 3x -> 5.4B effective active; 24 physical layers, middle core looped).
   code 70.7, JSON 68.9, 37k 59.3, 63k 55.4/53.9/55.4 tok/s.
 - Tried and reverted: control step restructured to read weights once for all rows (verify 5 rows 61.6 -> 66.2 ms: 8 blocks
   is too little parallelism).
+- Expert pruning for few-row steps (opt-in, INKLING_PRUNE=<share>, default off): routed experts whose normalised routing
+  weight share is below the threshold are skipped on the device (n < 32 only; their output rows are zeroed). Measured
+  over 256 decode-path positions, KL vs the unpruned engine / top-1 agreement / 6-row verify / plain step:
+  0.03: 0.0016 / 98.8% / 63.5 / 31.2 ms; 0.06: 0.0067 / 96.9% / 60.8 / 30.3; 0.08 (renormalised) 0.026 / 95%; 0.10: 0.040 /
+  94.5% / 48.9 / 27.7; 0.12 renormalised: 0.165 / 86% / 42.7 / 26.5 (baseline 63.5 / 31.5). Renormalising the kept
+  weights made KL worse at every threshold. Drafter head is NVFP4 (32768 ranked rows, draft 5.4 -> 4.3 ms).
