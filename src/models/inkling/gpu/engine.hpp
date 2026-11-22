@@ -62,6 +62,7 @@ public:
       std::uint32_t max_context, std::string* error_msg = nullptr);
   [[nodiscard]] bool LoadDrafter(const std::string& path,
                                  std::string* error_msg = nullptr);
+  [[nodiscard]] bool HasDrafter() const noexcept;
   [[nodiscard]] const Config& config() const noexcept;
   [[nodiscard]] std::size_t ResidentBytes() const noexcept;
 

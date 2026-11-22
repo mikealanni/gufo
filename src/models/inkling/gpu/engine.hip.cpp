@@ -3704,6 +3704,11 @@ void Session::KeepRows(std::uint32_t keep) {
   HIP_OK(hipStreamSynchronize(i.stream));
   i.position = i.pos_before_last + keep;
   i.dwarmed = std::min(i.dwarmed, i.position);
+  const std::size_t v = i.m->config.vocab_unpadded;
+  i.logits.erase(
+      i.logits.begin(),
+      i.logits.begin() + static_cast<std::ptrdiff_t>((keep - 1) * v));
+  i.logits.resize(v);
   i.last_rows = static_cast<int>(keep);
 }
 
@@ -3816,6 +3821,10 @@ bool Model::LoadDrafter(const std::string& path, std::string* error) {
   }
   st.has_draft = true;
   return true;
+}
+
+bool Model::HasDrafter() const noexcept {
+  return state_->has_draft;
 }
 
 std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
@@ -3982,7 +3991,7 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
     std::sscanf(tp, "%d,%d,%d,%d", &g_tap_layers[0], &g_tap_layers[1],
                 &g_tap_layers[2], &g_tap_layers[3]);
   }
-  if (std::getenv("INKLING_DRAFT") != nullptr) {
+  if (std::getenv("INKLING_DRAFT") != nullptr || state_->has_draft) {
     i.feat = static_cast<__half*>(i.AllocBytes(
         static_cast<std::size_t>(max_context) * kTapCount * h * 2));
   }

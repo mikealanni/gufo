@@ -146,7 +146,8 @@ public:
             std::vector<std::int32_t> stop_tokens, std::string* error,
             std::uint32_t max_context = 0, std::size_t session_count = 1,
             TextPrefillPolicy prefill_policy = {},
-            TextSchedulerPolicy scheduler_policy = {});
+            TextSchedulerPolicy scheduler_policy = {},
+            std::size_t draft_width = 0);
   /// Installs a previously loaded Laguna model with request-owned sessions.
   /// No disk-cache snapshot support yet (the engine has none).
   bool load(std::shared_ptr<models::laguna::gpu::Model> model,

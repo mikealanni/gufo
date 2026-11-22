@@ -4034,6 +4034,9 @@ public:
   [[nodiscard]] InklingSession& session() const { return *session_; }
   [[nodiscard]] std::size_t position() const noexcept { return position_; }
   void set_position(std::size_t position) noexcept { position_ = position; }
+  /// Running mean of tokens produced per drafted step; steers drafting.
+  double draft_yield{2.0};
+  std::size_t plain_steps{0};
 
 private:
   std::unique_ptr<InklingSession> session_;
@@ -4060,14 +4063,23 @@ public:
   static constexpr std::size_t kPrefillChunk = 8192;
   static constexpr std::size_t kWarmupTokens = 8192;
 
+  // Drafted steps verify width + 1 rows. Wider blocks cost more than the extra
+  // accepted tokens return (measured: width 3 is the best on code).
+  static constexpr std::size_t kMaxDraftWidth = 3;
+  // Below this many tokens per drafted step plain decode is faster.
+  static constexpr double kMinDraftYield = 1.75;
+  static constexpr double kYieldSmoothing = 0.25;
+  static constexpr std::size_t kProbeInterval = 16;
+
   InklingTextRunner(std::shared_ptr<InklingModel> model,
                     std::unique_ptr<tokenization::QwenTokenizer> tokenizer,
                     std::vector<std::int32_t> stop_tokens,
-                    std::uint32_t max_context)
+                    std::uint32_t max_context, std::size_t draft_width = 0)
       : model_(std::move(model)),
         tokenizer_(std::move(tokenizer)),
         stop_tokens_(std::move(stop_tokens)),
-        max_context_(max_context) {
+        max_context_(max_context),
+        draft_width_(std::min(draft_width, kMaxDraftWidth)) {
     MeasureSessionBytes();
     Warmup();
   }
@@ -4144,6 +4156,7 @@ public:
                 .fork = false,
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
+                .multi_token_decode = draft_width_ > 0,
                 .prefix_reuse = true,
                 .prefill_grid_tokens = 8192,
             },
@@ -4281,6 +4294,73 @@ public:
     return SelectNext(state, sampler);
   }
 
+  [[nodiscard]] TextDecodeStep DecodeStep(
+      TextRunnerState& state, std::size_t max_tokens,
+      sampling::SamplerState& sampler) const override {
+    auto& inkling = RequireInklingState(state);
+    if (draft_width_ == 0 || max_tokens < 2 ||
+        inkling.position() + 2 > max_context_) {
+      return TextModelRunner::DecodeStep(state, max_tokens, sampler);
+    }
+    if (inkling.draft_yield < kMinDraftYield &&
+        ++inkling.plain_steps % kProbeInterval != 0) {
+      return TextModelRunner::DecodeStep(state, max_tokens, sampler);
+    }
+    const std::size_t width = std::min<std::size_t>(
+        {draft_width_, max_tokens - 1, max_context_ - inkling.position() - 1});
+    auto& session = inkling.session();
+    sampling::SamplerState working = sampler;
+    const auto first = working.Sample(session.Logits());
+    if (IsStop(static_cast<std::int32_t>(first)))
+      return {.selections = {}, .stop = true};
+    const auto anchor = static_cast<std::int32_t>(first);
+    std::vector<std::int32_t> block(width + 1, anchor);
+    std::string error;
+    if (!session.Draft(anchor, {block.data() + 1, width})) {
+      return TextModelRunner::DecodeStep(state, max_tokens, sampler);
+    }
+    if (!session.AppendAll(block, &error)) {
+      inkling.Invalidate();
+      throw std::runtime_error("Inkling verification failed: " + error);
+    }
+    TextDecodeStep step;
+    step.selections.push_back(
+        {.stop = false,
+         .token = static_cast<TextRunnerToken>(anchor),
+         .piece = std::string(tokenizer_->DecodeToken(anchor))});
+    working.Accept(static_cast<sampling::TokenId>(anchor));
+    std::size_t kept = 1;
+    bool stopped = false;
+    for (std::size_t i = 0; i < width; ++i) {
+      const auto sampled = static_cast<std::int32_t>(
+          working.Sample(session.Logits(static_cast<std::uint32_t>(i))));
+      if (sampled != block[i + 1]) {
+        stopped = IsStop(sampled);
+        break;
+      }
+      if (IsStop(sampled)) {
+        stopped = true;
+        break;
+      }
+      step.selections.push_back(
+          {.stop = false,
+           .token = static_cast<TextRunnerToken>(sampled),
+           .piece = std::string(tokenizer_->DecodeToken(sampled))});
+      working.Accept(static_cast<sampling::TokenId>(sampled));
+      ++kept;
+    }
+    session.KeepRows(static_cast<std::uint32_t>(kept));
+    inkling.set_position(inkling.position() + kept);
+    sampler.CopyDrawStateFrom(working);
+    step.stop = stopped;
+    step.draft_rounds = 1;
+    step.draft_tokens = width;
+    step.draft_accepted_tokens = kept - 1;
+    inkling.draft_yield +=
+        kYieldSmoothing * (static_cast<double>(kept) - inkling.draft_yield);
+    return step;
+  }
+
   [[nodiscard]] std::size_t CheckpointPosition(
       const TextRunnerState& state) const override {
     return RequireInklingState(state).position();
@@ -4296,6 +4376,7 @@ private:
   std::unique_ptr<tokenization::QwenTokenizer> tokenizer_;
   std::vector<std::int32_t> stop_tokens_;
   std::uint32_t max_context_;
+  std::size_t draft_width_{0};
   std::size_t session_bytes_{0};
 };
 
@@ -5397,8 +5478,9 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                 scheduler_policy);
   }
   if (reader->GetMetadataString("general.architecture") == "inkling2") {
-    if (speculative_config.backend != TextSpeculativeBackend::kDisabled) {
-      SetError(error, "Inkling does not support speculation over serve yet");
+    if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
+        speculative_config.backend != TextSpeculativeBackend::kDSpark) {
+      SetError(error, "Inkling speculation over serve supports dspark only");
       return false;
     }
     std::string tokenizer_error;
@@ -5432,9 +5514,20 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
       SetError(error, "Failed to create Inkling model: " + load_error);
       return false;
     }
+    std::size_t draft_width = 0;
+    if (speculative_config.backend == TextSpeculativeBackend::kDSpark &&
+        !speculative_config.draft_model_path.empty()) {
+      std::string draft_error;
+      if (!model->LoadDrafter(speculative_config.draft_model_path,
+                              &draft_error)) {
+        SetError(error, "Failed to load Inkling drafter: " + draft_error);
+        return false;
+      }
+      draft_width = speculative_config.max_draft_tokens;
+    }
     return load(std::move(model), std::move(tokenizer), std::move(stop_tokens),
                 error, max_context, session_count, prefill_policy,
-                scheduler_policy);
+                scheduler_policy, draft_width);
   }
   if (reader->GetMetadataString("general.architecture") == "qwen4exp") {
     const bool mtp = speculative_config.backend == TextSpeculativeBackend::kMtp;
@@ -6058,7 +6151,8 @@ bool InferenceBackend::load(
     std::unique_ptr<tokenization::QwenTokenizer> tokenizer,
     std::vector<std::int32_t> stop_tokens, std::string* error,
     std::uint32_t max_context, std::size_t session_count,
-    TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy) {
+    TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
+    std::size_t draft_width) {
   if (model == nullptr || tokenizer == nullptr) {
     SetError(error, "Inkling model and tokenizer must not be null");
     return false;
@@ -6081,7 +6175,7 @@ bool InferenceBackend::load(
     new_state->sampling_defaults.supplied = {};
     auto runner = std::make_shared<InklingTextRunner>(
         std::move(model), std::move(tokenizer), std::move(stop_tokens),
-        max_context);
+        max_context, draft_width);
     new_state->model_id = runner->Descriptor().model_id;
     new_state->max_context = max_context;
     auto runner_pool = std::make_shared<TextRunnerPool>(
