@@ -1626,7 +1626,34 @@ std::size_t Model::ResidentBytes() const noexcept {
   return state_->resident_bytes;
 }
 
-struct Session::Impl {
+// Everything one token bank needs between layers; a session swaps two of these
+// so each bank has its own residual stream, blocks and scratch.
+struct Scratch {
+  int* d_tokens{nullptr};
+  float *cur{nullptr}, *tmp{nullptr}, *inp_sa{nullptr}, *in[3]{}, *q{nullptr},
+      *k{nullptr}, *v{nullptr}, *r{nullptr}, *dyn_k{nullptr}, *dyn_v{nullptr},
+      *sink{nullptr}, *gate{nullptr}, *att{nullptr}, *o{nullptr},
+      *mixed{nullptr}, *msgs{nullptr}, *ffn_inp{nullptr}, *x{nullptr},
+      *cat{nullptr}, *low{nullptr}, *gain{nullptr}, *forget{nullptr},
+      *router{nullptr}, *wts{nullptr}, *gu{nullptr}, *act{nullptr}, *y{nullptr},
+      *moe{nullptr}, *prelude{nullptr}, *bank_out{nullptr}, *d_logits{nullptr};
+  unsigned int* rcounts{nullptr};
+  int *rbounds{nullptr}, *rcursors{nullptr}, *rrows_token{nullptr},
+      *rrows_slot{nullptr};
+  int *sorted{nullptr}, *tiles{nullptr};
+  __half *xh{nullptr}, *act16{nullptr}, *xh0{nullptr}, *xh1{nullptr},
+      *xh2{nullptr}, *xhx{nullptr}, *atth{nullptr}, *cath{nullptr};
+  signed char* xq{nullptr};
+  float* xqs{nullptr};
+  float *split_m{nullptr}, *split_l{nullptr}, *split_o{nullptr};
+  int *blist{nullptr}, *bcount{nullptr};
+  int *ids{nullptr}, *xrow{nullptr}, *d_pos{nullptr};
+  float* block_pool[16]{};
+  int pool_used{0};
+  std::uint32_t pos_base{0};  // absolute position of this bank's first token
+};
+
+struct Session::Impl : Scratch {
   std::shared_ptr<ModelState> m;
   std::uint32_t ctx{0};
   std::uint32_t position{0};
@@ -1645,18 +1672,6 @@ struct Session::Impl {
   std::vector<void*> allocs;
   std::vector<float> logits;
   std::size_t allocated_bytes{0};
-  // scratch
-  int* d_tokens{nullptr};
-  float *cur{nullptr}, *tmp{nullptr}, *inp_sa{nullptr}, *in[3]{}, *q{nullptr},
-      *k{nullptr}, *v{nullptr}, *r{nullptr}, *dyn_k{nullptr}, *dyn_v{nullptr},
-      *sink{nullptr}, *gate{nullptr}, *att{nullptr}, *o{nullptr},
-      *mixed{nullptr}, *msgs{nullptr}, *ffn_inp{nullptr}, *x{nullptr},
-      *cat{nullptr}, *low{nullptr}, *gain{nullptr}, *forget{nullptr},
-      *router{nullptr}, *wts{nullptr}, *gu{nullptr}, *act{nullptr}, *y{nullptr},
-      *moe{nullptr}, *prelude{nullptr}, *bank_out{nullptr}, *d_logits{nullptr};
-  unsigned int* rcounts{nullptr};
-  int *rbounds{nullptr}, *rcursors{nullptr}, *rrows_token{nullptr},
-      *rrows_slot{nullptr};
   std::unordered_map<long long, std::pair<int*, int>> tile_maps;
   const int* TileMap(int n, int bn, int* count) {
     const long long key = static_cast<long long>(n) * 1024 + bn;
@@ -1680,22 +1695,12 @@ struct Session::Impl {
     *count = it->second.second;
     return it->second.first;
   }
-  int *sorted{nullptr}, *tiles{nullptr};
-  __half *xh{nullptr}, *act16{nullptr}, *xh0{nullptr}, *xh1{nullptr},
-      *xh2{nullptr}, *xhx{nullptr}, *atth{nullptr}, *cath{nullptr};
-  signed char* xq{nullptr};
-  float* xqs{nullptr};
-  float *split_m{nullptr}, *split_l{nullptr}, *split_o{nullptr};
-  int *blist{nullptr}, *bcount{nullptr};
   bool sparse{false};
   bool no_dp4{std::getenv("INKLING_NO_DP4") != nullptr};
-  int *ids{nullptr}, *xrow{nullptr}, *xrow_token{nullptr}, *xrow_item{nullptr},
-      *d_pos{nullptr};
+  int *xrow_token{nullptr}, *xrow_item{nullptr};
   hipStream_t stream{nullptr};
   hipGraph_t graph{nullptr};
   hipGraphExec_t graph_exec{nullptr};
-  float* block_pool[16]{};
-  int pool_used{0};
 
   float* Alloc(std::size_t floats) {
     void* p = nullptr;
@@ -1891,17 +1896,44 @@ struct Session::Impl {
   }
   float* Pool() { return block_pool[pool_used++]; }
 
-  // returns layer output in `cur`
-  void Layer(std::uint32_t slot, std::uint32_t ip,
-             std::vector<const float*>& blocks, const float* msgs_, int n) {
+  struct LayerCtx {
+    std::uint32_t slot{0}, ip{0}, p{0};
+    bool swa{false}, big{false};
+    int n{0};
+    std::size_t nh_{0};
+    const float* msgs{nullptr};
+    float* inp[3]{};
+    __half* inh[3]{};
+    const float* dk{nullptr};
+    const float* dv{nullptr};
+    float* vtmp{nullptr};
+  };
+
+  void BeginLayer(LayerCtx& L, std::uint32_t slot, std::uint32_t ip, const float* msgs_, int n) {
+    L.slot = slot;
+    L.ip = ip;
+    L.p = m->Phys(slot);
+    L.swa = m->config.is_swa[slot];
+    L.n = n;
+    L.nh_ = static_cast<std::size_t>(n) * m->config.hidden_size;
+    L.big = n >= kWmmaMinTokens;
+    L.msgs = msgs_;
+    L.dk = L.dv = nullptr;
+  }
+
+  // stage 1: attention input mix and norms -> L.inp / L.inh
+  void LayerFront(LayerCtx& L, std::vector<const float*>& blocks) {
     const Config& c = m->config;
     const int h = c.hidden_size, nh = c.num_heads, nkv = c.num_kv,
               hd = c.head_dim, nrel = c.relative_length;
-    const std::uint32_t p = m->Phys(slot);
-    const bool swa = c.is_swa[slot];
-    Slot& sl = slots[slot];
-    const std::size_t nh_ = static_cast<std::size_t>(n) * h;
-    const bool big = n >= kWmmaMinTokens;
+    const std::uint32_t p = L.p;
+    const bool swa = L.swa;
+    Slot& sl = slots[L.slot];
+    const int n = L.n;
+    const std::size_t nh_ = L.nh_;
+    const bool big = L.big;
+    const float* msgs_ = L.msgs;
+    (void)c; (void)h; (void)nh; (void)nkv; (void)hd; (void)nrel; (void)p; (void)swa; (void)sl; (void)n; (void)nh_; (void)big; (void)msgs_;
     float* inp[3] = {in[0], in[1], in[2]};
     const bool has_res = m->Has(m->P(p, "attn_res_query.weight"));
     __half* inh[3] = {big ? xh0 : nullptr, big ? xh1 : nullptr,
@@ -1980,6 +2012,27 @@ struct Session::Impl {
                   inp[j], n, h, h, h, inh[j]);
       }
     }
+    for (int j = 0; j < 3; ++j) {
+      L.inp[j] = inp[j];
+      L.inh[j] = inh[j];
+    }
+  }
+
+  // stage 2: q/k/v/gate/rel/sink projections (GPU or NPU)
+  void LayerQkv(LayerCtx& L) {
+    const Config& c = m->config;
+    const int h = c.hidden_size, nh = c.num_heads, nkv = c.num_kv,
+              hd = c.head_dim, nrel = c.relative_length;
+    const std::uint32_t p = L.p;
+    const bool swa = L.swa;
+    Slot& sl = slots[L.slot];
+    const int n = L.n;
+    const std::size_t nh_ = L.nh_;
+    const bool big = L.big;
+    float* const* inp = L.inp;
+    __half* const* inh = L.inh;
+    const float* msgs_ = L.msgs;
+    (void)c; (void)h; (void)nh; (void)nkv; (void)hd; (void)nrel; (void)p; (void)swa; (void)sl; (void)n; (void)nh_; (void)big; (void)inp; (void)inh; (void)msgs_;
     Dense(m->T(m->P(p, "attn_q.weight")), inp[0], h, q, nh * hd, n, -1, inh[0]);
     Dense(m->T(m->P(p, "attn_k.weight")), inp[1], h, tmp, nkv * hd, n, -1,
           inh[1]);
@@ -1987,20 +2040,40 @@ struct Session::Impl {
           inh[2]);
     Dense(m->T(m->P(p, "attn_rel.weight")), inp[0], h, r, nrel * nh, n, -1,
           inh[0]);
-    const float* dk = nullptr;
-    const float* dv = nullptr;
     if (!swa) {
       Dense(m->T(m->P(p, "attn_k_conv_proj.weight")), inp[1], h, dyn_k,
             kConvTaps * nkv, n, -1, inh[1]);
       Dense(m->T(m->P(p, "attn_v_conv_proj.weight")), inp[2], h, dyn_v,
             kConvTaps * nkv, n, -1, inh[2]);
-      dk = dyn_k;
-      dv = dyn_v;
+      L.dk = dyn_k;
+      L.dv = dyn_v;
     }
-    Convolve(tmp, m->T(m->P(p, "attn_k_conv.weight")), dk, nkv, sl.hist_k, k,
+    Dense(m->T(m->P(p, "attn_sink_proj.weight")), inp[0], h, sink, nh, n, -1,
+          inh[0]);
+    Dense(m->T(m->P(p, "attn_gate.weight")), inp[0], h, gate, nh * hd, n, -1,
+          inh[0]);
+  }
+
+  // stage 3: convolutions, clipping, KV store, attention -> att / atth
+  void LayerAttn(LayerCtx& L) {
+    const Config& c = m->config;
+    const int h = c.hidden_size, nh = c.num_heads, nkv = c.num_kv,
+              hd = c.head_dim, nrel = c.relative_length;
+    const std::uint32_t p = L.p;
+    const bool swa = L.swa;
+    Slot& sl = slots[L.slot];
+    const int n = L.n;
+    const std::size_t nh_ = L.nh_;
+    const bool big = L.big;
+    float* const* inp = L.inp;
+    __half* const* inh = L.inh;
+    const float* msgs_ = L.msgs;
+    (void)c; (void)h; (void)nh; (void)nkv; (void)hd; (void)nrel; (void)p; (void)swa; (void)sl; (void)n; (void)nh_; (void)big; (void)inp; (void)inh; (void)msgs_;
+    Convolve(tmp, m->T(m->P(p, "attn_k_conv.weight")), L.dk, nkv, sl.hist_k, k,
              nkv * hd, n);
     float* vtmp = tmp;
-    Convolve(v, m->T(m->P(p, "attn_v_conv.weight")), dv, nkv, sl.hist_v, vtmp,
+    L.vtmp = vtmp;
+    Convolve(v, m->T(m->P(p, "attn_v_conv.weight")), L.dv, nkv, sl.hist_v, vtmp,
              nkv * hd, n);
     const int* tau_p = swa ? nullptr : d_pos;
     const float tau_floor = static_cast<float>(c.log_scale_floor);
@@ -2012,8 +2085,6 @@ struct Session::Impl {
     Clip<<<n * nh, 128, 0, stream>>>(
         r, static_cast<const float*>(m->T(m->P(p, "attn_rel_clip.weight")).dev),
         nh, nrel, c.relative_clip, tau_p, nh, tau_floor, c.log_scale_alpha);
-    Dense(m->T(m->P(p, "attn_sink_proj.weight")), inp[0], h, sink, nh, n, -1,
-          inh[0]);
     StoreKv<<<n, 256, 0, stream>>>(k, vtmp, sl.k, sl.v, nkv * hd, d_pos,
                                    sl.ring, sl.vblocks);
     AttnArgs aa{nh,
@@ -2034,7 +2105,7 @@ struct Session::Impl {
       const bool sparse_now =
           sparse && !swa &&
           (n < kWmmaMinTokens ||
-           position + n >
+           pos_base + n >
                (kSparseSink + kSparseLocal + kSparseTop + 2) * kBlockKeys);
       if (sparse && !swa) {
         PoolKeys<<<dim3((n + kBlockKeys - 1) / kBlockKeys + 1, nkv), kFlashHd,
@@ -2070,8 +2141,6 @@ struct Session::Impl {
           static_cast<const float*>(m->T(m->P(p, "attn_rel_bias.weight")).dev),
           att);
     }
-    Dense(m->T(m->P(p, "attn_gate.weight")), inp[0], h, gate, nh * hd, n, -1,
-          inh[0]);
     if (big) {
       SigmoidMulH<<<(n * nh * hd + 255) / 256, 256, 0, stream>>>(
           att, gate, atth, static_cast<std::size_t>(n) * nh * hd);
@@ -2079,6 +2148,24 @@ struct Session::Impl {
       SigmoidMul<<<(n * nh * hd + 255) / 256, 256, 0, stream>>>(
           att, gate, static_cast<std::size_t>(n) * nh * hd);
     }
+  }
+
+  // stage 4: output projection, residual, FFN mix, MoE -> cur
+  void LayerOut(LayerCtx& L, std::vector<const float*>& blocks) {
+    const Config& c = m->config;
+    const int h = c.hidden_size, nh = c.num_heads, nkv = c.num_kv,
+              hd = c.head_dim, nrel = c.relative_length;
+    const std::uint32_t p = L.p;
+    const bool swa = L.swa;
+    Slot& sl = slots[L.slot];
+    const int n = L.n;
+    const std::size_t nh_ = L.nh_;
+    const bool big = L.big;
+    float* const* inp = L.inp;
+    __half* const* inh = L.inh;
+    const float* msgs_ = L.msgs;
+    (void)c; (void)h; (void)nh; (void)nkv; (void)hd; (void)nrel; (void)p; (void)swa; (void)sl; (void)n; (void)nh_; (void)big; (void)inp; (void)inh; (void)msgs_;
+    const std::uint32_t ip = L.ip;
     Dense(m->T(m->P(p, "attn_output.weight")), att, nh * hd, o, h, n, -1,
           big ? atth : nullptr);
     const bool push = ip % c.attn_res_block_size == 0;
@@ -2109,6 +2196,16 @@ struct Session::Impl {
     Moe(p, n, big ? xhx : nullptr);
     Convolve(moe, m->T(m->P(p, "ffn_post_conv.weight")), nullptr, 1,
              sl.hist_ffn, cur, h, n, ffn_inp);
+  }
+
+  // returns layer output in `cur`
+  void Layer(std::uint32_t slot, std::uint32_t ip, std::vector<const float*>& blocks, const float* msgs_, int n) {
+    LayerCtx L;
+    BeginLayer(L, slot, ip, msgs_, n);
+    LayerFront(L, blocks);
+    LayerQkv(L);
+    LayerAttn(L);
+    LayerOut(L, blocks);
   }
 
   void Moe(std::uint32_t p, int n, const __half* xhx_in = nullptr) {
@@ -2229,6 +2326,7 @@ struct Session::Impl {
     const int n = static_cast<int>(tokens.size());
     HIP_OK(hipMemcpy(d_tokens, tokens.data(), n * 4, hipMemcpyHostToDevice));
     const int pos = static_cast<int>(position);
+    pos_base = position;
     HIP_OK(hipMemcpy(d_pos, &pos, 4, hipMemcpyHostToDevice));
     if (n == 1) {
       if (graph_exec == nullptr) {
