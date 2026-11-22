@@ -54,7 +54,12 @@ a turn without a call fails as unsatisfied.
 
 ## Status and gaps
 
-There is no snapshot or disk cache and no image input. Structured output
+Continuation snapshots work like the other models: a RAM cache (`--cache-ram-bytes`)
+and a disk cache (`--cache-disk`) keyed by the GGUF and drafter fingerprints, context
+size and expert format. A 46K-token snapshot is about 2-3 GB; a RAM hit restores in
+tens of ms, a disk hit in 2-8 s (versus about 30 s to re-prefill). The request's
+reasoning effort maps to the model's own levels (0.1, 0.2, 0.7, 0.9, 0.99).
+There is no image input. Structured output
 (`response_format`) constrains the raw channel text, so it only applies in the
 text channel (`--think off`). Sampled (temperature above zero) speculation uses
 the same exact-match rule as greedy and therefore accepts fewer drafts.

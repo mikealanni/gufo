@@ -69,4 +69,6 @@ the artifact facts, engine design and what was learned, for the next person touc
   kernels while decode uses int8 activations.
 - Chat layer: `chat_template.cpp` mirrors the GGUF template including tools; `InklingOutputTranslator` in
   `inference_backend.cpp` maps channel tokens to `<think>` and native tool-call framing for the shared parsers.
-- Open: snapshots/disk cache, image input, enforcing `tool_choice: required`.
+- Snapshots: RAM and disk persistence (SessionSnapshot payload v1, shared cache flags) verified after restart (cache=disk).
+  Run script defaults: JOBS=2, RAM cache 6 GB.
+- Open: image input, enforcing `tool_choice: required`.
