@@ -2790,13 +2790,22 @@ struct Session::Impl : Scratch {
   }
 
   const int* gemm_skip{nullptr};
+  bool xq_reuse{false};
+  const float* xq_src{nullptr};
+  int xq_n{0};
+  int xq_cols{0};
   void Dense(const Tensor& w, const float* xin, std::size_t ldx, float* yout,
              std::size_t ldy, int n, int rows = -1,
              const __half* xhin = nullptr) {
     const int nrows = rows < 0 ? static_cast<int>(w.rows) : rows;
     if (n == 1 && w.type == kTypeQ8 && ldx == w.cols && !no_dp4) {
-      QuantRows<<<dim3(1, w.cols / 32), 32, 0, stream>>>(
-          xin, xq, xqs, static_cast<int>(w.cols));
+      if (!(xq_reuse && xin == xq_src && n == xq_n && w.cols == xq_cols)) {
+        QuantRows<<<dim3(1, w.cols / 32), 32, 0, stream>>>(
+            xin, xq, xqs, static_cast<int>(w.cols));
+        xq_src = xin;
+        xq_n = n;
+        xq_cols = static_cast<int>(w.cols);
+      }
       const int rpb8 = kThreads * 2 / 32;
       GemmDp4<kTypeQ8>
           <<<dim3((nrows + rpb8 - 1) / rpb8, 1), kThreads * 2, 0, stream>>>(
@@ -2806,8 +2815,13 @@ struct Session::Impl : Scratch {
       return;
     }
     if (n >= 2 && n <= 8 && w.type == kTypeQ8 && ldx == w.cols && !no_dp4) {
-      QuantRows<<<dim3(n, w.cols / 32), 32, 0, stream>>>(
-          xin, xq, xqs, static_cast<int>(w.cols));
+      if (!(xq_reuse && xin == xq_src && n == xq_n && w.cols == xq_cols)) {
+        QuantRows<<<dim3(n, w.cols / 32), 32, 0, stream>>>(
+            xin, xq, xqs, static_cast<int>(w.cols));
+        xq_src = xin;
+        xq_n = n;
+        xq_cols = static_cast<int>(w.cols);
+      }
       const int rpb8 = kThreads * 2 / 32;
       const dim3 g8((nrows + rpb8 - 1) / rpb8);
       const auto* wp = static_cast<const unsigned char*>(w.dev);
@@ -3256,20 +3270,23 @@ struct Session::Impl : Scratch {
         npu_a[0] >= 0 && big && m->npu_w.count(m->P(p, "attn_q.weight")) != 0;
     if (L.npu_on)
       NpuQkvBegin(L, 0);
+    xq_src = nullptr;
+    xq_reuse = true;
     if (!L.npu_on || (npu_mask & 1) == 0)
       Dense(m->T(m->P(p, "attn_q.weight")), inp[0], h, q, nh * hd, n, -1,
             inh[0]);
+    Dense(m->T(m->P(p, "attn_rel.weight")), inp[0], h, r, nrel * nh, n, -1,
+          inh[0]);
     if (!L.npu_on || (npu_mask & 4) == 0)
       Dense(m->T(m->P(p, "attn_k.weight")), inp[1], h, tmp, nkv * hd, n, -1,
             inh[1]);
+    if (!swa)
+      Dense(m->T(m->P(p, "attn_k_conv_proj.weight")), inp[1], h, dyn_k,
+            kConvTaps * nkv, n, -1, inh[1]);
     if (!L.npu_on || (npu_mask & 8) == 0)
       Dense(m->T(m->P(p, "attn_v.weight")), inp[2], h, v, nkv * hd, n, -1,
             inh[2]);
-    Dense(m->T(m->P(p, "attn_rel.weight")), inp[0], h, r, nrel * nh, n, -1,
-          inh[0]);
     if (!swa) {
-      Dense(m->T(m->P(p, "attn_k_conv_proj.weight")), inp[1], h, dyn_k,
-            kConvTaps * nkv, n, -1, inh[1]);
       Dense(m->T(m->P(p, "attn_v_conv_proj.weight")), inp[2], h, dyn_v,
             kConvTaps * nkv, n, -1, inh[2]);
       L.dk = dyn_k;
@@ -3277,6 +3294,8 @@ struct Session::Impl : Scratch {
     }
     Dense(m->T(m->P(p, "attn_sink_proj.weight")), inp[0], h, sink, nh, n, -1,
           inh[0]);
+    xq_reuse = false;
+    xq_src = nullptr;
   }
 
   void LayerQkvEnd(LayerCtx& L) {
