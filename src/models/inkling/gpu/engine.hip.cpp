@@ -863,6 +863,24 @@ __global__ void SituHalf(const float* gu, const int* group, const float* scale,
   }
 }
 
+__global__ void SituHalfIn(const __half* gu, __half* act, int ff, float beta, float lb) {
+  const int item = blockIdx.x;
+  for (int j = threadIdx.x; j < ff; j += blockDim.x) {
+    const float g = __half2float(gu[static_cast<std::size_t>(item) * 2 * ff + j]);
+    const float u = __half2float(gu[static_cast<std::size_t>(item) * 2 * ff + ff + j]);
+    act[static_cast<std::size_t>(item) * ff + j] = __float2half(beta * tanhf(g / beta) * Sigmoid(g) * lb * tanhf(u / lb));
+  }
+}
+
+__global__ void CombineHalf(const __half* y, const float* wts, float* out, int nu, int h) {
+  for (int i = threadIdx.x; i < h; i += blockDim.x) {
+    float a = 0.0F;
+    for (int k = 0; k < nu; ++k)
+      a += wts[blockIdx.x * nu + k] * __half2float(y[(static_cast<std::size_t>(blockIdx.x) * nu + k) * h + i]);
+    out[static_cast<std::size_t>(blockIdx.x) * h + i] = a;
+  }
+}
+
 __global__ void Combine(const float* y, const float* wts, float* out, int nu,
                         int h, const float* down_scale, const int* ids) {
   for (int i = threadIdx.x; i < h; i += blockDim.x) {
@@ -1754,6 +1772,7 @@ struct Scratch {
   signed char* xq{nullptr};
   float* xqs{nullptr};
   float *split_m{nullptr}, *split_l{nullptr}, *split_o{nullptr};
+  __half *gu16{nullptr}, *y16{nullptr};
   int *blist{nullptr}, *bcount{nullptr};
   int *ids{nullptr}, *xrow{nullptr}, *d_pos{nullptr};
   float* block_pool[16]{};
@@ -2663,20 +2682,19 @@ struct Session::Impl : Scratch {
       const int bn = n >= 2048 ? 192 : (n >= 512 ? 128 : 48);
       int ntiles = 0;
       const int* tmap = TileMap(n, bn, &ntiles);
-      const bool ok1 = qfn::RoutedF16Gemm(
-          wgu.dev, qfn::WeightType::kNVFP4, xmoe, tmap, ntiles, bn, rbounds,
-          rrows_token, rrows_slot, nullptr, gu, nullptr, 2 * ff, h, stream);
-      SituHalf<<<items, 256, 0, stream>>>(gu, ids, s_gu, act16, ff, c.situ_beta,
-                                          c.situ_linear_beta);
-      const bool ok2 = qfn::RoutedF16Gemm(
-          wdn.dev, qfn::WeightType::kNVFP4, act16, tmap, ntiles, bn, rbounds,
-          rrows_slot, rrows_slot, nullptr, y, nullptr, h, ff, stream);
+      const bool ok1 = qfn::RoutedNvfp4GemmF16(
+          wgu.dev, xmoe, tmap, ntiles, bn, rbounds, rrows_token, rrows_slot,
+          gu16, 2 * ff, h, s_gu, stream);
+      SituHalfIn<<<items, 256, 0, stream>>>(gu16, act16, ff, c.situ_beta,
+                                            c.situ_linear_beta);
+      const bool ok2 = qfn::RoutedNvfp4GemmF16(
+          wdn.dev, act16, tmap, ntiles, bn, rbounds, rrows_slot, rrows_slot,
+          y16, h, ff, s_dn, stream);
       if (!ok1 || !ok2) {
-        std::fprintf(stderr,
-                     "inkling: shared routed gemm rejected the launch\n");
+        std::fprintf(stderr, "inkling: shared routed gemm rejected the launch\n");
         std::abort();
       }
-      Combine<<<n, 256, 0, stream>>>(y, wts, moe, nu, h, s_dn, ids);
+      CombineHalf<<<n, 256, 0, stream>>>(y16, wts, moe, nu, h);
       return;
     }
     if (n >= kWmmaMinTokens) {
@@ -3122,6 +3140,8 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
       for (int j = 0; j < 8; ++j)
         i.npu_c[j] = state_->npu->NewBuffer(state_->npu->CBytes(), &npu_error);
     }
+    sc.gu16 = static_cast<__half*>(i.AllocBytes(b * c.expert_used * 2 * c.expert_ff * 2));
+    sc.y16 = static_cast<__half*>(i.AllocBytes(b * c.expert_used * h * 2));
     sc.xh0 = static_cast<__half*>(i.AllocBytes(b * h * 2));
     sc.xh1 = static_cast<__half*>(i.AllocBytes(b * h * 2));
     sc.xh2 = static_cast<__half*>(i.AllocBytes(b * h * 2));

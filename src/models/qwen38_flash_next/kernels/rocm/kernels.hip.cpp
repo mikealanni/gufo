@@ -5890,7 +5890,8 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
     __half* __restrict__ out_half, std::size_t m, std::size_t k,
     const void* __restrict__ w_up,
     const std::uint32_t* __restrict__ iq3s_grid = nullptr,
-    float out_scale = 1.0F) {
+    float out_scale = 1.0F,
+    const float* __restrict__ expert_scale = nullptr) {
   static_assert(BM == 128 || BM == 256, "eight waves, 16-row tiles");
   static_assert(!kPair || BM == 128);
   static_assert(BN % 16 == 0 && BN / 16 <= 16);
@@ -6676,6 +6677,11 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
             if (dst >= 0) {
               float2 v =
                   *reinterpret_cast<const float2*>(scratch + tr * stride + row);
+              if (expert_scale != nullptr) {
+                const float es = expert_scale[expert];
+                v.x *= es;
+                v.y *= es;
+              }
               const size_t o = size_t(dst) * m + r;
               if (swiglu_gate != nullptr) {
                 v.x *= SiluF(swiglu_gate[o]);
@@ -6723,6 +6729,8 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
             const std::size_t o = (static_cast<std::size_t>(dst) * m) +
                                   static_cast<std::size_t>(r);
             float v = tile_scratch[flat];
+            if (expert_scale != nullptr)
+              v *= expert_scale[expert];
             if (out_half != nullptr) {
               out_half[o] = __float2half(
                   swiglu_gate != nullptr ? v * SiluF(swiglu_gate[o]) : v);
@@ -8207,6 +8215,34 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
     default:
       return false;
   }
+}
+
+/// NVFP4 (repacked) routed GEMM with the per-expert output scale folded into the epilogue
+/// and F16 output rows. The scaled values of Inkling stay far inside the F16 range.
+bool RoutedNvfp4GemmF16(const void* w, const __half* x, const std::int32_t* tiles,
+                        std::uint32_t n_tiles, std::uint32_t tile_rows,
+                        const std::int32_t* pad_bounds,
+                        const std::int32_t* rows_in,
+                        const std::int32_t* rows_out, __half* out_half,
+                        std::size_t m, std::size_t k, const float* expert_scale,
+                        hipStream_t stream) {
+  if (m == 0 || k == 0 || k % 64 != 0 || n_tiles == 0 || out_half == nullptr)
+    return false;
+  constexpr int kBM = 128;
+  constexpr int kBK = 2;
+  const dim3 grid(static_cast<unsigned int>((m + kBM - 1) / kBM), n_tiles);
+#define INKLING_NV_LAUNCH(BN)                                                   \
+  hipLaunchKernelGGL((RoutedF16GEMMKernel<WeightType::kNVFP4, kBM, BN, kBK>),   \
+                     grid, dim3(kThreads), 0, stream, w, x, tiles, pad_bounds,   \
+                     rows_in, rows_out, nullptr, nullptr, out_half, m, k,        \
+                     nullptr, nullptr, 1.0F, expert_scale)
+  switch (tile_rows) {
+    case 48: INKLING_NV_LAUNCH(48); return true;
+    case 128: INKLING_NV_LAUNCH(128); return true;
+    case 192: INKLING_NV_LAUNCH(192); return true;
+    default: return false;
+  }
+#undef INKLING_NV_LAUNCH
 }
 
 // Additive experiment: RoutedF16GEMMKernel<kQ8_0, 128, 128, 2> directly,
