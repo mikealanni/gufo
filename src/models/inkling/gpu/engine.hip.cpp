@@ -2725,6 +2725,55 @@ struct Session::Impl : Scratch {
     static_cast<Scratch&>(*this) = saved[bank];
     active = bank;
   }
+  struct SnapRegion {
+    void* dev;
+    std::size_t bytes;
+  };
+  // Device ranges that make up a snapshot at `pos` rows: the order is the
+  // layout of the snapshot bytes.
+  std::vector<SnapRegion> SnapRegions(std::uint32_t pos, std::uint32_t dwarm,
+                                      bool drafter) const {
+    const Config& c = m->config;
+    const std::size_t kv = static_cast<std::size_t>(c.num_kv) * c.head_dim;
+    const std::size_t h = c.hidden_size;
+    std::vector<SnapRegion> out;
+    for (const auto& sl : slots) {
+      const std::size_t rows_total = static_cast<std::size_t>(sl.vblocks) * 64;
+      if (sl.ring > 0) {
+        out.push_back({sl.k, rows_total * kv * 2});
+        out.push_back({sl.v, rows_total * kv * 2});
+      } else {
+        const std::size_t rows = std::min<std::size_t>(pos, rows_total);
+        out.push_back({sl.k, rows * kv * 2});
+        const std::size_t nb = (rows + 63) / 64;
+        for (int g = 0; g < c.num_kv; ++g) {
+          out.push_back(
+              {sl.v + static_cast<std::size_t>(g) * sl.vblocks * 128 * 64,
+               nb * 128 * 64 * 2});
+        }
+        if (sl.kmm != nullptr) {
+          const std::size_t blocks =
+              std::min<std::size_t>(pos / kBlockKeys + 2, ctx / kBlockKeys + 2);
+          out.push_back({sl.kmm, blocks * c.num_kv * 2 * kFlashHd * 2});
+        }
+      }
+      out.push_back({sl.hist_k, kv * (kHistory + kWinLen) * 4});
+      out.push_back({sl.hist_v, kv * (kHistory + kWinLen) * 4});
+      out.push_back({sl.hist_attn, h * (kHistory + kWinLen) * 4});
+      out.push_back({sl.hist_ffn, h * (kHistory + kWinLen) * 4});
+    }
+    if (feat != nullptr)
+      out.push_back({feat, static_cast<std::size_t>(pos) * kTapCount * h * 2});
+    if (drafter && dready) {
+      for (int l = 0; l < 3; ++l) {
+        const std::size_t rows =
+            l == 1 ? std::min<std::size_t>(dwarm, dcap[l]) : dcap[l];
+        out.push_back({dk[l], rows * 1024 * 2});
+        out.push_back({dv[l], rows * 1024 * 2});
+      }
+    }
+    return out;
+  }
   std::vector<void*> allocs;
   std::vector<float> logits;  // host copy of rows fetched by Logits(row)
   std::vector<unsigned char> logits_have;
@@ -2747,6 +2796,7 @@ struct Session::Impl : Scratch {
           host.push_back(e | (j << 16));
       }
       int* dev = static_cast<int*>(AllocBytes(host.size() * sizeof(int)));
+      allocated_bytes -= host.size() * sizeof(int);  // grows with prompt shapes
       HIP_OK(hipMemcpy(dev, host.data(), host.size() * sizeof(int),
                        hipMemcpyHostToDevice));
       it = tile_maps
@@ -4269,6 +4319,116 @@ struct Session::Impl : Scratch {
 
 std::size_t Session::AllocatedBytes() const noexcept {
   return impl_->allocated_bytes;
+}
+
+struct SessionSnapshot::Data {
+  std::uint32_t position{0};
+  std::uint32_t dwarmed{0};
+  std::uint32_t ctx{0};
+  bool drafter{false};
+  int argmax{0};
+  std::vector<float> logits;
+  std::unique_ptr<unsigned char[]> bytes;
+  std::size_t size{0};
+};
+
+SessionSnapshot::SessionSnapshot() = default;
+SessionSnapshot::~SessionSnapshot() = default;
+std::uint64_t SessionSnapshot::SizeBytes() const noexcept {
+  return data_ == nullptr ? 0
+                          : data_->size + data_->logits.size() * sizeof(float);
+}
+std::uint32_t SessionSnapshot::position() const noexcept {
+  return data_ == nullptr ? 0 : data_->position;
+}
+
+void Session::PrepareDraft() {
+  if (impl_->m->has_draft && impl_->feat != nullptr)
+    impl_->DraftEnsure();
+}
+
+std::uint64_t Session::SnapshotBytes() const {
+  auto& i = *impl_;
+  std::uint64_t total = i.m->config.vocab_unpadded * sizeof(float);
+  for (const auto& r : i.SnapRegions(i.position, i.dwarmed, i.dready))
+    total += r.bytes;
+  return total;
+}
+
+std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(std::string* error_msg) {
+  auto& i = *impl_;
+  (void)error_msg;
+  auto snapshot = std::unique_ptr<SessionSnapshot>(new SessionSnapshot());
+  snapshot->data_ = std::make_unique<SessionSnapshot::Data>();
+  auto& d = *snapshot->data_;
+  d.position = i.position;
+  d.dwarmed = i.dwarmed;
+  d.ctx = i.ctx;
+  d.drafter = i.dready;
+  const auto regions = i.SnapRegions(d.position, d.dwarmed, d.drafter);
+  for (const auto& r : regions)
+    d.size += r.bytes;
+  d.bytes.reset(new unsigned char[d.size]);
+  std::size_t offset = 0;
+  for (const auto& r : regions) {
+    if (r.bytes > 0)
+      HIP_OK(hipMemcpyAsync(d.bytes.get() + offset, r.dev, r.bytes,
+                            hipMemcpyDeviceToHost, i.stream));
+    offset += r.bytes;
+  }
+  const std::size_t v = i.m->config.vocab_unpadded;
+  d.logits.resize(v);
+  HIP_OK(hipMemcpyAsync(
+      d.logits.data(), i.d_logits + static_cast<std::size_t>(i.logits_last) * v,
+      v * sizeof(float), hipMemcpyDeviceToHost, i.stream));
+  d.argmax = i.argmax_host[i.logits_last];
+  HIP_OK(hipStreamSynchronize(i.stream));
+  return snapshot;
+}
+
+bool Session::RestoreSnapshot(const SessionSnapshot& snapshot,
+                              std::string* error_msg) {
+  auto& i = *impl_;
+  if (snapshot.data_ == nullptr || snapshot.data_->ctx != i.ctx) {
+    if (error_msg != nullptr)
+      *error_msg = "snapshot does not match this session's context size";
+    return false;
+  }
+  const auto& d = *snapshot.data_;
+  if (d.drafter && !i.dready) {
+    if (!i.m->has_draft) {
+      if (error_msg != nullptr)
+        *error_msg = "snapshot needs the drafter, which is not loaded";
+      return false;
+    }
+    i.DraftEnsure();
+  }
+  const auto regions = i.SnapRegions(d.position, d.dwarmed, d.drafter);
+  std::size_t offset = 0;
+  for (const auto& r : regions) {
+    if (r.bytes > 0)
+      HIP_OK(hipMemcpyAsync(r.dev, d.bytes.get() + offset, r.bytes,
+                            hipMemcpyHostToDevice, i.stream));
+    offset += r.bytes;
+  }
+  if (offset != d.size) {
+    if (error_msg != nullptr)
+      *error_msg = "snapshot layout does not match this session";
+    return false;
+  }
+  HIP_OK(hipMemcpyAsync(i.d_logits, d.logits.data(),
+                        d.logits.size() * sizeof(float), hipMemcpyHostToDevice,
+                        i.stream));
+  HIP_OK(hipStreamSynchronize(i.stream));
+  i.position = d.position;
+  i.dwarmed = d.dwarmed;
+  i.argmax_host[0] = d.argmax;
+  i.logits_rows = 1;
+  i.logits_last = 0;
+  i.logits_have.assign(1, 0);
+  i.last_rows = 1;
+  i.pos_before_last = d.position > 0 ? d.position - 1 : 0;
+  return true;
 }
 
 Session::Session() = default;

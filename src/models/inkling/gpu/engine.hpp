@@ -13,6 +13,27 @@ namespace gufo::models::inkling::gpu {
 
 class Model;
 struct ModelState;
+class Session;
+
+/// Immutable copy of a session's context at one position: the full-attention
+/// K/V rows, sliding-window rings, convolution histories, drafter features
+/// and the last logits. Restores into any session of the same model and
+/// context size.
+class SessionSnapshot final {
+public:
+  ~SessionSnapshot();
+  SessionSnapshot(const SessionSnapshot&) = delete;
+  SessionSnapshot& operator=(const SessionSnapshot&) = delete;
+
+  [[nodiscard]] std::uint64_t SizeBytes() const noexcept;
+  [[nodiscard]] std::uint32_t position() const noexcept;
+
+private:
+  SessionSnapshot();
+  struct Data;
+  std::unique_ptr<Data> data_;
+  friend class Session;
+};
 
 class Session final {
 public:
@@ -28,6 +49,14 @@ public:
   [[nodiscard]] bool AppendAll(std::span<const std::int32_t> tokens,
                                std::string* error_msg);
   static constexpr std::uint32_t kMaxVerifyRows = 8;
+  /// Allocates the drafter's buffers now (otherwise on the first Draft).
+  void PrepareDraft();
+  /// Bytes a snapshot of the current position needs.
+  [[nodiscard]] std::uint64_t SnapshotBytes() const;
+  [[nodiscard]] std::unique_ptr<SessionSnapshot> SaveSnapshot(
+      std::string* error_msg = nullptr);
+  [[nodiscard]] bool RestoreSnapshot(const SessionSnapshot& snapshot,
+                                     std::string* error_msg = nullptr);
   [[nodiscard]] std::span<const float> Logits() const noexcept;
   [[nodiscard]] std::span<const float> Logits(std::uint32_t row) const noexcept;
   /// Greedy token of a row, computed on the device (no logits download).
