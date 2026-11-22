@@ -27,7 +27,7 @@ constexpr int kMaxStates = 8;
 constexpr int kConvTaps = 4;
 constexpr int kHistory = 3;
 constexpr int kMaxBatch = 4096;
-constexpr std::size_t kBankMin = 512;
+constexpr std::size_t kBankMin = 3072;
 constexpr std::uint32_t kNpuSlice = 1024;
 constexpr int kFlashHd = 128;
 constexpr int kWmmaMinTokens = 32;
@@ -1504,6 +1504,8 @@ struct ModelState {
   std::size_t resident_bytes{0};
   // optional NPU offload of the q / gate / k / v projections (INKLING_NPU=1)
   std::unique_ptr<gufo::models::qwen38_flash_next::rocm::NpuGemm> npu;
+  int npu_prog_o{-1}, npu_prog_o_small{-1};  // K=3072 programs for the attention output
+  int npu_prog_small{-1};  // M=2048 program for banks of at most 2048 rows
   std::uint32_t npu_tokens{2048};  // rows of the runtime-M program = rows of one bank
   std::unordered_map<std::string, std::vector<int>> npu_w;  // tensor -> 1024-row slices
   ~ModelState() {
@@ -1561,6 +1563,18 @@ std::shared_ptr<Model> Model::Load(const std::string& path,
     std::string npu_error;
     state->npu = gufo::models::qwen38_flash_next::rocm::NpuGemm::Create(nc, &npu_error);
     if (state->npu) {
+      if (state->npu_tokens > 2048) {
+        std::string add_error;
+        state->npu_prog_small = state->npu->AddProgram(
+            std::string(dir) + "/runtime_mk/insts_2048x" + std::to_string(cfg->hidden_size) + "x1024_128x64x128.txt",
+            &add_error);
+      }
+      std::string out_error;
+      state->npu_prog_o = state->npu->AddProgram(
+          std::string(dir) + "/runtime_mk/insts_" + std::to_string(state->npu_tokens) + "x3072x1024_128x64x128.txt", &out_error);
+      if (state->npu_tokens > 2048)
+        state->npu_prog_o_small = state->npu->AddProgram(
+            std::string(dir) + "/runtime_mk/insts_2048x3072x1024_128x64x128.txt", &out_error);
       HIP_OK(hipStreamCreate(&npu_stream));
     } else {
       std::fprintf(stderr, "inkling: NPU unavailable: %s\n", npu_error.c_str());
@@ -1617,6 +1631,26 @@ std::shared_ptr<Model> Model::Load(const std::string& path,
         HIP_OK(hipStreamSynchronize(npu_stream));
         for (const int id : ids) state->npu->FinalizeWeights(id);
         state->npu_w.emplace(std::string(info.name), std::move(ids));
+      }
+      const bool out_name = info.name.size() > 19 && info.name.substr(info.name.size() - 19) == ".attn_output.weight";
+      if (state->npu && state->npu_prog_o >= 0 && t.type == kTypeQ8 && out_name && t.cols == 3072) {
+        // rows are padded to a multiple of the slice with zeros
+        const std::uint64_t rows_pad = (t.rows + kNpuSlice - 1) / kNpuSlice * kNpuSlice;
+        void* padded = nullptr;
+        HIP_OK(hipMalloc(&padded, rows_pad * t.row_bytes));
+        HIP_OK(hipMemset(padded, 0, rows_pad * t.row_bytes));
+        HIP_OK(hipMemcpy(padded, tmp, info.size_bytes, hipMemcpyDeviceToDevice));
+        std::vector<int> ids;
+        for (std::uint64_t r0 = 0; r0 < rows_pad; r0 += kNpuSlice) {
+          const int id = state->npu->NewBuffer(state->npu->BBytes(3072), error);
+          gufo::models::qwen38_flash_next::rocm::NpuEncodeWeights(
+              padded, 3072, static_cast<std::uint32_t>(r0), kNpuSlice, 3072, 0, 3072, state->npu->Device(id), npu_stream);
+          ids.push_back(id);
+        }
+        HIP_OK(hipStreamSynchronize(npu_stream));
+        for (const int id : ids) state->npu->FinalizeWeights(id);
+        state->npu_w.emplace(std::string(info.name), std::move(ids));
+        HIP_OK(hipFree(padded));
       }
       const std::size_t qs_bytes = t.type == kTypeQ8 ? t.cols : t.cols / 2;
       const std::size_t sc_bytes =
@@ -1702,6 +1736,7 @@ struct Scratch {
   std::uint32_t pos_base{0};  // absolute position of this bank's first token
   int npu_a[3]{-1, -1, -1};
   int npu_c[8]{-1, -1, -1, -1, -1, -1, -1, -1};
+  int npu_ao{-1};
 };
 
 struct Session::Impl : Scratch {
@@ -1972,6 +2007,7 @@ struct Session::Impl : Scratch {
     float* vtmp{nullptr};
     std::uint64_t ticket{0};
     bool npu_on{false};
+    bool out_npu{false};
   };
 
   void BeginLayer(LayerCtx& L, std::uint32_t slot, std::uint32_t ip, const float* msgs_, int n) {
@@ -2125,9 +2161,10 @@ struct Session::Impl : Scratch {
       b.push_back(wv[0]);
       c.push_back(npu_c[7]);
     }
-    if (!b.empty()) npu.Submit(stream, npu_a[0], b.data(), c.data(), static_cast<int>(b.size()));
-    if (!k_shared && (npu_mask & 4) != 0) npu.Submit(stream, npu_a[1], &wk[0], &npu_c[6], 1);
-    if (!v_shared && (npu_mask & 8) != 0) npu.Submit(stream, npu_a[2], &wv[0], &npu_c[7], 1);
+    const int prog = (rows <= 2048 && m->npu_prog_small >= 0) ? m->npu_prog_small : 0;
+    if (!b.empty()) npu.Submit(stream, npu_a[0], b.data(), c.data(), static_cast<int>(b.size()), prog);
+    if (!k_shared && (npu_mask & 4) != 0) npu.Submit(stream, npu_a[1], &wk[0], &npu_c[6], 1, prog);
+    if (!v_shared && (npu_mask & 8) != 0) npu.Submit(stream, npu_a[2], &wv[0], &npu_c[7], 1, prog);
     L.ticket = npu.Ticket();
   }
 
@@ -2315,7 +2352,40 @@ struct Session::Impl : Scratch {
   }
 
   // stage 4: output projection, residual, FFN mix, MoE -> cur
-  void LayerOut1(LayerCtx& L, std::vector<const float*>& blocks) {
+  // attention output projection: queue on the NPU (INKLING_NPU_OUT=1) or compute on the GPU
+  void LayerOut1a(LayerCtx& L) {
+    const Config& c = m->config;
+    const int h = c.hidden_size, nh = c.num_heads, nkv = c.num_kv,
+              hd = c.head_dim, nrel = c.relative_length;
+    const std::uint32_t p = L.p;
+    const bool swa = L.swa;
+    Slot& sl = slots[L.slot];
+    const int n = L.n;
+    const std::size_t nh_ = L.nh_;
+    const bool big = L.big;
+    float* const* inp = L.inp;
+    __half* const* inh = L.inh;
+    const float* msgs_ = L.msgs;
+    (void)c; (void)h; (void)nh; (void)nkv; (void)hd; (void)nrel; (void)p; (void)swa; (void)sl; (void)n; (void)nh_; (void)big; (void)inp; (void)inh; (void)msgs_;
+    static const bool out_on = [] {
+      const char* e = std::getenv("INKLING_NPU_OUT");
+      return e == nullptr || e[0] != '0';
+    }();
+    L.out_npu = out_on && npu_ao >= 0 && big &&
+                m->npu_w.count(m->P(p, "attn_output.weight")) != 0;
+    if (L.out_npu) {
+      namespace rocm = gufo::models::qwen38_flash_next::rocm;
+      auto& npu = *m->npu;
+      const auto& wo = m->npu_w.at(m->P(p, "attn_output.weight"));
+      const std::uint32_t enc = static_cast<std::uint32_t>((n + 127) / 128 * 128);
+      rocm::NpuEncodeActivations(atth, nh * hd, enc, nh * hd, 0, nh * hd, npu.Device(npu_ao), stream);
+      const int prog = (n <= 2048 && m->npu_prog_o_small >= 0) ? m->npu_prog_o_small : m->npu_prog_o;
+      npu.Submit(stream, npu_ao, wo.data(), npu_c, static_cast<int>(wo.size()), prog);
+      L.ticket = npu.Ticket();
+    }
+  }
+
+  void LayerOut1b(LayerCtx& L, std::vector<const float*>& blocks) {
     const Config& c = m->config;
     const int h = c.hidden_size, nh = c.num_heads, nkv = c.num_kv,
               hd = c.head_dim, nrel = c.relative_length;
@@ -2330,8 +2400,18 @@ struct Session::Impl : Scratch {
     const float* msgs_ = L.msgs;
     (void)c; (void)h; (void)nh; (void)nkv; (void)hd; (void)nrel; (void)p; (void)swa; (void)sl; (void)n; (void)nh_; (void)big; (void)inp; (void)inh; (void)msgs_;
     const std::uint32_t ip = L.ip;
-    Dense(m->T(m->P(p, "attn_output.weight")), att, nh * hd, o, h, n, -1,
-          big ? atth : nullptr);
+    if (L.out_npu) {
+      namespace rocm = gufo::models::qwen38_flash_next::rocm;
+      auto& npu = *m->npu;
+      npu.Wait(stream, L.ticket);
+      for (int i = 0; i < 3; ++i) {
+        const std::uint32_t valid = (i == 2) ? static_cast<std::uint32_t>(h - 2 * 1024) : 0U;
+        rocm::NpuDecodeOutput(npu.Staged(stream, npu_c[i]), o, n, kNpuSlice, h, i * kNpuSlice, false, stream, valid);
+      }
+    } else {
+      Dense(m->T(m->P(p, "attn_output.weight")), att, nh * hd, o, h, n, -1,
+            big ? atth : nullptr);
+    }
     const bool push = ip % c.attn_res_block_size == 0;
     // ffn_inp = conv(o) (+ the layer input unless it starts a new block)
     Convolve(o, m->T(m->P(p, "attn_post_conv.weight")), nullptr, 1,
@@ -2386,7 +2466,8 @@ struct Session::Impl : Scratch {
     LayerQkvBegin(L);
     LayerQkvEnd(L);
     LayerAttn(L);
-    LayerOut1(L, blocks);
+    LayerOut1a(L);
+    LayerOut1b(L, blocks);
     LayerOut2(L, blocks);
   }
 
@@ -2637,37 +2718,32 @@ struct Session::Impl : Scratch {
     const int T = static_cast<int>(steps.size());
     for (int t = 0; t < T; ++t) {
       BankFront(0, R[0], steps[t]);
-      DebugSync("BankFront(0, R[0], steps[t]);", t);
       LayerQkvBegin(R[0].L);
-      DebugSync("LayerQkvBegin(R[0].L);", t);
       if (t > 0) {
         Activate(1);
+        LayerOut1b(R[1].L, R[1].blocks);
         LayerOut2(R[1].L, R[1].blocks);
-      DebugSync("LayerOut2(R[1].L, R[1].blocks);", t);
+        DebugSync("B.out2", t);
       }
       Activate(0);
       LayerQkvEnd(R[0].L);
-      DebugSync("LayerQkvEnd(R[0].L);", t);
       LayerAttn(R[0].L);
-      DebugSync("LayerAttn(R[0].L);", t);
-      LayerOut1(R[0].L, R[0].blocks);
-      DebugSync("LayerOut1(R[0].L, R[0].blocks);", t);
+      LayerOut1a(R[0].L);
+      DebugSync("A.attn", t);
       BankFront(1, R[1], steps[t]);
-      DebugSync("BankFront(1, R[1], steps[t]);", t);
       LayerQkvBegin(R[1].L);
-      DebugSync("LayerQkvBegin(R[1].L);", t);
       Activate(0);
+      LayerOut1b(R[0].L, R[0].blocks);
       LayerOut2(R[0].L, R[0].blocks);
-      DebugSync("LayerOut2(R[0].L, R[0].blocks);", t);
+      DebugSync("A.out2", t);
       Activate(1);
       LayerQkvEnd(R[1].L);
-      DebugSync("LayerQkvEnd(R[1].L);", t);
       LayerAttn(R[1].L);
-      DebugSync("LayerAttn(R[1].L);", t);
-      LayerOut1(R[1].L, R[1].blocks);
-      DebugSync("LayerOut1(R[1].L, R[1].blocks);", t);
+      LayerOut1a(R[1].L);
+      DebugSync("B.attn", t);
     }
     Activate(1);
+    LayerOut1b(R[1].L, R[1].blocks);
     LayerOut2(R[1].L, R[1].blocks);
     const int n = R[1].n;
     Mixer(R[1].blocks, cur, static_cast<const float*>(m->T("output_res_query.weight").dev), 1, n, x);
@@ -2921,6 +2997,7 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
         sc.npu_a[j] = state_->npu->NewBuffer(state_->npu->ABytes(), &npu_error);
       for (int j = 0; j < 8; ++j)
         sc.npu_c[j] = state_->npu->NewBuffer(state_->npu->CBytes(), &npu_error);
+      sc.npu_ao = state_->npu->NewBuffer(state_->npu->ABytes(3072), &npu_error);
     }
   };
   alloc_scratch(static_cast<Scratch&>(i), b);
