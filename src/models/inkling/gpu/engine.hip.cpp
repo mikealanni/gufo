@@ -4321,21 +4321,7 @@ std::size_t Session::AllocatedBytes() const noexcept {
   return impl_->allocated_bytes;
 }
 
-struct SnapshotHeader {
-  char magic[4]{'I', 'N', 'K', 'S'};
-  std::uint32_t version{SessionSnapshot::kPayloadVersion};
-  std::uint32_t ctx{0};
-  std::uint32_t position{0};
-  std::uint32_t dwarmed{0};
-  std::uint32_t drafter{0};
-  std::uint32_t sparse{0};
-  std::int32_t argmax{0};
-  std::uint64_t vocab{0};
-  std::uint64_t body_bytes{0};
-};
-
 struct SessionSnapshot::Data {
-  bool sparse{false};
   std::uint32_t position{0};
   std::uint32_t dwarmed{0};
   std::uint32_t ctx{0};
@@ -4379,7 +4365,6 @@ std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(std::string* error_msg) {
   d.dwarmed = i.dwarmed;
   d.ctx = i.ctx;
   d.drafter = i.dready;
-  d.sparse = i.sparse;
   const auto regions = i.SnapRegions(d.position, d.dwarmed, d.drafter);
   for (const auto& r : regions)
     d.size += r.bytes;
@@ -4404,8 +4389,7 @@ std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(std::string* error_msg) {
 bool Session::RestoreSnapshot(const SessionSnapshot& snapshot,
                               std::string* error_msg) {
   auto& i = *impl_;
-  if (snapshot.data_ == nullptr || snapshot.data_->ctx != i.ctx ||
-      snapshot.data_->sparse != i.sparse) {
+  if (snapshot.data_ == nullptr || snapshot.data_->ctx != i.ctx) {
     if (error_msg != nullptr)
       *error_msg = "snapshot does not match this session's context size";
     return false;
@@ -4444,112 +4428,6 @@ bool Session::RestoreSnapshot(const SessionSnapshot& snapshot,
   i.logits_have.assign(1, 0);
   i.last_rows = 1;
   i.pos_before_last = d.position > 0 ? d.position - 1 : 0;
-  return true;
-}
-
-namespace {
-SnapshotHeader HeaderOf(const SessionSnapshot::Data& d) {
-  SnapshotHeader header;
-  header.ctx = d.ctx;
-  header.position = d.position;
-  header.dwarmed = d.dwarmed;
-  header.drafter = d.drafter ? 1U : 0U;
-  header.sparse = d.sparse ? 1U : 0U;
-  header.argmax = d.argmax;
-  header.vocab = d.logits.size();
-  header.body_bytes = d.size;
-  return header;
-}
-}  // namespace
-
-std::uint64_t SessionSnapshot::PayloadBytes() const noexcept {
-  return data_ == nullptr
-             ? 0
-             : sizeof(SnapshotHeader) + data_->logits.size() * sizeof(float) +
-                   data_->size;
-}
-
-void SessionSnapshot::StreamPayload(
-    const std::function<void(std::span<const std::uint8_t>)>& sink) const {
-  if (data_ == nullptr)
-    return;
-  std::vector<std::uint8_t> head(sizeof(SnapshotHeader) +
-                                 data_->logits.size() * sizeof(float));
-  const SnapshotHeader header = HeaderOf(*data_);
-  std::memcpy(head.data(), &header, sizeof(header));
-  std::memcpy(head.data() + sizeof(header), data_->logits.data(),
-              data_->logits.size() * sizeof(float));
-  sink(head);
-  sink(std::span<const std::uint8_t>(data_->bytes.get(), data_->size));
-}
-
-bool SessionSnapshot::CopyPayloadTo(
-    std::span<std::uint8_t> destination) const noexcept {
-  if (data_ == nullptr || destination.size() != PayloadBytes())
-    return false;
-  std::size_t offset = 0;
-  StreamPayload([&](std::span<const std::uint8_t> part) {
-    std::memcpy(destination.data() + offset, part.data(), part.size());
-    offset += part.size();
-  });
-  return true;
-}
-
-bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
-                              std::string* error_msg) {
-  auto& i = *impl_;
-  const auto fail = [&](const char* message) {
-    if (error_msg != nullptr)
-      *error_msg = message;
-    return false;
-  };
-  if (payload.size() < sizeof(SnapshotHeader))
-    return fail("snapshot payload is truncated");
-  SnapshotHeader header;
-  std::memcpy(&header, payload.data(), sizeof(header));
-  if (std::memcmp(header.magic, "INKS", 4) != 0 ||
-      header.version != SessionSnapshot::kPayloadVersion)
-    return fail("snapshot payload version is not supported");
-  const std::size_t vocab = i.m->config.vocab_unpadded;
-  if (header.ctx != i.ctx || header.vocab != vocab ||
-      (header.sparse != 0) != i.sparse)
-    return fail("snapshot does not match this session's layout");
-  if (payload.size() !=
-      sizeof(header) + vocab * sizeof(float) + header.body_bytes)
-    return fail("snapshot payload size does not match its header");
-  const bool drafter = header.drafter != 0;
-  if (drafter && !i.dready) {
-    if (!i.m->has_draft)
-      return fail("snapshot needs the drafter, which is not loaded");
-    i.DraftEnsure();
-  }
-  const auto regions = i.SnapRegions(header.position, header.dwarmed, drafter);
-  std::size_t total = 0;
-  for (const auto& r : regions)
-    total += r.bytes;
-  if (total != header.body_bytes)
-    return fail("snapshot layout does not match this session");
-  const std::uint8_t* body =
-      payload.data() + sizeof(header) + vocab * sizeof(float);
-  std::size_t offset = 0;
-  for (const auto& r : regions) {
-    if (r.bytes > 0)
-      HIP_OK(hipMemcpyAsync(r.dev, body + offset, r.bytes,
-                            hipMemcpyHostToDevice, i.stream));
-    offset += r.bytes;
-  }
-  HIP_OK(hipMemcpyAsync(i.d_logits, payload.data() + sizeof(header),
-                        vocab * sizeof(float), hipMemcpyHostToDevice,
-                        i.stream));
-  HIP_OK(hipStreamSynchronize(i.stream));
-  i.position = header.position;
-  i.dwarmed = header.dwarmed;
-  i.argmax_host[0] = header.argmax;
-  i.logits_rows = 1;
-  i.logits_last = 0;
-  i.logits_have.assign(1, 0);
-  i.last_rows = 1;
-  i.pos_before_last = header.position > 0 ? header.position - 1 : 0;
   return true;
 }
 
