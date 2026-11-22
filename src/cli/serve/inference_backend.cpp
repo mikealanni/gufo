@@ -40,7 +40,6 @@
 
 #if defined(ENGINE_ENABLE_HIP)
 #include "src/core/hip/hip_utils.hpp"
-#include "src/core/platform/pages.hpp"
 #include "src/core/speculative/speculative_verifier.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
@@ -65,11 +64,6 @@
 #endif
 
 namespace gufo::server {
-
-namespace {
-/// Path of the GGUF being loaded, for the page-cache drop before the sessions.
-std::string g_loading_model_path;
-}  // namespace
 
 // A selected token ends the turn only when the request admits EOS and the token
 // is one of the model's stop tokens. The engine stops there itself and the stop
@@ -5563,7 +5557,6 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
 #if defined(ENGINE_ENABLE_HIP)
   TextDiskCacheConfig resolved_disk_cache_config = disk_cache_config;
   std::string load_error;
-  g_loading_model_path = model_path;
   auto reader_owner = core::GgufReader::OpenFile(model_path, &load_error);
   if (reader_owner == nullptr) {
     SetError(error, "Failed to open GGUF: " + load_error);
@@ -6187,14 +6180,6 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
           .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
       };
     }
-    // The weights are resident: the files they were read from only hold page
-    // cache, which the session allocations would otherwise have to reclaim
-    // (and compact) before the kernel can place their GPU memory.
-    platform::DropFilePageCache(g_loading_model_path.c_str());
-    platform::DropFilePageCache(speculative_config.draft_model_path.c_str());
-    platform::DropFilePageCache(
-        speculative_config.secondary_model_path.c_str());
-    platform::DropFilePageCache(std::getenv("GUFO_IU4_ARTIFACT"));
     Logger::Info("loader",
                  "event=load_phase phase=sessions " + Logger::MemoryStatus());
     auto runner_pool = std::make_shared<TextRunnerPool>(

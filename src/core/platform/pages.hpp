@@ -22,11 +22,6 @@ struct SharedTempMapping {
 /// runtime stays with the caller.
 void* CommitZeroedPages(std::size_t bytes) noexcept;
 
-/// Drops the clean page-cache pages of `path` that no mapping holds, so a
-/// loaded model file does not stay in RAM as cache. Pages still mapped by the
-/// process are kept. No-op where unsupported.
-void DropFilePageCache(const char* path) noexcept;
-
 /// Reserves `bytes` of anonymous memory backed by transparent huge pages where
 /// the kernel grants them and touches it, like the clone of a mapped weight
 /// region. GPU reads of registered memory are markedly faster on huge pages
