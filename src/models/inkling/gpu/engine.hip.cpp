@@ -26,6 +26,7 @@ constexpr int kMaxStates = 8;
 constexpr int kConvTaps = 4;
 constexpr int kHistory = 3;
 constexpr int kMaxBatch = 4096;
+constexpr int kFlashHd = 128;
 constexpr int kWmmaMinTokens = 32;
 constexpr float kMixEps = 1e-6F;
 constexpr int kTypeF32 = 0;
@@ -652,21 +653,27 @@ __global__ void Control(float* cur, const float* msg, const float* gain,
   }
 }
 
+// K rows are [row][kv head][128]; V is stored block-transposed per KV head:
+// [head][64-key block][d][key in block], so a key tile is one contiguous 16 KB.
 __global__ void StoreKv(const float* k, const float* v, __half* kc, __half* vc,
-                        int dim, const int* pos0, int ring) {
+                        int dim, const int* pos0, int ring, int vblocks) {
   const int row = *pos0 + blockIdx.x;
-  const std::size_t dst =
-      static_cast<std::size_t>(ring > 0 ? row % ring : row) * dim;
+  const int r = ring > 0 ? row % ring : row;
+  const std::size_t dst = static_cast<std::size_t>(r) * dim;
   for (int i = threadIdx.x; i < dim; i += blockDim.x) {
     kc[dst + i] =
         __float2half(k[static_cast<std::size_t>(blockIdx.x) * dim + i]);
-    vc[dst + i] =
+    const int g = i / kFlashHd;
+    const int d = i % kFlashHd;
+    vc[((static_cast<std::size_t>(g) * vblocks + (r >> 6)) * kFlashHd + d) *
+           64 +
+       (r & 63)] =
         __float2half(v[static_cast<std::size_t>(blockIdx.x) * dim + i]);
   }
 }
 
 struct AttnArgs {
-  int nh, nkv, hd, nrel, extent, window, ring;
+  int nh, nkv, hd, nrel, extent, window, ring, vblocks;
   const int* pos0;
   float scale;
 };
@@ -1058,7 +1065,7 @@ constexpr int kFlashK = 64;
 constexpr int kKStride = 136;
 constexpr int kVStride = 72;
 constexpr int kPStride = 72;
-constexpr int kFlashHd = 128;
+
 constexpr int kZStride = 88;
 constexpr int kSplitKeys = 2048;
 constexpr int kFlashRel = 16;
@@ -1153,12 +1160,19 @@ __global__ void __launch_bounds__(128)
       const std::size_t jr = a.ring > 0 ? j % a.ring : j;
       const uint4* ks = reinterpret_cast<const uint4*>(
           kc + jr * kvdim + g * kFlashHd + half * 64);
-      const __half* vs = vc + jr * kvdim + g * kFlashHd + half * 64;
       uint4* kd = reinterpret_cast<uint4*>(&Ks[key][half * 64]);
       for (int i = 0; i < 8; ++i)
         kd[i] = ok ? ks[i] : make_uint4(0, 0, 0, 0);
-      for (int i = 0; i < 64; ++i)
-        Vt[half * 64 + i][key] = ok ? vs[i] : __float2half(0.0F);
+      // V^T tile: one head-dimension row of 64 keys per thread (keys past the
+      // causal limit get zero probability, the cache is zero-initialised)
+      const int vb = (a.ring > 0 ? (kb % a.ring) : kb) >> 6;
+      const uint4* vsrc = reinterpret_cast<const uint4*>(
+          vc +
+          ((static_cast<std::size_t>(g) * a.vblocks + vb) * kFlashHd + tid) *
+              64);
+      uint4* vdst = reinterpret_cast<uint4*>(&Vt[tid][0]);
+      for (int i = 0; i < 8; ++i)
+        vdst[i] = vsrc[i];
     }
     {
       // relative-position bias of this wave's rows against the tile's distances
@@ -1591,6 +1605,7 @@ struct Session::Impl {
     __half* k{nullptr};
     __half* v{nullptr};
     int ring{0};
+    int vblocks{0};
     __half* kmm{nullptr};
     float* hist_k{nullptr};
     float* hist_v{nullptr};
@@ -1970,7 +1985,7 @@ struct Session::Impl {
     Dense(m->T(m->P(p, "attn_sink_proj.weight")), inp[0], h, sink, nh, n, -1,
           inh[0]);
     StoreKv<<<n, 256, 0, stream>>>(k, vtmp, sl.k, sl.v, nkv * hd, d_pos,
-                                   sl.ring);
+                                   sl.ring, sl.vblocks);
     AttnArgs aa{nh,
                 nkv,
                 hd,
@@ -1978,6 +1993,7 @@ struct Session::Impl {
                 static_cast<int>(c.relative_extent),
                 swa ? static_cast<int>(c.sliding_window) : 0,
                 sl.ring,
+                sl.vblocks,
                 d_pos,
                 1.0F / std::sqrt(static_cast<float>(hd))};
     const int span =
@@ -2337,7 +2353,9 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
     const std::size_t ring_rows = c.sliding_window + kMaxBatch;
     const bool use_ring = c.is_swa[slot_index] && max_context > ring_rows;
     sl.ring = use_ring ? static_cast<int>(ring_rows) : 0;
-    const std::size_t rows = use_ring ? ring_rows : max_context;
+    const std::size_t rows =
+        (use_ring ? ring_rows : max_context + 63) / 64 * 64;
+    sl.vblocks = static_cast<int>(rows / 64);
     sl.k = static_cast<__half*>(i.AllocBytes(rows * kv * 2));
     if (i.sparse && !c.is_swa[slot_index]) {
       sl.kmm = static_cast<__half*>(
