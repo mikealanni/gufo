@@ -852,6 +852,7 @@ struct AttnArgs {
   int nh, nkv, hd, nrel, extent, window, ring, vblocks;
   const int* pos0;
   float scale;
+  int pack{0};  // few-row decode: one block per kv group, rows x heads packed
 };
 
 // one block per (head, token); scores in dynamic shared memory
@@ -1298,17 +1299,28 @@ __global__ void __launch_bounds__(kFlashThreads)
   const int tid = threadIdx.x;
   const int wave = tid >> 5;
   const int lane = tid & 31;
-  const int h = blockIdx.y;
-  const int q0 = blockIdx.x * kFlashQ;
-  const int g = h / (a.nh / a.nkv);
+  const int gh = a.nh / a.nkv;
+  const int pk = a.pack;
+  const int h0 = blockIdx.y;
+  const int q0 = pk > 0 ? 0 : blockIdx.x * kFlashQ;
+  const int g = pk > 0 ? blockIdx.y : h0 / gh;
+  const int nrows = pk > 0 ? n * gh : n;
+  const auto row_tok = [&](int row) {
+    return min(pk > 0 ? row / gh : q0 + row, n - 1);
+  };
+  const auto row_head = [&](int row) {
+    return pk > 0 ? g * gh + row % gh : h0;
+  };
   const int kvdim = a.nkv * a.hd;
   const int pos0 = *a.pos0;
-  const int qmax_pos = pos0 + min(q0 + kFlashQ, n) - 1;
+  const int qmax_pos = pos0 + (pk > 0 ? n : min(q0 + kFlashQ, n)) - 1;
   const int qmin_pos = pos0 + q0;
   // Q fragments for this wave's 16 rows
   V16h qf[8];
   {
-    const int t = min(q0 + wave * 16 + (lane & 15), n - 1);
+    const int row = min(wave * 16 + (lane & 15), nrows - 1);
+    const int t = row_tok(row);
+    const int h = row_head(row);
     const float* qp = q + (static_cast<std::size_t>(t) * a.nh + h) * kFlashHd;
     for (int c = 0; c < 8; ++c) {
       for (int i = 0; i < 16; ++i)
@@ -1317,19 +1329,21 @@ __global__ void __launch_bounds__(kFlashThreads)
   }
   V16h rf;
   {
-    const int t = min(q0 + wave * 16 + (lane & 15), n - 1);
+    const int row = min(wave * 16 + (lane & 15), nrows - 1);
+    const int t = row_tok(row);
+    const int h = row_head(row);
     const float* rp = r + (static_cast<std::size_t>(t) * a.nh + h) * kFlashRel;
     for (int i = 0; i < 16; ++i)
       rf[i] = static_cast<_Float16>(rp[i]);
   }
-  const int qp0 = pos0 + q0 + wave * 16;
+  const int qp0 = pos0 + (pk > 0 ? (wave * 16) / gh : q0 + wave * 16);
   float sinkv[8];
   int qpos[8];
   for (int i = 0; i < 8; ++i) {
     const int row = wave * 16 + 2 * i + (lane >> 4);
-    const int t = min(q0 + row, n - 1);
-    sinkv[i] = sink[static_cast<std::size_t>(t) * a.nh + h];
-    qpos[i] = pos0 + q0 + row;
+    const int t = row_tok(row);
+    sinkv[i] = sink[static_cast<std::size_t>(t) * a.nh + row_head(row)];
+    qpos[i] = pos0 + (pk > 0 ? row / gh : q0 + row);
   }
   V8f o[8] = {};
   float m[8];
@@ -1347,7 +1361,7 @@ __global__ void __launch_bounds__(kFlashThreads)
   int it_end = 0;
   const int* list = nullptr;
   if (blist != nullptr) {
-    const int tile_head = blockIdx.x * a.nh + h;
+    const int tile_head = blockIdx.x * a.nh + h0;
     list = blist + static_cast<std::size_t>(tile_head) * list_cap;
     const int count = bcount[tile_head];
     const int per = (list_cap + nsplit - 1) / nsplit;
@@ -1355,7 +1369,11 @@ __global__ void __launch_bounds__(kFlashThreads)
     it_end = min(count, (split + 1) * per);
   } else {
     int kb_end = qmax_pos;
-    if (nsplit > 1) {
+    if (nsplit > 1 && a.window > 0) {
+      const int base = kb_begin;
+      kb_begin = base + split * split_keys;
+      kb_end = min(kb_end, base + (split + 1) * split_keys - 1);
+    } else if (nsplit > 1) {
       kb_begin = max(kb_begin, split * split_keys);
       kb_end = min(kb_end, (split + 1) * split_keys - 1);
     }
@@ -1476,9 +1494,11 @@ __global__ void __launch_bounds__(kFlashThreads)
     float ls = l[i];
     for (int off = 8; off > 0; off >>= 1)
       ls += __shfl_xor(ls, off);
-    const int t = q0 + wave * 16 + 2 * i + (lane >> 4);
-    if (t >= n)
+    const int orow = wave * 16 + 2 * i + (lane >> 4);
+    const int t = pk > 0 ? orow / gh : q0 + orow;
+    if (pk > 0 ? orow >= nrows : t >= n)
       continue;
+    const int h = row_head(orow);
     if (nsplit > 1) {
       const std::size_t part =
           (static_cast<std::size_t>(t) * a.nh + h) * nsplit + split;
@@ -3208,7 +3228,21 @@ struct Session::Impl : Scratch {
         PoolKeys<<<dim3((n + kBlockKeys - 1) / kBlockKeys + 1, nkv), kFlashHd,
                    0, stream>>>(sl.k, sl.kmm, d_pos, n, nkv);
       }
-      if (n == 1 && !sparse_now && nh / nkv <= kDecMaxGh) {
+      if (n <= static_cast<int>(kMaxVerifyRows) && !sparse_now &&
+          !(n == 1 && swa) && n * (nh / nkv) <= 128) {
+        AttnArgs pa = aa;
+        pa.pack = nh / nkv;
+        const int pk_keys = swa ? 256 : 512;
+        const int pk_split =
+            swa ? (span + 72 + pk_keys - 1) / pk_keys
+                : std::max(1, static_cast<int>((ctx + pk_keys - 1) / pk_keys));
+        FlashRel<<<dim3(1, nkv, pk_split), kFlashThreads, 0, stream>>>(
+            pa, q, r, sink, sl.k, sl.v, bias_w, att, n, pk_split, pk_keys,
+            split_m, split_l, split_o, nullptr, nullptr, 0);
+        if (pk_split > 1)
+          FlashCombine<<<dim3(n, nh), 128, 0, stream>>>(
+              split_m, split_l, split_o, att, nh, pk_split);
+      } else if (n == 1 && !sparse_now && nh / nkv <= kDecMaxGh) {
         const int nsd = (span + kDecKeys - 1) / kDecKeys;
         DecodeAttn<<<dim3(nsd, nkv), kDecThreads, 0, stream>>>(
             aa, q, r, sink, sl.k, sl.v, bias_w, split_m, split_l, split_o, nsd);
@@ -3218,7 +3252,7 @@ struct Session::Impl : Scratch {
         const int ntile = (n + kFlashQ - 1) / kFlashQ;
         SelectBlocks<<<dim3(ntile, nh), 256, kMaxSparseBlocks * sizeof(float),
                        stream>>>(q, sl.kmm, d_pos, n, nh, nkv, blist, bcount);
-        const int nsp = n < kWmmaMinTokens ? 8 : 1;
+        const int nsp = n < kWmmaMinTokens ? 32 : 1;
         FlashRel<<<dim3((n + kFlashQ - 1) / kFlashQ, nh, nsp), kFlashThreads, 0,
                    stream>>>(aa, q, r, sink, sl.k, sl.v, bias_w, att, n, nsp,
                              kSplitKeys, split_m, split_l, split_o, blist,
@@ -3227,12 +3261,18 @@ struct Session::Impl : Scratch {
           FlashCombine<<<dim3(n, nh), 128, 0, stream>>>(split_m, split_l,
                                                         split_o, att, nh, nsp);
       } else {
-        const bool split = n < kWmmaMinTokens && !swa && ctx > kSplitKeys;
+        const int split_keys =
+            swa ? 256 : (n <= 8 ? kSplitKeys / 4 : kSplitKeys);
+        const bool split =
+            n < kWmmaMinTokens &&
+            (swa ? n <= 8 : ctx > static_cast<std::uint32_t>(split_keys));
         const int nsplit =
-            split ? static_cast<int>((ctx + kSplitKeys - 1) / kSplitKeys) : 1;
+            !split ? 1
+            : swa  ? (span + 72 + split_keys - 1) / split_keys
+                   : static_cast<int>((ctx + split_keys - 1) / split_keys);
         FlashRel<<<dim3((n + kFlashQ - 1) / kFlashQ, nh, nsplit), kFlashThreads,
                    0, stream>>>(aa, q, r, sink, sl.k, sl.v, bias_w, att, n,
-                                nsplit, kSplitKeys, split_m, split_l, split_o,
+                                nsplit, split_keys, split_m, split_l, split_o,
                                 nullptr, nullptr, 0);
         if (nsplit > 1)
           FlashCombine<<<dim3(n, nh), 128, 0, stream>>>(

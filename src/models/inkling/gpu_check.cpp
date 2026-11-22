@@ -110,7 +110,8 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "drafter load failed: %s\n", err.c_str());
       return 1;
     }
-    auto session = model->CreateSession(4096, &err);
+    auto session =
+        model->CreateSession(std::max<std::uint32_t>(4096, kContext), &err);
     std::vector<std::int32_t> prefix;
     for (int i = 0; i < kPrefix; ++i)
       prefix.push_back(static_cast<std::int32_t>(ids[i]));
@@ -148,6 +149,9 @@ int main(int argc, char** argv) {
       batch.insert(batch.end(), d.begin(), d.end());
       (void)session->AppendAll(batch, &err);
       auto t2 = std::chrono::steady_clock::now();
+      if (steps == 0)
+        std::printf("first draft %.1f ms\n",
+                    std::chrono::duration<double, std::milli>(t1 - t0).count());
       draft_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
       verify_ms += std::chrono::duration<double, std::milli>(t2 - t1).count();
       int acc = 0;
@@ -202,6 +206,56 @@ int main(int argc, char** argv) {
     }
     return 0;
   }
+  if (argc >= 4 && std::string(argv[2]) == "--vtime") {
+    // --vtime <text file> <k>: time of a k-row verify and a single step at
+    // INKLING_PREFIX tokens of context
+    std::string err;
+    auto reader = gufo::core::GgufReader::OpenFile(argv[1], &err);
+    auto tok = gufo::tokenization::QwenTokenizer::CreateFromGguf(*reader, &err);
+    std::ifstream in(argv[3]);
+    std::stringstream ss;
+    ss << in.rdbuf();
+    const auto ids = tok->Encode(ss.str(), {});
+    const int k = argc > 4 ? std::atoi(argv[4]) : 4;
+    const int prefix_len = std::getenv("INKLING_PREFIX") != nullptr
+                               ? std::atoi(std::getenv("INKLING_PREFIX"))
+                               : 300;
+    auto model = gufo::models::inkling::gpu::Model::Load(argv[1], &err);
+    auto session =
+        model->CreateSession(std::max<std::uint32_t>(2048, kContext), &err);
+    std::vector<std::int32_t> prefix;
+    for (int i = 0; i < prefix_len; ++i)
+      prefix.push_back(static_cast<std::int32_t>(ids[i]));
+    std::vector<std::int32_t> next;
+    for (int i = 0; i < k; ++i)
+      next.push_back(static_cast<std::int32_t>(ids[prefix_len + i]));
+    (void)session->Append(prefix, &err);
+    constexpr int kReps = 20;
+    for (int pass = 0; pass < 2; ++pass) {
+      auto t0 = std::chrono::steady_clock::now();
+      for (int r = 0; r < kReps; ++r) {
+        (void)session->AppendAll(next, &err);
+        session->Rewind(static_cast<std::uint32_t>(prefix_len));
+      }
+      const double ms_batch = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t0)
+                                  .count() /
+                              kReps;
+      t0 = std::chrono::steady_clock::now();
+      for (int r = 0; r < kReps; ++r) {
+        (void)session->Append(std::span(&next[0], 1), &err);
+        session->Rewind(static_cast<std::uint32_t>(prefix_len));
+      }
+      const double ms_one = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t0)
+                                .count() /
+                            kReps;
+      if (pass == 1)
+        std::printf("context %d: verify %d rows %.2f ms, single step %.2f ms\n",
+                    prefix_len, k, ms_batch, ms_one);
+    }
+    return 0;
+  }
   if (argc >= 4 && std::string(argv[2]) == "--verify") {
     // --verify <text file> <k>: AppendAll(k rows) must match k sequential
     // single-token steps
@@ -213,9 +267,12 @@ int main(int argc, char** argv) {
     ss << in.rdbuf();
     const auto ids = tok->Encode(ss.str(), {});
     const int k = argc > 4 ? std::atoi(argv[4]) : 2;
-    constexpr int kPrefix = 300;
+    const int kPrefix = std::getenv("INKLING_PREFIX") != nullptr
+                            ? std::atoi(std::getenv("INKLING_PREFIX"))
+                            : 300;
     auto model = gufo::models::inkling::gpu::Model::Load(argv[1], &err);
-    auto session = model->CreateSession(2048, &err);
+    auto session =
+        model->CreateSession(std::max<std::uint32_t>(2048, kContext), &err);
     std::vector<std::int32_t> prefix;
     for (int i = 0; i < kPrefix; ++i)
       prefix.push_back(static_cast<std::int32_t>(ids[i]));
