@@ -4108,6 +4108,40 @@ private:
   std::string tool_;
 };
 
+std::vector<std::uint8_t> InklingCompatibilityIdentity(
+    std::string_view artifact_fingerprint, std::string_view draft_fingerprint,
+    bool has_draft, std::uint32_t max_context, bool expert_nvfp4) {
+  if (!IsSha256Hex(artifact_fingerprint)) {
+    throw std::invalid_argument(
+        "Inkling disk cache requires an artifact fingerprint");
+  }
+  if (has_draft && !IsSha256Hex(draft_fingerprint)) {
+    throw std::invalid_argument(
+        "Inkling DSpark disk cache requires a draft artifact fingerprint");
+  }
+  std::ostringstream identity;
+  identity << "schema=gufo-text-continuation-v2\n"
+           << "model_kind=inkling2\n"
+           << "artifact_id=" << core::kGgufIdentityScheme << ':'
+           << artifact_fingerprint << '\n'
+           << "tokenizer=embedded-in-artifact-inkling2-v1\n"
+           << "chat_template=inkling-channels-v1\n"
+           << "state_abi=" << kInklingStateAbi << '\n'
+           << "payload_layout=inkling-session-snapshot-v"
+           << models::inkling::gpu::SessionSnapshot::kPayloadVersion << '\n'
+           << "context_tokens=" << max_context << '\n'
+           << "expert_layers=" << (expert_nvfp4 ? "nvfp4" : "source") << '\n'
+           << "position_policy=absolute-v1\n"
+           << "adapters=none\n";
+  if (has_draft) {
+    identity << "draft_backend=inkling-dspark-v1\n"
+             << "draft_artifact_id=" << core::kGgufIdentityScheme << ':'
+             << draft_fingerprint << '\n';
+  }
+  const std::string canonical = identity.str();
+  return {canonical.begin(), canonical.end()};
+}
+
 class InklingTextRunnerSnapshot final : public TextRunnerSnapshot {
 public:
   InklingTextRunnerSnapshot(std::shared_ptr<InklingModel> model,
@@ -4195,12 +4229,25 @@ public:
   InklingTextRunner(std::shared_ptr<InklingModel> model,
                     std::unique_ptr<tokenization::QwenTokenizer> tokenizer,
                     std::vector<std::int32_t> stop_tokens,
-                    std::uint32_t max_context, std::size_t draft_width = 0)
+                    std::uint32_t max_context, std::size_t draft_width = 0,
+                    std::string artifact_fingerprint = {},
+                    std::string draft_fingerprint = {})
       : model_(std::move(model)),
         tokenizer_(std::move(tokenizer)),
         stop_tokens_(std::move(stop_tokens)),
         max_context_(max_context),
         draft_width_(std::min(draft_width, kMaxDraftWidth)) {
+    if (!artifact_fingerprint.empty()) {
+      const char* source = std::getenv("INKLING_EXPERT_NVFP4");
+      persistence_ = TextRunnerPersistenceDescriptor{
+          .compatibility_identity = InklingCompatibilityIdentity(
+              artifact_fingerprint, draft_width_ > 0 ? draft_fingerprint : "",
+              draft_width_ > 0, max_context_,
+              source == nullptr || source[0] != '0'),
+          .payload_version =
+              models::inkling::gpu::SessionSnapshot::kPayloadVersion,
+      };
+    }
     MeasureSessionBytes();
     Warmup();
   }
@@ -4283,6 +4330,7 @@ public:
                 .prefix_reuse = true,
                 .prefill_grid_tokens = 8192,
             },
+        .persistence = persistence_,
     };
   }
 
@@ -4591,12 +4639,60 @@ public:
     inkling.translator = {};
   }
 
+  [[nodiscard]] std::size_t PersistentSnapshotPayloadBytes(
+      const TextRunnerSnapshot& snapshot) const override {
+    return static_cast<std::size_t>(
+        RequireInklingSnapshot(snapshot).snapshot->PayloadBytes());
+  }
+
+  [[nodiscard]] std::size_t SerializePersistentSnapshot(
+      const TextRunnerSnapshot& snapshot,
+      std::span<std::uint8_t> destination) const override {
+    const auto& inkling = RequireInklingSnapshot(snapshot);
+    if (destination.size() != inkling.snapshot->PayloadBytes() ||
+        !inkling.snapshot->CopyPayloadTo(destination)) {
+      throw std::invalid_argument(
+          "Inkling persistent snapshot serialization failed");
+    }
+    return destination.size();
+  }
+
+  void StreamPersistentSnapshot(const TextRunnerSnapshot& snapshot,
+                                const SnapshotSink& sink) const override {
+    RequireInklingSnapshot(snapshot).snapshot->StreamPayload(sink);
+  }
+
+  void RestorePersistentSnapshot(
+      TextRunnerState& state,
+      std::span<const std::uint8_t> payload) const override {
+    auto& inkling = RequireInklingState(state);
+    std::string error;
+    if (!inkling.session().RestoreSnapshot(payload, &error)) {
+      inkling.Invalidate();
+      throw std::runtime_error("Inkling persistent restore failed: " + error);
+    }
+    inkling.set_position(inkling.session().Position());
+    inkling.translator = {};
+  }
+
   [[nodiscard]] std::size_t CheckpointPosition(
       const TextRunnerState& state) const override {
     return RequireInklingState(state).position();
   }
 
 private:
+  [[nodiscard]] const InklingTextRunnerSnapshot& RequireInklingSnapshot(
+      const TextRunnerSnapshot& snapshot) const {
+    const auto* inkling =
+        dynamic_cast<const InklingTextRunnerSnapshot*>(&snapshot);
+    if (inkling == nullptr || inkling->model.get() != model_.get() ||
+        inkling->snapshot == nullptr) {
+      throw std::invalid_argument(
+          "Inkling snapshot does not belong to this model");
+    }
+    return *inkling;
+  }
+
   [[nodiscard]] bool IsStop(std::int32_t token) const {
     return std::find(stop_tokens_.begin(), stop_tokens_.end(), token) !=
            stop_tokens_.end();
@@ -4608,6 +4704,7 @@ private:
   std::uint32_t max_context_;
   std::size_t draft_width_{0};
   std::size_t session_bytes_{0};
+  std::optional<TextRunnerPersistenceDescriptor> persistence_;
 };
 
 constexpr std::string_view kGlmStateAbi = "glm53-flash-rocm-session-v1";
@@ -5756,9 +5853,26 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
       }
       draft_width = speculative_config.max_draft_tokens;
     }
+    if (DiskCacheEnabled(resolved_disk_cache_config)) {
+      if (resolved_disk_cache_config.model_artifact_fingerprint.empty() &&
+          !FingerprintArtifact(
+              "Inkling", *reader,
+              &resolved_disk_cache_config.model_artifact_fingerprint, error)) {
+        return false;
+      }
+      if (draft_width > 0 &&
+          resolved_disk_cache_config.draft_model_artifact_fingerprint.empty() &&
+          !FingerprintArtifactFile(
+              "DSpark", speculative_config.draft_model_path,
+              &resolved_disk_cache_config.draft_model_artifact_fingerprint,
+              error)) {
+        return false;
+      }
+    }
     return load(std::move(model), std::move(tokenizer), std::move(stop_tokens),
                 error, max_context, session_count, prefill_policy,
-                scheduler_policy, draft_width, ram_cache_config);
+                scheduler_policy, draft_width,
+                std::move(resolved_disk_cache_config), ram_cache_config);
   }
   if (reader->GetMetadataString("general.architecture") == "qwen4exp") {
     const bool mtp = speculative_config.backend == TextSpeculativeBackend::kMtp;
@@ -6391,7 +6505,8 @@ bool InferenceBackend::load(
     std::vector<std::int32_t> stop_tokens, std::string* error,
     std::uint32_t max_context, std::size_t session_count,
     TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
-    std::size_t draft_width, TextRunnerRamCacheOptions ram_cache_config) {
+    std::size_t draft_width, TextDiskCacheConfig disk_cache_config,
+    TextRunnerRamCacheOptions ram_cache_config) {
   if (model == nullptr || tokenizer == nullptr) {
     SetError(error, "Inkling model and tokenizer must not be null");
     return false;
@@ -6412,13 +6527,34 @@ bool InferenceBackend::load(
     new_state->sampling_defaults.model =
         sampling::TextModelPreset::kUnspecified;
     new_state->sampling_defaults.supplied = {};
+    const bool disk = DiskCacheEnabled(disk_cache_config);
+    if (disk &&
+        (!IsSha256Hex(disk_cache_config.model_artifact_fingerprint) ||
+         (draft_width > 0 &&
+          !IsSha256Hex(disk_cache_config.draft_model_artifact_fingerprint)) ||
+         disk_cache_config.capacity_bytes == 0)) {
+      SetError(error, "Inkling persistent disk cache configuration is invalid");
+      return false;
+    }
     auto runner = std::make_shared<InklingTextRunner>(
         std::move(model), std::move(tokenizer), std::move(stop_tokens),
-        max_context, draft_width);
+        max_context, draft_width,
+        disk ? disk_cache_config.model_artifact_fingerprint : std::string{},
+        disk ? disk_cache_config.draft_model_artifact_fingerprint
+             : std::string{});
     new_state->model_id = runner->Descriptor().model_id;
     new_state->max_context = max_context;
+    std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
+    if (disk) {
+      runner_disk_cache = TextRunnerDiskCacheOptions{
+          .directory = std::move(disk_cache_config.directory),
+          .capacity_bytes = disk_cache_config.capacity_bytes,
+          .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
+      };
+    }
     auto runner_pool = std::make_shared<TextRunnerPool>(
-        std::move(runner), session_count, std::nullopt, ram_cache_config);
+        std::move(runner), session_count, std::move(runner_disk_cache),
+        ram_cache_config);
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
     {
