@@ -453,6 +453,16 @@ __global__ void ConvHist(const float* cur, float* hist, int ch, int n) {
     hist[c * kHistory + k] = nh[k];
 }
 
+constexpr int kTapCount = 4;
+constexpr int kTapLayers[kTapCount] = {4, 22, 40, 47};  // virtual layers whose outputs feed the drafter
+
+// feature rows of the drafter: feat[pos][tap][h] as F16
+__global__ void TapStore(const float* cur, __half* feat, const int* pos0, int tap, int h) {
+  const std::size_t dst = (static_cast<std::size_t>(*pos0 + blockIdx.x) * kTapCount + tap) * h;
+  for (int i = threadIdx.x; i < h; i += blockDim.x)
+    feat[dst + i] = __float2half(cur[static_cast<std::size_t>(blockIdx.x) * h + i]);
+}
+
 struct HistEntry {
   float* hist;
   int ch;
@@ -1827,6 +1837,7 @@ struct Session::Impl : Scratch {
   };
   std::vector<Slot> slots;
   bool banked{false};
+  __half* feat{nullptr};  // tapped hidden states per position (drafter features), when enabled
   HistEntry* hist_entries{nullptr};
   int n_hist_entries{0};
   int last_rows{0};
@@ -2820,6 +2831,16 @@ struct Session::Impl : Scratch {
     position += n;
   }
 
+  void Tap(int v, int n) {
+    if (feat == nullptr)
+      return;
+    for (int k = 0; k < kTapCount; ++k) {
+      if (kTapLayers[k] == v)
+        TapStore<<<n, 256, 0, stream>>>(cur, feat, d_pos, k,
+                                        static_cast<int>(m->config.hidden_size));
+    }
+  }
+
   struct BankRun {
     int n{0};
     std::uint32_t pos{0};
@@ -2945,6 +2966,7 @@ struct Session::Impl : Scratch {
         Activate(1);
         LayerOut1b(R[1].L, R[1].blocks);
         LayerOut2(R[1].L, R[1].blocks);
+        Tap(t - 1, R[1].n);
         DebugSync("B.out2", t);
       }
       Activate(0);
@@ -2957,6 +2979,7 @@ struct Session::Impl : Scratch {
       Activate(0);
       LayerOut1b(R[0].L, R[0].blocks);
       LayerOut2(R[0].L, R[0].blocks);
+      Tap(t, R[0].n);
       DebugSync("A.out2", t);
       Activate(1);
       LayerQkvEnd(R[1].L);
@@ -2967,6 +2990,7 @@ struct Session::Impl : Scratch {
     Activate(1);
     LayerOut1b(R[1].L, R[1].blocks);
     LayerOut2(R[1].L, R[1].blocks);
+    Tap(T - 1, R[1].n);
     const int n = R[1].n;
     Mixer(R[1].blocks, cur,
           static_cast<const float*>(m->T("output_res_query.weight").dev), 1, n,
@@ -2990,10 +3014,13 @@ struct Session::Impl : Scratch {
     RmsRows(cur, static_cast<const float*>(m->T("token_embd_norm.weight").dev),
             cur, n, h, h, h);
     pool_used = 0;
+    int v = 0;
     std::vector<const float*> blocks;
     const std::uint32_t start = c.loop_core_start, end = c.loop_core_end;
-    for (std::uint32_t il = 0; il < start; ++il)
+    for (std::uint32_t il = 0; il < start; ++il) {
       Layer(il, il, blocks, nullptr, n);
+      Tap(v++, n);
+    }
     HIP_OK(
         hipMemcpyAsync(prelude, cur, nh_ * 4, hipMemcpyDeviceToDevice, stream));
     const std::vector<const float*> prelude_blocks = blocks;
@@ -3013,6 +3040,7 @@ struct Session::Impl : Scratch {
                       : m->n_phys + (pass - 1) * (end - start) + (ip - start);
         if (pass == 0) {
           Layer(il, ip, blocks, nullptr, n);
+          Tap(v++, n);
           continue;
         }
         // per-layer message queries (attn, k, v, ffn) from the global tables;
@@ -3033,10 +3061,13 @@ struct Session::Impl : Scratch {
                               hipMemcpyDeviceToDevice, stream));
         Mixer(bank, bank_out, mq, 4, n, msgs);
         Layer(il, ip, blocks, msgs, n);
+        Tap(v++, n);
       }
     }
-    for (std::uint32_t il = end; il < m->n_phys; ++il)
+    for (std::uint32_t il = end; il < m->n_phys; ++il) {
       Layer(il, il, blocks, nullptr, n);
+      Tap(v++, n);
+    }
     Mixer(blocks, cur,
           static_cast<const float*>(m->T("output_res_query.weight").dev), 1, n,
           x);
@@ -3291,6 +3322,9 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
                      hipMemcpyHostToDevice));
   }
   HIP_OK(hipStreamCreateWithFlags(&i.stream, hipStreamNonBlocking));
+  if (std::getenv("INKLING_DRAFT") != nullptr) {
+    i.feat = static_cast<__half*>(i.AllocBytes(static_cast<std::size_t>(max_context) * kTapCount * h * 2));
+  }
   {
     std::vector<HistEntry> entries;
     for (auto& sl : i.slots) {
