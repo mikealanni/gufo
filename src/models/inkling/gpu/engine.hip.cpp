@@ -1363,7 +1363,7 @@ __global__ void __launch_bounds__(WAVES * 32)
   int it_end = 0;
   const int* list = nullptr;
   if (blist != nullptr) {
-    const int tile_head = blockIdx.x * a.nh + h0;
+    const int tile_head = blockIdx.x * a.nh + (pk > 0 ? g : h0);
     list = blist + static_cast<std::size_t>(tile_head) * list_cap;
     const int count = bcount[tile_head];
     const int per = (list_cap + nsplit - 1) / nsplit;
@@ -1723,7 +1723,8 @@ __global__ void PoolKeys(const __half* kc, __half* kmm, const int* pos0, int n,
 // one block per (query tile of 64, head): sink + local + top-k older key blocks
 // by the Quest bound of the tile's mean query
 __global__ void SelectBlocks(const float* q, const __half* kmm, const int* pos0,
-                             int n, int nh, int nkv, int* blist, int* bcount) {
+                             int n, int nh, int nkv, int* blist, int* bcount,
+                             int pack) {
   extern __shared__ float score[];
   __shared__ float qbar[kFlashHd];
   __shared__ float qlo[kFlashHd];
@@ -1734,7 +1735,8 @@ __global__ void SelectBlocks(const float* q, const __half* kmm, const int* pos0,
   __shared__ int cnt;
   const int tile = blockIdx.x;
   const int h = blockIdx.y;
-  const int g = h / (nh / nkv);
+  const int gh = nh / nkv;
+  const int g = pack > 0 ? h : h / gh;
   const int pos = *pos0;
   const int rows = min(kFlashQ, n - tile * kFlashQ);
   const int tile_first = pos + tile * kFlashQ;
@@ -1748,15 +1750,19 @@ __global__ void SelectBlocks(const float* q, const __half* kmm, const int* pos0,
     float a = 0.0F;
     float lo = 1e30F;
     float hi = -1e30F;
+    const int heads = pack > 0 ? gh : 1;
     for (int t = 0; t < rows; ++t) {
-      const float v =
-          q[(static_cast<std::size_t>(tile * kFlashQ + t) * nh + h) * kFlashHd +
-            d];
-      a += v;
-      lo = fminf(lo, v);
-      hi = fmaxf(hi, v);
+      for (int hl = 0; hl < heads; ++hl) {
+        const float v = q[(static_cast<std::size_t>(tile * kFlashQ + t) * nh +
+                           (pack > 0 ? g * gh + hl : h)) *
+                              kFlashHd +
+                          d];
+        a += v;
+        lo = fminf(lo, v);
+        hi = fmaxf(hi, v);
+      }
     }
-    qbar[d] = a / rows;
+    qbar[d] = a / (rows * heads);
     qlo[d] = lo;
     qhi[d] = hi;
   }
@@ -3264,10 +3270,21 @@ struct Session::Impl : Scratch {
                                                       att, nh, nsd);
       } else if (sparse_now) {
         const int ntile = (n + kFlashQ - 1) / kFlashQ;
-        SelectBlocks<<<dim3(ntile, nh), 256, kMaxSparseBlocks * sizeof(float),
-                       stream>>>(q, sl.kmm, d_pos, n, nh, nkv, blist, bcount);
-        const int nsp = n < kWmmaMinTokens ? 32 : 1;
-        if (n < kWmmaMinTokens) {
+        const bool grouped = n <= static_cast<int>(kMaxVerifyRows) &&
+                             std::getenv("INKLING_SPARSE_PER_HEAD") == nullptr;
+        const int gh = nh / nkv;
+        SelectBlocks<<<dim3(ntile, grouped ? nkv : nh), 256,
+                       kMaxSparseBlocks * sizeof(float), stream>>>(
+            q, sl.kmm, d_pos, n, nh, nkv, blist, bcount, grouped ? gh : 0);
+        const int nsp = n < kWmmaMinTokens ? (grouped ? 64 : 32) : 1;
+        if (grouped) {
+          AttnArgs pa = aa;
+          pa.pack = gh;
+          FlashRel<kPackWaves>
+              <<<dim3(1, nkv, nsp), kPackWaves * 32, 0, stream>>>(
+                  pa, q, r, sink, sl.k, sl.v, bias_w, att, n, nsp, kSplitKeys,
+                  split_m, split_l, split_o, blist, bcount, kListCap);
+        } else if (n < kWmmaMinTokens) {
           FlashRel<kPackWaves>
               <<<dim3(1, nh, nsp), kPackWaves * 32, 0, stream>>>(
                   aa, q, r, sink, sl.k, sl.v, bias_w, att, n, nsp, kSplitKeys,
