@@ -3267,10 +3267,17 @@ struct Session::Impl : Scratch {
         SelectBlocks<<<dim3(ntile, nh), 256, kMaxSparseBlocks * sizeof(float),
                        stream>>>(q, sl.kmm, d_pos, n, nh, nkv, blist, bcount);
         const int nsp = n < kWmmaMinTokens ? 32 : 1;
-        FlashRel<8><<<dim3((n + kFlashQ - 1) / kFlashQ, nh, nsp), kFlashThreads,
-                      0, stream>>>(aa, q, r, sink, sl.k, sl.v, bias_w, att, n,
-                                   nsp, kSplitKeys, split_m, split_l, split_o,
-                                   blist, bcount, kListCap);
+        if (n < kWmmaMinTokens) {
+          FlashRel<kPackWaves>
+              <<<dim3(1, nh, nsp), kPackWaves * 32, 0, stream>>>(
+                  aa, q, r, sink, sl.k, sl.v, bias_w, att, n, nsp, kSplitKeys,
+                  split_m, split_l, split_o, blist, bcount, kListCap);
+        } else {
+          FlashRel<8><<<dim3((n + kFlashQ - 1) / kFlashQ, nh, nsp),
+                        kFlashThreads, 0, stream>>>(
+              aa, q, r, sink, sl.k, sl.v, bias_w, att, n, nsp, kSplitKeys,
+              split_m, split_l, split_o, blist, bcount, kListCap);
+        }
         if (nsp > 1)
           FlashCombine<<<dim3(n, nh), 128, 0, stream>>>(split_m, split_l,
                                                         split_o, att, nh, nsp);
