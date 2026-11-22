@@ -16,7 +16,9 @@ machine. It has two parts.
   commands conflict with the loaded model; small models that leave RAM free
   are not stopped for RAM-only work.
 - **Same-model restart.** The guard restarts gufo only if it stopped it, with
-  the model it stopped. The last loaded model is kept across guard restarts.
+  the model it stopped. A fresh guard start loads the model named by `GUFO_MODEL`
+  (default `flash-next`); a model remembered from an earlier run never overrides it.
+  A server started with `GUFO_THINK=off` keeps thinking off for every request.
 - **Watchdogs.** Memory and KFD watchdogs stop gufo before the host runs out
   of memory or the GPU driver wedges.
 - **Model switch.** `/jev switch <model>` reloads gufo as another model;

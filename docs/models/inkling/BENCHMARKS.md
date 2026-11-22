@@ -19,6 +19,11 @@ cache); decode is `gufo serve` over HTTP with `--think off`, 400-token (short) o
 The 8k to 128k rows predate the expert-layer conversion, which added about 2% at
 2k and 4k.
 
+## Load
+
+About 15 s with the model file in the page cache (weights go through the shared
+`hip::TensorUpload` staging pipeline); 44 s before that change with a cold cache.
+
 ## Decode
 
 | Workload | tok/s |

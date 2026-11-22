@@ -133,6 +133,8 @@ a `gufo_<model>` library, attach it with `add_subdirectory`, keep kernels under
 `tests/models/<model>`, a row in [the model index](models/README.md), and the
 four required documents `README.md`, `BENCHMARKS.md`, `QUALITY.md` and
 `EXPERIMENTS.md` under `docs/models/<model>/`.
+Loaders upload tensors with `hip::TensorUpload` (`src/core/hip/weight_upload.hpp`),
+not `hipMemcpy` from the GGUF mapping, and leave the model files in the page cache.
 
 **A dependency.** Record it in `THIRD_PARTY_NOTICES.md`; `tools/ci/check-dependencies.py`
 validates that shipped and evaluation components carry license, version and

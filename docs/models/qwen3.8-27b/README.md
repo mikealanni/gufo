@@ -79,6 +79,14 @@ Image numbering is off by default; `--add-vision-id` or
 Cache identity includes processed pixels, placement, preprocessing version and
 projector contents. See [vision checks and limits](QUALITY.md#vision).
 
+## Int4 prefill (rotated 4-bit artifact)
+
+With the rotated int4 artifact loaded (`GUFO_IU4_ARTIFACT`, found automatically by
+`~/run-gufo.sh`), the dense projections run as int4 x int4 WMMA and the FFN gate/up
+slices go to the NPU. Measured 2026-11-21 on the main binary: prefill 1,335 tok/s
+at 8K (806 with the Q4_K_XL GGUF and the NPU), plain decode 14.7 tok/s. HumanEval
+156/164 against 158/164 for the GGUF; equal NLL. See `.agents/skills/iu4-prefill`.
+
 ## NPU prefill
 
 With the XDNA2 NPU set up as in the [repository README](../../../README.md#try-it),
