@@ -829,6 +829,8 @@ class Guard:
             self.launch_env["GUFO_MODEL_PATH"] = self.launch_env.pop("GUFO_MODEL")
         if "GUFO_KIND" in self.launch_env:
             self.launch_env.setdefault("GUFO_MODEL", self.launch_env.pop("GUFO_KIND"))
+        # A server started with GUFO_THINK=off owns the decision: no plugin or client effort turns thinking back on.
+        self.think_forced_off = str(self.launch_env.get("GUFO_THINK", "")).strip().lower() == "off"
         # The model last loaded survives a guard restart: unless GUFO_MODEL is set explicitly, boot loads it again.
         self.model_file = os.path.join(os.path.expanduser("~"), ".gufo", "jev-log", "guard-model.json")
         if "GUFO_MODEL" not in self.launch_env and not any(k in self.launch_env for k in MODEL_SPECIFIC_ENV):
@@ -1257,9 +1259,28 @@ class Guard:
             return None
         return level if level in EFFORT_LEVELS else DEFAULT_PINNED_EFFORT
 
+    def force_think_off(self, body):
+        try:
+            data = json.loads(body or b"{}")
+        except ValueError:
+            return body
+        if not isinstance(data, dict):
+            return body
+        data.pop("reasoning_effort", None)
+        data.pop("reasoning_budget_tokens", None)
+        data.pop("thinking_budget_tokens", None)
+        kwargs = data.get("chat_template_kwargs")
+        if isinstance(kwargs, dict):
+            kwargs.pop("reasoning_effort", None)
+            kwargs.pop("enable_thinking", None)
+        data["thinking"] = {"type": "disabled"}
+        return json.dumps(data).encode()
+
     def pin_effort(self, request, body):
         if request.method != "POST" or not request.path.endswith("/chat/completions"):
             return body
+        if getattr(self, "think_forced_off", False):
+            return self.force_think_off(body)
         level = self.pinned_effort()
         if level is None:
             return body
@@ -1457,7 +1478,7 @@ class Guard:
     async def status(self, request):
         return web.json_response({
             "state": self.state, "stops": self.stops, "inflight": self.inflight,
-            "opencode_active": self.opencode_active(), "prepare_api": 1, "default_effort": os.environ.get("GUFO_EFFORT", "low"), "pinned_effort": self.pinned_effort(),
+            "opencode_active": self.opencode_active(), "prepare_api": 1, "default_effort": "none" if getattr(self, "think_forced_off", False) else os.environ.get("GUFO_EFFORT", "low"), "think_forced_off": bool(getattr(self, "think_forced_off", False)), "pinned_effort": self.pinned_effort(),
             "idle_s": round(time.time() - self.last_activity) if self.last_activity else None,
             "mem_available_gb": round(mem_available_gb(), 1),
             "model": self.model_id, "kind": self.model_name(), "models": list(MODEL_KINDS),
