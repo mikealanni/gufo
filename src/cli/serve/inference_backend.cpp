@@ -4269,10 +4269,13 @@ public:
     auto& inkling = RequireInklingState(state);
     if (inkling.position() >= max_context_)
       return {.stop = true, .piece = {}};
-    const auto logits = inkling.session().Logits();
-    if (logits.empty())
-      throw std::runtime_error("Inkling token selection has no logits");
-    const auto token = static_cast<std::int32_t>(sampler.Sample(logits));
+    std::int32_t token = inkling.session().Argmax();
+    if (!sampler.CanSelectArgmax(static_cast<sampling::TokenId>(token))) {
+      const auto logits = inkling.session().Logits();
+      if (logits.empty())
+        throw std::runtime_error("Inkling token selection has no logits");
+      token = static_cast<std::int32_t>(sampler.Sample(logits));
+    }
     if (IsStop(token))
       return {.stop = true, .token = 0, .piece = {}};
     return {.stop = false,
@@ -4312,10 +4315,16 @@ public:
         {draft_width_, max_tokens - 1, max_context_ - inkling.position() - 1});
     auto& session = inkling.session();
     sampling::SamplerState working = sampler;
-    const auto first = working.Sample(session.Logits());
-    if (IsStop(static_cast<std::int32_t>(first)))
+    const auto pick = [&](std::int32_t greedy, std::uint32_t row,
+                          bool last) -> std::int32_t {
+      if (working.CanSelectArgmax(static_cast<sampling::TokenId>(greedy)))
+        return greedy;
+      return static_cast<std::int32_t>(
+          working.Sample(last ? session.Logits() : session.Logits(row)));
+    };
+    const std::int32_t anchor = pick(session.Argmax(), 0, true);
+    if (IsStop(anchor))
       return {.selections = {}, .stop = true};
-    const auto anchor = static_cast<std::int32_t>(first);
     std::vector<std::int32_t> block(width + 1, anchor);
     std::vector<float> confidence(width);
     std::string error;
@@ -4344,8 +4353,9 @@ public:
     std::size_t kept = 1;
     bool stopped = false;
     for (std::size_t i = 0; i < width; ++i) {
-      const auto sampled = static_cast<std::int32_t>(
-          working.Sample(session.Logits(static_cast<std::uint32_t>(i))));
+      const std::int32_t sampled =
+          pick(session.Argmax(static_cast<std::uint32_t>(i)),
+               static_cast<std::uint32_t>(i), false);
       if (sampled != block[i + 1]) {
         stopped = IsStop(sampled);
         break;

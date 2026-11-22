@@ -2398,6 +2398,9 @@ __global__ void GatherRows(const unsigned char* src, std::size_t row_bytes,
 
 __global__ void ArgMaxRow(const float* x, int n, int* out, int* out2,
                           const int* map = nullptr, float* conf = nullptr) {
+  x += static_cast<std::size_t>(blockIdx.x) * n;
+  out += blockIdx.x;
+  out2 += blockIdx.x;
   __shared__ float bv[256];
   __shared__ int bi[256];
   __shared__ float sv[256];
@@ -2541,7 +2544,12 @@ struct Session::Impl : Scratch {
     active = bank;
   }
   std::vector<void*> allocs;
-  std::vector<float> logits;
+  std::vector<float> logits;  // host copy of rows fetched by Logits(row)
+  std::vector<unsigned char> logits_have;
+  int* d_argmax{nullptr};
+  int argmax_host[8]{};
+  int logits_rows{0};
+  int logits_last{0};
   std::size_t allocated_bytes{0};
   std::unordered_map<long long, std::pair<int*, int>> tile_maps;
   const int* TileMap(int n, int bn, int* count) {
@@ -3553,11 +3561,15 @@ struct Session::Impl : Scratch {
         Body(n);
       }
     }
-    HIP_OK(hipStreamSynchronize(stream));
     const int rows = all_rows ? n : 1;
-    logits.resize(static_cast<std::size_t>(rows) * c.vocab_unpadded);
-    HIP_OK(hipMemcpy(logits.data(), d_logits, logits.size() * 4,
-                     hipMemcpyDeviceToHost));
+    ArgMaxRow<<<rows, 256, 0, stream>>>(
+        d_logits, static_cast<int>(c.vocab_unpadded), d_argmax, d_argmax);
+    HIP_OK(hipMemcpyAsync(argmax_host, d_argmax, rows * 4,
+                          hipMemcpyDeviceToHost, stream));
+    HIP_OK(hipStreamSynchronize(stream));
+    logits_rows = rows;
+    logits_last = rows - 1;
+    logits_have.assign(static_cast<std::size_t>(rows), 0);
     n_logit_rows = rows;
     position += n;
   }
@@ -4008,13 +4020,28 @@ Session::Session() = default;
 Session::~Session() = default;
 
 std::span<const float> Session::Logits() const noexcept {
-  const std::size_t v = impl_->m->config.vocab_unpadded;
-  return std::span<const float>(impl_->logits).last(v);
+  return Logits(static_cast<std::uint32_t>(impl_->logits_last));
 }
 
 std::span<const float> Session::Logits(std::uint32_t row) const noexcept {
-  const std::size_t v = impl_->m->config.vocab_unpadded;
-  return std::span<const float>(impl_->logits).subspan(row * v, v);
+  auto& i = *impl_;
+  const std::size_t v = i.m->config.vocab_unpadded;
+  if (i.logits.size() < static_cast<std::size_t>(i.logits_rows) * v)
+    i.logits.resize(static_cast<std::size_t>(i.logits_rows) * v);
+  if (i.logits_have[row] == 0) {
+    HIP_OK(hipMemcpy(i.logits.data() + row * v, i.d_logits + row * v, v * 4,
+                     hipMemcpyDeviceToHost));
+    i.logits_have[row] = 1;
+  }
+  return std::span<const float>(i.logits).subspan(row * v, v);
+}
+
+std::int32_t Session::Argmax(std::uint32_t row) const noexcept {
+  return impl_->argmax_host[row];
+}
+
+std::int32_t Session::Argmax() const noexcept {
+  return impl_->argmax_host[impl_->logits_last];
 }
 
 bool Session::AppendAll(std::span<const std::int32_t> tokens,
@@ -4045,11 +4072,7 @@ void Session::KeepRows(std::uint32_t keep) {
   HIP_OK(hipStreamSynchronize(i.stream));
   i.position = i.pos_before_last + keep;
   i.dwarmed = std::min(i.dwarmed, i.position);
-  const std::size_t v = i.m->config.vocab_unpadded;
-  i.logits.erase(
-      i.logits.begin(),
-      i.logits.begin() + static_cast<std::ptrdiff_t>((keep - 1) * v));
-  i.logits.resize(v);
+  i.logits_last = static_cast<int>(keep) - 1;
   i.last_rows = static_cast<int>(keep);
 }
 
@@ -4279,6 +4302,7 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
     sc.prelude = i.Alloc(b * h);
     sc.bank_out = i.Alloc(b * h);
     sc.d_logits = i.Alloc(kMaxVerifyRows * c.vocab_padded);
+    i.d_argmax = static_cast<int*>(i.AllocBytes(kMaxVerifyRows * 4));
     sc.d_pos = static_cast<int*>(i.AllocBytes(4));
     if (state_->npu) {
       std::string npu_error;

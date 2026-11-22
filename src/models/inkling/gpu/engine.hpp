@@ -30,6 +30,9 @@ public:
   static constexpr std::uint32_t kMaxVerifyRows = 8;
   [[nodiscard]] std::span<const float> Logits() const noexcept;
   [[nodiscard]] std::span<const float> Logits(std::uint32_t row) const noexcept;
+  /// Greedy token of a row, computed on the device (no logits download).
+  [[nodiscard]] std::int32_t Argmax(std::uint32_t row) const noexcept;
+  [[nodiscard]] std::int32_t Argmax() const noexcept;
   /// After AppendAll: keeps only the first `keep` rows (cache rows past them
   /// are overwritten by the next append and the convolution history is rewound
   /// to that point).

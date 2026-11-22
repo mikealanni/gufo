@@ -125,8 +125,9 @@ int main(int argc, char** argv) {
     int anchor = argmax(session->Logits());
     std::vector<int> hist(width + 2, 0);
     int produced = 0, steps = 0;
-    double draft_ms = 0.0, verify_ms = 0.0;
+    double draft_ms = 0.0, verify_ms = 0.0, host_ms = 0.0;
     std::vector<int> stream;
+    const auto wall0 = std::chrono::steady_clock::now();
     while (produced < gen) {
       std::vector<std::int32_t> d(width);
       std::vector<float> cf(width);
@@ -159,10 +160,14 @@ int main(int argc, char** argv) {
           std::printf("CONF %d %.3f %d\n", i, cf[i],
                       i < a2 ? 1 : (i == a2 ? 0 : -1));
       }
+      const auto ta = std::chrono::steady_clock::now();
       while (acc < static_cast<int>(d.size()) &&
-             argmax(session->Logits(static_cast<std::uint32_t>(acc))) == d[acc])
+             session->Argmax(static_cast<std::uint32_t>(acc)) == d[acc])
         ++acc;
-      const int next = argmax(session->Logits(static_cast<std::uint32_t>(acc)));
+      const int next = session->Argmax(static_cast<std::uint32_t>(acc));
+      host_ms += std::chrono::duration<double, std::milli>(
+                     std::chrono::steady_clock::now() - ta)
+                     .count();
       session->KeepRows(static_cast<std::uint32_t>(acc + 1));
       stream.push_back(anchor);
       for (int i = 0; i < acc; ++i)
@@ -177,6 +182,10 @@ int main(int argc, char** argv) {
         "ms\n",
         steps, produced, static_cast<double>(produced - steps) / steps,
         draft_ms / steps, verify_ms / steps);
+    std::printf("host argmax %.2f ms/step, wall %.1f tok/s\n", host_ms / steps,
+                produced / std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() - wall0)
+                               .count());
     std::printf("accepted histogram:");
     for (int i = 0; i <= width; ++i)
       std::printf(" %d", hist[i]);
