@@ -28,6 +28,7 @@ constexpr int kConvTaps = 4;
 constexpr int kHistory = 3;
 constexpr int kMaxBatch = 4096;
 constexpr std::uint32_t kNpuTokens = 2048;
+constexpr std::size_t kBankRows = 2048;
 constexpr std::uint32_t kNpuSlice = 1024;
 constexpr int kFlashHd = 128;
 constexpr int kWmmaMinTokens = 32;
@@ -1697,6 +1698,8 @@ struct Scratch {
   float* block_pool[16]{};
   int pool_used{0};
   std::uint32_t pos_base{0};  // absolute position of this bank's first token
+  int npu_a[3]{-1, -1, -1};
+  int npu_c[8]{-1, -1, -1, -1, -1, -1, -1, -1};
 };
 
 struct Session::Impl : Scratch {
@@ -1715,6 +1718,16 @@ struct Session::Impl : Scratch {
     float* hist_ffn{nullptr};
   };
   std::vector<Slot> slots;
+  bool banked{false};
+  Scratch saved[2];  // bank scratch while another bank is active
+  int active{0};
+  void Activate(int bank) {
+    if (bank == active)
+      return;
+    saved[active] = static_cast<Scratch&>(*this);
+    static_cast<Scratch&>(*this) = saved[bank];
+    active = bank;
+  }
   std::vector<void*> allocs;
   std::vector<float> logits;
   std::size_t allocated_bytes{0};
@@ -2063,11 +2076,6 @@ struct Session::Impl : Scratch {
       L.inh[j] = inh[j];
     }
   }
-
-  // NPU buffers of this session: activation streams for the three layer inputs and
-  // eight 1024-column result slices (q x3, gate x3, k, v)
-  int npu_a[3]{-1, -1, -1};
-  int npu_c[8]{-1, -1, -1, -1, -1, -1, -1, -1};
 
   void NpuQkv(LayerCtx& L) {
     namespace rocm = gufo::models::qwen38_flash_next::rocm;
@@ -2607,86 +2615,100 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
     sl.hist_ffn = static_cast<float*>(i.AllocBytes(h * kHistory * 4));
   }
   const std::size_t qd = static_cast<std::size_t>(c.num_heads) * c.head_dim;
-  i.d_tokens = static_cast<int*>(i.AllocBytes(b * 4));
-  i.cur = i.Alloc(b * h);
-  i.tmp = i.Alloc(b * std::max<std::size_t>(kv, h));
-  i.inp_sa = i.Alloc(b * h);
-  for (auto& p : i.in)
+  auto alloc_scratch = [&](Scratch& sc, std::size_t b) {
+    sc.d_tokens = static_cast<int*>(i.AllocBytes(b * 4));
+    sc.cur = i.Alloc(b * h);
+    sc.tmp = i.Alloc(b * std::max<std::size_t>(kv, h));
+    sc.inp_sa = i.Alloc(b * h);
+    for (auto& p : sc.in)
     p = i.Alloc(b * h);
-  i.q = i.Alloc(b * qd);
-  i.k = i.Alloc(b * kv);
-  i.v = i.Alloc(b * kv);
-  i.r = i.Alloc(b * c.relative_length * c.num_heads);
-  i.dyn_k = i.Alloc(b * kConvTaps * c.num_kv);
-  i.dyn_v = i.Alloc(b * kConvTaps * c.num_kv);
-  i.sink = i.Alloc(b * c.num_heads);
-  i.gate = i.Alloc(b * qd);
-  i.att = i.Alloc(b * qd);
-  i.o = i.Alloc(b * h);
-  i.mixed = i.Alloc(b * h * 3);
-  i.msgs = i.Alloc(b * h * 4);
-  i.ffn_inp = i.Alloc(b * h);
-  i.x = i.Alloc(b * h);
-  i.cat = i.Alloc(b * h * 2);
-  i.low = i.Alloc(std::max<std::size_t>(b * c.loop_gate_rank, h * 4));
-  i.gain = i.Alloc(b * h);
-  i.forget = i.Alloc(b * h);
-  i.router = i.Alloc(b * c.expert_count);
-  i.wts = i.Alloc(b * c.expert_used);
-  i.gu = i.Alloc(b * c.expert_used * 2 * c.expert_ff);
-  i.act = i.Alloc(b * c.expert_used * c.expert_ff);
-  i.y = i.Alloc(b * c.expert_used * h);
-  i.moe = i.Alloc(b * h);
-  i.prelude = i.Alloc(b * h);
-  i.bank_out = i.Alloc(b * h);
-  i.d_logits = i.Alloc(c.vocab_padded);
-  i.d_pos = static_cast<int*>(i.AllocBytes(4));
-  if (state_->npu) {
+    sc.q = i.Alloc(b * qd);
+    sc.k = i.Alloc(b * kv);
+    sc.v = i.Alloc(b * kv);
+    sc.r = i.Alloc(b * c.relative_length * c.num_heads);
+    sc.dyn_k = i.Alloc(b * kConvTaps * c.num_kv);
+    sc.dyn_v = i.Alloc(b * kConvTaps * c.num_kv);
+    sc.sink = i.Alloc(b * c.num_heads);
+    sc.gate = i.Alloc(b * qd);
+    sc.att = i.Alloc(b * qd);
+    sc.o = i.Alloc(b * h);
+    sc.mixed = i.Alloc(b * h * 3);
+    sc.msgs = i.Alloc(b * h * 4);
+    sc.ffn_inp = i.Alloc(b * h);
+    sc.x = i.Alloc(b * h);
+    sc.cat = i.Alloc(b * h * 2);
+    sc.low = i.Alloc(std::max<std::size_t>(b * c.loop_gate_rank, h * 4));
+    sc.gain = i.Alloc(b * h);
+    sc.forget = i.Alloc(b * h);
+    sc.router = i.Alloc(b * c.expert_count);
+    sc.wts = i.Alloc(b * c.expert_used);
+    sc.gu = i.Alloc(b * c.expert_used * 2 * c.expert_ff);
+    sc.act = i.Alloc(b * c.expert_used * c.expert_ff);
+    sc.y = i.Alloc(b * c.expert_used * h);
+    sc.moe = i.Alloc(b * h);
+    sc.prelude = i.Alloc(b * h);
+    sc.bank_out = i.Alloc(b * h);
+    sc.d_logits = i.Alloc(c.vocab_padded);
+    sc.d_pos = static_cast<int*>(i.AllocBytes(4));
+    if (state_->npu) {
     std::string npu_error;
     for (int j = 0; j < 3; ++j) i.npu_a[j] = state_->npu->NewBuffer(state_->npu->ABytes(), &npu_error);
     for (int j = 0; j < 8; ++j) i.npu_c[j] = state_->npu->NewBuffer(state_->npu->CBytes(), &npu_error);
-  }
-  i.xh0 = static_cast<__half*>(i.AllocBytes(b * h * 2));
-  i.xh1 = static_cast<__half*>(i.AllocBytes(b * h * 2));
-  i.xh2 = static_cast<__half*>(i.AllocBytes(b * h * 2));
-  i.xhx = static_cast<__half*>(i.AllocBytes(b * h * 2));
-  i.atth = static_cast<__half*>(i.AllocBytes(b * qd * 2));
-  i.cath = static_cast<__half*>(i.AllocBytes(b * h * 4));
-  i.rcounts = static_cast<unsigned int*>(
+    }
+    sc.xh0 = static_cast<__half*>(i.AllocBytes(b * h * 2));
+    sc.xh1 = static_cast<__half*>(i.AllocBytes(b * h * 2));
+    sc.xh2 = static_cast<__half*>(i.AllocBytes(b * h * 2));
+    sc.xhx = static_cast<__half*>(i.AllocBytes(b * h * 2));
+    sc.atth = static_cast<__half*>(i.AllocBytes(b * qd * 2));
+    sc.cath = static_cast<__half*>(i.AllocBytes(b * h * 4));
+    sc.rcounts = static_cast<unsigned int*>(
       i.AllocBytes(c.expert_count * sizeof(unsigned int)));
-  i.rbounds =
+    sc.rbounds =
       static_cast<int*>(i.AllocBytes((c.expert_count + 1) * sizeof(int)));
-  i.rcursors = static_cast<int*>(i.AllocBytes(c.expert_count * sizeof(int)));
-  {
+    sc.rcursors = static_cast<int*>(i.AllocBytes(c.expert_count * sizeof(int)));
+    {
     const std::size_t rows =
         gufo::models::qwen38_flash_next::rocm::RoutedCompactRows(
             b * c.expert_used, c.expert_count);
     i.rrows_token = static_cast<int*>(i.AllocBytes(rows * sizeof(int)));
     i.rrows_slot = static_cast<int*>(i.AllocBytes(rows * sizeof(int)));
-  }
-  i.xq = static_cast<signed char*>(
+    }
+    sc.xq = static_cast<signed char*>(
       i.AllocBytes(static_cast<std::size_t>(kWmmaMinTokens) * c.expert_used *
                    std::max<std::size_t>(c.hidden_size, 3072) * 2));
-  i.xqs = i.Alloc(static_cast<std::size_t>(kWmmaMinTokens) * c.expert_used *
+    sc.xqs = i.Alloc(static_cast<std::size_t>(kWmmaMinTokens) * c.expert_used *
                   std::max<std::size_t>(c.hidden_size, 3072) / 16);
-  i.blist = static_cast<int*>(
+    sc.blist = static_cast<int*>(
       i.AllocBytes(static_cast<std::size_t>(kMaxBatch / kFlashQ) * c.num_heads *
                    kListCap * 4));
-  i.bcount = static_cast<int*>(i.AllocBytes(
+    sc.bcount = static_cast<int*>(i.AllocBytes(
       static_cast<std::size_t>(kMaxBatch / kFlashQ) * c.num_heads * 4));
-  {
+    {
     const std::size_t splits = (max_context + kSplitKeys - 1) / kSplitKeys;
     i.split_m = i.Alloc(kWmmaMinTokens * c.num_heads * splits);
     i.split_l = i.Alloc(kWmmaMinTokens * c.num_heads * splits);
     i.split_o = i.Alloc(kWmmaMinTokens * c.num_heads * splits * kFlashHd);
-  }
-  i.xh = static_cast<__half*>(
+    }
+    sc.xh = static_cast<__half*>(
       i.AllocBytes(b * std::max<std::size_t>(qd, 2 * h) * 2));
-  i.act16 =
+    sc.act16 =
       static_cast<__half*>(i.AllocBytes(b * c.expert_used * c.expert_ff * 2));
-  i.sorted = static_cast<int*>(i.AllocBytes(b * c.expert_used * 4));
-  i.tiles = static_cast<int*>(
+    sc.sorted = static_cast<int*>(i.AllocBytes(b * c.expert_used * 4));
+    sc.tiles = static_cast<int*>(
       i.AllocBytes((b * c.expert_used / kTileM + c.expert_count) * 3 * 4));
+    sc.ids = static_cast<int*>(i.AllocBytes(b * c.expert_used * 4));
+    sc.xrow = static_cast<int*>(i.AllocBytes(b * c.expert_used * 4));
+    for (auto& p : sc.block_pool)
+    p = i.Alloc(b * h);
+    if (state_->npu) {
+      std::string npu_error;
+      for (int j = 0; j < 3; ++j)
+        sc.npu_a[j] = state_->npu->NewBuffer(state_->npu->ABytes(), &npu_error);
+      for (int j = 0; j < 8; ++j)
+        sc.npu_c[j] = state_->npu->NewBuffer(state_->npu->CBytes(), &npu_error);
+    }
+  };
+  alloc_scratch(static_cast<Scratch&>(i), b);
   {
     std::vector<int> tok(b * c.expert_used);
     std::vector<int> item(b * c.expert_used);
@@ -2702,10 +2724,10 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
                      hipMemcpyHostToDevice));
   }
   HIP_OK(hipStreamCreateWithFlags(&i.stream, hipStreamNonBlocking));
-  i.ids = static_cast<int*>(i.AllocBytes(b * c.expert_used * 4));
-  i.xrow = static_cast<int*>(i.AllocBytes(b * c.expert_used * 4));
-  for (auto& p : i.block_pool)
-    p = i.Alloc(b * h);
+  if (state_->npu || std::getenv("INKLING_BANKS") != nullptr) {
+    i.banked = true;
+    alloc_scratch(i.saved[1], kBankRows);
+  }
   return s;
 }
 
