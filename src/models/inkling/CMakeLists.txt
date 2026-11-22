@@ -16,3 +16,8 @@ if(ENGINE_ENABLE_HIP)
   add_executable(gufo_inkling_gpu_check gpu_check.cpp)
   target_link_libraries(gufo_inkling_gpu_check PRIVATE gufo_inkling)
 endif()
+
+if(ENGINE_ENABLE_HIP AND GUFO_ENABLE_NPU)
+  add_executable(gufo_inkling_npu_probe npu_probe.cpp)
+  target_link_libraries(gufo_inkling_npu_probe PRIVATE gufo_inkling gufo_qwen38_flash_next gufo_core)
+endif()
