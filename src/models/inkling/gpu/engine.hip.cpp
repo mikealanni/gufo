@@ -1294,7 +1294,7 @@ constexpr int kSparseTop = 192;
 constexpr bool kGroupBound = false;
 constexpr int kListCap = kSparseSink + kSparseLocal + kSparseTop + 4;
 constexpr int kBlockKeys = 64;
-constexpr int kMaxSparseBlocks = 2048;
+constexpr int kMaxSparseBlocks = 4096;
 constexpr std::uint32_t kSparseAutoContext = 65536;
 
 constexpr int kPackWaves = 4;
