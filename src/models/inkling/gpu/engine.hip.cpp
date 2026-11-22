@@ -1720,6 +1720,7 @@ struct Session::Impl : Scratch {
   };
   std::vector<Slot> slots;
   bool banked{false};
+  int npu_mask{std::getenv("INKLING_NPU_PARTS") != nullptr ? std::atoi(std::getenv("INKLING_NPU_PARTS")) : 15};  // 1=q 2=gate 4=k 8=v
   Scratch saved[2];  // bank scratch while another bank is active
   int active{0};
   void Activate(int bank) {
@@ -2102,25 +2103,29 @@ struct Session::Impl : Scratch {
       rocm::NpuEncodeActivations(L.inh[2] + static_cast<std::size_t>(r0) * h, h, enc, h, 0, h, npu.Device(npu_a[2]), stream);
     std::vector<int> b;
     std::vector<int> c;
-    for (std::size_t i = 0; i < wq.size(); ++i) {
-      b.push_back(wq[i]);
-      c.push_back(npu_c[i]);
+    if ((npu_mask & 1) != 0) {
+      for (std::size_t i = 0; i < wq.size(); ++i) {
+        b.push_back(wq[i]);
+        c.push_back(npu_c[i]);
+      }
     }
-    for (std::size_t i = 0; i < wg.size(); ++i) {
-      b.push_back(wg[i]);
-      c.push_back(npu_c[3 + i]);
+    if ((npu_mask & 2) != 0) {
+      for (std::size_t i = 0; i < wg.size(); ++i) {
+        b.push_back(wg[i]);
+        c.push_back(npu_c[3 + i]);
+      }
     }
-    if (k_shared) {
+    if (k_shared && (npu_mask & 4) != 0) {
       b.push_back(wk[0]);
       c.push_back(npu_c[6]);
     }
-    if (v_shared) {
+    if (v_shared && (npu_mask & 8) != 0) {
       b.push_back(wv[0]);
       c.push_back(npu_c[7]);
     }
-    npu.Submit(stream, npu_a[0], b.data(), c.data(), static_cast<int>(b.size()));
-    if (!k_shared) npu.Submit(stream, npu_a[1], &wk[0], &npu_c[6], 1);
-    if (!v_shared) npu.Submit(stream, npu_a[2], &wv[0], &npu_c[7], 1);
+    if (!b.empty()) npu.Submit(stream, npu_a[0], b.data(), c.data(), static_cast<int>(b.size()));
+    if (!k_shared && (npu_mask & 4) != 0) npu.Submit(stream, npu_a[1], &wk[0], &npu_c[6], 1);
+    if (!v_shared && (npu_mask & 8) != 0) npu.Submit(stream, npu_a[2], &wv[0], &npu_c[7], 1);
     L.ticket = npu.Ticket();
   }
 
@@ -2132,12 +2137,16 @@ struct Session::Impl : Scratch {
     const auto& wg = m->npu_w.at(m->P(L.p, "attn_gate.weight"));
     const int qd = static_cast<int>(wq.size()) * static_cast<int>(kNpuSlice);
     npu.Wait(stream, L.ticket);
-    for (std::size_t i = 0; i < wq.size(); ++i)
-      rocm::NpuDecodeOutput(npu.Staged(stream, npu_c[i]), q + static_cast<std::size_t>(r0) * qd, rows, kNpuSlice, qd, i * kNpuSlice, false, stream);
-    for (std::size_t i = 0; i < wg.size(); ++i)
-      rocm::NpuDecodeOutput(npu.Staged(stream, npu_c[3 + i]), gate + static_cast<std::size_t>(r0) * qd, rows, kNpuSlice, qd, i * kNpuSlice, false, stream);
-    rocm::NpuDecodeOutput(npu.Staged(stream, npu_c[6]), tmp + static_cast<std::size_t>(r0) * kNpuSlice, rows, kNpuSlice, kNpuSlice, 0, false, stream);
-    rocm::NpuDecodeOutput(npu.Staged(stream, npu_c[7]), v + static_cast<std::size_t>(r0) * kNpuSlice, rows, kNpuSlice, kNpuSlice, 0, false, stream);
+    if ((npu_mask & 1) != 0)
+      for (std::size_t i = 0; i < wq.size(); ++i)
+        rocm::NpuDecodeOutput(npu.Staged(stream, npu_c[i]), q + static_cast<std::size_t>(r0) * qd, rows, kNpuSlice, qd, i * kNpuSlice, false, stream);
+    if ((npu_mask & 2) != 0)
+      for (std::size_t i = 0; i < wg.size(); ++i)
+        rocm::NpuDecodeOutput(npu.Staged(stream, npu_c[3 + i]), gate + static_cast<std::size_t>(r0) * qd, rows, kNpuSlice, qd, i * kNpuSlice, false, stream);
+    if ((npu_mask & 4) != 0)
+      rocm::NpuDecodeOutput(npu.Staged(stream, npu_c[6]), tmp + static_cast<std::size_t>(r0) * kNpuSlice, rows, kNpuSlice, kNpuSlice, 0, false, stream);
+    if ((npu_mask & 8) != 0)
+      rocm::NpuDecodeOutput(npu.Staged(stream, npu_c[7]), v + static_cast<std::size_t>(r0) * kNpuSlice, rows, kNpuSlice, kNpuSlice, 0, false, stream);
   }
 
   // stage 2: q/k/v/gate/rel/sink projections (GPU or NPU)
@@ -2157,15 +2166,16 @@ struct Session::Impl : Scratch {
     (void)c; (void)h; (void)nh; (void)nkv; (void)hd; (void)nrel; (void)p; (void)swa; (void)sl; (void)n; (void)nh_; (void)big; (void)inp; (void)inh; (void)msgs_;
     L.npu_on = npu_a[0] >= 0 && big &&
                m->npu_w.count(m->P(p, "attn_q.weight")) != 0;
-    if (L.npu_on) {
+    if (L.npu_on)
       NpuQkvBegin(L, 0);
-    } else {
+    if (!L.npu_on || (npu_mask & 1) == 0)
       Dense(m->T(m->P(p, "attn_q.weight")), inp[0], h, q, nh * hd, n, -1, inh[0]);
+    if (!L.npu_on || (npu_mask & 4) == 0)
       Dense(m->T(m->P(p, "attn_k.weight")), inp[1], h, tmp, nkv * hd, n, -1,
             inh[1]);
+    if (!L.npu_on || (npu_mask & 8) == 0)
       Dense(m->T(m->P(p, "attn_v.weight")), inp[2], h, v, nkv * hd, n, -1,
             inh[2]);
-    }
     Dense(m->T(m->P(p, "attn_rel.weight")), inp[0], h, r, nrel * nh, n, -1,
           inh[0]);
     if (!swa) {
@@ -2200,10 +2210,10 @@ struct Session::Impl : Scratch {
         NpuQkvBegin(L, r0);
         NpuQkvEnd(L, r0);
       }
-    } else {
+    }
+    if (!L.npu_on || (npu_mask & 2) == 0)
       Dense(m->T(m->P(p, "attn_gate.weight")), inp[0], h, gate, nh * hd, n, -1,
             inh[0]);
-    }
   }
 
   // stage 3: convolutions, clipping, KV store, attention -> att / atth
