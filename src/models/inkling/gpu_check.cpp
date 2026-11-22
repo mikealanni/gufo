@@ -1,10 +1,10 @@
 #include <algorithm>
 #include <chrono>
-#include <fstream>
-#include <sstream>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <numeric>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -19,7 +19,9 @@ int main(int argc, char** argv) {
           ? static_cast<std::uint32_t>(std::atoi(std::getenv("INKLING_CTX")))
           : 8192U;
   if (argc >= 3 && std::string(argv[2]) == "--text") {
-    const int kGenerate = std::getenv("INKLING_GEN") != nullptr ? std::atoi(std::getenv("INKLING_GEN")) : 64;
+    const int kGenerate = std::getenv("INKLING_GEN") != nullptr
+                              ? std::atoi(std::getenv("INKLING_GEN"))
+                              : 64;
     std::string err;
     auto reader = gufo::core::GgufReader::OpenFile(argv[1], &err);
     auto tok = gufo::tokenization::QwenTokenizer::CreateFromGguf(*reader, &err);
@@ -91,12 +93,15 @@ int main(int argc, char** argv) {
     if (const char* file = std::getenv("INKLING_BENCH_FILE")) {
       std::string err;
       auto reader = gufo::core::GgufReader::OpenFile(argv[1], &err);
-      auto tok = gufo::tokenization::QwenTokenizer::CreateFromGguf(*reader, &err);
+      auto tok =
+          gufo::tokenization::QwenTokenizer::CreateFromGguf(*reader, &err);
       std::ifstream in(file);
       std::stringstream ss;
       ss << in.rdbuf();
       const auto ids = tok->Encode(ss.str(), {});
-      for (int i = 0; i < n; ++i) prompt.push_back(static_cast<std::int32_t>(ids[static_cast<std::size_t>(i) % ids.size()]));
+      for (int i = 0; i < n; ++i)
+        prompt.push_back(static_cast<std::int32_t>(
+            ids[static_cast<std::size_t>(i) % ids.size()]));
     } else {
       prompt.assign(n, kBenchToken);
     }
@@ -108,14 +113,16 @@ int main(int argc, char** argv) {
     const auto t1 = std::chrono::steady_clock::now();
     for (int i = 0; i < kDecode; ++i) {
       const auto logits = session->Logits();
-      const auto best = static_cast<std::int32_t>(std::max_element(logits.begin(), logits.end()) - logits.begin());
+      const auto best = static_cast<std::int32_t>(
+          std::max_element(logits.begin(), logits.end()) - logits.begin());
       if (!session->Append(std::span(&best, 1), &error)) {
         std::fprintf(stderr, "bench decode failed: %s\n", error.c_str());
         return 1;
       }
     }
     const auto t2 = std::chrono::steady_clock::now();
-    std::printf("pp %d: %.1f tok/s, tg: %.2f tok/s\n", n, n / std::chrono::duration<double>(t1 - t0).count(),
+    std::printf("pp %d: %.1f tok/s, tg: %.2f tok/s\n", n,
+                n / std::chrono::duration<double>(t1 - t0).count(),
                 kDecode / std::chrono::duration<double>(t2 - t1).count());
   }
   return 0;

@@ -827,7 +827,8 @@ __global__ void __launch_bounds__(128)
   float l[8];
   const int split = blockIdx.z;
   for (int i = 0; i < 8; ++i) {
-    // the zero sink logit belongs to split 0 only (counted once after the 16-lane sum)
+    // the zero sink logit belongs to split 0 only (counted once after the
+    // 16-lane sum)
     m[i] = split == 0 ? 0.0F : kNegInf;
     l[i] = split == 0 ? 1.0F / 16.0F : 0.0F;
   }
@@ -852,7 +853,8 @@ __global__ void __launch_bounds__(128)
     it_end = kb_end >= kb_begin ? (kb_end - kb_begin) / kFlashK + 1 : 0;
   }
   for (int it = it_begin; it < it_end; ++it) {
-    const int kb = list != nullptr ? list[it] * kFlashK : kb_begin + it * kFlashK;
+    const int kb =
+        list != nullptr ? list[it] * kFlashK : kb_begin + it * kFlashK;
     __syncthreads();
     {
       const int key = tid >> 1;
@@ -944,12 +946,14 @@ __global__ void __launch_bounds__(128)
     if (t >= n)
       continue;
     if (nsplit > 1) {
-      const std::size_t part = (static_cast<std::size_t>(t) * a.nh + h) * nsplit + split;
+      const std::size_t part =
+          (static_cast<std::size_t>(t) * a.nh + h) * nsplit + split;
       if ((lane & 15) == 0) {
         pm[part] = m[i];
         pl[part] = ls;
       }
-      for (int ni = 0; ni < 8; ++ni) po[part * kFlashHd + ni * 16 + (lane & 15)] = o[ni][i];
+      for (int ni = 0; ni < 8; ++ni)
+        po[part * kFlashHd + ni * 16 + (lane & 15)] = o[ni][i];
       continue;
     }
     for (int ni = 0; ni < 8; ++ni) {
@@ -959,36 +963,42 @@ __global__ void __launch_bounds__(128)
   }
 }
 
-
 constexpr int kSparseSink = 2;
 constexpr int kSparseLocal = 16;
-constexpr int kSparseTop = 128;
+constexpr int kSparseTop = 256;
 constexpr int kListCap = kSparseSink + kSparseLocal + kSparseTop + 4;
 constexpr int kBlockKeys = 64;
 constexpr int kMaxSparseBlocks = 2048;
+constexpr std::uint32_t kSparseAutoContext = 65536;
 
 // pooled per-block key bounds: kmm[b][g][0|1][128] = min / max over the 64 keys
-__global__ void PoolKeys(const __half* kc, __half* kmm, const int* pos0, int n, int nkv) {
+__global__ void PoolKeys(const __half* kc, __half* kmm, const int* pos0, int n,
+                         int nkv) {
   const int pos = *pos0;
   const int b = pos / kBlockKeys + blockIdx.x;
-  if (b * kBlockKeys > pos + n - 1) return;
+  if (b * kBlockKeys > pos + n - 1)
+    return;
   const int g = blockIdx.y;
   const int d = threadIdx.x;
   const int total = pos + n;
   float mn = 1e30F;
   float mx = -1e30F;
   for (int j = b * kBlockKeys; j < min((b + 1) * kBlockKeys, total); ++j) {
-    const float v = __half2float(kc[(static_cast<std::size_t>(j) * nkv + g) * kFlashHd + d]);
+    const float v = __half2float(
+        kc[(static_cast<std::size_t>(j) * nkv + g) * kFlashHd + d]);
     mn = fminf(mn, v);
     mx = fmaxf(mx, v);
   }
-  kmm[((static_cast<std::size_t>(b) * nkv + g) * 2) * kFlashHd + d] = __float2half(mn);
-  kmm[((static_cast<std::size_t>(b) * nkv + g) * 2 + 1) * kFlashHd + d] = __float2half(mx);
+  kmm[((static_cast<std::size_t>(b) * nkv + g) * 2) * kFlashHd + d] =
+      __float2half(mn);
+  kmm[((static_cast<std::size_t>(b) * nkv + g) * 2 + 1) * kFlashHd + d] =
+      __float2half(mx);
 }
 
-// one block per (query tile of 64, head): sink + local + top-k older key blocks by the Quest bound of the tile's mean query
-__global__ void SelectBlocks(const float* q, const __half* kmm, const int* pos0, int n, int nh, int nkv, int* blist,
-                             int* bcount) {
+// one block per (query tile of 64, head): sink + local + top-k older key blocks
+// by the Quest bound of the tile's mean query
+__global__ void SelectBlocks(const float* q, const __half* kmm, const int* pos0,
+                             int n, int nh, int nkv, int* blist, int* bcount) {
   extern __shared__ float score[];
   __shared__ float qbar[kFlashHd];
   __shared__ int taken;
@@ -1009,7 +1019,10 @@ __global__ void SelectBlocks(const float* q, const __half* kmm, const int* pos0,
   int* out = blist + static_cast<std::size_t>(tile * nh + h) * kListCap;
   for (int d = threadIdx.x; d < kFlashHd; d += blockDim.x) {
     float a = 0.0F;
-    for (int t = 0; t < rows; ++t) a += q[(static_cast<std::size_t>(tile * kFlashQ + t) * nh + h) * kFlashHd + d];
+    for (int t = 0; t < rows; ++t)
+      a +=
+          q[(static_cast<std::size_t>(tile * kFlashQ + t) * nh + h) * kFlashHd +
+            d];
     qbar[d] = a / rows;
   }
   if (threadIdx.x == 0) {
@@ -1018,18 +1031,24 @@ __global__ void SelectBlocks(const float* q, const __half* kmm, const int* pos0,
   __syncthreads();
   auto push = [&](int blk) {
     const int slot = atomicAdd(&taken, 1);
-    if (slot < kListCap) out[slot] = blk;
+    if (slot < kListCap)
+      out[slot] = blk;
   };
-  for (int b = threadIdx.x; b < min(kSparseSink, last_blk + 1); b += blockDim.x) push(b);
+  for (int b = threadIdx.x; b < min(kSparseSink, last_blk + 1); b += blockDim.x)
+    push(b);
   if (ncand <= kSparseTop) {
-    for (int i = threadIdx.x; i < ncand; i += blockDim.x) push(kSparseSink + i);
+    for (int i = threadIdx.x; i < ncand; i += blockDim.x)
+      push(kSparseSink + i);
   } else {
     for (int i = threadIdx.x; i < ncand; i += blockDim.x) {
-      const __half* mm = kmm + ((static_cast<std::size_t>(kSparseSink + i) * nkv + g) * 2) * kFlashHd;
+      const __half* mm =
+          kmm + ((static_cast<std::size_t>(kSparseSink + i) * nkv + g) * 2) *
+                    kFlashHd;
       float sc = 0.0F;
       for (int d = 0; d < kFlashHd; ++d) {
         const float qd = qbar[d];
-        sc += fmaxf(qd * __half2float(mm[d]), qd * __half2float(mm[kFlashHd + d]));
+        sc += fmaxf(qd * __half2float(mm[d]),
+                    qd * __half2float(mm[kFlashHd + d]));
       }
       score[i] = sc;
     }
@@ -1047,38 +1066,52 @@ __global__ void SelectBlocks(const float* q, const __half* kmm, const int* pos0,
     }
     __syncthreads();
     for (int it = 0; it < 24; ++it) {
-      if (threadIdx.x == 0) cnt = 0;
+      if (threadIdx.x == 0)
+        cnt = 0;
       __syncthreads();
       const float mid = 0.5F * (lo_t + hi_t);
       int local = 0;
-      for (int i = threadIdx.x; i < ncand; i += blockDim.x) local += score[i] >= mid ? 1 : 0;
+      for (int i = threadIdx.x; i < ncand; i += blockDim.x)
+        local += score[i] >= mid ? 1 : 0;
       atomicAdd(&cnt, local);
       __syncthreads();
       if (threadIdx.x == 0) {
-        if (cnt > kSparseTop) lo_t = mid; else hi_t = mid;
+        if (cnt > kSparseTop)
+          lo_t = mid;
+        else
+          hi_t = mid;
       }
       __syncthreads();
     }
     // hi_t keeps at most kSparseTop candidates; take everything at or above it
     for (int i = threadIdx.x; i < ncand; i += blockDim.x) {
-      if (score[i] >= hi_t) push(kSparseSink + i);
+      if (score[i] >= hi_t)
+        push(kSparseSink + i);
     }
   }
-  for (int b = local_start + threadIdx.x; b <= last_blk; b += blockDim.x) push(b);
+  for (int b = local_start + threadIdx.x; b <= last_blk; b += blockDim.x)
+    push(b);
   __syncthreads();
-  if (threadIdx.x == 0) bcount[tile * nh + h] = min(taken, kListCap);
+  if (threadIdx.x == 0)
+    bcount[tile * nh + h] = min(taken, kListCap);
 }
 
-__global__ void FlashCombine(const float* pm, const float* pl, const float* po, float* out, int nh, int nsplit) {
-  const std::size_t base = (static_cast<std::size_t>(blockIdx.x) * nh + blockIdx.y) * nsplit;
+__global__ void FlashCombine(const float* pm, const float* pl, const float* po,
+                             float* out, int nh, int nsplit) {
+  const std::size_t base =
+      (static_cast<std::size_t>(blockIdx.x) * nh + blockIdx.y) * nsplit;
   float mx = kNegInf;
-  for (int s = 0; s < nsplit; ++s) mx = fmaxf(mx, pm[base + s]);
+  for (int s = 0; s < nsplit; ++s)
+    mx = fmaxf(mx, pm[base + s]);
   float den = 0.0F;
-  for (int s = 0; s < nsplit; ++s) den += expf(pm[base + s] - mx) * pl[base + s];
+  for (int s = 0; s < nsplit; ++s)
+    den += expf(pm[base + s] - mx) * pl[base + s];
   for (int d = threadIdx.x; d < kFlashHd; d += blockDim.x) {
     float acc = 0.0F;
-    for (int s = 0; s < nsplit; ++s) acc += expf(pm[base + s] - mx) * po[(base + s) * kFlashHd + d];
-    out[(static_cast<std::size_t>(blockIdx.x) * nh + blockIdx.y) * kFlashHd + d] = acc / den;
+    for (int s = 0; s < nsplit; ++s)
+      acc += expf(pm[base + s] - mx) * po[(base + s) * kFlashHd + d];
+    out[(static_cast<std::size_t>(blockIdx.x) * nh + blockIdx.y) * kFlashHd +
+        d] = acc / den;
   }
 }
 
@@ -1255,8 +1288,10 @@ struct Session::Impl {
         static_cast<std::uint64_t>(nrows) <= w.rows) {
       const std::size_t xcount = static_cast<std::size_t>(n) * w.cols;
       ToHalf<<<(xcount + 255) / 256, 256, 0, stream>>>(xin, xh, xcount);
-      if (w.type == kTypeQ8 && ldx == w.cols && std::getenv("INKLING_SHARED_DENSE") != nullptr &&
-          gufo::models::qwen38_flash_next::rocm::DenseF16Gemm(w.dev, xh, yout, n, nrows, w.cols, stream)) {
+      if (w.type == kTypeQ8 && ldx == w.cols &&
+          std::getenv("INKLING_SHARED_DENSE") != nullptr &&
+          gufo::models::qwen38_flash_next::rocm::DenseF16Gemm(
+              w.dev, xh, yout, n, nrows, w.cols, stream)) {
         return;
       }
       WmmaArgs wa{static_cast<const unsigned char*>(w.dev),
@@ -1466,24 +1501,39 @@ struct Session::Impl {
     const int span =
         swa ? static_cast<int>(c.sliding_window) : static_cast<int>(ctx);
     if (hd == kFlashHd && nrel == kFlashRel) {
-      const float* bias_w = static_cast<const float*>(m->T(m->P(p, "attn_rel_bias.weight")).dev);
-      const bool sparse_now = sparse && !swa && (n < kWmmaMinTokens || position + n > (kSparseSink + kSparseLocal + kSparseTop + 2) * kBlockKeys);
+      const float* bias_w =
+          static_cast<const float*>(m->T(m->P(p, "attn_rel_bias.weight")).dev);
+      const bool sparse_now =
+          sparse && !swa &&
+          (n < kWmmaMinTokens ||
+           position + n >
+               (kSparseSink + kSparseLocal + kSparseTop + 2) * kBlockKeys);
       if (sparse && !swa) {
-        PoolKeys<<<dim3((n + kBlockKeys - 1) / kBlockKeys + 1, nkv), kFlashHd, 0, stream>>>(sl.k, sl.kmm, d_pos, n, nkv);
+        PoolKeys<<<dim3((n + kBlockKeys - 1) / kBlockKeys + 1, nkv), kFlashHd,
+                   0, stream>>>(sl.k, sl.kmm, d_pos, n, nkv);
       }
       if (sparse_now) {
         const int ntile = (n + kFlashQ - 1) / kFlashQ;
-        SelectBlocks<<<dim3(ntile, nh), 256, kMaxSparseBlocks * sizeof(float), stream>>>(q, sl.kmm, d_pos, n, nh, nkv, blist, bcount);
+        SelectBlocks<<<dim3(ntile, nh), 256, kMaxSparseBlocks * sizeof(float),
+                       stream>>>(q, sl.kmm, d_pos, n, nh, nkv, blist, bcount);
         const int nsp = n < kWmmaMinTokens ? 8 : 1;
-        FlashRel<<<dim3(ntile, nh, nsp), 128, 0, stream>>>(aa, q, r, sink, sl.k, sl.v, bias_w, att, n, nsp, kSplitKeys, split_m, split_l, split_o,
-                                                         blist, bcount, kListCap);
-        if (nsp > 1) FlashCombine<<<dim3(n, nh), 128, 0, stream>>>(split_m, split_l, split_o, att, nh, nsp);
+        FlashRel<<<dim3(ntile, nh, nsp), 128, 0, stream>>>(
+            aa, q, r, sink, sl.k, sl.v, bias_w, att, n, nsp, kSplitKeys,
+            split_m, split_l, split_o, blist, bcount, kListCap);
+        if (nsp > 1)
+          FlashCombine<<<dim3(n, nh), 128, 0, stream>>>(split_m, split_l,
+                                                        split_o, att, nh, nsp);
       } else {
         const bool split = n < kWmmaMinTokens && !swa && ctx > kSplitKeys;
-        const int nsplit = split ? static_cast<int>((ctx + kSplitKeys - 1) / kSplitKeys) : 1;
-        FlashRel<<<dim3((n + kFlashQ - 1) / kFlashQ, nh, nsplit), 128, 0, stream>>>(
-            aa, q, r, sink, sl.k, sl.v, bias_w, att, n, nsplit, kSplitKeys, split_m, split_l, split_o, nullptr, nullptr, 0);
-        if (nsplit > 1) FlashCombine<<<dim3(n, nh), 128, 0, stream>>>(split_m, split_l, split_o, att, nh, nsplit);
+        const int nsplit =
+            split ? static_cast<int>((ctx + kSplitKeys - 1) / kSplitKeys) : 1;
+        FlashRel<<<dim3((n + kFlashQ - 1) / kFlashQ, nh, nsplit), 128, 0,
+                   stream>>>(aa, q, r, sink, sl.k, sl.v, bias_w, att, n, nsplit,
+                             kSplitKeys, split_m, split_l, split_o, nullptr,
+                             nullptr, 0);
+        if (nsplit > 1)
+          FlashCombine<<<dim3(n, nh), 128, 0, stream>>>(
+              split_m, split_l, split_o, att, nh, nsplit);
       }
     } else {
       Attention<<<dim3(nh, n), kThreads, (span + 1) * sizeof(float), stream>>>(
@@ -1745,7 +1795,10 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
   const std::size_t b = kMaxBatch;
   {
     const char* e = std::getenv("INKLING_SPARSE");
-    i.sparse = e != nullptr && e[0] == '1' && max_context / kBlockKeys + 2 <= kMaxSparseBlocks + 2;
+    const bool fits = max_context / kBlockKeys + 2 <= kMaxSparseBlocks + 2;
+    const bool wanted =
+        e != nullptr ? e[0] == '1' : max_context >= kSparseAutoContext;
+    i.sparse = wanted && fits;
   }
   i.slots.resize(c.num_layers);
   for (auto& sl : i.slots) {
@@ -1756,7 +1809,9 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
     const std::size_t rows = use_ring ? ring_rows : max_context;
     sl.k = static_cast<__half*>(i.AllocBytes(rows * kv * 2));
     if (i.sparse && !c.is_swa[slot_index]) {
-      sl.kmm = static_cast<__half*>(i.AllocBytes(static_cast<std::size_t>(max_context / kBlockKeys + 2) * c.num_kv * 2 * kFlashHd * 2));
+      sl.kmm = static_cast<__half*>(
+          i.AllocBytes(static_cast<std::size_t>(max_context / kBlockKeys + 2) *
+                       c.num_kv * 2 * kFlashHd * 2));
     }
     sl.v = static_cast<__half*>(i.AllocBytes(rows * kv * 2));
     sl.hist_k = static_cast<float*>(i.AllocBytes(kv * kHistory * 4));
@@ -1799,8 +1854,11 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
   i.bank_out = i.Alloc(b * h);
   i.d_logits = i.Alloc(c.vocab_padded);
   i.d_pos = static_cast<int*>(i.AllocBytes(4));
-  i.blist = static_cast<int*>(i.AllocBytes(static_cast<std::size_t>(kMaxBatch / kFlashQ) * c.num_heads * kListCap * 4));
-  i.bcount = static_cast<int*>(i.AllocBytes(static_cast<std::size_t>(kMaxBatch / kFlashQ) * c.num_heads * 4));
+  i.blist = static_cast<int*>(
+      i.AllocBytes(static_cast<std::size_t>(kMaxBatch / kFlashQ) * c.num_heads *
+                   kListCap * 4));
+  i.bcount = static_cast<int*>(i.AllocBytes(
+      static_cast<std::size_t>(kMaxBatch / kFlashQ) * c.num_heads * 4));
   {
     const std::size_t splits = (max_context + kSplitKeys - 1) / kSplitKeys;
     i.split_m = i.Alloc(kWmmaMinTokens * c.num_heads * splits);
