@@ -5740,6 +5740,7 @@ __device__ __forceinline__ std::size_t RoutedF16RowBytes(std::size_t k) {
          : kType == WeightType::kIQ2_XXS ? (k / 256) * 66
          : kType == WeightType::kIQ2_S   ? (k / 256) * 82
          : kType == WeightType::kIQ4_XS  ? (k / 256) * 136
+         : kType == WeightType::kNVFP4   ? ((k / 2 + k / 16 + 15) / 16) * 16
                                          : (k / 32) * sizeof(Q8_0Block);
 }
 
@@ -5851,6 +5852,32 @@ __device__ __forceinline__ uint4 LoadUint4Aligned2(const std::uint8_t* p) {
   return *reinterpret_cast<const UnalignedUint4*>(p);
 }
 
+/// NVFP4 (E2M1) nibbles as signed bytes plus 128 (doubled values 0, 1, 2, 3,
+/// 4, 6, 8, 12), four per word, for the 1152 magic conversion.
+__device__ __forceinline__ std::uint32_t Nv4Bytes(std::uint32_t nibbles) {
+  constexpr std::uint32_t kP0 = 0x83828180U;  // 128 + 0, 1, 2, 3
+  constexpr std::uint32_t kP1 = 0x8C888684U;  // 128 + 4, 6, 8, 12
+  constexpr std::uint32_t kN0 = 0x7D7E7F80U;  // 128 - 0, 1, 2, 3
+  constexpr std::uint32_t kN1 = 0x74787A7CU;  // 128 - 4, 6, 8, 12
+  const std::uint32_t sel = nibbles & 0x07070707U;
+  const std::uint32_t pos = __builtin_amdgcn_perm(kP1, kP0, sel);
+  const std::uint32_t neg = __builtin_amdgcn_perm(kN1, kN0, sel);
+  const std::uint32_t mask = ((nibbles >> 3U) & 0x01010101U) * 0xFFU;
+  return (neg & mask) | (pos & ~mask);
+}
+
+/// UE4M3 scale byte of an NVFP4 sub-block (includes the 0.5 of the doubled
+/// E2M1 values).
+__device__ __forceinline__ float Nv4Scale(std::uint32_t x) {
+  if (x == 0 || x == 0x7F)
+    return 0.0F;
+  const int e = static_cast<int>((x >> 3) & 0xF);
+  const int m = static_cast<int>(x & 7);
+  const float raw = e == 0 ? ldexpf(static_cast<float>(m), -9)
+                           : ldexpf(1.0F + static_cast<float>(m) / 8.0F, e - 7);
+  return raw * 0.5F;
+}
+
 template<WeightType kType, int BM, int BN, int BK, bool kPair = false,
          bool kClampSwiglu = false>
 __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
@@ -5863,7 +5890,7 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
     __half* __restrict__ out_half, std::size_t m, std::size_t k,
     const void* __restrict__ w_up,
     const std::uint32_t* __restrict__ iq3s_grid = nullptr,
-    float out_scale = 1.0F) {
+    float out_scale = 1.0F, const float* __restrict__ expert_scale = nullptr) {
   static_assert(BM == 128 || BM == 256, "eight waves, 16-row tiles");
   static_assert(!kPair || BM == 128);
   static_assert(BN % 16 == 0 && BN / 16 <= 16);
@@ -5879,6 +5906,7 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
   constexpr bool kI3 = kType == WeightType::kIQ3_S;
   constexpr bool kI2X = kType == WeightType::kIQ2_XXS;
   constexpr bool kI2S = kType == WeightType::kIQ2_S;
+  constexpr bool kNV = kType == WeightType::kNVFP4;
   constexpr bool kGrid = kI3 || kI2X || kI2S;
   // GLM-5.3 experts clamp the gate at 10 and the up projection to +-10.
   // IQ2_XXS always carried it; other types ask for it via kClampSwiglu.
@@ -5926,6 +5954,8 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
   const int t_local = (tile >> 16) * BN;
   const int bucket_begin = pad_bounds[expert];
   const int bucket_rows = pad_bounds[expert + 1] - bucket_begin;
+  if (bucket_rows - t_local <= 0)
+    return;
   const int live_tok_tiles =
       std::min(kTokTiles, (bucket_rows - t_local + 15) / 16);
   const int num_kb = static_cast<int>(k / 32);
@@ -6093,6 +6123,13 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
         const std::uint32_t qh = blk[66 + ib32];
         const std::uint32_t sc = blk[74 + ib32];
         f_codes[u] = make_uint4(idx, sgn, qh | (sc << 8U), 0u);
+      } else if constexpr (kNV) {
+        // Repacked row: 16 nibble bytes per 32-element block, then one UE4M3
+        // scale byte per 16 elements.
+        const int j = kb0 + f_c;
+        f_codes[u] = *reinterpret_cast<const uint4*>(f_ptr[u] + (j * 16));
+        f_dm[u] = *reinterpret_cast<const std::uint16_t*>(f_ptr[u] + (k / 2) +
+                                                          (j * 2));
       } else if constexpr (kQ8) {
         // block_q8_0 is 34 bytes, so the code loads are 2-byte aligned.
         const auto* blk = f_ptr[u] + ((kb0 + f_c) * 34);
@@ -6256,6 +6293,11 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
       if constexpr (kQ8) {
       } else if constexpr (kNL) {
         scale_bias = f_live[u] ? f_dm[u] : 0U;  // half2 (d, 0)
+      } else if constexpr (kNV) {
+        const float lo = f_live[u] ? Nv4Scale(f_dm[u] & 0xFFU) : 0.0F;
+        const float hi = f_live[u] ? Nv4Scale((f_dm[u] >> 8U) & 0xFFU) : 0.0F;
+        scale_bias =
+            __builtin_bit_cast(std::uint32_t, __floats2half2_rn(lo, hi));
       } else if constexpr (kXs) {
         const int ib32 = f_i3_ib32[u];
         const std::uint32_t ls =
@@ -6347,8 +6389,9 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
     }
   }
 
-  constexpr bool kTwoScale = kI2S || kQ3;
-  constexpr bool kSigned = kQ8 || kNL || kXs || kI3 || kI2X || kI2S || kQ3;
+  constexpr bool kTwoScale = kI2S || kQ3 || kNV;
+  constexpr bool kSigned =
+      kQ8 || kNL || kXs || kI3 || kI2X || kI2S || kQ3 || kNV;
   const __half2 magic = __floats2half2_rn(kSigned ? -1152.0F : -1024.0F,
                                           kSigned ? -1152.0F : -1024.0F);
   const auto compute_stage = [&]() {
@@ -6408,6 +6451,18 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
           for (int g = 0; g < 8; ++g) {
             nib[g] = Iq2sBytes(r, g, s_grid);
           }
+        } else if constexpr (kNV) {
+          // Elements 0-7 / 8-15 are the low / high nibbles of bytes 0-7
+          // (scale 0); 16-23 / 24-31 those of bytes 8-15 (scale 1).
+          const uint4 r = raw[u][kb];
+          nib[0] = Nv4Bytes(r.x & 0x0F0F0F0FU);
+          nib[1] = Nv4Bytes(r.y & 0x0F0F0F0FU);
+          nib[2] = Nv4Bytes((r.x >> 4U) & 0x0F0F0F0FU);
+          nib[3] = Nv4Bytes((r.y >> 4U) & 0x0F0F0F0FU);
+          nib[4] = Nv4Bytes(r.z & 0x0F0F0F0FU);
+          nib[5] = Nv4Bytes(r.w & 0x0F0F0F0FU);
+          nib[6] = Nv4Bytes((r.z >> 4U) & 0x0F0F0F0FU);
+          nib[7] = Nv4Bytes((r.w >> 4U) & 0x0F0F0F0FU);
         } else if constexpr (kNL || kXs) {
           const uint4 r = raw[u][kb];
           const std::uint32_t words[4] = {r.x, r.y, r.z, r.w};
@@ -6470,9 +6525,9 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
       }
 #pragma unroll
       for (int j = 0; j < kTokTiles; ++j) {
-        if constexpr (kPair ||
-                      ((kQ5 || kQ8 || kQ3 || kNL || kXs || kGrid || kKQuant) &&
-                       BN >= 48)) {
+        if constexpr (kPair || ((kQ5 || kQ8 || kQ3 || kNL || kXs || kNV ||
+                                 kGrid || kKQuant) &&
+                                BN >= 48)) {
           // Keep one token tile's LDS fragments live at a time. Hoisting
           // all eight tiles spills registers and defeats the wider tile's
           // reuse of each weight decode. This is a compiler barrier only.
@@ -6480,9 +6535,9 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
         }
         // A short expert bucket has no output in the remaining token
         // tiles, so omit their WMMA work.
-        if constexpr ((kPair ||
-                       ((kQ5 || kQ8 || kQ3 || kNL || kXs || kGrid || kKQuant) &&
-                        BN >= 48)) &&
+        if constexpr ((kPair || ((kQ5 || kQ8 || kQ3 || kNL || kXs || kNV ||
+                                  kGrid || kKQuant) &&
+                                 BN >= 48)) &&
                       kTokTiles > 1) {
           if (j >= live_tok_tiles)
             continue;
@@ -6621,6 +6676,11 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
             if (dst >= 0) {
               float2 v =
                   *reinterpret_cast<const float2*>(scratch + tr * stride + row);
+              if (expert_scale != nullptr) {
+                const float es = expert_scale[expert];
+                v.x *= es;
+                v.y *= es;
+              }
               const size_t o = size_t(dst) * m + r;
               if (swiglu_gate != nullptr) {
                 v.x *= SiluF(swiglu_gate[o]);
@@ -6668,6 +6728,8 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
             const std::size_t o = (static_cast<std::size_t>(dst) * m) +
                                   static_cast<std::size_t>(r);
             float v = tile_scratch[flat];
+            if (expert_scale != nullptr)
+              v *= expert_scale[expert];
             if (out_half != nullptr) {
               out_half[o] = __float2half(
                   swiglu_gate != nullptr ? v * SiluF(swiglu_gate[o]) : v);
@@ -8065,6 +8127,12 @@ bool LaunchRoutedF16(const void* w, WeightType type, const __half* x,
           dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
           swiglu_gate, out, out_half, m, k, nullptr);
       return true;
+    case WeightType::kNVFP4:
+      hipLaunchKernelGGL(
+          (RoutedF16GEMMKernel<WeightType::kNVFP4, kBM, BN, kBK>), grid,
+          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
+          swiglu_gate, out, out_half, m, k, nullptr);
+      return true;
     case WeightType::kIQ4_XS:
       hipLaunchKernelGGL(
           (RoutedF16GEMMKernel<WeightType::kIQ4_XS, kBM, BN, kBK>), grid,
@@ -8146,6 +8214,42 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
     default:
       return false;
   }
+}
+
+/// NVFP4 (repacked) routed GEMM with the per-expert output scale folded into
+/// the epilogue and F16 output rows. The scaled values of Inkling stay far
+/// inside the F16 range.
+bool RoutedNvfp4GemmF16(const void* w, const __half* x,
+                        const std::int32_t* tiles, std::uint32_t n_tiles,
+                        std::uint32_t tile_rows, const std::int32_t* pad_bounds,
+                        const std::int32_t* rows_in,
+                        const std::int32_t* rows_out, __half* out_half,
+                        std::size_t m, std::size_t k, const float* expert_scale,
+                        hipStream_t stream) {
+  if (m == 0 || k == 0 || k % 64 != 0 || n_tiles == 0 || out_half == nullptr)
+    return false;
+  constexpr int kBM = 128;
+  constexpr int kBK = 2;
+  const dim3 grid(static_cast<unsigned int>((m + kBM - 1) / kBM), n_tiles);
+#define INKLING_NV_LAUNCH(BN)                                                  \
+  hipLaunchKernelGGL((RoutedF16GEMMKernel<WeightType::kNVFP4, kBM, BN, kBK>),  \
+                     grid, dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, \
+                     rows_in, rows_out, nullptr, nullptr, out_half, m, k,      \
+                     nullptr, nullptr, 1.0F, expert_scale)
+  switch (tile_rows) {
+    case 48:
+      INKLING_NV_LAUNCH(48);
+      return true;
+    case 128:
+      INKLING_NV_LAUNCH(128);
+      return true;
+    case 192:
+      INKLING_NV_LAUNCH(192);
+      return true;
+    default:
+      return false;
+  }
+#undef INKLING_NV_LAUNCH
 }
 
 // Additive experiment: RoutedF16GEMMKernel<kQ8_0, 128, 128, 2> directly,

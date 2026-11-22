@@ -74,6 +74,9 @@ endif()
 add_subdirectory(src/models/flint)
 add_subdirectory(src/models/laguna)
 
+# Inkling 2 — looped hybrid MoE text model (CPU reference plus ROCm engine).
+add_subdirectory(src/models/inkling)
+
 # Qwen3.8-Flash-Next — model-private CPU reference plus ROCm runtime.
 add_subdirectory(src/models/qwen38_flash_next)
 
@@ -235,7 +238,7 @@ add_library(gufo_llm_cli STATIC
 target_link_libraries(gufo_llm_cli PUBLIC gufo_core gufo_flint gufo_laguna gufo_glm53_flash)
 if(ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_llm_cli PUBLIC gufo_deepseek_v4_flash
-    gufo_qwen38_flash_next gufo_glm53_flash_engine)
+    gufo_qwen38_flash_next gufo_glm53_flash_engine gufo_inkling)
 endif()
 
 add_library(gufo_logging STATIC src/cli/serve/logging.cpp src/cli/serve/trace.cpp)

@@ -181,6 +181,7 @@ std::size_t QuantizedRowBytes(core::GgmlType type,
       block_bytes = 24;
       break;
     case core::GgmlType::kQ8_1:
+    case core::GgmlType::kNVFP4:
       block_bytes = 36;
       break;
     case core::GgmlType::kQ2_K:

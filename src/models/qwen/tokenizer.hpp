@@ -99,6 +99,7 @@ private:
     kQwen35,
     kGlm4,
     kLaguna,
+    kInkling2,
   };
 
   struct PairHash {
@@ -125,6 +126,7 @@ private:
   /// (`tokenizer.ggml.ignore_merges`) before BPE.
   std::vector<TokenId> Glm4EncodeText(std::string_view text) const;
   std::vector<TokenId> LagunaEncodeText(std::string_view text) const;
+  std::vector<TokenId> Inkling2EncodeText(std::string_view text) const;
   std::vector<TokenId> RegexEncodeText(std::string_view text,
                                        const char* pattern,
                                        bool ignore_merges) const;

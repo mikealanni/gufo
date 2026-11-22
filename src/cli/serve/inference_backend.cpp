@@ -48,6 +48,8 @@
 #include "src/models/flint/gpu/engine.hpp"
 #include "src/models/glm53_flash/chat_template.hpp"
 #include "src/models/glm53_flash/engine.hpp"
+#include "src/models/inkling/chat_template.hpp"
+#include "src/models/inkling/gpu/engine.hpp"
 #include "src/models/laguna/chat_template.hpp"
 #include "src/models/laguna/gpu/engine.hpp"
 #include "src/models/qwen/hip/auto_draft.hpp"
@@ -4014,6 +4016,418 @@ private:
   std::size_t session_bytes_{0};
 };
 
+constexpr std::string_view kInklingStateAbi = "inkling-rocm-session-v1";
+
+using InklingModel = models::inkling::gpu::Model;
+using InklingSession = models::inkling::gpu::Session;
+
+std::vector<std::int32_t> InklingEngineTokens(
+    std::span<const TextRunnerToken> tokens) {
+  std::vector<std::int32_t> converted;
+  converted.reserve(tokens.size());
+  for (const auto token : tokens) {
+    if (token > static_cast<TextRunnerToken>(
+                    std::numeric_limits<std::int32_t>::max())) {
+      throw std::invalid_argument("Inkling token ID exceeds engine range");
+    }
+    converted.push_back(static_cast<std::int32_t>(token));
+  }
+  return converted;
+}
+
+class InklingTextRunnerState final : public TextRunnerState {
+public:
+  InklingTextRunnerState(const std::shared_ptr<InklingModel>& model,
+                         std::uint32_t max_context) {
+    std::string error;
+    session_ = model->CreateSession(max_context + 0, &error);
+    if (session_ == nullptr) {
+      throw std::runtime_error("Failed to create Inkling session: " + error);
+    }
+  }
+
+  void Invalidate() noexcept override {
+    session_->Reset();
+    position_ = 0;
+  }
+  [[nodiscard]] TextRunnerMeasuredResources MeasuredResources()
+      const noexcept override {
+    return {.per_request_state_bytes = session_->AllocatedBytes(),
+            .temporary_scratch_bytes = 0};
+  }
+
+  [[nodiscard]] InklingSession& session() const { return *session_; }
+  [[nodiscard]] std::size_t position() const noexcept { return position_; }
+  void set_position(std::size_t position) noexcept { position_ = position; }
+  /// Running mean of tokens produced per drafted step; steers drafting.
+  double draft_yield{2.0};
+  std::size_t plain_steps{0};
+
+private:
+  std::unique_ptr<InklingSession> session_;
+  std::size_t position_{0};
+};
+
+InklingTextRunnerState& RequireInklingState(TextRunnerState& state) {
+  auto* inkling = dynamic_cast<InklingTextRunnerState*>(&state);
+  if (inkling == nullptr)
+    throw std::logic_error("text runner state is not Inkling");
+  return *inkling;
+}
+
+const InklingTextRunnerState& RequireInklingState(
+    const TextRunnerState& state) {
+  const auto* inkling = dynamic_cast<const InklingTextRunnerState*>(&state);
+  if (inkling == nullptr)
+    throw std::logic_error("text runner state is not Inkling");
+  return *inkling;
+}
+
+class InklingTextRunner final : public HipTextModelRunner {
+public:
+  static constexpr std::size_t kPrefillChunk = 8192;
+  static constexpr std::size_t kWarmupTokens = 8192;
+
+  // Drafted steps verify keep + 1 rows, where keep is the leading run of draft
+  // slots whose top-1 probability reaches kDraftConfidence (about 94% of those
+  // are accepted; each extra verify row costs about 7 ms).
+  static constexpr std::size_t kMaxDraftWidth = 7;
+  static constexpr float kDraftConfidence = 0.75F;
+  // Below this many tokens per drafted step plain decode is faster.
+  static constexpr double kMinDraftYield = 1.2;
+  static constexpr double kYieldSmoothing = 0.25;
+  static constexpr std::size_t kProbeInterval = 8;
+
+  InklingTextRunner(std::shared_ptr<InklingModel> model,
+                    std::unique_ptr<tokenization::QwenTokenizer> tokenizer,
+                    std::vector<std::int32_t> stop_tokens,
+                    std::uint32_t max_context, std::size_t draft_width = 0)
+      : model_(std::move(model)),
+        tokenizer_(std::move(tokenizer)),
+        stop_tokens_(std::move(stop_tokens)),
+        max_context_(max_context),
+        draft_width_(std::min(draft_width, kMaxDraftWidth)) {
+    MeasureSessionBytes();
+    Warmup();
+  }
+
+  // Resource admission needs an upfront per-request state estimate; the
+  // engine has no closed-form size (KV plus banked NPU scratch vary with
+  // config), so probe it once with a throwaway session of the real size.
+  void MeasureSessionBytes() {
+    std::string error;
+    auto probe = model_->CreateSession(max_context_ + 0, &error);
+    if (probe == nullptr) {
+      Logger::Warn("loader", "event=session_probe_failed reason=" + error);
+      return;
+    }
+    session_bytes_ = probe->AllocatedBytes();
+  }
+
+  void Warmup() const {
+    const char* disabled = std::getenv("GUFO_WARMUP");
+    if (disabled != nullptr && disabled[0] == '0')
+      return;
+    try {
+      const std::size_t room = max_context_ > 128 ? max_context_ - 128 : 0;
+      const std::size_t length = std::min<std::size_t>(kWarmupTokens, room);
+      if (length < 1024)
+        return;
+      const auto started = std::chrono::steady_clock::now();
+      std::string error;
+      auto session = model_->CreateSession(
+          static_cast<std::uint32_t>(length + 16), &error);
+      if (session == nullptr) {
+        Logger::Warn("loader", "event=warmup_skipped reason=" + error);
+        return;
+      }
+      const auto unit = tokenizer_->Encode(
+          "The quick brown fox jumps over the lazy dog while the engine warms "
+          "its kernels. ");
+      if (unit.empty())
+        return;
+      std::vector<std::int32_t> prompt;
+      prompt.reserve(length);
+      for (std::size_t i = 0; i < length; ++i)
+        prompt.push_back(static_cast<std::int32_t>(unit[i % unit.size()]));
+      if (!session->Append(prompt, &error)) {
+        Logger::Warn("loader", "event=warmup_failed reason=" + error);
+        return;
+      }
+      for (int step = 0; step < 4; ++step) {
+        const std::int32_t next = 1;
+        if (!session->Append({&next, 1}, &error))
+          break;
+      }
+      const auto elapsed = std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() - started)
+                               .count();
+      Logger::Info("loader",
+                   "event=warmup_completed tokens=" + std::to_string(length) +
+                       " elapsed_s=" + std::to_string(elapsed));
+    } catch (const std::exception& failure) {
+      Logger::Warn("loader",
+                   std::string("event=warmup_failed reason=") + failure.what());
+    }
+  }
+
+  [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
+    return {
+        .model_id = "Inkling 2 Mini",
+        .state_abi = std::string(kInklingStateAbi),
+        .max_context = max_context_,
+        .capabilities =
+            TextRunnerCapabilities{
+                .incremental_prefill = true,
+                .snapshot = false,
+                .fork = false,
+                .final_token_advance_required = false,
+                .incremental_text_is_exact = true,
+                .multi_token_decode = draft_width_ > 0,
+                .prefix_reuse = true,
+                .prefill_grid_tokens = 8192,
+            },
+    };
+  }
+
+  [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
+    std::size_t free_bytes = 0;
+    std::size_t total_bytes = 0;
+    std::optional<std::size_t> capacity;
+    if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess)
+      capacity = free_bytes;
+    return {
+        .resident_weights_bytes = model_->ResidentBytes(),
+        .state_capacity_bytes = capacity,
+        .per_request_state_bytes = session_bytes_,
+        .temporary_scratch_bytes = 0,
+        .requires_device_runtime_lock = true,
+    };
+  }
+
+  [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
+    return {{.kind = TextExecutionPlanKind::kSerial, .physical_width = 1}};
+  }
+
+  [[nodiscard]] std::shared_ptr<const sampling::ConstraintVocabulary>
+  BuildConstraintVocabulary() const override {
+    return std::make_shared<const sampling::ConstraintVocabulary>(
+        tokenizer_->GetVocabSize(), [this](std::uint32_t id) {
+          return sampling::ConstraintVocabulary::Piece{
+              tokenizer_->DecodeTokenCopy(id), IsStop(id)};
+        });
+  }
+
+  [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
+      std::string_view text) const override {
+    return tokenizer_->Encode(text);
+  }
+
+  [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
+      const ChatRequest& request) const override {
+    // Inkling has no tool-call rendering yet. Reject only when the caller
+    // actually requires a tool call (we cannot satisfy that); clients that
+    // merely attach a tool list with tool_choice=auto (opencode does this
+    // on every request) proceed with tools silently ignored.
+    if (!request.tools.empty() &&
+        request.tool_choice == ChatRequest::ToolChoice::kRequired) {
+      throw std::invalid_argument("Inkling does not support tools yet");
+    }
+    std::vector<models::inkling::ChatMessage> messages;
+    messages.reserve(request.messages.size());
+    for (const auto& message : request.messages) {
+      if (!message.images.empty())
+        throw std::invalid_argument("Inkling does not support image input");
+      messages.push_back({std::string(tokenization::ToString(message.role)),
+                          message.content + message.framing_suffix,
+                          message.thought});
+      if (message.role == tokenization::ChatRole::kDeveloper)
+        messages.back().role = "developer";
+    }
+    models::inkling::ChatTemplateOptions chat_options;
+    chat_options.enable_thinking = request.reasoning.enabled.value_or(true);
+    tokenization::TokenizerOptions options;
+    options.parse_special_tokens = true;
+    return tokenizer_->Encode(
+        models::inkling::RenderPrompt(messages, chat_options), options);
+  }
+
+  [[nodiscard]] std::string Decode(
+      std::span<const TextRunnerToken> tokens) const override {
+    return tokenizer_->Decode(tokens);
+  }
+
+  [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
+    return std::make_unique<InklingTextRunnerState>(model_, max_context_);
+  }
+
+  void PreparePrefixReuse(
+      TextRunnerState& state,
+      std::span<const TextRunnerToken> prefix) const override {
+    if (RequireInklingState(state).position() != prefix.size())
+      throw std::logic_error("Inkling reused prefix does not match checkpoint");
+  }
+
+  [[nodiscard]] TextPrefillStep Prefill(
+      TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t max_input_tokens) const override {
+    auto& inkling = RequireInklingState(state);
+    if (offset != inkling.position())
+      throw std::logic_error("Inkling prefill offset does not match state");
+    if (offset >= prompt.size())
+      throw std::logic_error("Inkling prefill has no remaining input");
+    const std::size_t consumed = std::min<std::size_t>(
+        {max_input_tokens, prompt.size() - offset, kPrefillChunk});
+    const auto chunk = InklingEngineTokens(prompt.subspan(offset, consumed));
+    std::string error;
+    if (!inkling.session().Append(chunk, &error)) {
+      inkling.Invalidate();
+      throw std::runtime_error("Inkling prefill failed: " + error);
+    }
+    inkling.set_position(offset + consumed);
+    return {.consumed_tokens = consumed,
+            .decode_ready = offset + consumed == prompt.size()};
+  }
+
+  [[nodiscard]] TextDecodeSelection SelectNext(
+      TextRunnerState& state, sampling::SamplerState& sampler) const override {
+    auto& inkling = RequireInklingState(state);
+    if (inkling.position() >= max_context_)
+      return {.stop = true, .piece = {}};
+    std::int32_t token = inkling.session().Argmax();
+    if (!sampler.CanSelectArgmax(static_cast<sampling::TokenId>(token))) {
+      const auto logits = inkling.session().Logits();
+      if (logits.empty())
+        throw std::runtime_error("Inkling token selection has no logits");
+      token = static_cast<std::int32_t>(sampler.Sample(logits));
+    }
+    if (IsStop(token))
+      return {.stop = true, .token = 0, .piece = {}};
+    return {.stop = false,
+            .token = static_cast<TextRunnerToken>(token),
+            .piece = std::string(tokenizer_->DecodeToken(token))};
+  }
+
+  void Advance(TextRunnerState& state, TextRunnerToken token) const override {
+    auto& inkling = RequireInklingState(state);
+    const std::int32_t input = InklingEngineTokens({&token, 1}).front();
+    std::string error;
+    if (!inkling.session().Append({&input, 1}, &error)) {
+      inkling.Invalidate();
+      throw std::runtime_error("Inkling decode failed: " + error);
+    }
+    inkling.set_position(inkling.position() + 1);
+  }
+
+  [[nodiscard]] std::optional<TextDecodeSelection> PreviewFirstToken(
+      TextRunnerState& state, sampling::SamplerState& sampler) const override {
+    return SelectNext(state, sampler);
+  }
+
+  [[nodiscard]] TextDecodeStep DecodeStep(
+      TextRunnerState& state, std::size_t max_tokens,
+      sampling::SamplerState& sampler) const override {
+    auto& inkling = RequireInklingState(state);
+    if (draft_width_ == 0 || max_tokens < 2 ||
+        inkling.position() + 2 > max_context_) {
+      return TextModelRunner::DecodeStep(state, max_tokens, sampler);
+    }
+    if (inkling.draft_yield < kMinDraftYield &&
+        ++inkling.plain_steps % kProbeInterval != 0) {
+      return TextModelRunner::DecodeStep(state, max_tokens, sampler);
+    }
+    std::size_t width = std::min<std::size_t>(
+        {draft_width_, max_tokens - 1, max_context_ - inkling.position() - 1});
+    auto& session = inkling.session();
+    sampling::SamplerState working = sampler;
+    const auto pick = [&](std::int32_t greedy, std::uint32_t row,
+                          bool last) -> std::int32_t {
+      if (working.CanSelectArgmax(static_cast<sampling::TokenId>(greedy)))
+        return greedy;
+      return static_cast<std::int32_t>(
+          working.Sample(last ? session.Logits() : session.Logits(row)));
+    };
+    const std::int32_t anchor = pick(session.Argmax(), 0, true);
+    if (IsStop(anchor))
+      return {.selections = {}, .stop = true};
+    std::vector<std::int32_t> block(width + 1, anchor);
+    std::vector<float> confidence(width);
+    std::string error;
+    if (!session.Draft(anchor, {block.data() + 1, width}, confidence,
+                       kDraftConfidence)) {
+      return TextModelRunner::DecodeStep(state, max_tokens, sampler);
+    }
+    std::size_t keep = 0;
+    while (keep < width && confidence[keep] >= kDraftConfidence)
+      ++keep;
+    if (keep == 0) {
+      inkling.draft_yield += kYieldSmoothing * (1.0 - inkling.draft_yield);
+      return TextModelRunner::DecodeStep(state, max_tokens, sampler);
+    }
+    width = keep;
+    block.resize(width + 1);
+    if (!session.AppendAll(block, &error)) {
+      inkling.Invalidate();
+      throw std::runtime_error("Inkling verification failed: " + error);
+    }
+    TextDecodeStep step;
+    step.selections.push_back(
+        {.stop = false,
+         .token = static_cast<TextRunnerToken>(anchor),
+         .piece = std::string(tokenizer_->DecodeToken(anchor))});
+    working.Accept(static_cast<sampling::TokenId>(anchor));
+    std::size_t kept = 1;
+    bool stopped = false;
+    for (std::size_t i = 0; i < width; ++i) {
+      const std::int32_t sampled =
+          pick(session.Argmax(static_cast<std::uint32_t>(i)),
+               static_cast<std::uint32_t>(i), false);
+      if (sampled != block[i + 1]) {
+        stopped = IsStop(sampled);
+        break;
+      }
+      if (IsStop(sampled)) {
+        stopped = true;
+        break;
+      }
+      step.selections.push_back(
+          {.stop = false,
+           .token = static_cast<TextRunnerToken>(sampled),
+           .piece = std::string(tokenizer_->DecodeToken(sampled))});
+      working.Accept(static_cast<sampling::TokenId>(sampled));
+      ++kept;
+    }
+    session.KeepRows(static_cast<std::uint32_t>(kept));
+    inkling.set_position(inkling.position() + kept);
+    sampler.CopyDrawStateFrom(working);
+    step.stop = stopped;
+    step.draft_rounds = 1;
+    step.draft_tokens = width;
+    step.draft_accepted_tokens = kept - 1;
+    inkling.draft_yield +=
+        kYieldSmoothing * (static_cast<double>(kept) - inkling.draft_yield);
+    return step;
+  }
+
+  [[nodiscard]] std::size_t CheckpointPosition(
+      const TextRunnerState& state) const override {
+    return RequireInklingState(state).position();
+  }
+
+private:
+  [[nodiscard]] bool IsStop(std::int32_t token) const {
+    return std::find(stop_tokens_.begin(), stop_tokens_.end(), token) !=
+           stop_tokens_.end();
+  }
+
+  std::shared_ptr<InklingModel> model_;
+  std::unique_ptr<tokenization::QwenTokenizer> tokenizer_;
+  std::vector<std::int32_t> stop_tokens_;
+  std::uint32_t max_context_;
+  std::size_t draft_width_{0};
+  std::size_t session_bytes_{0};
+};
+
 constexpr std::string_view kGlmStateAbi = "glm53-flash-rocm-session-v1";
 // Context served when none is requested; a session needs about 12 KB per token.
 constexpr std::uint32_t kGlmDefaultContext = 131072;
@@ -5112,6 +5526,58 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                 error, max_context, session_count, prefill_policy,
                 scheduler_policy);
   }
+  if (reader->GetMetadataString("general.architecture") == "inkling2") {
+    if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
+        speculative_config.backend != TextSpeculativeBackend::kDSpark) {
+      SetError(error, "Inkling speculation over serve supports dspark only");
+      return false;
+    }
+    std::string tokenizer_error;
+    auto tokenizer =
+        tokenization::QwenTokenizer::CreateFromGguf(*reader, &tokenizer_error);
+    if (tokenizer == nullptr) {
+      SetError(error, "Inkling tokenizer failed: " + tokenizer_error);
+      return false;
+    }
+    std::vector<std::int32_t> stop_tokens;
+    for (const char* key :
+         {"tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id",
+          "tokenizer.ggml.eom_token_id"}) {
+      if (const auto id = reader->GetMetadataUint32(key))
+        stop_tokens.push_back(static_cast<std::int32_t>(*id));
+    }
+    if (const auto* meta =
+            reader->FindMetadata("tokenizer.ggml.eog_token_ids")) {
+      if (const auto* ids =
+              std::get_if<std::vector<std::int64_t>>(&meta->value)) {
+        for (const auto id : *ids)
+          stop_tokens.push_back(static_cast<std::int32_t>(id));
+      } else if (const auto* ids =
+                     std::get_if<std::vector<std::uint64_t>>(&meta->value)) {
+        for (const auto id : *ids)
+          stop_tokens.push_back(static_cast<std::int32_t>(id));
+      }
+    }
+    auto model = models::inkling::gpu::Model::Load(model_path, &load_error);
+    if (model == nullptr) {
+      SetError(error, "Failed to create Inkling model: " + load_error);
+      return false;
+    }
+    std::size_t draft_width = 0;
+    if (speculative_config.backend == TextSpeculativeBackend::kDSpark &&
+        !speculative_config.draft_model_path.empty()) {
+      std::string draft_error;
+      if (!model->LoadDrafter(speculative_config.draft_model_path,
+                              &draft_error)) {
+        SetError(error, "Failed to load Inkling drafter: " + draft_error);
+        return false;
+      }
+      draft_width = speculative_config.max_draft_tokens;
+    }
+    return load(std::move(model), std::move(tokenizer), std::move(stop_tokens),
+                error, max_context, session_count, prefill_policy,
+                scheduler_policy, draft_width);
+  }
   if (reader->GetMetadataString("general.architecture") == "qwen4exp") {
     const bool mtp = speculative_config.backend == TextSpeculativeBackend::kMtp;
     const bool dflash =
@@ -5719,6 +6185,54 @@ bool InferenceBackend::load(
     auto runner = std::make_shared<LagunaTextRunner>(
         std::move(model), std::move(tokenizer), std::move(stop_tokens),
         max_context);
+    new_state->model_id = runner->Descriptor().model_id;
+    new_state->max_context = max_context;
+    auto runner_pool = std::make_shared<TextRunnerPool>(
+        std::move(runner), session_count, std::nullopt,
+        TextRunnerRamCacheOptions{});
+    new_state->scheduler = std::make_shared<TextGenerationScheduler>(
+        std::move(runner_pool), prefill_policy, scheduler_policy);
+    {
+      const std::lock_guard<std::mutex> lock(impl_->state_mutex);
+      impl_->state = std::move(new_state);
+    }
+    return true;
+  } catch (const std::exception& exception) {
+    SetError(error, exception.what());
+    return false;
+  }
+}
+
+bool InferenceBackend::load(
+    std::shared_ptr<models::inkling::gpu::Model> model,
+    std::unique_ptr<tokenization::QwenTokenizer> tokenizer,
+    std::vector<std::int32_t> stop_tokens, std::string* error,
+    std::uint32_t max_context, std::size_t session_count,
+    TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
+    std::size_t draft_width) {
+  if (model == nullptr || tokenizer == nullptr) {
+    SetError(error, "Inkling model and tokenizer must not be null");
+    return false;
+  }
+  const std::uint32_t model_context = model->config().context_length;
+  if (max_context == 0)
+    max_context = model_context;
+  if (session_count == 0) {
+    SetError(error, "HTTP session count must be at least one");
+    return false;
+  }
+  if (max_context < 2 || max_context > model_context) {
+    SetError(error, "HTTP context exceeds the loaded Inkling model context");
+    return false;
+  }
+  try {
+    auto new_state = std::make_shared<Impl::State>();
+    new_state->sampling_defaults.model =
+        sampling::TextModelPreset::kUnspecified;
+    new_state->sampling_defaults.supplied = {};
+    auto runner = std::make_shared<InklingTextRunner>(
+        std::move(model), std::move(tokenizer), std::move(stop_tokens),
+        max_context, draft_width);
     new_state->model_id = runner->Descriptor().model_id;
     new_state->max_context = max_context;
     auto runner_pool = std::make_shared<TextRunnerPool>(

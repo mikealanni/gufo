@@ -53,6 +53,7 @@ enum class WeightType : std::uint32_t {
   kIQ2_S = 22,
   kIQ4_XS = 23,
   kBF16 = 30,
+  kNVFP4 = 40,  ///< Inkling repack: [qs: k/2][scales: k/16] rows padded to 16 B
 };
 
 /// res[t][s][hidden] = table[tokens[t]] for every stream s (Q8_0 rows).
@@ -508,6 +509,16 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
                    const std::int32_t* rows_in, const std::int32_t* rows_out,
                    const float* swiglu_gate, float* out, __half* out_half,
                    std::size_t m, std::size_t k, hipStream_t stream);
+
+/// Repacked NVFP4 routed GEMM (WeightType::kNVFP4) with the per-expert scale
+/// folded into the epilogue and F16 output rows (tile_rows 48, 128 or 192).
+bool RoutedNvfp4GemmF16(const void* w, const __half* x,
+                        const std::int32_t* tiles, std::uint32_t n_tiles,
+                        std::uint32_t tile_rows, const std::int32_t* pad_bounds,
+                        const std::int32_t* rows_in,
+                        const std::int32_t* rows_out, __half* out_half,
+                        std::size_t m, std::size_t k, const float* expert_scale,
+                        hipStream_t stream);
 
 /// Experimental 128-row-per-tile variant of RoutedF16Gemm for Q8_0 only,
 /// bypassing the tile_rows<=64 limit RoutedF16Gemm enforces for that type.

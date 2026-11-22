@@ -9,6 +9,7 @@ are downloaded separately and are not part of the runtime package.
 | DeepSeek V4 Flash | Flash 0731 mixed IQ2/Q2/Q8 GGUF; text | [Usage and modes](deepseek-v4-flash/README.md) |
 | Qwen3.8 27B | Q4/Q8 GGUF; text/images | [Usage and modes](qwen3.8-27b/README.md) |
 | Qwen3.6 35B-A3B | UD-Q4_K_XL GGUF; text | [Usage and modes](qwen3.6-35b-a3b/README.md) |
+| Inkling 2 Mini | UD-Q4_K_XL GGUF + optional DSpark drafter; text | [Usage and modes](inkling/README.md) |
 | Qwen3.8 Flash-Next | Sharded Q4 GGUF; text/images | [Usage and modes](qwen3.8-flash-next/README.md) |
 | GLM-5.3 Flash | AJ-IQ2_XXS / RCO-152E Q3_K_M sharded GGUF; text | [Usage and modes](glm53-flash/README.md) |
 | Qwen3.6 35B-A3B | Q4 GGUF; text | [Usage and modes](qwen3.6-35b-a3b/README.md) |
