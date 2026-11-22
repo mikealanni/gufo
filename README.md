@@ -2,13 +2,39 @@
 
 Fast local inference for AMD Strix Halo (Ryzen AI MAX+ 395, Radeon 8060S
 `gfx1151`), with prefill shared between the GPU and the Ryzen AI NPU and
-speculative decoding on top, for Qwen, Flint and GLM-5.3 Flash models. Fork of [gufo-org/gufo](https://github.com/gufo-org/gufo) (MIT).
+speculative decoding on top, for Qwen, Inkling, Flint, GLM-5.3 Flash and Laguna models. Fork of [gufo-org/gufo](https://github.com/gufo-org/gufo) (MIT).
+
+## What's new
+
+- **jev: agent guard and opencode plugin.** A proxy in front of gufo that stops
+  the server before heavy GPU/NPU/RAM jobs, restarts the same model afterwards,
+  switches models with `/jev switch`, picks reasoning effort per request (or pins
+  it), and recovers turns that fail when the server restarts. The plugin adds
+  `/jev` to opencode and works with `opencode --standalone`, so one session
+  leaves no background service behind. A server started with `GUFO_THINK=off`
+  keeps thinking off for every request. See [docs/JEV.md](docs/JEV.md).
+- **Inkling 2 Mini** (26.4B MoE, 3.4B active, looped middle layers) on the GPU with
+  DSpark speculation and NPU prefill. Up to 256K context with block-sparse
+  attention, tool calls, a reasoning channel, and the same RAM and disk
+  continuation cache as the other models. Prefill about 1,700 to 1,850 tok/s
+  (1,647 at 128K with the NPU); decode 74.6 tok/s on code and 71.1 on JSON, 54 to
+  61 tok/s at 63K context. See [docs/models/inkling](docs/models/inkling/README.md).
+- **Qwen3.8-27B on int4 WMMA plus NPU.** The dense projections run as int4 x int4
+  WMMA on the GPU with the FFN split across the NPU: prefill 1,335 tok/s at 8K
+  (806 with the Q4_K_XL GGUF and the NPU), plain decode 14.7 tok/s, HumanEval
+  156/164 against 158/164 for the GGUF, equal NLL. DFlash2 decode as before.
+- **Standalone NPU engine.** `gufo-gen` runs dense and hybrid models and the jev
+  decision model on the NPU alone, with no GPU involved
+  (see [Pure NPU engine](#pure-npu-engine)).
+- **Faster loads.** Loaders upload tensors through one shared pinned staging
+  pipeline (`hip::TensorUpload`); Inkling loads in about 15 s warm.
 
 | Model | Weights tested | NPU prefill | Speculative decode |
 | --- | --- | --- | --- |
 | Qwen3.6-35B-A3B | UD-Q4_K_XL | linear-attention and attention projections | MTP (embedded head), DFlash2, auto |
 | Qwen3.8-27B | UD-Q4_K_XL | FFN, attention and linear-attention projections | DFlash2, MTP, auto |
 | Qwen3.8 Flash-Next | UD-IQ4_XS | whole projections, two-bank lock-step | DFlash2 (default), MTP |
+| Inkling 2 Mini | UD-Q4_K_XL | q/gate/k/v and attention output, two-bank | DSpark (external drafter) |
 | Flint | UD-Q4_K_XL | shared expert and QKV, two-bank pipeline | prompt lookup (no draft model) |
 | GLM-5.3 Flash | AJ-IQ2_XXS / RCO-152E Q3_K_M | KDA q/k/v and shared expert, two-bank lock-step | DFlash2 with prompt-lookup drafts |
 | Laguna S 2.1 | UD-Q4_K_M | shared expert, two-bank pipeline | DFlash v1 (block-diffusion) |
