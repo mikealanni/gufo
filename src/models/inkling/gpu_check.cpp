@@ -86,6 +86,85 @@ int main(int argc, char** argv) {
     }
     return 0;
   }
+  if (argc >= 5 && std::string(argv[2]) == "--draft") {
+    // --draft <text file> <drafter gguf> [width]: greedy speculative loop,
+    // acceptance stats
+    std::string err;
+    auto reader = gufo::core::GgufReader::OpenFile(argv[1], &err);
+    auto tok = gufo::tokenization::QwenTokenizer::CreateFromGguf(*reader, &err);
+    std::ifstream in(argv[3]);
+    std::stringstream ss;
+    ss << in.rdbuf();
+    const auto ids = tok->Encode(ss.str(), {});
+    const int width = argc > 5 ? std::atoi(argv[5]) : 7;
+    const int gen = std::getenv("INKLING_GEN") != nullptr
+                        ? std::atoi(std::getenv("INKLING_GEN"))
+                        : 128;
+    constexpr int kPrefix = 600;
+    auto model = gufo::models::inkling::gpu::Model::Load(argv[1], &err);
+    if (!model->LoadDrafter(argv[4], &err)) {
+      std::fprintf(stderr, "drafter load failed: %s\n", err.c_str());
+      return 1;
+    }
+    auto session = model->CreateSession(4096, &err);
+    std::vector<std::int32_t> prefix;
+    for (int i = 0; i < kPrefix; ++i)
+      prefix.push_back(static_cast<std::int32_t>(ids[i]));
+    (void)session->Append(prefix, &err);
+    const auto argmax = [](std::span<const float> l) {
+      int a = 0;
+      for (std::size_t j = 1; j < l.size(); ++j)
+        if (l[j] > l[a])
+          a = static_cast<int>(j);
+      return a;
+    };
+    int anchor = argmax(session->Logits());
+    std::vector<int> hist(width + 2, 0);
+    int produced = 0, steps = 0;
+    double draft_ms = 0.0, verify_ms = 0.0;
+    std::vector<int> stream;
+    while (produced < gen) {
+      std::vector<std::int32_t> d(width);
+      auto t0 = std::chrono::steady_clock::now();
+      if (!session->Draft(anchor, d)) {
+        std::fprintf(stderr, "draft failed\n");
+        return 1;
+      }
+      auto t1 = std::chrono::steady_clock::now();
+      std::vector<std::int32_t> batch{anchor};
+      batch.insert(batch.end(), d.begin(), d.end());
+      (void)session->AppendAll(batch, &err);
+      auto t2 = std::chrono::steady_clock::now();
+      draft_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+      verify_ms += std::chrono::duration<double, std::milli>(t2 - t1).count();
+      int acc = 0;
+      while (acc < width &&
+             argmax(session->Logits(static_cast<std::uint32_t>(acc))) == d[acc])
+        ++acc;
+      const int next = argmax(session->Logits(static_cast<std::uint32_t>(acc)));
+      session->KeepRows(static_cast<std::uint32_t>(acc + 1));
+      stream.push_back(anchor);
+      for (int i = 0; i < acc; ++i)
+        stream.push_back(d[i]);
+      produced += acc + 1;
+      ++hist[acc];
+      ++steps;
+      anchor = next;
+    }
+    std::printf(
+        "steps %d, tokens %d, mean accepted %.2f, draft %.2f ms, verify %.2f "
+        "ms\n",
+        steps, produced, static_cast<double>(produced - steps) / steps,
+        draft_ms / steps, verify_ms / steps);
+    std::printf("accepted histogram:");
+    for (int i = 0; i <= width; ++i)
+      std::printf(" %d", hist[i]);
+    std::printf("\nsample: ");
+    for (int i = 0; i < 40 && i < static_cast<int>(stream.size()); ++i)
+      std::printf("%d ", stream[i]);
+    std::printf("\n");
+    return 0;
+  }
   if (argc >= 4 && std::string(argv[2]) == "--verify") {
     // --verify <text file> <k>: AppendAll(k rows) must match k sequential
     // single-token steps

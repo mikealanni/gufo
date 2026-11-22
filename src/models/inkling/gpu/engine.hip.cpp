@@ -455,7 +455,7 @@ __global__ void ConvHist(const float* cur, float* hist, int ch, int n) {
 }
 
 constexpr int kTapCount = 4;
-constexpr int kTapLayers[kTapCount] = {
+inline int g_tap_layers[kTapCount] = {
     4, 22, 40, 47};  // virtual layers whose outputs feed the drafter
 
 // feature rows of the drafter: feat[pos][tap][h] as F16
@@ -1570,6 +1570,8 @@ struct ModelState {
   std::unordered_map<std::string, Tensor> tensors;
   std::vector<void*> allocations;
   std::size_t resident_bytes{0};
+  bool has_draft{false};
+  float draft_fuse[4][4]{};  // softmax of every row of dspark_fuse
   // optional NPU offload of the q / gate / k / v projections (INKLING_NPU=1)
   std::unique_ptr<gufo::models::qwen38_flash_next::rocm::NpuGemm> npu;
   int npu_prog_o{-1},
@@ -1802,6 +1804,309 @@ std::size_t Model::ResidentBytes() const noexcept {
   return state_->resident_bytes;
 }
 
+// ---------------------------------------------------------------- DSpark
+// drafter kernels
+constexpr float kDraftRopeTheta = 1000000.0F;
+constexpr int kDraftSlots = 8;
+
+// per position: mix = sum_k w[k] * feat[pos][k]; out = rms(mix) * norm
+__global__ void DraftFuseNorm(const __half* feat, int pos0, const float* w4,
+                              const float* norm, float* out, int h, float eps) {
+  __shared__ float red[256];
+  const __half* f =
+      feat + static_cast<std::size_t>(pos0 + blockIdx.x) * kTapCount * h;
+  float ss = 0.0F;
+  for (int i = threadIdx.x; i < h; i += blockDim.x) {
+    float m = 0.0F;
+    for (int k = 0; k < kTapCount; ++k)
+      m += w4[k] * __half2float(f[static_cast<std::size_t>(k) * h + i]);
+    out[static_cast<std::size_t>(blockIdx.x) * h + i] = m;
+    ss += m * m;
+  }
+  ss = BlockSum(ss, red);
+  const float inv = rsqrtf(ss / static_cast<float>(h) + eps);
+  for (int i = threadIdx.x; i < h; i += blockDim.x)
+    out[static_cast<std::size_t>(blockIdx.x) * h + i] *= inv * norm[i];
+}
+
+// per (row, head): rms over 128 (optional weight) then NEOX rope at position
+// pos_base + row
+__global__ void DraftNormRope(float* x, const float* w, int heads, int pos_base,
+                              float eps, bool rope) {
+  __shared__ float red[128];
+  float* p =
+      x + (static_cast<std::size_t>(blockIdx.x) * heads + blockIdx.y) * 128;
+  const int d = threadIdx.x;
+  float v = p[d];
+  float ss = BlockSum(v * v, red);
+  const float inv = rsqrtf(ss / 128.0F + eps);
+  v = v * inv * (w != nullptr ? w[d] : 1.0F);
+  if (!rope) {
+    p[d] = v;
+    return;
+  }
+  __shared__ float sh[128];
+  sh[d] = v;
+  __syncthreads();
+  const int i = d & 63;
+  const float freq =
+      expf(-static_cast<float>(i) * (logf(kDraftRopeTheta) / 64.0F));
+  const float ang = static_cast<float>(pos_base + blockIdx.x) * freq;
+  const float c = cosf(ang);
+  const float sn = sinf(ang);
+  p[d] = d < 64 ? sh[i] * c - sh[i + 64] * sn : sh[i + 64] * c + sh[i] * sn;
+}
+
+// context K/V (rows [n][1024]) -> f16 cache rows at positions pos0 + row (K
+// already normed and roped)
+__global__ void DraftStoreCtx(const float* k, const float* v, __half* kc,
+                              __half* vc, int pos0, int cap) {
+  const std::size_t dst =
+      static_cast<std::size_t>((pos0 + blockIdx.x) % cap) * 1024;
+  for (int i = threadIdx.x; i < 1024; i += blockDim.x) {
+    kc[dst + i] =
+        __float2half(k[static_cast<std::size_t>(blockIdx.x) * 1024 + i]);
+    vc[dst + i] =
+        __float2half(v[static_cast<std::size_t>(blockIdx.x) * 1024 + i]);
+  }
+}
+
+// block attention for one head and one key split: all 8 query slots share every
+// key load. Keys are the cached context rows [lo, P) (ring of cap rows)
+// followed by the 8 block keys (non-causal).
+__global__ void DraftAttnPartial(const float* q, const float* kb,
+                                 const float* vb, const __half* kc,
+                                 const __half* vc, int P, int lo, int cap,
+                                 int nsplit, float* pm, float* pl, float* po) {
+  __shared__ float sm[4][kDraftSlots], sl[4][kDraftSlots];
+  __shared__ float so[4][kDraftSlots][128];
+  const int h = blockIdx.x;
+  const int split = blockIdx.y;
+  const int g = h / 3;
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int nctx = P - lo;
+  const int total = nctx + kDraftSlots;
+  const int chunk = (total + nsplit - 1) / nsplit;
+  const int st = split * chunk;
+  const int en = min(total, st + chunk);
+  constexpr float scale = 0.08838834764831843F;
+  float q4[kDraftSlots][4];
+  float m[kDraftSlots], l[kDraftSlots], o4[kDraftSlots][4];
+  for (int s = 0; s < kDraftSlots; ++s) {
+    const float* qp =
+        q + (static_cast<std::size_t>(s) * 24 + h) * 128 + lane * 4;
+    for (int t = 0; t < 4; ++t) {
+      q4[s][t] = qp[t] * scale;
+      o4[s][t] = 0.0F;
+    }
+    m[s] = -3.0e38F;
+    l[s] = 0.0F;
+  }
+  for (int j = st + warp; j < en; j += 4) {
+    float k4[4], v4[4];
+    if (j < nctx) {
+      const std::size_t base =
+          static_cast<std::size_t>((lo + j) % cap) * 1024 + g * 128 + lane * 4;
+      for (int t = 0; t < 4; ++t) {
+        k4[t] = __half2float(kc[base + t]);
+        v4[t] = __half2float(vc[base + t]);
+      }
+    } else {
+      const std::size_t base =
+          (static_cast<std::size_t>(j - nctx) * 8 + g) * 128 + lane * 4;
+      for (int t = 0; t < 4; ++t) {
+        k4[t] = kb[base + t];
+        v4[t] = vb[base + t];
+      }
+    }
+    for (int s = 0; s < kDraftSlots; ++s) {
+      float dot = q4[s][0] * k4[0] + q4[s][1] * k4[1] + q4[s][2] * k4[2] +
+                  q4[s][3] * k4[3];
+      for (int off = 16; off > 0; off >>= 1)
+        dot += __shfl_xor(dot, off);
+      const float mn = fmaxf(m[s], dot);
+      const float a = expf(m[s] - mn);
+      const float p = expf(dot - mn);
+      l[s] = l[s] * a + p;
+      for (int t = 0; t < 4; ++t)
+        o4[s][t] = o4[s][t] * a + p * v4[t];
+      m[s] = mn;
+    }
+  }
+  for (int s = 0; s < kDraftSlots; ++s) {
+    if (lane == 0) {
+      sm[warp][s] = m[s];
+      sl[warp][s] = l[s];
+    }
+    for (int t = 0; t < 4; ++t)
+      so[warp][s][lane * 4 + t] = o4[s][t];
+  }
+  __syncthreads();
+  for (int idx = threadIdx.x; idx < kDraftSlots * 128; idx += blockDim.x) {
+    const int s = idx >> 7;
+    const int d = idx & 127;
+    float mx = -3.0e38F;
+    for (int w = 0; w < 4; ++w)
+      mx = fmaxf(mx, sm[w][s]);
+    float den = 0.0F, acc = 0.0F;
+    for (int w = 0; w < 4; ++w) {
+      const float sc = sm[w][s] > -1.0e38F ? expf(sm[w][s] - mx) : 0.0F;
+      den += sc * sl[w][s];
+      acc += sc * so[w][s][d];
+    }
+    const std::size_t part =
+        (static_cast<std::size_t>(s) * 24 + h) * nsplit + split;
+    po[part * 128 + d] = acc;
+    if (d == 0) {
+      pm[part] = mx;
+      pl[part] = den;
+    }
+  }
+}
+
+__global__ void DraftAttnCombine(const float* pm, const float* pl,
+                                 const float* po, float* out, int nsplit) {
+  const std::size_t base =
+      (static_cast<std::size_t>(blockIdx.x) * 24 + blockIdx.y) * nsplit;
+  float mx = -3.0e38F;
+  for (int s = 0; s < nsplit; ++s)
+    mx = fmaxf(mx, pm[base + s]);
+  float den = 0.0F, acc = 0.0F;
+  for (int s = 0; s < nsplit; ++s) {
+    const float sc = pm[base + s] > -1.0e38F ? expf(pm[base + s] - mx) : 0.0F;
+    den += sc * pl[base + s];
+    acc += sc * po[(base + s) * 128 + threadIdx.x];
+  }
+  out[(static_cast<std::size_t>(blockIdx.x) * 24 + blockIdx.y) * 128 +
+      threadIdx.x] = acc / den;
+}
+
+// x += y; h = rms(x) * w
+__global__ void DraftAddNorm(float* x, const float* y, const float* w,
+                             float* hout, int h, float eps) {
+  __shared__ float red[256];
+  float* xp = x + static_cast<std::size_t>(blockIdx.x) * h;
+  float ss = 0.0F;
+  for (int i = threadIdx.x; i < h; i += blockDim.x) {
+    const float v =
+        xp[i] +
+        (y != nullptr ? y[static_cast<std::size_t>(blockIdx.x) * h + i] : 0.0F);
+    xp[i] = v;
+    ss += v * v;
+  }
+  ss = BlockSum(ss, red);
+  const float inv = rsqrtf(ss / static_cast<float>(h) + eps);
+  if (hout != nullptr) {
+    for (int i = threadIdx.x; i < h; i += blockDim.x)
+      hout[static_cast<std::size_t>(blockIdx.x) * h + i] = xp[i] * inv * w[i];
+  }
+}
+
+__global__ void DraftSwiglu(const float* gate, const float* up, float* act,
+                            std::size_t count) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < count) {
+    const float g = gate[i];
+    act[i] = g / (1.0F + expf(-g)) * up[i];
+  }
+}
+
+// mask rows for slots 1..7 (slot 0 is the embedded anchor) and the first-layer
+// norm of every slot
+__global__ void DraftSlotsInit(const float* mask, const float* anchor_row,
+                               float* x, int h) {
+  const int slot = blockIdx.x;
+  for (int i = threadIdx.x; i < h; i += blockDim.x)
+    x[static_cast<std::size_t>(slot) * h + i] =
+        slot == 0 ? anchor_row[i] : mask[i];
+}
+
+// joint input row = [state(256), w1[prev](256), cur(2304), carry(2304)]
+__global__ void DraftJointIn(const float* state, const unsigned short* w1,
+                             const int* prev_p, const float* cur,
+                             const float* carry, float* out, int h, int r) {
+  const int prev = *prev_p;
+  for (int i = threadIdx.x; i < 2 * r + 2 * h; i += blockDim.x) {
+    float v;
+    if (i < r)
+      v = state[i];
+    else if (i < 2 * r)
+      v = __uint_as_float(static_cast<unsigned>(
+                              w1[static_cast<std::size_t>(prev) * r + (i - r)])
+                          << 16);
+    else if (i < 2 * r + h)
+      v = cur[i - 2 * r];
+    else
+      v = carry[i - 2 * r - h];
+    out[i] = v;
+  }
+}
+
+// state = gate*state + (1-gate)*cand; latent = tanh(u2)
+__global__ void DraftMarkovState(const float* joint, const float* bias,
+                                 float* state, float* latent, int r) {
+  const int i = threadIdx.x;
+  if (i >= r)
+    return;
+  const float u0 = joint[i] + bias[i];
+  const float u1 = joint[r + i] + bias[r + i];
+  const float u2 = joint[2 * r + i] + bias[2 * r + i];
+  const float gate = 1.0F / (1.0F + expf(-u0));
+  const float cand = tanhf(u1);
+  state[i] = gate * (state[i] - cand) + cand;
+  latent[i] = tanhf(u2);
+}
+
+// y[r] = w[r] . x + a1[r] + a2[r]; w is bf16 [rows][cols]; one wave per row
+__global__ void DraftBf16Gemv(const unsigned short* w, const float* x, float* y,
+                              int cols, int rows, const float* a1,
+                              const float* a2) {
+  const int lane = threadIdx.x % warpSize;
+  const int r = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
+  if (r >= rows)
+    return;
+  const unsigned short* wr = w + static_cast<std::size_t>(r) * cols;
+  float acc = 0.0F;
+  for (int c = lane; c < cols; c += warpSize)
+    acc += __uint_as_float(static_cast<unsigned>(wr[c]) << 16) * x[c];
+  for (int off = warpSize / 2; off > 0; off >>= 1)
+    acc += __shfl_down(acc, off);
+  if (lane == 0)
+    y[r] =
+        acc + (a1 != nullptr ? a1[r] : 0.0F) + (a2 != nullptr ? a2[r] : 0.0F);
+}
+
+__global__ void ArgMaxRow(const float* x, int n, int* out, int* out2) {
+  __shared__ float bv[256];
+  __shared__ int bi[256];
+  float best = -3.0e38F;
+  int idx = 0;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    if (x[i] > best) {
+      best = x[i];
+      idx = i;
+    }
+  }
+  bv[threadIdx.x] = best;
+  bi[threadIdx.x] = idx;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s && (bv[threadIdx.x + s] > bv[threadIdx.x] ||
+                            (bv[threadIdx.x + s] == bv[threadIdx.x] &&
+                             bi[threadIdx.x + s] < bi[threadIdx.x]))) {
+      bv[threadIdx.x] = bv[threadIdx.x + s];
+      bi[threadIdx.x] = bi[threadIdx.x + s];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    *out = bi[0];
+    *out2 = bi[0];
+  }
+}
+
 // Everything one token bank needs between layers; a session swaps two of these
 // so each bank has its own residual stream, blocks and scratch.
 struct Scratch {
@@ -1852,6 +2157,19 @@ struct Session::Impl : Scratch {
   bool banked{false};
   __half* feat{nullptr};  // tapped hidden states per position (drafter
                           // features), when enabled
+  // ---- drafter state
+  std::uint32_t dwarmed{0};
+  bool dready{false};
+  __half* dk[3]{};
+  __half* dv[3]{};
+  int dcap[3]{};
+  float *dctx{}, *dck{}, *dcv{}, *dx{}, *dh{}, *dq{}, *dkb{}, *dvb{}, *datt{},
+      *dgate{}, *dup{}, *dact{}, *dpm{}, *dpl{}, *dpo{}, *dcarry{}, *dstate{},
+      *dlatent{}, *djin{}, *djout{}, *deff{}, *dlog{}, *dtmp{}, *dw{};
+  int *dprev{}, *dtok{}, *dout{};
+  static constexpr int kDraftWarmChunk = 256;
+  static constexpr int kDraftSplit = 64;
+  static constexpr int kDraftShortlist = 65536;
   HistEntry* hist_entries{nullptr};
   int n_hist_entries{0};
   int last_rows{0};
@@ -2849,13 +3167,168 @@ struct Session::Impl : Scratch {
     position += n;
   }
 
-  void Tap(int v, int n) {
+  const float* DW(const std::string& n) const {
+    return static_cast<const float*>(m->T("d." + n).dev);
+  }
+  void DraftEnsure() {
+    if (dready)
+      return;
+    const int h = static_cast<int>(m->config.hidden_size);
+    constexpr int kSlots = 8;
+    const auto f = [&](std::size_t n) {
+      return static_cast<float*>(AllocBytes(n * 4));
+    };
+    for (int l = 0; l < 3; ++l) {
+      dcap[l] = l == 1 ? static_cast<int>(ctx) : 1024;
+      dk[l] = static_cast<__half*>(
+          AllocBytes(static_cast<std::size_t>(dcap[l]) * 1024 * 2));
+      dv[l] = static_cast<__half*>(
+          AllocBytes(static_cast<std::size_t>(dcap[l]) * 1024 * 2));
+    }
+    dctx = f(static_cast<std::size_t>(kDraftWarmChunk) * h);
+    dck = f(static_cast<std::size_t>(kDraftWarmChunk) * 1024);
+    dcv = f(static_cast<std::size_t>(kDraftWarmChunk) * 1024);
+    dx = f(kSlots * h);
+    dh = f(kSlots * h);
+    dtmp = f(kSlots * h);
+    dq = f(kSlots * 3072);
+    dkb = f(kSlots * 1024);
+    dvb = f(kSlots * 1024);
+    datt = f(kSlots * 3072);
+    dgate = f(kSlots * 9216);
+    dup = f(kSlots * 9216);
+    dact = f(kSlots * 9216);
+    const std::size_t parts =
+        static_cast<std::size_t>(kSlots) * 24 * kDraftSplit;
+    dpm = f(parts);
+    dpl = f(parts);
+    dpo = f(parts * 128);
+    dcarry = f(h);
+    dstate = f(256);
+    dlatent = f(256);
+    djin = f(5120);
+    djout = f(768);
+    deff = f(h);
+    dlog = f(kDraftShortlist);
+    dw = f(16);
+    HIP_OK(hipMemcpy(dw, m->draft_fuse, 16 * 4, hipMemcpyHostToDevice));
+    dprev = static_cast<int*>(AllocBytes(4));
+    dtok = static_cast<int*>(AllocBytes(4));
+    dout = static_cast<int*>(AllocBytes(8 * 4));
+    dready = true;
+  }
+  void DraftAttention(int layer, int P) {
+    const int lo = layer == 1 ? 0 : std::max(0, P - 1024);
+    const int total = P - lo + 8;
+    const int nsplit = std::min(kDraftSplit, std::max(1, (total + 255) / 256));
+    DraftAttnPartial<<<dim3(24, nsplit), 128, 0, stream>>>(
+        dq, dkb, dvb, dk[layer], dv[layer], P, lo, dcap[layer], nsplit, dpm,
+        dpl, dpo);
+    DraftAttnCombine<<<dim3(8, 24), 128, 0, stream>>>(dpm, dpl, dpo, datt,
+                                                      nsplit);
+  }
+  void DraftWarm(int P) {
+    const int h = static_cast<int>(m->config.hidden_size);
+    const float eps = m->config.rms_eps;
+    for (int p0 = static_cast<int>(dwarmed); p0 < P; p0 += kDraftWarmChunk) {
+      const int n = std::min(kDraftWarmChunk, P - p0);
+      for (int l = 0; l < 3; ++l) {
+        const std::string b = "blk." + std::to_string(l) + ".";
+        DraftFuseNorm<<<n, 256, 0, stream>>>(
+            feat, p0, dw + 4 * l, DW(b + "dflare_norm.weight"), dctx, h, eps);
+        Dense(m->T("d." + b + "attn_k_ctx.weight"), dctx, h, dck, 1024, n);
+        Dense(m->T("d." + b + "attn_v_ctx.weight"), dctx, h, dcv, 1024, n);
+        DraftNormRope<<<dim3(n, 8), 128, 0, stream>>>(
+            dck, DW(b + "attn_k_ctx_norm.weight"), 8, p0, eps, true);
+        DraftStoreCtx<<<n, 256, 0, stream>>>(dck, dcv, dk[l], dv[l], p0,
+                                             dcap[l]);
+      }
+    }
+    dwarmed = static_cast<std::uint32_t>(P);
+  }
+  bool Draft(std::int32_t anchor, std::int32_t* out, int count) {
+    const int h = static_cast<int>(m->config.hidden_size);
+    const float eps = m->config.rms_eps;
+    const int P = static_cast<int>(position);
+    if (feat == nullptr || !m->has_draft || P == 0)
+      return false;
+    DraftEnsure();
+    if (dwarmed > static_cast<std::uint32_t>(P))
+      dwarmed = static_cast<std::uint32_t>(P);
+    DraftWarm(P);
+    DraftFuseNorm<<<1, 256, 0, stream>>>(
+        feat, P - 1, dw + 12, DW("dspark_norm.weight"), dcarry, h, eps);
+    HIP_OK(hipMemcpyAsync(dtok, &anchor, 4, hipMemcpyHostToDevice, stream));
+    HIP_OK(hipMemcpyAsync(dprev, &anchor, 4, hipMemcpyHostToDevice, stream));
+    const Tensor& emb = m->T("token_embd.weight");
+    EmbedQ8<<<1, 256, 0, stream>>>(static_cast<const unsigned char*>(emb.dev),
+                                   emb.row_bytes, dtok, dtmp, h);
+    RmsRows(dtmp, static_cast<const float*>(m->T("token_embd_norm.weight").dev),
+            dtmp, 1, h, h, h);
+    DraftSlotsInit<<<8, 256, 0, stream>>>(DW("mask_embd.weight"), dtmp, dx, h);
+    DraftAddNorm<<<8, 256, 0, stream>>>(
+        dx, nullptr, DW("blk.0.attn_norm.weight"), dh, h, eps);
+    for (int l = 0; l < 3; ++l) {
+      const std::string b = "d.blk." + std::to_string(l) + ".";
+      Dense(m->T(b + "attn_q.weight"), dh, h, dq, 3072, 8);
+      Dense(m->T(b + "attn_k.weight"), dh, h, dkb, 1024, 8);
+      Dense(m->T(b + "attn_v.weight"), dh, h, dvb, 1024, 8);
+      DraftNormRope<<<dim3(8, 24), 128, 0, stream>>>(
+          dq, DW("blk." + std::to_string(l) + ".attn_q_norm.weight"), 24, P,
+          eps, true);
+      DraftNormRope<<<dim3(8, 8), 128, 0, stream>>>(
+          dkb, DW("blk." + std::to_string(l) + ".attn_k_norm.weight"), 8, P,
+          eps, true);
+      DraftAttention(l, P);
+      Dense(m->T(b + "attn_output.weight"), datt, 3072, dtmp, h, 8);
+      DraftAddNorm<<<8, 256, 0, stream>>>(
+          dx, dtmp, DW("blk." + std::to_string(l) + ".ffn_norm.weight"), dh, h,
+          eps);
+      Dense(m->T(b + "ffn_gate.weight"), dh, h, dgate, 9216, 8);
+      Dense(m->T(b + "ffn_up.weight"), dh, h, dup, 9216, 8);
+      DraftSwiglu<<<(8 * 9216 + 255) / 256, 256, 0, stream>>>(dgate, dup, dact,
+                                                              8 * 9216);
+      Dense(m->T(b + "ffn_down.weight"), dact, 9216, dtmp, h, 8);
+      const float* next =
+          l == 2 ? DW("output_norm.weight")
+                 : DW("blk." + std::to_string(l + 1) + ".attn_norm.weight");
+      DraftAddNorm<<<8, 256, 0, stream>>>(dx, dtmp, next, dh, h, eps);
+    }
+    const unsigned short* joint_w =
+        static_cast<const unsigned short*>(m->T("d.joint_proj.weight").dev);
+    const unsigned short* w1 =
+        static_cast<const unsigned short*>(m->T("d.markov_w1.weight").dev);
+    const unsigned short* how = static_cast<const unsigned short*>(
+        m->T("d.dspark_hidden_out.weight").dev);
+    const Tensor& head = m->T("output.weight");
+    HIP_OK(hipMemsetAsync(dstate, 0, 256 * 4, stream));
+    const int steps = std::min(count, 7);
+    for (int s = 1; s <= steps; ++s) {
+      const float* cur = dh + static_cast<std::size_t>(s) * h;
+      DraftJointIn<<<1, 256, 0, stream>>>(dstate, w1, dprev, cur, dcarry, djin,
+                                          h, 256);
+      DraftBf16Gemv<<<768 / 4, 128, 0, stream>>>(joint_w, djin, djout, 5120,
+                                                 768, nullptr, nullptr);
+      DraftMarkovState<<<1, 256, 0, stream>>>(djout, DW("joint_proj.bias"),
+                                              dstate, dlatent, 256);
+      DraftBf16Gemv<<<h / 4, 128, 0, stream>>>(how, dlatent, deff, 256, h, cur,
+                                               DW("dspark_hidden_out.bias"));
+      Dense(head, deff, h, dlog, kDraftShortlist, 1, kDraftShortlist);
+      ArgMaxRow<<<1, 256, 0, stream>>>(dlog, kDraftShortlist, dprev,
+                                       dout + (s - 1));
+    }
+    HIP_OK(hipMemcpyAsync(out, dout, steps * 4, hipMemcpyDeviceToHost, stream));
+    HIP_OK(hipStreamSynchronize(stream));
+    return true;
+  }
+  void Tap(int v, int n, const float* src = nullptr) {
     if (feat == nullptr)
       return;
     for (int k = 0; k < kTapCount; ++k) {
-      if (kTapLayers[k] == v)
+      if (g_tap_layers[k] == v)
         TapStore<<<n, 256, 0, stream>>>(
-            cur, feat, d_pos, k, static_cast<int>(m->config.hidden_size));
+            src != nullptr ? src : cur, feat, d_pos, k,
+            static_cast<int>(m->config.hidden_size));
     }
   }
 
@@ -3013,6 +3486,7 @@ struct Session::Impl : Scratch {
     Mixer(R[1].blocks, cur,
           static_cast<const float*>(m->T("output_res_query.weight").dev), 1, n,
           x);
+    Tap(48, n, x);
     RmsRows(x, static_cast<const float*>(m->T("output_norm.weight").dev), x, n,
             h, h, h);
     const Tensor& out = m->T("output.weight");
@@ -3089,6 +3563,7 @@ struct Session::Impl : Scratch {
     Mixer(blocks, cur,
           static_cast<const float*>(m->T("output_res_query.weight").dev), 1, n,
           x);
+    Tap(48, n, x);
     RmsRows(x, static_cast<const float*>(m->T("output_norm.weight").dev), x, n,
             h, h, h);
     const Tensor& out = m->T("output.weight");
@@ -3151,11 +3626,17 @@ void Session::KeepRows(std::uint32_t keep) {
       i.hist_entries, static_cast<int>(keep));
   HIP_OK(hipStreamSynchronize(i.stream));
   i.position = i.pos_before_last + keep;
+  i.dwarmed = std::min(i.dwarmed, i.position);
   i.last_rows = static_cast<int>(keep);
+}
+
+bool Session::Draft(std::int32_t anchor, std::span<std::int32_t> out) {
+  return impl_->Draft(anchor, out.data(), static_cast<int>(out.size()));
 }
 
 void Session::Rewind(std::uint32_t position) noexcept {
   impl_->position = position;
+  impl_->dwarmed = std::min(impl_->dwarmed, position);
 }
 std::uint32_t Session::Position() const noexcept {
   return impl_->position;
@@ -3163,6 +3644,7 @@ std::uint32_t Session::Position() const noexcept {
 
 void Session::Reset() noexcept {
   impl_->position = 0;
+  impl_->dwarmed = 0;
   const Config& c = impl_->m->config;
   const std::size_t kv = static_cast<std::size_t>(c.num_kv) * c.head_dim;
   for (auto& s : impl_->slots) {
@@ -3186,6 +3668,76 @@ bool Session::Append(std::span<const std::int32_t> tokens, std::string* error) {
     impl_->Forward(
         tokens.subspan(off, std::min<std::size_t>(chunk, tokens.size() - off)));
   }
+  return true;
+}
+
+bool Model::LoadDrafter(const std::string& path, std::string* error) {
+  auto reader = gufo::core::GgufReader::OpenFile(path, error);
+  if (!reader)
+    return false;
+  auto& st = *state_;
+  for (const auto& info : reader->GetTensors()) {
+    Tensor t;
+    switch (info.type) {
+      case GgmlType::kF32:
+        t.type = kTypeF32;
+        break;
+      case GgmlType::kBF16:
+        t.type = kTypeBf16;
+        break;
+      case GgmlType::kQ8_0:
+        t.type = kTypeQ8;
+        break;
+      default:
+        if (error != nullptr)
+          *error =
+              "unsupported drafter tensor type in " + std::string(info.name);
+        return false;
+    }
+    t.cols = info.dimensions[0];
+    t.rows = 1;
+    for (std::size_t d = 1; d < info.dimensions.size(); ++d)
+      t.rows *= info.dimensions[d];
+    t.row_bytes = info.size_bytes / t.rows;
+    const std::string name = "d." + std::string(info.name);
+    if (t.type == kTypeQ8) {
+      void* tmp = nullptr;
+      HIP_OK(hipMalloc(&tmp, info.size_bytes));
+      HIP_OK(hipMemcpy(tmp, info.data, info.size_bytes, hipMemcpyHostToDevice));
+      const std::size_t stride = (t.cols + (t.cols / 32) * 2 + 15) / 16 * 16;
+      HIP_OK(hipMalloc(&t.dev, stride * t.rows));
+      HIP_OK(hipMemset(t.dev, 0, stride * t.rows));
+      RepackRows<<<static_cast<unsigned>(t.rows), 256>>>(
+          static_cast<const unsigned char*>(tmp), t.row_bytes,
+          static_cast<unsigned char*>(t.dev), stride, static_cast<int>(t.cols),
+          false);
+      HIP_OK(hipDeviceSynchronize());
+      HIP_OK(hipFree(tmp));
+      t.row_bytes = stride;
+      st.resident_bytes += stride * t.rows;
+    } else {
+      HIP_OK(hipMalloc(&t.dev, info.size_bytes));
+      HIP_OK(
+          hipMemcpy(t.dev, info.data, info.size_bytes, hipMemcpyHostToDevice));
+      st.resident_bytes += info.size_bytes;
+    }
+    st.allocations.push_back(t.dev);
+    if (info.name == "dspark_fuse.weight") {
+      const float* f = static_cast<const float*>(info.data);
+      for (int r = 0; r < 4; ++r) {
+        float mx = f[r * 4];
+        for (int k = 1; k < 4; ++k)
+          mx = std::max(mx, f[r * 4 + k]);
+        float sum = 0.0F;
+        for (int k = 0; k < 4; ++k)
+          sum += std::exp(f[r * 4 + k] - mx);
+        for (int k = 0; k < 4; ++k)
+          st.draft_fuse[r][k] = std::exp(f[r * 4 + k] - mx) / sum;
+      }
+    }
+    st.tensors.emplace(name, t);
+  }
+  st.has_draft = true;
   return true;
 }
 
@@ -3349,6 +3901,10 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
                      hipMemcpyHostToDevice));
   }
   HIP_OK(hipStreamCreateWithFlags(&i.stream, hipStreamNonBlocking));
+  if (const char* tp = std::getenv("INKLING_TAPS"); tp != nullptr) {
+    std::sscanf(tp, "%d,%d,%d,%d", &g_tap_layers[0], &g_tap_layers[1],
+                &g_tap_layers[2], &g_tap_layers[3]);
+  }
   if (std::getenv("INKLING_DRAFT") != nullptr) {
     i.feat = static_cast<__half*>(i.AllocBytes(
         static_cast<std::size_t>(max_context) * kTapCount * h * 2));

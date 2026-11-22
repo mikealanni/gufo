@@ -196,7 +196,13 @@ looped 3x -> 5.4B effective active; 24 physical layers, middle core looped).
   mask_embd for the rest, 3 layers (ffn 9216), output_norm, target lm head (the reference runtime uses a Q4_0 shortlist head) + Markov RNN
   (markov_w1 [256, vocab], joint_proj [5120 -> 768] over [state, w1[prev], 2x2304 features], dspark_hidden_out); the
   artifact has no markov_w2, so the vocab bias is probably tied to markov_w1 (to confirm in g_dsp_markov_*).
-- Next: drafter engine (warm: fuse/K/V ctx projections; propose: 3 layers + head + Markov chain), accept loop
+- Drafter engine (2026-11-22, `Session::Draft`, `Model::LoadDrafter`, `gpu_check --draft`): warm (fuse + K/V ctx
+  into a drafter KV, rings for the two SWA layers), 3 layers over 8 slots, Markov RNN head over the first 65536 vocab
+  rows (greedy). Tap definition settled by acceptance on prose: virtual layer outputs 4, 22, 40, 47 (mean accepted 1.72
+  of 7 vs 0.3-1.5 for neighbours). First-slot acceptance ~64%, matching the reference runtime's depth-1 58-70%. Draft ~9.5 ms (7
+  sequential Q8 head matvecs over 65536 rows dominate) vs verify-8 93 ms.
+- Decode is the lever: plain step 35 ms vs ~16 ms bandwidth ceiling (3.6 GB at 225 GB/s); the draft must be under 3 ms
+  and verify-2 near the plain step to reach 50 tok/s.
   (greedy first), captured verify graphs, serve integration.
 
 ## Open questions / next steps (skill default order)

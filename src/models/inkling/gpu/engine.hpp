@@ -34,6 +34,9 @@ public:
   /// are overwritten by the next append and the convolution history is rewound
   /// to that point).
   void KeepRows(std::uint32_t keep);
+  /// Drafts out.size() (at most 7) tokens after `anchor`, the next token to
+  /// append; needs INKLING_DRAFT and Model::LoadDrafter.
+  [[nodiscard]] bool Draft(std::int32_t anchor, std::span<std::int32_t> out);
   /// Drops cache rows past `position`; later appends overwrite them.
   void Rewind(std::uint32_t position) noexcept;
   [[nodiscard]] std::uint32_t Position() const noexcept;
@@ -57,6 +60,8 @@ public:
       const std::string& model_path, std::string* error_msg = nullptr);
   [[nodiscard]] std::unique_ptr<Session> CreateSession(
       std::uint32_t max_context, std::string* error_msg = nullptr);
+  [[nodiscard]] bool LoadDrafter(const std::string& path,
+                                 std::string* error_msg = nullptr);
   [[nodiscard]] const Config& config() const noexcept;
   [[nodiscard]] std::size_t ResidentBytes() const noexcept;
 
