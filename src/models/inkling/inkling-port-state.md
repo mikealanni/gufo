@@ -151,6 +151,31 @@ looped 3x -> 5.4B effective active; 24 physical layers, middle core looped).
 - Not done: other-model regression for the shared-kernel edits (NVFP4 weight type, routed empty-tile
   return); merge.
 
+## the reference runtime Inkling port as a reference (2026-11-22) and what it gave us
+
+- `an external package`: GPU-only the reference runtime package (programs only, same Q4_K_XL GGUF),
+  prefill 1.45k (1k) / 1.65-1.70k (2k) / 1.69-1.74k (8k) / 1.61-1.64k (16k) / 1.24-1.26k (32k), decode 46 tok/s
+  with DSpark depth 1 (58-70% accepted), upstream ROCm 273 / 15 tok/s. Their kernel list (its program) showed:
+  NVFP4 expert GEMMs with the expert scale folded in and F16 outputs (`g_moe_ggu_nvfp4_fused_sc_f16o`),
+  Q8 activation planes out of the norms (int8 GEMMs), many fused small kernels, tile selection by token count.
+- Taken: NVFP4 routed GEMM with folded expert scale and F16 output (scaled gate/up max 20, down max 21.6, far
+  inside F16): GPU-only 4k 1643 -> 1694, 8k 1614 -> 1663. With the NPU: 8k 1864, 32k 1718, 128k 1647 tok/s.
+- Not taken yet: fused gate+up+SiTU epilogue (needs split gate/up tensors), Q8 activation planes / W8A8 dense.
+
+## DSpark drafter (not implemented) - spec recovered from the the reference runtime program (its program)
+
+- Drafter GGUF `dspark-Inkling-2-Mini-Q8_0.gguf` (arch `dflash`, 54 tensors): 3 dense layers (hidden 2304, 24 heads /
+  8 kv, ffn 9216, q/k norm 128), per-layer `dflare_norm`, `attn_k_ctx` / `attn_v_ctx` (+ `attn_k_ctx_norm`),
+  `dspark_fuse` [4,4] (fuses 4 target tap features), `dspark_norm`, `mask_embd`, Markov RNN head
+  (`markov_w1` [256, vocab], `joint_proj` [5120 -> 3x768?], `dspark_hidden_out`), block size 8, token embeddings and the
+  output head are the target's (the reference runtime ships a Q4_0 shortlisted head).
+- Flow per round: (1) warm: target tap features (`target_layers` of the looped model) -> 4x4 fuse -> per drafter layer
+  `dflare_norm` -> K/V ctx projections -> drafter SWA KV cache; (2) propose: embed anchor token with target embeddings +
+  mask embeddings for the other block slots, 3 decoder layers (non-causal over the block + ctx KV), head + Markov RNN
+  chain per slot; (3) verify the draft with the target (n = 1 + depth rows) and accept the matching prefix. the reference runtime uses
+  depth 1. Needs: tap capture in the engine, an n=2..8 verify path (batched decode kernels + graph per width),
+  drafter engine, acceptance logic and serve integration.
+
 ## Open questions / next steps (skill default order)
 
 1. CPU reference (`src/models/inkling/reference.cpp`) + config parser.
