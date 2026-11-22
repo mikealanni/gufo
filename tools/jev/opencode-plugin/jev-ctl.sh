@@ -70,7 +70,7 @@ jev control (type jev <option>)
   pause [all]                 pause jev for this session, or all sessions
   resume [all]                resume jev
   autoeffort on|off [level]   let jev pick reasoning effort, or pin it (none = no thinking|minimal|low|medium|high|xhigh|max)
-  switch <model>              reload gufo as another model (flash-next 27b 35b glm flint laguna)
+  switch <model>              reload gufo as another model (flash-next 27b 35b glm flint laguna inkling)
   goal [text]                 keep the agent working until the task is done (no text = current task)
   goal off                    cancel the goal
   feature <name> on|off       switch one feature: command, effort, goal, finish, pre
