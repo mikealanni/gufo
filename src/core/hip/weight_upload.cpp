@@ -258,4 +258,39 @@ bool WeightUpload::Finish(std::string* error) {
   return s.Status(error);
 }
 
+TensorUpload::TensorUpload(const core::GgufReader& reader) {
+  const auto mapped = reader.GetMappedRegions();
+  shards_.assign(mapped.begin(), mapped.end());
+  std::string ignored;
+  stager_ = WeightUpload::Create(shards_, &ignored);
+}
+
+TensorUpload::~TensorUpload() = default;
+
+bool TensorUpload::Upload(const core::GgufTensorInfo& tensor, void* device,
+                          std::size_t dst_offset, std::string* error) {
+  auto* destination = static_cast<char*>(device) + dst_offset;
+  const auto* at = static_cast<const char*>(tensor.data);
+  if (stager_ != nullptr) {
+    for (std::uint32_t shard = 0; shard < shards_.size(); ++shard) {
+      const auto* base = static_cast<const char*>(shards_[shard].data);
+      if (at < base || at + tensor.size_bytes > base + shards_[shard].size)
+        continue;
+      std::string stage_error;
+      if (stager_->Copy(shard, static_cast<std::uint64_t>(at - base),
+                        tensor.size_bytes, destination, &stage_error) &&
+          stager_->Finish(&stage_error))
+        return true;
+      break;
+    }
+  }
+  if (hipMemcpy(destination, tensor.data, tensor.size_bytes,
+                hipMemcpyHostToDevice) != hipSuccess) {
+    if (error != nullptr)
+      *error = "device copy failed for " + std::string(tensor.name);
+    return false;
+  }
+  return true;
+}
+
 }  // namespace gufo::hip
