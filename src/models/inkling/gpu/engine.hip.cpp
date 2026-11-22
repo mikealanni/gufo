@@ -749,6 +749,86 @@ __global__ void Control(float* cur, const float* msg, const float* gain,
   }
 }
 
+constexpr int kControlRank = 64;
+constexpr int kControlWaves = 8;
+
+// low[row][r] = down[r] . [rms(cur[row]); rms(msg[row])] for 8 outputs per
+// block
+__global__ void __launch_bounds__(kControlWaves * 32)
+    ControlLow(const float* cur, const float* msg, const float* down, int h,
+               float eps, float* low) {
+  __shared__ float red[2][kControlWaves];
+  const int row = blockIdx.x;
+  const int wave = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const float* c = cur + static_cast<std::size_t>(row) * h;
+  const float* m = msg + static_cast<std::size_t>(row) * h;
+  float sc = 0.0F;
+  float sm = 0.0F;
+  for (int i = threadIdx.x; i < h; i += blockDim.x) {
+    sc += c[i] * c[i];
+    sm += m[i] * m[i];
+  }
+  for (int off = 16; off > 0; off >>= 1) {
+    sc += __shfl_xor(sc, off);
+    sm += __shfl_xor(sm, off);
+  }
+  if (lane == 0) {
+    red[0][wave] = sc;
+    red[1][wave] = sm;
+  }
+  __syncthreads();
+  float tc = 0.0F;
+  float tm = 0.0F;
+  for (int w = 0; w < kControlWaves; ++w) {
+    tc += red[0][w];
+    tm += red[1][w];
+  }
+  const float ic = rsqrtf(tc / static_cast<float>(h) + eps);
+  const float im = rsqrtf(tm / static_cast<float>(h) + eps);
+  const int r = blockIdx.y * kControlWaves + wave;
+  const float* w = down + static_cast<std::size_t>(r) * 2 * h;
+  float acc = 0.0F;
+  for (int i = lane; i < h; i += 32)
+    acc += w[i] * c[i] * ic + w[h + i] * m[i] * im;
+  for (int off = 16; off > 0; off >>= 1)
+    acc += __shfl_xor(acc, off);
+  if (lane == 0)
+    low[static_cast<std::size_t>(row) * kControlRank + r] = acc;
+}
+
+// cur += -tanh(forget) * cur + tanh(gain) * msg with gain/forget = W . low
+__global__ void ControlApply(float* cur, const float* msg, const float* low,
+                             const float* gain_w, const float* forget_w,
+                             int h) {
+  __shared__ float lw[kControlRank];
+  const int row = blockIdx.x;
+  if (threadIdx.x < kControlRank)
+    lw[threadIdx.x] =
+        low[static_cast<std::size_t>(row) * kControlRank + threadIdx.x];
+  __syncthreads();
+  const int j = blockIdx.y * blockDim.x + threadIdx.x;
+  if (j >= h)
+    return;
+  const float4* g4 = reinterpret_cast<const float4*>(
+      gain_w + static_cast<std::size_t>(j) * kControlRank);
+  const float4* f4 = reinterpret_cast<const float4*>(
+      forget_w + static_cast<std::size_t>(j) * kControlRank);
+  float g = 0.0F;
+  float f = 0.0F;
+  for (int k = 0; k < kControlRank / 4; ++k) {
+    const float4 gv = g4[k];
+    const float4 fv = f4[k];
+    g += gv.x * lw[4 * k] + gv.y * lw[4 * k + 1] + gv.z * lw[4 * k + 2] +
+         gv.w * lw[4 * k + 3];
+    f += fv.x * lw[4 * k] + fv.y * lw[4 * k + 1] + fv.z * lw[4 * k + 2] +
+         fv.w * lw[4 * k + 3];
+  }
+  const std::size_t idx = static_cast<std::size_t>(row) * h + j;
+  const float c = cur[idx];
+  cur[idx] = c - tanhf(f) * c + tanhf(g) * msg[idx];
+}
+
 // K rows are [row][kv head][128]; V is stored block-transposed per KV head:
 // [head][64-key block][d][key in block], so a key tile is one contiguous 16 KB.
 __global__ void StoreKv(const float* k, const float* v, __half* kc, __half* vc,
@@ -2656,6 +2736,20 @@ struct Session::Impl : Scratch {
                    const char* group, int n) {
     const int h = static_cast<int>(m->config.hidden_size);
     const bool big = n >= kWmmaMinTokens;
+    if (!big && m->config.loop_gate_rank == kControlRank) {
+      const std::string fb =
+          "blk." + std::to_string(phys) + ".loop_" + group + "_";
+      ControlLow<<<dim3(n, kControlRank / kControlWaves), kControlWaves * 32, 0,
+                   stream>>>(
+          cur_, message,
+          static_cast<const float*>(m->T(fb + "down.weight").dev), h,
+          m->config.rms_eps, low);
+      ControlApply<<<dim3(n, (h + 255) / 256), 256, 0, stream>>>(
+          cur_, message, low,
+          static_cast<const float*>(m->T(fb + "gain.weight").dev),
+          static_cast<const float*>(m->T(fb + "forget.weight").dev), h);
+      return;
+    }
     RmsRows(cur_, nullptr, cat, n, h, h, 2 * h, big ? cath : nullptr);
     RmsRows(message, nullptr, cat + h, n, h, h, 2 * h,
             big ? cath + h : nullptr);
