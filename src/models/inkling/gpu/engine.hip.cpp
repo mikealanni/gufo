@@ -327,7 +327,9 @@ __global__ void Rms(const float* in, const float* w, float* out, int dim,
 // per-row L2 clip after optional per-element scale indexed [(row % scale_rows)
 // * dim + i]
 __global__ void Clip(float* x, const float* scale, int scale_rows, int dim,
-                     float threshold) {
+                     float threshold, const int* tau_pos = nullptr,
+                     int rows_per_token = 1, float tau_floor = 1.0F,
+                     float tau_alpha = 0.0F) {
   __shared__ float red[256];
   float* p = x + static_cast<std::size_t>(blockIdx.x) * dim;
   const int sr = scale != nullptr ? blockIdx.x % scale_rows : 0;
@@ -338,7 +340,13 @@ __global__ void Clip(float* x, const float* scale, int scale_rows, int dim,
     s += p[i] * p[i];
   }
   s = BlockSum(s, red);
-  const float f = fminf(1.0F, threshold / (sqrtf(s) + 1e-6F));
+  float f = fminf(1.0F, threshold / (sqrtf(s) + 1e-6F));
+  if (tau_pos != nullptr) {
+    const int token = blockIdx.x / rows_per_token;
+    f *= 1.0F +
+         tau_alpha * logf(fmaxf(1.0F, static_cast<float>(*tau_pos + token + 1) /
+                                          tau_floor));
+  }
   for (int i = threadIdx.x; i < dim; i += blockDim.x)
     p[i] *= f;
 }
@@ -547,6 +555,89 @@ __global__ void MixBig(StatePtrs blocks, const float* cur, const float* query,
       for (int s = 0; s < ns; ++s)
         a += e[s] / den * st[s][i] * inv[s];
       out[(static_cast<std::size_t>(q) * n + t) * h + i] = a;
+    }
+  }
+}
+
+struct NormPtrs {
+  const float* w[3];
+  float* out[3];
+  __half* outh[3];
+};
+
+// MixBig followed by the per-query RMS norm with weights; writes float and half
+// rows.
+__global__ void MixRms(StatePtrs blocks, const float* cur, const float* query,
+                       int nq, int h, int n, NormPtrs np, float eps) {
+  extern __shared__ float mixbuf[];
+  __shared__ float red[256][5];
+  __shared__ float inv[kMaxStates];
+  __shared__ float score[4][kMaxStates];
+  __shared__ float rsum[256];
+  const int t = blockIdx.x;
+  const int ns = blocks.count + 1;
+  const float* st[kMaxStates];
+  for (int s = 0; s < blocks.count; ++s)
+    st[s] = blocks.p[s] + static_cast<std::size_t>(t) * h;
+  st[blocks.count] = cur + static_cast<std::size_t>(t) * h;
+  for (int s = 0; s < ns; ++s) {
+    float acc[5] = {};
+    for (int i = threadIdx.x; i < h; i += blockDim.x) {
+      const float v = st[s][i];
+      acc[0] += v * v;
+      for (int q = 0; q < nq; ++q)
+        acc[1 + q] += v * query[q * h + i];
+    }
+    for (int k = 0; k < 5; ++k)
+      red[threadIdx.x][k] = acc[k];
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (threadIdx.x < stride) {
+        for (int k = 0; k < 5; ++k)
+          red[threadIdx.x][k] += red[threadIdx.x + stride][k];
+      }
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+      inv[s] = rsqrtf(red[0][0] / static_cast<float>(h) + kMixEps);
+      for (int q = 0; q < nq; ++q)
+        score[q][s] = red[0][1 + q] * inv[s] * rsqrtf(static_cast<float>(h));
+    }
+    __syncthreads();
+  }
+  for (int q = 0; q < nq; ++q) {
+    float mx = -1e30F;
+    for (int s = 0; s < ns; ++s)
+      mx = fmaxf(mx, score[q][s]);
+    float e[kMaxStates];
+    float den = 0.0F;
+    for (int s = 0; s < ns; ++s) {
+      e[s] = expf(score[q][s] - mx);
+      den += e[s];
+    }
+    float ss = 0.0F;
+    for (int i = threadIdx.x; i < h; i += blockDim.x) {
+      float a = 0.0F;
+      for (int s = 0; s < ns; ++s)
+        a += e[s] / den * st[s][i] * inv[s];
+      mixbuf[q * h + i] = a;
+      ss += a * a;
+    }
+    rsum[threadIdx.x] = ss;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (threadIdx.x < stride)
+        rsum[threadIdx.x] += rsum[threadIdx.x + stride];
+      __syncthreads();
+    }
+    const float r = rsqrtf(rsum[0] / static_cast<float>(h) + eps);
+    __syncthreads();
+    for (int i = threadIdx.x; i < h; i += blockDim.x) {
+      const float v = mixbuf[q * h + i] * r * np.w[q][i];
+      const std::size_t at = static_cast<std::size_t>(t) * h + i;
+      np.out[q][at] = v;
+      if (np.outh[q] != nullptr)
+        np.outh[q][at] = __float2half(v);
     }
   }
 }
@@ -968,6 +1059,7 @@ constexpr int kKStride = 136;
 constexpr int kVStride = 72;
 constexpr int kPStride = 72;
 constexpr int kFlashHd = 128;
+constexpr int kZStride = 88;
 constexpr int kSplitKeys = 2048;
 constexpr int kFlashRel = 16;
 constexpr float kNegInf = -1e30F;
@@ -976,13 +1068,13 @@ constexpr float kNegInf = -1e30F;
 // queries of one head; 4 waves x 16 query rows.
 __global__ void __launch_bounds__(128)
     FlashRel(AttnArgs a, const float* q, const float* r, const float* sink,
-             const __half* kc, const __half* vc, const float* bias, float* out,
+             const __half* kc, const __half* vc, const __half* bias, float* out,
              int n, int nsplit, int split_keys, float* pm, float* pl, float* po,
              const int* blist, const int* bcount, int list_cap) {
   __shared__ __half Ks[kFlashK][kKStride];
   __shared__ __half Vt[kFlashHd][kVStride];
   __shared__ __half Ps[kFlashQ][kPStride];
-  __shared__ float Rs[kFlashQ][kFlashRel];
+  __shared__ __half Zs[4][16][kZStride];
   const int tid = threadIdx.x;
   const int wave = tid >> 5;
   const int lane = tid & 31;
@@ -993,12 +1085,6 @@ __global__ void __launch_bounds__(128)
   const int pos0 = *a.pos0;
   const int qmax_pos = pos0 + min(q0 + kFlashQ, n) - 1;
   const int qmin_pos = pos0 + q0;
-  for (int i = tid; i < kFlashQ * kFlashRel; i += 128) {
-    const int row = i / kFlashRel;
-    const int t = min(q0 + row, n - 1);
-    Rs[row][i % kFlashRel] =
-        r[(static_cast<std::size_t>(t) * a.nh + h) * kFlashRel + i % kFlashRel];
-  }
   // Q fragments for this wave's 16 rows
   V16h qf[8];
   {
@@ -1009,6 +1095,14 @@ __global__ void __launch_bounds__(128)
         qf[c][i] = static_cast<_Float16>(qp[c * 16 + i]);
     }
   }
+  V16h rf;
+  {
+    const int t = min(q0 + wave * 16 + (lane & 15), n - 1);
+    const float* rp = r + (static_cast<std::size_t>(t) * a.nh + h) * kFlashRel;
+    for (int i = 0; i < 16; ++i)
+      rf[i] = static_cast<_Float16>(rp[i]);
+  }
+  const int qp0 = pos0 + q0 + wave * 16;
   float sinkv[8];
   int qpos[8];
   for (int i = 0; i < 8; ++i) {
@@ -1066,14 +1160,28 @@ __global__ void __launch_bounds__(128)
       for (int i = 0; i < 64; ++i)
         Vt[half * 64 + i][key] = ok ? vs[i] : __float2half(0.0F);
     }
+    {
+      // relative-position bias of this wave's rows against the tile's distances
+      const int dmin = qp0 - (kb + kFlashK - 1);
+      for (int nt = 0; nt < 5; ++nt) {
+        const int dist = dmin + nt * 16 + (lane & 15);
+        const int idx = (dist < 0 || dist >= a.extent) ? a.extent : dist;
+        V16h bt;
+        std::memcpy(&bt, bias + static_cast<std::size_t>(idx) * kFlashRel,
+                    sizeof(V16h));
+        V8f z = {};
+        z = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(rf, bt, z);
+        for (int i = 0; i < 8; ++i)
+          Zs[wave][2 * i + (lane >> 4)][nt * 16 + (lane & 15)] =
+              __float2half(z[i]);
+      }
+    }
     __syncthreads();
     V8f sc[4] = {};
     for (int c = 0; c < 8; ++c) {
       for (int ni = 0; ni < 4; ++ni) {
         V16h bf;
-        const __half* kp = &Ks[ni * 16 + (lane & 15)][c * 16];
-        for (int i = 0; i < 16; ++i)
-          bf[i] = static_cast<_Float16>(__half2float(kp[i]));
+        std::memcpy(&bf, &Ks[ni * 16 + (lane & 15)][c * 16], sizeof(V16h));
         sc[ni] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(qf[c], bf, sc[ni]);
       }
     }
@@ -1087,13 +1195,12 @@ __global__ void __launch_bounds__(128)
         const bool valid = dist >= 0 && (a.window == 0 || dist < a.window);
         float v = kNegInf;
         if (valid) {
-          float b = 0.0F;
-          if (dist < a.extent) {
-            const float* bp = bias + static_cast<std::size_t>(dist) * kFlashRel;
-            const float* rp = Rs[wave * 16 + 2 * i + (lane >> 4)];
-            for (int d = 0; d < kFlashRel; ++d)
-              b += bp[d] * rp[d];
-          }
+          const int lr = 2 * i + (lane >> 4);
+          const float b =
+              dist < a.extent
+                  ? __half2float(
+                        Zs[wave][lr][dist - (qp0 - (kb + kFlashK - 1))])
+                  : 0.0F;
           v = sc[ni][i] * a.scale + b - sinkv[i];
         }
         sc[ni][i] = v;
@@ -1121,14 +1228,10 @@ __global__ void __launch_bounds__(128)
     __syncthreads();
     for (int c = 0; c < 4; ++c) {
       V16h pf;
-      const __half* pp = &Ps[wave * 16 + (lane & 15)][c * 16];
-      for (int i = 0; i < 16; ++i)
-        pf[i] = static_cast<_Float16>(__half2float(pp[i]));
+      std::memcpy(&pf, &Ps[wave * 16 + (lane & 15)][c * 16], sizeof(V16h));
       for (int ni = 0; ni < 8; ++ni) {
         V16h vf;
-        const __half* vp = &Vt[ni * 16 + (lane & 15)][c * 16];
-        for (int i = 0; i < 16; ++i)
-          vf[i] = static_cast<_Float16>(__half2float(vp[i]));
+        std::memcpy(&vf, &Vt[ni * 16 + (lane & 15)][c * 16], sizeof(V16h));
         o[ni] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pf, vf, o[ni]);
       }
     }
@@ -1447,6 +1550,26 @@ std::shared_ptr<Model> Model::Load(const std::string& path,
     state->resident_bytes += info.size_bytes;
     state->tensors.emplace(std::string(info.name), t);
   }
+  // F16 copy of every relative-bias table with one zero row appended
+  for (std::uint32_t il = 0; il < state->n_phys; ++il) {
+    const std::string name = state->P(il, "attn_rel_bias.weight");
+    const Tensor& src = state->T(name);
+    Tensor t;
+    t.type = kTypeBf16;
+    t.cols = src.cols;
+    t.rows = src.rows + 1;
+    t.row_bytes = src.cols * 2;
+    const std::size_t bytes = t.rows * t.row_bytes;
+    HIP_OK(hipMalloc(&t.dev, bytes));
+    HIP_OK(hipMemset(t.dev, 0, bytes));
+    const std::size_t count = src.rows * src.cols;
+    ToHalf<<<(count + 255) / 256, 256>>>(static_cast<const float*>(src.dev),
+                                         static_cast<__half*>(t.dev), count);
+    HIP_OK(hipDeviceSynchronize());
+    state->allocations.push_back(t.dev);
+    state->resident_bytes += bytes;
+    state->tensors.emplace(name + ".h", t);
+  }
   auto model = std::shared_ptr<Model>(new Model());
   model->state_ = std::move(state);
   return model;
@@ -1514,7 +1637,8 @@ struct Session::Impl {
     return it->second.first;
   }
   int *sorted{nullptr}, *tiles{nullptr};
-  __half *xh{nullptr}, *act16{nullptr}, *xh0{nullptr}, *xh1{nullptr}, *xh2{nullptr}, *xhx{nullptr}, *atth{nullptr};
+  __half *xh{nullptr}, *act16{nullptr}, *xh0{nullptr}, *xh1{nullptr},
+      *xh2{nullptr}, *xhx{nullptr}, *atth{nullptr};
   signed char* xq{nullptr};
   float* xqs{nullptr};
   float *split_m{nullptr}, *split_l{nullptr}, *split_o{nullptr};
@@ -1661,8 +1785,7 @@ struct Session::Impl {
   }
   int* ids_flat{nullptr};
   void RmsRows(const float* in_, const float* w, float* out, int rows, int dim,
-               std::size_t ld_in, std::size_t ld_out,
-               __half* out_h = nullptr) {
+               std::size_t ld_in, std::size_t ld_out, __half* out_h = nullptr) {
     Rms<<<rows, 256, 0, stream>>>(in_, w, out, dim, ld_in, ld_out,
                                   m->config.rms_eps, out_h);
   }
@@ -1679,6 +1802,16 @@ struct Session::Impl {
       Mix<<<n, 256, 0, stream>>>(
           sp, cur_, query, nq, static_cast<int>(m->config.hidden_size), n, out);
     }
+  }
+  void MixRmsLaunch(const std::vector<const float*>& blocks, const float* cur_,
+                    const float* query, int nq, int n, const NormPtrs& np) {
+    StatePtrs sp{};
+    sp.count = static_cast<int>(blocks.size());
+    for (std::size_t i = 0; i < blocks.size(); ++i)
+      sp.p[i] = blocks[i];
+    const int hh = static_cast<int>(m->config.hidden_size);
+    MixRms<<<n, 256, nq * hh * sizeof(float), stream>>>(
+        sp, cur_, query, nq, hh, n, np, m->config.rms_eps);
   }
   void ControlStep(float* cur_, const float* message, std::uint32_t phys,
                    const char* group, int n) {
@@ -1724,58 +1857,89 @@ struct Session::Impl {
     const bool big = n >= kWmmaMinTokens;
     float* inp[3] = {in[0], in[1], in[2]};
     const bool has_res = m->Has(m->P(p, "attn_res_query.weight"));
-    if (has_res) {
+    __half* inh[3] = {big ? xh0 : nullptr, big ? xh1 : nullptr,
+                      big ? xh2 : nullptr};
+    const bool fused_attn = has_res && big && msgs_ == nullptr;
+    if (fused_attn) {
       const int nq = swa ? 1 : 3;
-      Mixer(
+      NormPtrs np{};
+      if (swa) {
+        np.w[0] =
+            static_cast<const float*>(m->T(m->P(p, "attn_norm.weight")).dev);
+        np.out[0] = mixed;
+        np.outh[0] = xh0;
+        inp[0] = inp[1] = inp[2] = mixed;
+        inh[1] = inh[2] = xh0;
+      } else {
+        static const char* const kN[3] = {"attn_q_inp_norm.weight",
+                                          "attn_k_inp_norm.weight",
+                                          "attn_v_inp_norm.weight"};
+        for (int j = 0; j < 3; ++j) {
+          np.w[j] = static_cast<const float*>(m->T(m->P(p, kN[j])).dev);
+          np.out[j] = mixed + j * nh_;
+          np.outh[j] = inh[j];
+          inp[j] = mixed + j * nh_;
+        }
+      }
+      MixRmsLaunch(
           blocks, cur,
           static_cast<const float*>(m->T(m->P(p, "attn_res_query.weight")).dev),
-          nq, n, mixed);
-      for (int j = 0; j < 3; ++j)
-        inp[j] = mixed + (swa ? 0 : j) * nh_;
-      if (swa && msgs_ != nullptr) {
-        for (int j = 1; j < 3; ++j) {
-          HIP_OK(hipMemcpyAsync(in[j], mixed, nh_ * 4, hipMemcpyDeviceToDevice,
+          nq, n, np);
+    } else {
+      if (has_res) {
+        const int nq = swa ? 1 : 3;
+        Mixer(blocks, cur,
+              static_cast<const float*>(
+                  m->T(m->P(p, "attn_res_query.weight")).dev),
+              nq, n, mixed);
+        for (int j = 0; j < 3; ++j)
+          inp[j] = mixed + (swa ? 0 : j) * nh_;
+        if (swa && msgs_ != nullptr) {
+          for (int j = 1; j < 3; ++j) {
+            HIP_OK(hipMemcpyAsync(in[j], mixed, nh_ * 4,
+                                  hipMemcpyDeviceToDevice, stream));
+            inp[j] = in[j];
+          }
+        }
+      } else {
+        for (int j = 0; j < 3; ++j) {
+          HIP_OK(hipMemcpyAsync(in[j], cur, nh_ * 4, hipMemcpyDeviceToDevice,
                                 stream));
           inp[j] = in[j];
         }
       }
-    } else {
-      for (int j = 0; j < 3; ++j) {
-        HIP_OK(hipMemcpyAsync(in[j], cur, nh_ * 4, hipMemcpyDeviceToDevice,
-                              stream));
-        inp[j] = in[j];
-      }
-    }
-    if (msgs_ != nullptr) {
-      static const char* const kGroup[3] = {"attn", "k", "v"};
-      for (int j = 0; j < 3; ++j)
-        ControlStep(inp[j], msgs_ + j * nh_, p, kGroup[j], n);
-    }
-    __half* inh[3] = {big ? xh0 : nullptr, big ? xh1 : nullptr,
-                      big ? xh2 : nullptr};
-    if (swa) {
-      const float* w =
-          static_cast<const float*>(m->T(m->P(p, "attn_norm.weight")).dev);
       if (msgs_ != nullptr) {
+        static const char* const kGroup[3] = {"attn", "k", "v"};
         for (int j = 0; j < 3; ++j)
-          RmsRows(inp[j], w, inp[j], n, h, h, h, inh[j]);
-      } else {
-        RmsRows(inp[0], w, inp[0], n, h, h, h, inh[0]);
-        inp[1] = inp[2] = inp[0];
-        inh[1] = inh[2] = inh[0];
+          ControlStep(inp[j], msgs_ + j * nh_, p, kGroup[j], n);
       }
-    } else {
-      static const char* const kN[3] = {"attn_q_inp_norm.weight",
-                                        "attn_k_inp_norm.weight",
-                                        "attn_v_inp_norm.weight"};
-      for (int j = 0; j < 3; ++j)
-        RmsRows(inp[j], static_cast<const float*>(m->T(m->P(p, kN[j])).dev),
-                inp[j], n, h, h, h, inh[j]);
+      if (swa) {
+        const float* w =
+            static_cast<const float*>(m->T(m->P(p, "attn_norm.weight")).dev);
+        if (msgs_ != nullptr) {
+          for (int j = 0; j < 3; ++j)
+            RmsRows(inp[j], w, inp[j], n, h, h, h, inh[j]);
+        } else {
+          RmsRows(inp[0], w, inp[0], n, h, h, h, inh[0]);
+          inp[1] = inp[2] = inp[0];
+          inh[1] = inh[2] = inh[0];
+        }
+      } else {
+        static const char* const kN[3] = {"attn_q_inp_norm.weight",
+                                          "attn_k_inp_norm.weight",
+                                          "attn_v_inp_norm.weight"};
+        for (int j = 0; j < 3; ++j)
+          RmsRows(inp[j], static_cast<const float*>(m->T(m->P(p, kN[j])).dev),
+                  inp[j], n, h, h, h, inh[j]);
+      }
     }
     Dense(m->T(m->P(p, "attn_q.weight")), inp[0], h, q, nh * hd, n, -1, inh[0]);
-    Dense(m->T(m->P(p, "attn_k.weight")), inp[1], h, tmp, nkv * hd, n, -1, inh[1]);
-    Dense(m->T(m->P(p, "attn_v.weight")), inp[2], h, v, nkv * hd, n, -1, inh[2]);
-    Dense(m->T(m->P(p, "attn_rel.weight")), inp[0], h, r, nrel * nh, n, -1, inh[0]);
+    Dense(m->T(m->P(p, "attn_k.weight")), inp[1], h, tmp, nkv * hd, n, -1,
+          inh[1]);
+    Dense(m->T(m->P(p, "attn_v.weight")), inp[2], h, v, nkv * hd, n, -1,
+          inh[2]);
+    Dense(m->T(m->P(p, "attn_rel.weight")), inp[0], h, r, nrel * nh, n, -1,
+          inh[0]);
     const float* dk = nullptr;
     const float* dv = nullptr;
     if (!swa) {
@@ -1791,24 +1955,20 @@ struct Session::Impl {
     float* vtmp = tmp;
     Convolve(v, m->T(m->P(p, "attn_v_conv.weight")), dv, nkv, sl.hist_v, vtmp,
              nkv * hd, n);
+    const int* tau_p = swa ? nullptr : d_pos;
+    const float tau_floor = static_cast<float>(c.log_scale_floor);
     Clip<<<n * nh, 128, 0, stream>>>(
         q, static_cast<const float*>(m->T(m->P(p, "attn_q_clip.weight")).dev),
-        nh, hd, c.qk_clip);
+        nh, hd, c.qk_clip, tau_p, nh, tau_floor, c.log_scale_alpha);
     Clip<<<n * nkv, 128, 0, stream>>>(k, nullptr, 1, hd, c.qk_clip);
     RmsRows(vtmp, nullptr, vtmp, n * nkv, hd, hd, hd);
     Clip<<<n * nh, 128, 0, stream>>>(
         r, static_cast<const float*>(m->T(m->P(p, "attn_rel_clip.weight")).dev),
-        nh, nrel, c.relative_clip);
-    if (!swa) {
-      TauScale<<<n, 256, 0, stream>>>(q, nh * hd, d_pos,
-                                      static_cast<float>(c.log_scale_floor),
-                                      c.log_scale_alpha);
-      TauScale<<<n, 256, 0, stream>>>(r, nh * nrel, d_pos,
-                                      static_cast<float>(c.log_scale_floor),
-                                      c.log_scale_alpha);
-    }
-    Dense(m->T(m->P(p, "attn_sink_proj.weight")), inp[0], h, sink, nh, n, -1, inh[0]);
-    StoreKv<<<n, 256, 0, stream>>>(k, vtmp, sl.k, sl.v, nkv * hd, d_pos, sl.ring);
+        nh, nrel, c.relative_clip, tau_p, nh, tau_floor, c.log_scale_alpha);
+    Dense(m->T(m->P(p, "attn_sink_proj.weight")), inp[0], h, sink, nh, n, -1,
+          inh[0]);
+    StoreKv<<<n, 256, 0, stream>>>(k, vtmp, sl.k, sl.v, nkv * hd, d_pos,
+                                   sl.ring);
     AttnArgs aa{nh,
                 nkv,
                 hd,
@@ -1821,8 +1981,8 @@ struct Session::Impl {
     const int span =
         swa ? static_cast<int>(c.sliding_window) : static_cast<int>(ctx);
     if (hd == kFlashHd && nrel == kFlashRel) {
-      const float* bias_w =
-          static_cast<const float*>(m->T(m->P(p, "attn_rel_bias.weight")).dev);
+      const __half* bias_w = static_cast<const __half*>(
+          m->T(m->P(p, "attn_rel_bias.weight.h")).dev);
       const bool sparse_now =
           sparse && !swa &&
           (n < kWmmaMinTokens ||
@@ -1861,7 +2021,8 @@ struct Session::Impl {
           static_cast<const float*>(m->T(m->P(p, "attn_rel_bias.weight")).dev),
           att);
     }
-    Dense(m->T(m->P(p, "attn_gate.weight")), inp[0], h, gate, nh * hd, n, -1, inh[0]);
+    Dense(m->T(m->P(p, "attn_gate.weight")), inp[0], h, gate, nh * hd, n, -1,
+          inh[0]);
     if (big) {
       SigmoidMulH<<<(n * nh * hd + 255) / 256, 256, 0, stream>>>(
           att, gate, atth, static_cast<std::size_t>(n) * nh * hd);
@@ -1880,13 +2041,22 @@ struct Session::Impl {
       HIP_OK(hipMemcpyAsync(b, cur, nh_ * 4, hipMemcpyDeviceToDevice, stream));
       blocks.push_back(b);
     }
-    Mixer(blocks, ffn_inp,
-          static_cast<const float*>(m->T(m->P(p, "ffn_res_query.weight")).dev),
-          1, n, x);
-    if (msgs_ != nullptr)
-      ControlStep(x, msgs_ + 3 * nh_, p, "mlp", n);
-    RmsRows(x, static_cast<const float*>(m->T(m->P(p, "ffn_norm.weight")).dev),
-            x, n, h, h, h, big ? xhx : nullptr);
+    const float* ffn_w =
+        static_cast<const float*>(m->T(m->P(p, "ffn_norm.weight")).dev);
+    const float* ffn_q =
+        static_cast<const float*>(m->T(m->P(p, "ffn_res_query.weight")).dev);
+    if (big && msgs_ == nullptr) {
+      NormPtrs np{};
+      np.w[0] = ffn_w;
+      np.out[0] = x;
+      np.outh[0] = xhx;
+      MixRmsLaunch(blocks, ffn_inp, ffn_q, 1, n, np);
+    } else {
+      Mixer(blocks, ffn_inp, ffn_q, 1, n, x);
+      if (msgs_ != nullptr)
+        ControlStep(x, msgs_ + 3 * nh_, p, "mlp", n);
+      RmsRows(x, ffn_w, x, n, h, h, h, big ? xhx : nullptr);
+    }
     Moe(p, n, big ? xhx : nullptr);
     Convolve(moe, m->T(m->P(p, "ffn_post_conv.weight")), nullptr, 1,
              sl.hist_ffn, cur, h, n, ffn_inp);
