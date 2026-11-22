@@ -307,7 +307,8 @@ __global__ void EmbedQ8(const unsigned char* table, std::size_t row_bytes,
 
 // out[row] = rms(in[row]) * w ; rows of `dim`, strided.
 __global__ void Rms(const float* in, const float* w, float* out, int dim,
-                    std::size_t ld_in, std::size_t ld_out, float eps) {
+                    std::size_t ld_in, std::size_t ld_out, float eps,
+                    __half* out_h) {
   __shared__ float red[256];
   const float* x = in + blockIdx.x * ld_in;
   float s = 0.0F;
@@ -315,8 +316,12 @@ __global__ void Rms(const float* in, const float* w, float* out, int dim,
     s += x[i] * x[i];
   s = BlockSum(s, red);
   const float inv = rsqrtf(s / static_cast<float>(dim) + eps);
-  for (int i = threadIdx.x; i < dim; i += blockDim.x)
-    out[blockIdx.x * ld_out + i] = x[i] * inv * (w != nullptr ? w[i] : 1.0F);
+  for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+    const float v = x[i] * inv * (w != nullptr ? w[i] : 1.0F);
+    out[blockIdx.x * ld_out + i] = v;
+    if (out_h != nullptr)
+      out_h[blockIdx.x * ld_out + i] = __float2half(v);
+  }
 }
 
 // per-row L2 clip after optional per-element scale indexed [(row % scale_rows)
@@ -349,7 +354,8 @@ __global__ void TauScale(float* x, int per_token, const int* pos0,
 }
 
 __global__ void Conv(const float* cur, const float* w, const float* dyn,
-                     int heads, float* hist, float* out, int ch, int n) {
+                     int heads, float* hist, float* out, int ch, int n,
+                     const float* add) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= ch)
     return;
@@ -374,7 +380,9 @@ __global__ void Conv(const float* cur, const float* w, const float* dyn,
       for (int lag = 0; lag < kConvTaps; ++lag)
         o += d[lag] * win[kHistory - lag];
     }
-    out[static_cast<std::size_t>(t) * ch + c] = (x + o) * norm;
+    out[static_cast<std::size_t>(t) * ch + c] =
+        (x + o) * norm +
+        (add != nullptr ? add[static_cast<std::size_t>(t) * ch + c] : 0.0F);
     for (int k = 0; k < kHistory; ++k)
       win[k] = win[k + 1];
   }
@@ -383,7 +391,8 @@ __global__ void Conv(const float* cur, const float* w, const float* dyn,
 }
 
 __global__ void ConvT(const float* cur, const float* w, const float* dyn,
-                      int heads, const float* hist, float* out, int ch) {
+                      int heads, const float* hist, float* out, int ch,
+                      const float* add) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= ch)
     return;
@@ -406,7 +415,8 @@ __global__ void ConvT(const float* cur, const float* w, const float* dyn,
   }
   out[static_cast<std::size_t>(t) * ch + c] =
       (win[kHistory] + o) *
-      rsqrtf(static_cast<float>((dyn != nullptr ? 2 : 1) * kConvTaps + 1));
+          rsqrtf(static_cast<float>((dyn != nullptr ? 2 : 1) * kConvTaps + 1)) +
+      (add != nullptr ? add[static_cast<std::size_t>(t) * ch + c] : 0.0F);
 }
 
 __global__ void ConvHist(const float* cur, float* hist, int ch, int n) {
@@ -641,6 +651,17 @@ __global__ void SigmoidMul(float* x, const float* g, std::size_t count) {
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i < count)
     x[i] *= Sigmoid(g[i]);
+}
+
+__global__ void SigmoidMulH(float* x, const float* g, __half* xh,
+                            std::size_t count) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < count) {
+    const float v = x[i] * Sigmoid(g[i]);
+    x[i] = v;
+    xh[i] = __float2half(v);
+  }
 }
 
 __global__ void AddInto(float* x, const float* y, std::size_t count) {
@@ -1493,7 +1514,7 @@ struct Session::Impl {
     return it->second.first;
   }
   int *sorted{nullptr}, *tiles{nullptr};
-  __half *xh{nullptr}, *act16{nullptr};
+  __half *xh{nullptr}, *act16{nullptr}, *xh0{nullptr}, *xh1{nullptr}, *xh2{nullptr}, *xhx{nullptr}, *atth{nullptr};
   signed char* xq{nullptr};
   float* xqs{nullptr};
   float *split_m{nullptr}, *split_l{nullptr}, *split_o{nullptr};
@@ -1534,7 +1555,8 @@ struct Session::Impl {
   }
 
   void Dense(const Tensor& w, const float* xin, std::size_t ldx, float* yout,
-             std::size_t ldy, int n, int rows = -1) {
+             std::size_t ldy, int n, int rows = -1,
+             const __half* xhin = nullptr) {
     const int nrows = rows < 0 ? static_cast<int>(w.rows) : rows;
     if (n == 1 && w.type == kTypeQ8 && ldx == w.cols) {
       QuantRows<<<dim3(1, w.cols / 32), 32, 0, stream>>>(
@@ -1551,12 +1573,16 @@ struct Session::Impl {
         ldy == static_cast<std::size_t>(nrows) &&
         static_cast<std::uint64_t>(nrows) <= w.rows) {
       const std::size_t xcount = static_cast<std::size_t>(n) * w.cols;
-      ToHalf<<<(xcount + 255) / 256, 256, 0, stream>>>(xin, xh, xcount);
+      const __half* xsrc = xhin;
+      if (xsrc == nullptr || ldx != w.cols) {
+        ToHalf<<<(xcount + 255) / 256, 256, 0, stream>>>(xin, xh, xcount);
+        xsrc = xh;
+      }
       WmmaArgs wa{static_cast<const unsigned char*>(w.dev),
                   w.row_bytes,
                   static_cast<int>(w.cols),
                   nrows,
-                  xh,
+                  xsrc,
                   1,
                   yout,
                   nullptr,
@@ -1635,9 +1661,10 @@ struct Session::Impl {
   }
   int* ids_flat{nullptr};
   void RmsRows(const float* in_, const float* w, float* out, int rows, int dim,
-               std::size_t ld_in, std::size_t ld_out) {
+               std::size_t ld_in, std::size_t ld_out,
+               __half* out_h = nullptr) {
     Rms<<<rows, 256, 0, stream>>>(in_, w, out, dim, ld_in, ld_out,
-                                  m->config.rms_eps);
+                                  m->config.rms_eps, out_h);
   }
   void Mixer(const std::vector<const float*>& blocks, const float* cur_,
              const float* query, int nq, int n, float* out) {
@@ -1669,15 +1696,18 @@ struct Session::Impl {
     Control<<<n, 256, 0, stream>>>(cur_, message, gain, forget, h);
   }
   void Convolve(const float* in_, const Tensor& w, const float* dyn, int heads,
-                float* hist, float* out, int ch, int n) {
+                float* hist, float* out, int ch, int n,
+                const float* add = nullptr) {
     if (n >= kWmmaMinTokens) {
       ConvT<<<dim3((ch + 127) / 128, n), 128, 0, stream>>>(
-          in_, static_cast<const float*>(w.dev), dyn, heads, hist, out, ch);
+          in_, static_cast<const float*>(w.dev), dyn, heads, hist, out, ch,
+          add);
       ConvHist<<<(ch + 127) / 128, 128, 0, stream>>>(in_, hist, ch, n);
       return;
     }
     Conv<<<(ch + 127) / 128, 128, 0, stream>>>(
-        in_, static_cast<const float*>(w.dev), dyn, heads, hist, out, ch, n);
+        in_, static_cast<const float*>(w.dev), dyn, heads, hist, out, ch, n,
+        add);
   }
   float* Pool() { return block_pool[pool_used++]; }
 
@@ -1691,59 +1721,68 @@ struct Session::Impl {
     const bool swa = c.is_swa[slot];
     Slot& sl = slots[slot];
     const std::size_t nh_ = static_cast<std::size_t>(n) * h;
-    HIP_OK(
-        hipMemcpyAsync(inp_sa, cur, nh_ * 4, hipMemcpyDeviceToDevice, stream));
-    for (int j = 0; j < 3; ++j)
-      HIP_OK(
-          hipMemcpyAsync(in[j], cur, nh_ * 4, hipMemcpyDeviceToDevice, stream));
-    if (m->Has(m->P(p, "attn_res_query.weight"))) {
+    const bool big = n >= kWmmaMinTokens;
+    float* inp[3] = {in[0], in[1], in[2]};
+    const bool has_res = m->Has(m->P(p, "attn_res_query.weight"));
+    if (has_res) {
       const int nq = swa ? 1 : 3;
       Mixer(
           blocks, cur,
           static_cast<const float*>(m->T(m->P(p, "attn_res_query.weight")).dev),
           nq, n, mixed);
+      for (int j = 0; j < 3; ++j)
+        inp[j] = mixed + (swa ? 0 : j) * nh_;
+      if (swa && msgs_ != nullptr) {
+        for (int j = 1; j < 3; ++j) {
+          HIP_OK(hipMemcpyAsync(in[j], mixed, nh_ * 4, hipMemcpyDeviceToDevice,
+                                stream));
+          inp[j] = in[j];
+        }
+      }
+    } else {
       for (int j = 0; j < 3; ++j) {
-        HIP_OK(hipMemcpyAsync(in[j], mixed + (swa ? 0 : j) * nh_, nh_ * 4,
-                              hipMemcpyDeviceToDevice, stream));
+        HIP_OK(hipMemcpyAsync(in[j], cur, nh_ * 4, hipMemcpyDeviceToDevice,
+                              stream));
+        inp[j] = in[j];
       }
     }
     if (msgs_ != nullptr) {
       static const char* const kGroup[3] = {"attn", "k", "v"};
       for (int j = 0; j < 3; ++j)
-        ControlStep(in[j], msgs_ + j * nh_, p, kGroup[j], n);
+        ControlStep(inp[j], msgs_ + j * nh_, p, kGroup[j], n);
     }
+    __half* inh[3] = {big ? xh0 : nullptr, big ? xh1 : nullptr,
+                      big ? xh2 : nullptr};
     if (swa) {
       const float* w =
           static_cast<const float*>(m->T(m->P(p, "attn_norm.weight")).dev);
       if (msgs_ != nullptr) {
         for (int j = 0; j < 3; ++j)
-          RmsRows(in[j], w, in[j], n, h, h, h);
+          RmsRows(inp[j], w, inp[j], n, h, h, h, inh[j]);
       } else {
-        RmsRows(in[0], w, in[0], n, h, h, h);
-        HIP_OK(hipMemcpyAsync(in[1], in[0], nh_ * 4, hipMemcpyDeviceToDevice,
-                              stream));
-        HIP_OK(hipMemcpyAsync(in[2], in[0], nh_ * 4, hipMemcpyDeviceToDevice,
-                              stream));
+        RmsRows(inp[0], w, inp[0], n, h, h, h, inh[0]);
+        inp[1] = inp[2] = inp[0];
+        inh[1] = inh[2] = inh[0];
       }
     } else {
       static const char* const kN[3] = {"attn_q_inp_norm.weight",
                                         "attn_k_inp_norm.weight",
                                         "attn_v_inp_norm.weight"};
       for (int j = 0; j < 3; ++j)
-        RmsRows(in[j], static_cast<const float*>(m->T(m->P(p, kN[j])).dev),
-                in[j], n, h, h, h);
+        RmsRows(inp[j], static_cast<const float*>(m->T(m->P(p, kN[j])).dev),
+                inp[j], n, h, h, h, inh[j]);
     }
-    Dense(m->T(m->P(p, "attn_q.weight")), in[0], h, q, nh * hd, n);
-    Dense(m->T(m->P(p, "attn_k.weight")), in[1], h, tmp, nkv * hd, n);
-    Dense(m->T(m->P(p, "attn_v.weight")), in[2], h, v, nkv * hd, n);
-    Dense(m->T(m->P(p, "attn_rel.weight")), in[0], h, r, nrel * nh, n);
+    Dense(m->T(m->P(p, "attn_q.weight")), inp[0], h, q, nh * hd, n, -1, inh[0]);
+    Dense(m->T(m->P(p, "attn_k.weight")), inp[1], h, tmp, nkv * hd, n, -1, inh[1]);
+    Dense(m->T(m->P(p, "attn_v.weight")), inp[2], h, v, nkv * hd, n, -1, inh[2]);
+    Dense(m->T(m->P(p, "attn_rel.weight")), inp[0], h, r, nrel * nh, n, -1, inh[0]);
     const float* dk = nullptr;
     const float* dv = nullptr;
     if (!swa) {
-      Dense(m->T(m->P(p, "attn_k_conv_proj.weight")), in[1], h, dyn_k,
-            kConvTaps * nkv, n);
-      Dense(m->T(m->P(p, "attn_v_conv_proj.weight")), in[2], h, dyn_v,
-            kConvTaps * nkv, n);
+      Dense(m->T(m->P(p, "attn_k_conv_proj.weight")), inp[1], h, dyn_k,
+            kConvTaps * nkv, n, -1, inh[1]);
+      Dense(m->T(m->P(p, "attn_v_conv_proj.weight")), inp[2], h, dyn_v,
+            kConvTaps * nkv, n, -1, inh[2]);
       dk = dyn_k;
       dv = dyn_v;
     }
@@ -1752,13 +1791,11 @@ struct Session::Impl {
     float* vtmp = tmp;
     Convolve(v, m->T(m->P(p, "attn_v_conv.weight")), dv, nkv, sl.hist_v, vtmp,
              nkv * hd, n);
-    HIP_OK(hipMemcpyAsync(v, vtmp, static_cast<std::size_t>(n) * nkv * hd * 4,
-                          hipMemcpyDeviceToDevice, stream));
     Clip<<<n * nh, 128, 0, stream>>>(
         q, static_cast<const float*>(m->T(m->P(p, "attn_q_clip.weight")).dev),
         nh, hd, c.qk_clip);
     Clip<<<n * nkv, 128, 0, stream>>>(k, nullptr, 1, hd, c.qk_clip);
-    RmsRows(v, nullptr, v, n * nkv, hd, hd, hd);
+    RmsRows(vtmp, nullptr, vtmp, n * nkv, hd, hd, hd);
     Clip<<<n * nh, 128, 0, stream>>>(
         r, static_cast<const float*>(m->T(m->P(p, "attn_rel_clip.weight")).dev),
         nh, nrel, c.relative_clip);
@@ -1770,8 +1807,8 @@ struct Session::Impl {
                                       static_cast<float>(c.log_scale_floor),
                                       c.log_scale_alpha);
     }
-    Dense(m->T(m->P(p, "attn_sink_proj.weight")), in[0], h, sink, nh, n);
-    StoreKv<<<n, 256, 0, stream>>>(k, v, sl.k, sl.v, nkv * hd, d_pos, sl.ring);
+    Dense(m->T(m->P(p, "attn_sink_proj.weight")), inp[0], h, sink, nh, n, -1, inh[0]);
+    StoreKv<<<n, 256, 0, stream>>>(k, vtmp, sl.k, sl.v, nkv * hd, d_pos, sl.ring);
     AttnArgs aa{nh,
                 nkv,
                 hd,
@@ -1824,36 +1861,38 @@ struct Session::Impl {
           static_cast<const float*>(m->T(m->P(p, "attn_rel_bias.weight")).dev),
           att);
     }
-    Dense(m->T(m->P(p, "attn_gate.weight")), in[0], h, gate, nh * hd, n);
-    SigmoidMul<<<(n * nh * hd + 255) / 256, 256, 0, stream>>>(
-        att, gate, static_cast<std::size_t>(n) * nh * hd);
-    Dense(m->T(m->P(p, "attn_output.weight")), att, nh * hd, o, h, n);
-    Convolve(o, m->T(m->P(p, "attn_post_conv.weight")), nullptr, 1,
-             sl.hist_attn, cur, h, n);
-    if (ip % c.attn_res_block_size == 0) {
-      float* b = Pool();
-      HIP_OK(
-          hipMemcpyAsync(b, inp_sa, nh_ * 4, hipMemcpyDeviceToDevice, stream));
-      blocks.push_back(b);
+    Dense(m->T(m->P(p, "attn_gate.weight")), inp[0], h, gate, nh * hd, n, -1, inh[0]);
+    if (big) {
+      SigmoidMulH<<<(n * nh * hd + 255) / 256, 256, 0, stream>>>(
+          att, gate, atth, static_cast<std::size_t>(n) * nh * hd);
     } else {
-      AddInto<<<(n * h + 255) / 256, 256, 0, stream>>>(cur, inp_sa, nh_);
+      SigmoidMul<<<(n * nh * hd + 255) / 256, 256, 0, stream>>>(
+          att, gate, static_cast<std::size_t>(n) * nh * hd);
     }
-    HIP_OK(
-        hipMemcpyAsync(ffn_inp, cur, nh_ * 4, hipMemcpyDeviceToDevice, stream));
-    Mixer(blocks, cur,
+    Dense(m->T(m->P(p, "attn_output.weight")), att, nh * hd, o, h, n, -1,
+          big ? atth : nullptr);
+    const bool push = ip % c.attn_res_block_size == 0;
+    // ffn_inp = conv(o) (+ the layer input unless it starts a new block)
+    Convolve(o, m->T(m->P(p, "attn_post_conv.weight")), nullptr, 1,
+             sl.hist_attn, ffn_inp, h, n, push ? nullptr : cur);
+    if (push) {
+      float* b = Pool();
+      HIP_OK(hipMemcpyAsync(b, cur, nh_ * 4, hipMemcpyDeviceToDevice, stream));
+      blocks.push_back(b);
+    }
+    Mixer(blocks, ffn_inp,
           static_cast<const float*>(m->T(m->P(p, "ffn_res_query.weight")).dev),
           1, n, x);
     if (msgs_ != nullptr)
       ControlStep(x, msgs_ + 3 * nh_, p, "mlp", n);
     RmsRows(x, static_cast<const float*>(m->T(m->P(p, "ffn_norm.weight")).dev),
-            x, n, h, h, h);
-    Moe(p, n);
+            x, n, h, h, h, big ? xhx : nullptr);
+    Moe(p, n, big ? xhx : nullptr);
     Convolve(moe, m->T(m->P(p, "ffn_post_conv.weight")), nullptr, 1,
-             sl.hist_ffn, cur, h, n);
-    AddInto<<<(n * h + 255) / 256, 256, 0, stream>>>(cur, ffn_inp, nh_);
+             sl.hist_ffn, cur, h, n, ffn_inp);
   }
 
-  void Moe(std::uint32_t p, int n) {
+  void Moe(std::uint32_t p, int n, const __half* xhx_in = nullptr) {
     const Config& c = m->config;
     const int h = c.hidden_size, ne = c.expert_count, nu = c.expert_used,
               ff = c.expert_ff;
@@ -1883,13 +1922,17 @@ struct Session::Impl {
                                                             rcounts);
       qfn::RoutedCompact(ids, rcounts, rbounds, rcursors, rrows_token,
                          rrows_slot, n, nu, ne, stream);
-      ToHalf<<<(static_cast<std::size_t>(n) * h + 255) / 256, 256, 0, stream>>>(
-          x, xh, static_cast<std::size_t>(n) * h);
+      const __half* xmoe = xhx_in;
+      if (xmoe == nullptr) {
+        ToHalf<<<(static_cast<std::size_t>(n) * h + 255) / 256, 256, 0,
+                 stream>>>(x, xh, static_cast<std::size_t>(n) * h);
+        xmoe = xh;
+      }
       const int bn = n >= 512 ? 128 : 48;
       int ntiles = 0;
       const int* tmap = TileMap(n, bn, &ntiles);
       const bool ok1 = qfn::RoutedF16Gemm(
-          wgu.dev, qfn::WeightType::kNVFP4, xh, tmap, ntiles, bn, rbounds,
+          wgu.dev, qfn::WeightType::kNVFP4, xmoe, tmap, ntiles, bn, rbounds,
           rrows_token, rrows_slot, nullptr, gu, nullptr, 2 * ff, h, stream);
       SituHalf<<<items, 256, 0, stream>>>(gu, ids, s_gu, act16, ff, c.situ_beta,
                                           c.situ_linear_beta);
@@ -2169,6 +2212,11 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
   i.bank_out = i.Alloc(b * h);
   i.d_logits = i.Alloc(c.vocab_padded);
   i.d_pos = static_cast<int*>(i.AllocBytes(4));
+  i.xh0 = static_cast<__half*>(i.AllocBytes(b * h * 2));
+  i.xh1 = static_cast<__half*>(i.AllocBytes(b * h * 2));
+  i.xh2 = static_cast<__half*>(i.AllocBytes(b * h * 2));
+  i.xhx = static_cast<__half*>(i.AllocBytes(b * h * 2));
+  i.atth = static_cast<__half*>(i.AllocBytes(b * qd * 2));
   i.rcounts = static_cast<unsigned int*>(
       i.AllocBytes(c.expert_count * sizeof(unsigned int)));
   i.rbounds =
