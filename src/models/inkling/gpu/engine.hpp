@@ -37,6 +37,10 @@ public:
   /// Drafts out.size() (at most 7) tokens after `anchor`, the next token to
   /// append; needs INKLING_DRAFT and Model::LoadDrafter.
   [[nodiscard]] bool Draft(std::int32_t anchor, std::span<std::int32_t> out);
+  /// Also returns each drafted token's top-1 probability over the proposal
+  /// vocabulary (out.size() entries).
+  [[nodiscard]] bool Draft(std::int32_t anchor, std::span<std::int32_t> out,
+                           std::span<float> confidence);
   /// Drops cache rows past `position`; later appends overwrite them.
   void Rewind(std::uint32_t position) noexcept;
   [[nodiscard]] std::uint32_t Position() const noexcept;

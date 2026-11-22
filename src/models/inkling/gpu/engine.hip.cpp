@@ -2397,20 +2397,45 @@ __global__ void GatherRows(const unsigned char* src, std::size_t row_bytes,
 }
 
 __global__ void ArgMaxRow(const float* x, int n, int* out, int* out2,
-                          const int* map = nullptr) {
+                          const int* map = nullptr, float* conf = nullptr) {
   __shared__ float bv[256];
   __shared__ int bi[256];
+  __shared__ float sv[256];
   float best = -3.0e38F;
+  float sum = 0.0F;
   int idx = 0;
   for (int i = threadIdx.x; i < n; i += blockDim.x) {
-    if (x[i] > best) {
-      best = x[i];
+    const float v = x[i];
+    if (v > best) {
+      sum = sum * expf(best - v) + 1.0F;
+      best = v;
       idx = i;
+    } else {
+      sum += expf(v - best);
     }
   }
   bv[threadIdx.x] = best;
   bi[threadIdx.x] = idx;
+  sv[threadIdx.x] = sum;
   __syncthreads();
+  if (conf != nullptr) {
+    float gm = -3.0e38F;
+    for (int i = 0; i < 256; ++i)
+      gm = fmaxf(gm, bv[i]);
+    float tot = 0.0F;
+    for (int i = threadIdx.x; i < 256; i += 256)
+      tot += sv[i] * expf(bv[i] - gm);
+    __syncthreads();
+    sv[threadIdx.x] = tot;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      float t = 0.0F;
+      for (int i = 0; i < 256; ++i)
+        t += sv[i];
+      *conf = 1.0F / t;
+    }
+    __syncthreads();
+  }
   for (int s = blockDim.x / 2; s > 0; s >>= 1) {
     if (threadIdx.x < s && (bv[threadIdx.x + s] > bv[threadIdx.x] ||
                             (bv[threadIdx.x + s] == bv[threadIdx.x] &&
@@ -2492,6 +2517,7 @@ struct Session::Impl : Scratch {
   static constexpr int kDraftShortlistMax = 65536;
   unsigned char* dhead{nullptr};
   int* dmap{nullptr};
+  float* dconf{nullptr};
   int kDraftShortlist{std::getenv("INKLING_SHORTLIST") != nullptr
                           ? std::atoi(std::getenv("INKLING_SHORTLIST"))
                           : 32768};
@@ -3581,6 +3607,7 @@ struct Session::Impl : Scratch {
     dlog = f(kDraftShortlistMax);
     dw = f(16);
     HIP_OK(hipMemcpy(dw, m->draft_fuse, 16 * 4, hipMemcpyHostToDevice));
+    dconf = f(8);
     {
       const Tensor& head = m->T("output.weight");
       const int n = std::min<int>(kDraftShortlist,
@@ -3630,7 +3657,8 @@ struct Session::Impl : Scratch {
     }
     dwarmed = static_cast<std::uint32_t>(P);
   }
-  bool Draft(std::int32_t anchor, std::int32_t* out, int count) {
+  bool Draft(std::int32_t anchor, std::int32_t* out, int count,
+             float* conf_out = nullptr) {
     const int h = static_cast<int>(m->config.hidden_size);
     const float eps = m->config.rms_eps;
     const int P = static_cast<int>(position);
@@ -3702,9 +3730,12 @@ struct Session::Impl : Scratch {
       sub.rows = static_cast<std::size_t>(kDraftShortlist);
       Dense(sub, deff, h, dlog, kDraftShortlist, 1, kDraftShortlist);
       ArgMaxRow<<<1, 256, 0, stream>>>(dlog, kDraftShortlist, dprev,
-                                       dout + (s - 1), dmap);
+                                       dout + (s - 1), dmap, dconf + (s - 1));
     }
     HIP_OK(hipMemcpyAsync(out, dout, steps * 4, hipMemcpyDeviceToHost, stream));
+    if (conf_out != nullptr)
+      HIP_OK(hipMemcpyAsync(conf_out, dconf, steps * 4, hipMemcpyDeviceToHost,
+                            stream));
     HIP_OK(hipStreamSynchronize(stream));
     return true;
   }
@@ -4024,6 +4055,12 @@ void Session::KeepRows(std::uint32_t keep) {
 
 bool Session::Draft(std::int32_t anchor, std::span<std::int32_t> out) {
   return impl_->Draft(anchor, out.data(), static_cast<int>(out.size()));
+}
+
+bool Session::Draft(std::int32_t anchor, std::span<std::int32_t> out,
+                    std::span<float> confidence) {
+  return impl_->Draft(anchor, out.data(), static_cast<int>(out.size()),
+                      confidence.data());
 }
 
 void Session::Rewind(std::uint32_t position) noexcept {

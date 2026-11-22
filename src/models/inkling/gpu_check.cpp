@@ -129,12 +129,20 @@ int main(int argc, char** argv) {
     std::vector<int> stream;
     while (produced < gen) {
       std::vector<std::int32_t> d(width);
+      std::vector<float> cf(width);
       auto t0 = std::chrono::steady_clock::now();
-      if (!session->Draft(anchor, d)) {
+      if (!session->Draft(anchor, d, cf)) {
         std::fprintf(stderr, "draft failed\n");
         return 1;
       }
       auto t1 = std::chrono::steady_clock::now();
+      if (const char* tau_env = std::getenv("INKLING_TAU")) {
+        const float tau = static_cast<float>(std::atof(tau_env));
+        int keep = 0;
+        while (keep < width && cf[keep] >= tau)
+          ++keep;
+        d.resize(static_cast<std::size_t>(keep));
+      }
       std::vector<std::int32_t> batch{anchor};
       batch.insert(batch.end(), d.begin(), d.end());
       (void)session->AppendAll(batch, &err);
@@ -142,7 +150,16 @@ int main(int argc, char** argv) {
       draft_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
       verify_ms += std::chrono::duration<double, std::milli>(t2 - t1).count();
       int acc = 0;
-      while (acc < width &&
+      if (std::getenv("INKLING_CONF") != nullptr) {
+        int a2 = 0;
+        while (a2 < width &&
+               argmax(session->Logits(static_cast<std::uint32_t>(a2))) == d[a2])
+          ++a2;
+        for (int i = 0; i < width; ++i)
+          std::printf("CONF %d %.3f %d\n", i, cf[i],
+                      i < a2 ? 1 : (i == a2 ? 0 : -1));
+      }
+      while (acc < static_cast<int>(d.size()) &&
              argmax(session->Logits(static_cast<std::uint32_t>(acc))) == d[acc])
         ++acc;
       const int next = argmax(session->Logits(static_cast<std::uint32_t>(acc)));

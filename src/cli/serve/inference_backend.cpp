@@ -4063,13 +4063,15 @@ public:
   static constexpr std::size_t kPrefillChunk = 8192;
   static constexpr std::size_t kWarmupTokens = 8192;
 
-  // Drafted steps verify width + 1 rows. Wider blocks cost more than the extra
-  // accepted tokens return (measured: width 3 is the best on code).
-  static constexpr std::size_t kMaxDraftWidth = 3;
+  // Drafted steps verify keep + 1 rows, where keep is the leading run of draft
+  // slots whose top-1 probability reaches kDraftConfidence (about 94% of those
+  // are accepted; each extra verify row costs about 7 ms).
+  static constexpr std::size_t kMaxDraftWidth = 7;
+  static constexpr float kDraftConfidence = 0.75F;
   // Below this many tokens per drafted step plain decode is faster.
-  static constexpr double kMinDraftYield = 1.75;
+  static constexpr double kMinDraftYield = 1.2;
   static constexpr double kYieldSmoothing = 0.25;
-  static constexpr std::size_t kProbeInterval = 16;
+  static constexpr std::size_t kProbeInterval = 8;
 
   InklingTextRunner(std::shared_ptr<InklingModel> model,
                     std::unique_ptr<tokenization::QwenTokenizer> tokenizer,
@@ -4306,7 +4308,7 @@ public:
         ++inkling.plain_steps % kProbeInterval != 0) {
       return TextModelRunner::DecodeStep(state, max_tokens, sampler);
     }
-    const std::size_t width = std::min<std::size_t>(
+    std::size_t width = std::min<std::size_t>(
         {draft_width_, max_tokens - 1, max_context_ - inkling.position() - 1});
     auto& session = inkling.session();
     sampling::SamplerState working = sampler;
@@ -4315,10 +4317,20 @@ public:
       return {.selections = {}, .stop = true};
     const auto anchor = static_cast<std::int32_t>(first);
     std::vector<std::int32_t> block(width + 1, anchor);
+    std::vector<float> confidence(width);
     std::string error;
-    if (!session.Draft(anchor, {block.data() + 1, width})) {
+    if (!session.Draft(anchor, {block.data() + 1, width}, confidence)) {
       return TextModelRunner::DecodeStep(state, max_tokens, sampler);
     }
+    std::size_t keep = 0;
+    while (keep < width && confidence[keep] >= kDraftConfidence)
+      ++keep;
+    if (keep == 0) {
+      inkling.draft_yield += kYieldSmoothing * (1.0 - inkling.draft_yield);
+      return TextModelRunner::DecodeStep(state, max_tokens, sampler);
+    }
+    width = keep;
+    block.resize(width + 1);
     if (!session.AppendAll(block, &error)) {
       inkling.Invalidate();
       throw std::runtime_error("Inkling verification failed: " + error);

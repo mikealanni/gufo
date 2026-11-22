@@ -63,6 +63,8 @@ std::string RenderPrompt(const std::vector<ChatMessage>& messages,
   if (!effort_emitted)
     effort();
   out += kModelRole;
+  if (!options.enable_thinking)
+    out += kText;
   return out;
 }
 
