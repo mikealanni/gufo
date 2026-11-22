@@ -27,8 +27,6 @@ constexpr int kMaxStates = 8;
 constexpr int kConvTaps = 4;
 constexpr int kHistory = 3;
 constexpr int kMaxBatch = 4096;
-constexpr std::uint32_t kNpuTokens = 2048;
-constexpr std::size_t kBankRows = 2048;
 constexpr std::size_t kBankMin = 512;
 constexpr std::uint32_t kNpuSlice = 1024;
 constexpr int kFlashHd = 128;
@@ -1506,6 +1504,7 @@ struct ModelState {
   std::size_t resident_bytes{0};
   // optional NPU offload of the q / gate / k / v projections (INKLING_NPU=1)
   std::unique_ptr<gufo::models::qwen38_flash_next::rocm::NpuGemm> npu;
+  std::uint32_t npu_tokens{2048};  // rows of the runtime-M program = rows of one bank
   std::unordered_map<std::string, std::vector<int>> npu_w;  // tensor -> 1024-row slices
   ~ModelState() {
     npu.reset();
@@ -1551,10 +1550,12 @@ std::shared_ptr<Model> Model::Load(const std::string& path,
   if (const char* dir = std::getenv("GUFO_NPU_DIR");
       dir != nullptr && std::getenv("INKLING_NPU") != nullptr) {
     gufo::models::qwen38_flash_next::rocm::NpuGemm::Config nc;
+    if (const char* mm = std::getenv("INKLING_NPU_M"))
+      state->npu_tokens = static_cast<std::uint32_t>(std::atoi(mm));
     nc.xclbin = std::string(dir) + "/runtime_mk/final_4096xKx1024_128x64x128.xclbin";
-    nc.insts = std::string(dir) + "/runtime_mk/insts_2048x" +
+    nc.insts = std::string(dir) + "/runtime_mk/insts_" + std::to_string(state->npu_tokens) + "x" +
                std::to_string(cfg->hidden_size) + "x1024_128x64x128.txt";
-    nc.tokens = kNpuTokens;
+    nc.tokens = state->npu_tokens;
     nc.k = cfg->hidden_size;
     nc.n = kNpuSlice;
     std::string npu_error;
@@ -1720,6 +1721,7 @@ struct Session::Impl : Scratch {
   };
   std::vector<Slot> slots;
   bool banked{false};
+  std::size_t bank_rows{2048};
   int npu_mask{std::getenv("INKLING_NPU_PARTS") != nullptr ? std::atoi(std::getenv("INKLING_NPU_PARTS")) : 15};  // 1=q 2=gate 4=k 8=v
   Scratch saved[2];  // bank scratch while another bank is active
   int active{0};
@@ -2094,7 +2096,7 @@ struct Session::Impl : Scratch {
     const auto& wv = m->npu_w.at(m->P(L.p, "attn_v.weight"));
     const bool k_shared = L.inp[1] == L.inp[0];
     const bool v_shared = L.inp[2] == L.inp[0];
-    const int rows = std::min<int>(kNpuTokens, n - r0);
+    const int rows = std::min<int>(m->npu_tokens, n - r0);
     const std::uint32_t enc = static_cast<std::uint32_t>((rows + 127) / 128 * 128);
     rocm::NpuEncodeActivations(L.inh[0] + static_cast<std::size_t>(r0) * h, h, enc, h, 0, h, npu.Device(npu_a[0]), stream);
     if (!k_shared)
@@ -2132,7 +2134,7 @@ struct Session::Impl : Scratch {
   void NpuQkvEnd(LayerCtx& L, int r0) {
     namespace rocm = gufo::models::qwen38_flash_next::rocm;
     auto& npu = *m->npu;
-    const int rows = std::min<int>(kNpuTokens, L.n - r0);
+    const int rows = std::min<int>(m->npu_tokens, L.n - r0);
     const auto& wq = m->npu_w.at(m->P(L.p, "attn_q.weight"));
     const auto& wg = m->npu_w.at(m->P(L.p, "attn_gate.weight"));
     const int qd = static_cast<int>(wq.size()) * static_cast<int>(kNpuSlice);
@@ -2206,7 +2208,7 @@ struct Session::Impl : Scratch {
     (void)c; (void)h; (void)nh; (void)nkv; (void)hd; (void)nrel; (void)p; (void)swa; (void)sl; (void)n; (void)nh_; (void)big; (void)inp; (void)inh; (void)msgs_;
     if (L.npu_on) {
       NpuQkvEnd(L, 0);
-      for (int r0 = static_cast<int>(kNpuTokens); r0 < n; r0 += static_cast<int>(kNpuTokens)) {
+      for (int r0 = static_cast<int>(m->npu_tokens); r0 < n; r0 += static_cast<int>(m->npu_tokens)) {
         NpuQkvBegin(L, r0);
         NpuQkvEnd(L, r0);
       }
@@ -2505,24 +2507,25 @@ struct Session::Impl : Scratch {
     Activate(0);
     const Config& c = m->config;
     const int n = static_cast<int>(tokens.size());
-    HIP_OK(hipMemcpy(d_tokens, tokens.data(), n * 4, hipMemcpyHostToDevice));
-    const int pos = static_cast<int>(position);
-    pos_base = position;
-    HIP_OK(hipMemcpy(d_pos, &pos, 4, hipMemcpyHostToDevice));
-    Activate(0);
     if (banked && n >= static_cast<int>(kBankMin) &&
-        n <= static_cast<int>(2 * kBankRows)) {
+        n <= static_cast<int>(2 * bank_rows)) {
       BodyBanks(tokens);
-    } else if (n == 1) {
-      if (graph_exec == nullptr) {
-        HIP_OK(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal));
-        Body(1);
-        HIP_OK(hipStreamEndCapture(stream, &graph));
-        HIP_OK(hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
-      }
-      HIP_OK(hipGraphLaunch(graph_exec, stream));
     } else {
-      Body(n);
+      HIP_OK(hipMemcpy(d_tokens, tokens.data(), n * 4, hipMemcpyHostToDevice));
+      const int pos = static_cast<int>(position);
+      pos_base = position;
+      HIP_OK(hipMemcpy(d_pos, &pos, 4, hipMemcpyHostToDevice));
+      if (n == 1) {
+        if (graph_exec == nullptr) {
+          HIP_OK(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal));
+          Body(1);
+          HIP_OK(hipStreamEndCapture(stream, &graph));
+          HIP_OK(hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
+        }
+        HIP_OK(hipGraphLaunch(graph_exec, stream));
+      } else {
+        Body(n);
+      }
     }
     HIP_OK(hipStreamSynchronize(stream));
     logits.resize(c.vocab_unpadded);
@@ -2612,7 +2615,7 @@ struct Session::Impl : Scratch {
     const Config& c = m->config;
     const int h = c.hidden_size;
     const int total = static_cast<int>(tokens.size());
-    const int na = std::min<int>(static_cast<int>(kBankRows), (total / 2 + 127) / 128 * 128);
+    const int na = std::min<int>(static_cast<int>(bank_rows), (total / 2 + 127) / 128 * 128);
     const int nb = total - na;
     BankRun R[2];
     R[0].n = na;
@@ -2778,9 +2781,10 @@ bool Session::Append(std::span<const std::int32_t> tokens, std::string* error) {
       *error = "context exceeded or empty append";
     return false;
   }
-  for (std::size_t off = 0; off < tokens.size(); off += kMaxBatch) {
-    impl_->Forward(tokens.subspan(
-        off, std::min<std::size_t>(kMaxBatch, tokens.size() - off)));
+  const std::size_t chunk = impl_->banked ? 2 * impl_->bank_rows : kMaxBatch;
+  for (std::size_t off = 0; off < tokens.size(); off += chunk) {
+    impl_->Forward(
+        tokens.subspan(off, std::min<std::size_t>(chunk, tokens.size() - off)));
   }
   return true;
 }
@@ -2937,7 +2941,8 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
   HIP_OK(hipStreamCreateWithFlags(&i.stream, hipStreamNonBlocking));
   if (state_->npu || std::getenv("INKLING_BANKS") != nullptr) {
     i.banked = true;
-    alloc_scratch(i.saved[1], kBankRows);
+    i.bank_rows = state_->npu ? state_->npu_tokens : 2048;
+    alloc_scratch(i.saved[1], i.bank_rows);
   }
   return s;
 }
