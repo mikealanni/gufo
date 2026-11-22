@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <unordered_map>
 
+#include "src/core/hip/weight_upload.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
 #include "src/models/flint/gpu/kernels/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
@@ -43,7 +44,10 @@ class Uploader {
 public:
   Uploader(const core::GgufReader& reader, std::vector<void*>* allocations,
            std::size_t* bytes, std::string* error)
-      : allocations_(allocations), bytes_(bytes), error_(error) {
+      : upload_(reader),
+        allocations_(allocations),
+        bytes_(bytes),
+        error_(error) {
     for (const auto& t : reader.GetTensors()) {
       tensors_.emplace(std::string(t.name), &t);
     }
@@ -77,9 +81,9 @@ public:
       return false;
     std::size_t offset = 0;
     for (const auto* t : parts) {
-      if (hipMemcpy(static_cast<char*>(out->data) + offset, t->data,
-                    t->size_bytes, hipMemcpyHostToDevice) != hipSuccess) {
-        SetError(error_, "device copy failed");
+      std::string upload_error;
+      if (!upload_.Upload(*t, out->data, offset, &upload_error)) {
+        SetError(error_, upload_error);
         return false;
       }
       offset += t->size_bytes;
@@ -159,7 +163,14 @@ public:
       out->type = core::GgmlType::kQ8_0;
       return ReencodeQ6KToQ8(out, t);
     }
-    return Copy(out, t.data, t.size_bytes);
+    if (!Alloc(out, t.size_bytes))
+      return false;
+    std::string upload_error;
+    if (!upload_.Upload(t, out->data, &upload_error)) {
+      SetError(error_, upload_error);
+      return false;
+    }
+    return true;
   }
 
 private:
@@ -232,10 +243,11 @@ private:
     return true;
   }
 
-  std::unordered_map<std::string, const core::GgufTensorInfo*> tensors_;
+  hip::TensorUpload upload_;
   std::vector<void*>* allocations_;
   std::size_t* bytes_;
   std::string* error_;
+  std::unordered_map<std::string, const core::GgufTensorInfo*> tensors_;
 };
 
 }  // namespace

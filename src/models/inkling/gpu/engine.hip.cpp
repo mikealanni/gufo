@@ -2111,30 +2111,12 @@ std::shared_ptr<Model> Model::Load(const std::string& path,
       std::fprintf(stderr, "inkling: NPU unavailable: %s\n", npu_error.c_str());
     }
   }
-  const auto mapped_regions = reader->GetMappedRegions();
-  const std::vector<gufo::core::GgufMappedRegion> shards(mapped_regions.begin(),
-                                                         mapped_regions.end());
-  std::string upload_error;
-  const auto stager = gufo::hip::WeightUpload::Create(shards, &upload_error);
+  gufo::hip::TensorUpload tensor_upload(*reader);
   const auto upload = [&](const gufo::core::GgufTensorInfo& info,
                           void* device) -> hipError_t {
-    const auto* at = static_cast<const char*>(info.data);
-    if (stager != nullptr) {
-      for (std::uint32_t shard = 0; shard < shards.size(); ++shard) {
-        const auto* base = static_cast<const char*>(shards[shard].data);
-        if (at < base || at + info.size_bytes > base + shards[shard].size)
-          continue;
-        std::string copy_error;
-        if (stager->Copy(shard, static_cast<std::uint64_t>(at - base),
-                         info.size_bytes, device, &copy_error) &&
-            stager->Finish(&copy_error))
-          return hipSuccess;
-        std::fprintf(stderr, "inkling: staged upload failed (%s), copying\n",
-                     copy_error.c_str());
-        break;
-      }
-    }
-    return hipMemcpy(device, info.data, info.size_bytes, hipMemcpyHostToDevice);
+    std::string upload_error;
+    return tensor_upload.Upload(info, device, &upload_error) ? hipSuccess
+                                                             : hipErrorUnknown;
   };
   const auto npu_name = [](std::string_view n) {
     for (const char* suffix :
