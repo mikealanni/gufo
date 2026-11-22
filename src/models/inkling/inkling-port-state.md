@@ -246,3 +246,11 @@ looped 3x -> 5.4B effective active; 24 physical layers, middle core looped).
   dense, per-head sparse and grouped sparse give identical answers. Draft slots after the first low-confidence one are
   skipped on the device. Serve decode at 63k: 54.2 / 52.1 / 54.2 tok/s (37k 56.9; short code 67.7, JSON 64-68).
   Tried and reverted: register prefetch of the next K/V tile (slower, register pressure), multi-row chunk kernel.
+- Expert layers 20-23 (Q8_0 in the GGUF, 1.083 GB each) are converted to NVFP4 at load (nearest E2M1 with a 3-candidate
+  UE4M3 scale search per 16 elements; INKLING_EXPERT_NVFP4=0 disables). The reference runtime's "fitted" final-layer banks
+  are 574.7 MB each = one NVFP4 expert layer, so this matches what they ship. KL(orig||converted) over 12 mixed
+  prose/code windows of 2048 tokens: mean 0.0013 nats, max 0.0048, top-1 12/12 (their figure 0.0095). Gains: 6-row
+  verify 65.8 -> 63.0 ms, plain step -0.6 ms, GPU pp 2k 1652 -> 1692, 4k 1745 -> 1768. Serve (greedy, thinking off):
+  code 70.7, JSON 68.9, 37k 59.3, 63k 55.4/53.9/55.4 tok/s.
+- Tried and reverted: control step restructured to read weights once for all rows (verify 5 rows 61.6 -> 66.2 ms: 8 blocks
+  is too little parallelism).
