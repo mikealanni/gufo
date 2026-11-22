@@ -12,7 +12,8 @@ speculative decoding on top, for Qwen, Inkling, Flint, GLM-5.3 Flash and Laguna 
   it), and recovers turns that fail when the server restarts. The plugin adds
   `/jev` to opencode and works with `opencode --standalone`, so one session
   leaves no background service behind. A server started with `GUFO_THINK=off`
-  keeps thinking off for every request. See [docs/JEV.md](docs/JEV.md).
+  keeps thinking off for every request. See [docs/JEV.md](docs/JEV.md) and the
+  [setup guide](docs/JEV-SETUP.md).
 - **Inkling 2 Mini** (26.4B MoE, 3.4B active, looped middle layers) on the GPU with
   DSpark speculation and NPU prefill. Up to 256K context with block-sparse
   attention, tool calls, a reasoning channel, and the same RAM and disk
@@ -390,7 +391,8 @@ Every option is described in [docs/NPU.md](docs/NPU.md). Without
 `tools/jev/` holds a guard proxy and an opencode plugin that keep a local gufo
 server usable next to heavy work: it stops gufo before heavy commands, restarts
 the same model afterwards, switches models with `/jev switch`, and controls
-reasoning effort. See [docs/JEV.md](docs/JEV.md).
+reasoning effort. See [docs/JEV.md](docs/JEV.md); install steps, flags and every
+environment variable are in [docs/JEV-SETUP.md](docs/JEV-SETUP.md).
 
 ## Build from source
 

@@ -72,6 +72,8 @@ only stops a running gufo.
 
 ## opencode plugin
 
+The full setup, flags and environment variables are in [JEV-SETUP.md](JEV-SETUP.md).
+
 Install the server plugin and the TUI plugin from the opencode config
 directory:
 
