@@ -19,7 +19,7 @@ int main(int argc, char** argv) {
           ? static_cast<std::uint32_t>(std::atoi(std::getenv("INKLING_CTX")))
           : 8192U;
   if (argc >= 3 && std::string(argv[2]) == "--text") {
-    constexpr int kGenerate = 64;
+    const int kGenerate = std::getenv("INKLING_GEN") != nullptr ? std::atoi(std::getenv("INKLING_GEN")) : 64;
     std::string err;
     auto reader = gufo::core::GgufReader::OpenFile(argv[1], &err);
     auto tok = gufo::tokenization::QwenTokenizer::CreateFromGguf(*reader, &err);
@@ -29,8 +29,14 @@ int main(int argc, char** argv) {
     }
     auto model = gufo::models::inkling::gpu::Model::Load(argv[1], &err);
     auto session = model->CreateSession(kContext, &err);
-    const auto ids =
-        tok->Encode(argc > 3 ? argv[3] : "The capital of France is", {});
+    std::string prompt_text = argc > 3 ? argv[3] : "The capital of France is";
+    if (const char* pf = std::getenv("INKLING_PROMPT_FILE")) {
+      std::ifstream pin(pf);
+      std::stringstream pss;
+      pss << pin.rdbuf();
+      prompt_text = pss.str();
+    }
+    const auto ids = tok->Encode(prompt_text, {});
     std::vector<std::int32_t> in(ids.begin(), ids.end());
     std::printf("prompt tokens: %zu\n", in.size());
     (void)session->Append(in, &err);
