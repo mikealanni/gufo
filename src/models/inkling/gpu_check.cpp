@@ -100,7 +100,9 @@ int main(int argc, char** argv) {
     const int gen = std::getenv("INKLING_GEN") != nullptr
                         ? std::atoi(std::getenv("INKLING_GEN"))
                         : 128;
-    constexpr int kPrefix = 600;
+    const int kPrefix = std::getenv("INKLING_PREFIX") != nullptr
+                            ? std::atoi(std::getenv("INKLING_PREFIX"))
+                            : 600;
     auto model = gufo::models::inkling::gpu::Model::Load(argv[1], &err);
     if (!model->LoadDrafter(argv[4], &err)) {
       std::fprintf(stderr, "drafter load failed: %s\n", err.c_str());

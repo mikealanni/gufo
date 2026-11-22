@@ -201,8 +201,11 @@ looped 3x -> 5.4B effective active; 24 physical layers, middle core looped).
   rows (greedy). Tap definition settled by acceptance on prose: virtual layer outputs 4, 22, 40, 47 (mean accepted 1.72
   of 7 vs 0.3-1.5 for neighbours). First-slot acceptance ~64%, matching the reference runtime's depth-1 58-70%. Draft ~9.5 ms (7
   sequential Q8 head matvecs over 65536 rows dominate) vs verify-8 93 ms.
-- Decode is the lever: plain step 35 ms vs ~16 ms bandwidth ceiling (3.6 GB at 225 GB/s); the draft must be under 3 ms
-  and verify-2 near the plain step to reach 50 tok/s.
+- Speculation verdict (2026-11-22): break-even. Draft 3.3 ms with an 8192-row head shortlist (acceptance same as 65536),
+  verify-2 ~40 ms vs plain 32 ms (two tokens touch ~14 distinct experts), 1.4-2.3 tokens/step over widths 1-4 gives
+  29-36 tok/s vs 31 plain. Not wired into serve. Only a cheaper plain step or a smarter verify (shared experts across
+  rows, higher acceptance) changes this. Fusing the tiny per-layer GEMVs into one launch did not help (reverted):
+  the step is bandwidth-bound, not launch-bound. The built-in GGUF has no draft/MTP tensors; DSpark is external only.
   (greedy first), captured verify graphs, serve integration.
 
 ## Open questions / next steps (skill default order)

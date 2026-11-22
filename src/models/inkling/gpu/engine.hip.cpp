@@ -2219,7 +2219,10 @@ struct Session::Impl : Scratch {
   int *dprev{}, *dtok{}, *dout{};
   static constexpr int kDraftWarmChunk = 256;
   static constexpr int kDraftSplit = 64;
-  static constexpr int kDraftShortlist = 65536;
+  static constexpr int kDraftShortlistMax = 65536;
+  int kDraftShortlist{std::getenv("INKLING_SHORTLIST") != nullptr
+                          ? std::atoi(std::getenv("INKLING_SHORTLIST"))
+                          : 8192};
   HistEntry* hist_entries{nullptr};
   int n_hist_entries{0};
   int last_rows{0};
@@ -3283,7 +3286,7 @@ struct Session::Impl : Scratch {
     djin = f(5120);
     djout = f(768);
     deff = f(h);
-    dlog = f(kDraftShortlist);
+    dlog = f(kDraftShortlistMax);
     dw = f(16);
     HIP_OK(hipMemcpy(dw, m->draft_fuse, 16 * 4, hipMemcpyHostToDevice));
     dprev = static_cast<int*>(AllocBytes(4));
