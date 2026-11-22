@@ -238,3 +238,11 @@ looped 3x -> 5.4B effective active; 24 physical layers, middle core looped).
 5. Serve runner + dispatch (`general.architecture` == "inkling2").
 6. Bench integration.
 7. Docs, regression, merge from clean worktree.
+
+- Deep-context decode (2026-11-22): packed few-row attention (all rows x the 3 heads of one KV group in one 4-wave flash
+  tile, K/V read once per group), sliding-window verify split into 256-key parts, drafter attention with slots across
+  lanes, and per-KV-group sparse block selection (Quest bound over the group's heads and rows) with the same packed
+  tile: 62k verify-6 94 -> 73 ms, plain step 50 -> 36 ms (short context 33). Needle test at 10/50/90% in 63k:
+  dense, per-head sparse and grouped sparse give identical answers. Draft slots after the first low-confidence one are
+  skipped on the device. Serve decode at 63k: 54.2 / 52.1 / 54.2 tok/s (37k 56.9; short code 67.7, JSON 64-68).
+  Tried and reverted: register prefetch of the next K/V tile (slower, register pressure), multi-row chunk kernel.

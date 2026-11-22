@@ -4326,13 +4326,18 @@ public:
     if (IsStop(anchor))
       return {.selections = {}, .stop = true};
     std::vector<std::int32_t> block(width + 1, anchor);
+    static const float conf_min =
+        std::getenv("INKLING_DRAFT_CONF") != nullptr
+            ? static_cast<float>(std::atof(std::getenv("INKLING_DRAFT_CONF")))
+            : kDraftConfidence;
     std::vector<float> confidence(width);
     std::string error;
-    if (!session.Draft(anchor, {block.data() + 1, width}, confidence)) {
+    if (!session.Draft(anchor, {block.data() + 1, width}, confidence,
+                       conf_min)) {
       return TextModelRunner::DecodeStep(state, max_tokens, sampler);
     }
     std::size_t keep = 0;
-    while (keep < width && confidence[keep] >= kDraftConfidence)
+    while (keep < width && confidence[keep] >= conf_min)
       ++keep;
     if (keep == 0) {
       inkling.draft_yield += kYieldSmoothing * (1.0 - inkling.draft_yield);

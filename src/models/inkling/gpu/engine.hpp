@@ -42,8 +42,11 @@ public:
   [[nodiscard]] bool Draft(std::int32_t anchor, std::span<std::int32_t> out);
   /// Also returns each drafted token's top-1 probability over the proposal
   /// vocabulary (out.size() entries).
+  /// Slots after the first whose probability is below stop_confidence (> 0)
+  /// are skipped on the device; their tokens and confidences are stale.
   [[nodiscard]] bool Draft(std::int32_t anchor, std::span<std::int32_t> out,
-                           std::span<float> confidence);
+                           std::span<float> confidence,
+                           float stop_confidence = 0.0F);
   /// Drops cache rows past `position`; later appends overwrite them.
   void Rewind(std::uint32_t position) noexcept;
   [[nodiscard]] std::uint32_t Position() const noexcept;
