@@ -207,6 +207,16 @@ looped 3x -> 5.4B effective active; 24 physical layers, middle core looped).
   rows, higher acceptance) changes this. Fusing the tiny per-layer GEMVs into one launch did not help (reverted):
   the step is bandwidth-bound, not launch-bound. The built-in GGUF has no draft/MTP tensors; DSpark is external only.
   (greedy first), captured verify graphs, serve integration.
+- Acceptance fix (2026-11-22): the proposal vocabulary must be the top 65536 rows of markov_w1 by L2 norm (the drafter's
+  own reduced vocabulary), not the first N token ids; most chat/code tokens have ids above 65536, so a first-N shortlist
+  could never propose them (mean accepted 0.68 -> 2.15 of 3 on templated code, 32768 rows by norm, draft ~4 ms). Fourth tap
+  is the final hidden state after output_norm (the reference runtime taps [5,23,41,48] = outputs of virtual layers 4, 22, 40 and the
+  normed final state). Measured with templated chat prompts, not raw text: code harness 55 tok/s at width 3 (verify-4
+  ~52 ms, plain 32); serve (thinking text) code 44.8 tok/s, JSON 35.9 tok/s, 52-60% of drafted tokens accepted.
+  Verify cost per extra row is ~7 ms, so width 3 beats 5 and 7.
+- Decode attention (2026-11-22): n=1 decode used the 128-query prefill flash kernel; a dedicated split-key kernel
+  (DecodeAttn, 256 keys per block, 16 lanes per key row) raised plain decode 23.0 -> 28.2 tok/s at 4k, 19.6 -> 23.3 at
+  16k. Full-attention layers still ~1 ms each at 16k (~60 GB/s), room left.
 
 ## Open questions / next steps (skill default order)
 
