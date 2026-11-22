@@ -28,6 +28,7 @@ constexpr int kConvTaps = 4;
 constexpr int kHistory = 3;
 constexpr int kMaxBatch = 4096;
 constexpr std::size_t kBankMin = 3072;
+constexpr std::size_t kMaxVerifyRows = 8;
 constexpr std::uint32_t kNpuSlice = 1024;
 constexpr int kFlashHd = 128;
 constexpr int kWmmaMinTokens = 32;
@@ -1800,6 +1801,8 @@ struct Session::Impl : Scratch {
   };
   std::vector<Slot> slots;
   bool banked{false};
+  int n_logit_rows{1};
+  bool all_rows{false};  // keep the logits of every row (verification batches)
   std::size_t bank_rows{2048};
   int npu_mask{std::getenv("INKLING_NPU_PARTS") != nullptr
                    ? std::atoi(std::getenv("INKLING_NPU_PARTS"))
@@ -2779,9 +2782,11 @@ struct Session::Impl : Scratch {
       }
     }
     HIP_OK(hipStreamSynchronize(stream));
-    logits.resize(c.vocab_unpadded);
-    HIP_OK(hipMemcpy(logits.data(), d_logits, c.vocab_unpadded * 4,
+    const int rows = all_rows ? n : 1;
+    logits.resize(static_cast<std::size_t>(rows) * c.vocab_unpadded);
+    HIP_OK(hipMemcpy(logits.data(), d_logits, logits.size() * 4,
                      hipMemcpyDeviceToHost));
+    n_logit_rows = rows;
     position += n;
   }
 
@@ -3008,10 +3013,18 @@ struct Session::Impl : Scratch {
     RmsRows(x, static_cast<const float*>(m->T("output_norm.weight").dev), x, n,
             h, h, h);
     const Tensor& out = m->T("output.weight");
-    Dense(out, x + static_cast<std::size_t>(n - 1) * h, h, d_logits,
-          c.vocab_unpadded, 1, static_cast<int>(c.vocab_unpadded));
-    Softcap<<<(c.vocab_unpadded + 255) / 256, 256, 0, stream>>>(
-        d_logits, c.vocab_unpadded, c.final_logit_softcapping);
+    if (all_rows && n <= static_cast<int>(kMaxVerifyRows)) {
+      Dense(out, x, h, d_logits, c.vocab_unpadded, n,
+            static_cast<int>(c.vocab_unpadded));
+      Softcap<<<(static_cast<std::size_t>(n) * c.vocab_unpadded + 255) / 256,
+                256, 0, stream>>>(d_logits, n * c.vocab_unpadded,
+                                  c.final_logit_softcapping);
+    } else {
+      Dense(out, x + static_cast<std::size_t>(n - 1) * h, h, d_logits,
+            c.vocab_unpadded, 1, static_cast<int>(c.vocab_unpadded));
+      Softcap<<<(c.vocab_unpadded + 255) / 256, 256, 0, stream>>>(
+          d_logits, c.vocab_unpadded, c.final_logit_softcapping);
+    }
   }
 };
 
@@ -3023,7 +3036,30 @@ Session::Session() = default;
 Session::~Session() = default;
 
 std::span<const float> Session::Logits() const noexcept {
-  return impl_->logits;
+  const std::size_t v = impl_->m->config.vocab_unpadded;
+  return std::span<const float>(impl_->logits).last(v);
+}
+
+std::span<const float> Session::Logits(std::uint32_t row) const noexcept {
+  const std::size_t v = impl_->m->config.vocab_unpadded;
+  return std::span<const float>(impl_->logits).subspan(row * v, v);
+}
+
+bool Session::AppendAll(std::span<const std::int32_t> tokens, std::string* error) {
+  if (tokens.empty() || tokens.size() > kMaxVerifyRows ||
+      impl_->position + tokens.size() > impl_->ctx) {
+    if (error != nullptr)
+      *error = "verification batch must be 1..8 tokens within the context";
+    return false;
+  }
+  impl_->all_rows = true;
+  impl_->Forward(tokens);
+  impl_->all_rows = false;
+  return true;
+}
+
+void Session::Rewind(std::uint32_t position) noexcept {
+  impl_->position = position;
 }
 std::uint32_t Session::Position() const noexcept {
   return impl_->position;
@@ -3131,7 +3167,7 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
     sc.moe = i.Alloc(b * h);
     sc.prelude = i.Alloc(b * h);
     sc.bank_out = i.Alloc(b * h);
-    sc.d_logits = i.Alloc(c.vocab_padded);
+    sc.d_logits = i.Alloc(kMaxVerifyRows * c.vocab_padded);
     sc.d_pos = static_cast<int*>(i.AllocBytes(4));
     if (state_->npu) {
       std::string npu_error;

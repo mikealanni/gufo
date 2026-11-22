@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -82,6 +83,49 @@ int main(int argc, char** argv) {
       const auto l = session->Logits();
       out.write(reinterpret_cast<const char*>(l.data()),
                 static_cast<std::streamsize>(l.size() * sizeof(float)));
+    }
+    return 0;
+  }
+  if (argc >= 4 && std::string(argv[2]) == "--verify") {
+    // --verify <text file> <k>: AppendAll(k rows) must match k sequential single-token steps
+    std::string err;
+    auto reader = gufo::core::GgufReader::OpenFile(argv[1], &err);
+    auto tok = gufo::tokenization::QwenTokenizer::CreateFromGguf(*reader, &err);
+    std::ifstream in(argv[3]);
+    std::stringstream ss;
+    ss << in.rdbuf();
+    const auto ids = tok->Encode(ss.str(), {});
+    const int k = argc > 4 ? std::atoi(argv[4]) : 2;
+    constexpr int kPrefix = 300;
+    auto model = gufo::models::inkling::gpu::Model::Load(argv[1], &err);
+    auto session = model->CreateSession(2048, &err);
+    std::vector<std::int32_t> prefix;
+    for (int i = 0; i < kPrefix; ++i) prefix.push_back(static_cast<std::int32_t>(ids[i]));
+    std::vector<std::int32_t> next;
+    for (int i = 0; i < k; ++i) next.push_back(static_cast<std::int32_t>(ids[kPrefix + i]));
+    (void)session->Append(prefix, &err);
+    std::vector<std::vector<float>> seq;
+    for (int i = 0; i < k; ++i) {
+      (void)session->Append(std::span(&next[i], 1), &err);
+      const auto l = session->Logits();
+      seq.emplace_back(l.begin(), l.end());
+    }
+    session->Reset();
+    (void)session->Append(prefix, &err);
+    if (!session->AppendAll(next, &err)) {
+      std::fprintf(stderr, "AppendAll failed: %s\n", err.c_str());
+      return 1;
+    }
+    for (int i = 0; i < k; ++i) {
+      const auto l = session->Logits(static_cast<std::uint32_t>(i));
+      double maxd = 0.0;
+      int a0 = 0, a1 = 0;
+      for (std::size_t j = 0; j < l.size(); ++j) {
+        maxd = std::max(maxd, std::fabs(static_cast<double>(l[j]) - seq[i][j]));
+        if (l[j] > l[a0]) a0 = static_cast<int>(j);
+        if (seq[i][j] > seq[i][a1]) a1 = static_cast<int>(j);
+      }
+      std::printf("row %d: max |dlogit| %.4f, argmax batch %d seq %d\n", i, maxd, a0, a1);
     }
     return 0;
   }
