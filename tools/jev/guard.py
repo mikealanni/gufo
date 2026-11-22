@@ -831,16 +831,8 @@ class Guard:
             self.launch_env.setdefault("GUFO_MODEL", self.launch_env.pop("GUFO_KIND"))
         # A server started with GUFO_THINK=off owns the decision: no plugin or client effort turns thinking back on.
         self.think_forced_off = str(self.launch_env.get("GUFO_THINK", "")).strip().lower() == "off"
-        # The model last loaded survives a guard restart: unless GUFO_MODEL is set explicitly, boot loads it again.
+        # The model named by the first launch wins (GUFO_MODEL, else the default); a saved model never overrides it.
         self.model_file = os.path.join(os.path.expanduser("~"), ".gufo", "jev-log", "guard-model.json")
-        if "GUFO_MODEL" not in self.launch_env and not any(k in self.launch_env for k in MODEL_SPECIFIC_ENV):
-            try:
-                with open(self.model_file) as f:
-                    saved = json.load(f).get("kind")
-                if isinstance(saved, str) and saved in MODEL_KINDS:
-                    self.launch_env["GUFO_MODEL"] = saved
-            except (OSError, ValueError):
-                pass
         self.switching = False
         self.rewritten = set()
         self.model_id = None  # id reported by gufo's /v1/models after the last successful start
