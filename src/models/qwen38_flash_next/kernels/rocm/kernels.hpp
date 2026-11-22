@@ -53,6 +53,7 @@ enum class WeightType : std::uint32_t {
   kIQ2_S = 22,
   kIQ4_XS = 23,
   kBF16 = 30,
+  kNVFP4 = 40,  ///< Inkling repack: [qs: k/2][scales: k/16] rows padded to 16 B
 };
 
 /// res[t][s][hidden] = table[tokens[t]] for every stream s (Q8_0 rows).

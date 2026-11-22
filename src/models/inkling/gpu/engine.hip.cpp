@@ -9,9 +9,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
 namespace gufo::models::inkling::gpu {
 namespace {
@@ -482,6 +484,63 @@ __global__ void Mix(StatePtrs blocks, const float* cur, const float* query,
   }
 }
 
+// states = rms(blocks..., cur); out[q][t] = softmax(states . query[q] /
+// sqrt(h)) mixture of normalized states
+__global__ void MixBig(StatePtrs blocks, const float* cur, const float* query,
+                       int nq, int h, int n, float* out) {
+  __shared__ float red[256][5];
+  __shared__ float inv[kMaxStates];
+  __shared__ float score[4][kMaxStates];
+  const int t = blockIdx.x;
+  const int ns = blocks.count + 1;
+  const float* st[kMaxStates];
+  for (int s = 0; s < blocks.count; ++s)
+    st[s] = blocks.p[s] + static_cast<std::size_t>(t) * h;
+  st[blocks.count] = cur + static_cast<std::size_t>(t) * h;
+  for (int s = 0; s < ns; ++s) {
+    float acc[5] = {};
+    for (int i = threadIdx.x; i < h; i += blockDim.x) {
+      const float v = st[s][i];
+      acc[0] += v * v;
+      for (int q = 0; q < nq; ++q)
+        acc[1 + q] += v * query[q * h + i];
+    }
+    for (int k = 0; k < 5; ++k)
+      red[threadIdx.x][k] = acc[k];
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (threadIdx.x < stride) {
+        for (int k = 0; k < 5; ++k)
+          red[threadIdx.x][k] += red[threadIdx.x + stride][k];
+      }
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+      inv[s] = rsqrtf(red[0][0] / static_cast<float>(h) + kMixEps);
+      for (int q = 0; q < nq; ++q)
+        score[q][s] = red[0][1 + q] * inv[s] * rsqrtf(static_cast<float>(h));
+    }
+    __syncthreads();
+  }
+  for (int q = 0; q < nq; ++q) {
+    float mx = -1e30F;
+    for (int s = 0; s < ns; ++s)
+      mx = fmaxf(mx, score[q][s]);
+    float e[kMaxStates];
+    float den = 0.0F;
+    for (int s = 0; s < ns; ++s) {
+      e[s] = expf(score[q][s] - mx);
+      den += e[s];
+    }
+    for (int i = threadIdx.x; i < h; i += blockDim.x) {
+      float a = 0.0F;
+      for (int s = 0; s < ns; ++s)
+        a += e[s] / den * st[s][i] * inv[s];
+      out[(static_cast<std::size_t>(q) * n + t) * h + i] = a;
+    }
+  }
+}
+
 __global__ void Control(float* cur, const float* msg, const float* gain,
                         const float* forget, int h) {
   const std::size_t base = static_cast<std::size_t>(blockIdx.x) * h;
@@ -657,6 +716,12 @@ __global__ void Situ(const float* gu, const int* group, const float* scale,
   }
 }
 
+__global__ void CountExperts(const int* ids, int items, unsigned int* counts) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < items)
+    atomicAdd(&counts[ids[i]], 1U);
+}
+
 __global__ void ToHalf(const float* x, __half* y, std::size_t count) {
   const std::size_t i =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -677,12 +742,15 @@ __global__ void SituHalf(const float* gu, const int* group, const float* scale,
 }
 
 __global__ void Combine(const float* y, const float* wts, float* out, int nu,
-                        int h) {
+                        int h, const float* down_scale, const int* ids) {
   for (int i = threadIdx.x; i < h; i += blockDim.x) {
     float a = 0.0F;
-    for (int k = 0; k < nu; ++k)
-      a += wts[blockIdx.x * nu + k] *
+    for (int k = 0; k < nu; ++k) {
+      const float sc =
+          down_scale != nullptr ? down_scale[ids[blockIdx.x * nu + k]] : 1.0F;
+      a += wts[blockIdx.x * nu + k] * sc *
            y[(static_cast<std::size_t>(blockIdx.x) * nu + k) * h + i];
+    }
     out[static_cast<std::size_t>(blockIdx.x) * h + i] = a;
   }
 }
@@ -1398,6 +1466,32 @@ struct Session::Impl {
       *cat{nullptr}, *low{nullptr}, *gain{nullptr}, *forget{nullptr},
       *router{nullptr}, *wts{nullptr}, *gu{nullptr}, *act{nullptr}, *y{nullptr},
       *moe{nullptr}, *prelude{nullptr}, *bank_out{nullptr}, *d_logits{nullptr};
+  unsigned int* rcounts{nullptr};
+  int *rbounds{nullptr}, *rcursors{nullptr}, *rrows_token{nullptr},
+      *rrows_slot{nullptr};
+  std::unordered_map<long long, std::pair<int*, int>> tile_maps;
+  const int* TileMap(int n, int bn, int* count) {
+    const long long key = static_cast<long long>(n) * 1024 + bn;
+    auto it = tile_maps.find(key);
+    if (it == tile_maps.end()) {
+      const int ne = static_cast<int>(m->config.expert_count);
+      const int per = (n + bn - 1) / bn;
+      std::vector<int> host;
+      host.reserve(static_cast<std::size_t>(ne) * per);
+      for (int e = 0; e < ne; ++e) {
+        for (int j = 0; j < per; ++j)
+          host.push_back(e | (j << 16));
+      }
+      int* dev = static_cast<int*>(AllocBytes(host.size() * sizeof(int)));
+      HIP_OK(hipMemcpy(dev, host.data(), host.size() * sizeof(int),
+                       hipMemcpyHostToDevice));
+      it = tile_maps
+               .emplace(key, std::make_pair(dev, static_cast<int>(host.size())))
+               .first;
+    }
+    *count = it->second.second;
+    return it->second.first;
+  }
   int *sorted{nullptr}, *tiles{nullptr};
   __half *xh{nullptr}, *act16{nullptr};
   signed char* xq{nullptr};
@@ -1551,8 +1645,13 @@ struct Session::Impl {
     sp.count = static_cast<int>(blocks.size());
     for (std::size_t i = 0; i < blocks.size(); ++i)
       sp.p[i] = blocks[i];
-    Mix<<<n, 256, 0, stream>>>(sp, cur_, query, nq,
-                               static_cast<int>(m->config.hidden_size), n, out);
+    if (n >= kWmmaMinTokens) {
+      MixBig<<<n, 256, 0, stream>>>(
+          sp, cur_, query, nq, static_cast<int>(m->config.hidden_size), n, out);
+    } else {
+      Mix<<<n, 256, 0, stream>>>(
+          sp, cur_, query, nq, static_cast<int>(m->config.hidden_size), n, out);
+    }
   }
   void ControlStep(float* cur_, const float* message, std::uint32_t phys,
                    const char* group, int n) {
@@ -1773,6 +1872,38 @@ struct Session::Impl {
                                   m->T(m->P(p, "ffn_down_exps.scale")).dev)
                             : nullptr;
     const int items = n * nu;
+    if (n >= kWmmaMinTokens &&
+        m->T(m->P(p, "ffn_gate_up_exps.weight")).type == kTypeNvfp4 &&
+        std::getenv("INKLING_OWN_EXPERTS") == nullptr) {
+      namespace qfn = gufo::models::qwen38_flash_next::rocm;
+      const Tensor& wgu = m->T(m->P(p, "ffn_gate_up_exps.weight"));
+      const Tensor& wdn = m->T(m->P(p, "ffn_down_exps.weight"));
+      HIP_OK(hipMemsetAsync(rcounts, 0, ne * sizeof(unsigned int), stream));
+      CountExperts<<<(items + 255) / 256, 256, 0, stream>>>(ids, items,
+                                                            rcounts);
+      qfn::RoutedCompact(ids, rcounts, rbounds, rcursors, rrows_token,
+                         rrows_slot, n, nu, ne, stream);
+      ToHalf<<<(static_cast<std::size_t>(n) * h + 255) / 256, 256, 0, stream>>>(
+          x, xh, static_cast<std::size_t>(n) * h);
+      const int bn = n >= 512 ? 128 : 48;
+      int ntiles = 0;
+      const int* tmap = TileMap(n, bn, &ntiles);
+      const bool ok1 = qfn::RoutedF16Gemm(
+          wgu.dev, qfn::WeightType::kNVFP4, xh, tmap, ntiles, bn, rbounds,
+          rrows_token, rrows_slot, nullptr, gu, nullptr, 2 * ff, h, stream);
+      SituHalf<<<items, 256, 0, stream>>>(gu, ids, s_gu, act16, ff, c.situ_beta,
+                                          c.situ_linear_beta);
+      const bool ok2 = qfn::RoutedF16Gemm(
+          wdn.dev, qfn::WeightType::kNVFP4, act16, tmap, ntiles, bn, rbounds,
+          rrows_slot, rrows_slot, nullptr, y, nullptr, h, ff, stream);
+      if (!ok1 || !ok2) {
+        std::fprintf(stderr,
+                     "inkling: shared routed gemm rejected the launch\n");
+        std::abort();
+      }
+      Combine<<<n, 256, 0, stream>>>(y, wts, moe, nu, h, s_dn, ids);
+      return;
+    }
     if (n >= kWmmaMinTokens) {
       const int max_tiles = items / kTileM + ne;
       SortItems<<<1, 1024, 0, stream>>>(ids, items, ne, sorted, tiles,
@@ -1817,7 +1948,7 @@ struct Session::Impl {
       } else {
         WmmaGemm<kTypeQ8><<<g2, kWmmaThreads, 0, stream>>>(a2);
       }
-      Combine<<<n, 256, 0, stream>>>(y, wts, moe, nu, h);
+      Combine<<<n, 256, 0, stream>>>(y, wts, moe, nu, h, nullptr, nullptr);
       return;
     }
     xrow = xrow_token;
@@ -1827,7 +1958,7 @@ struct Session::Impl {
                                     c.situ_linear_beta);
     xrow = xrow_item;
     Routed(m->T(m->P(p, "ffn_down_exps.weight")), h, items, s_dn, act, y);
-    Combine<<<n, 256, 0, stream>>>(y, wts, moe, nu, h);
+    Combine<<<n, 256, 0, stream>>>(y, wts, moe, nu, h, nullptr, nullptr);
   }
 
   void Forward(std::span<const std::int32_t> tokens) {
@@ -2038,6 +2169,18 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
   i.bank_out = i.Alloc(b * h);
   i.d_logits = i.Alloc(c.vocab_padded);
   i.d_pos = static_cast<int*>(i.AllocBytes(4));
+  i.rcounts = static_cast<unsigned int*>(
+      i.AllocBytes(c.expert_count * sizeof(unsigned int)));
+  i.rbounds =
+      static_cast<int*>(i.AllocBytes((c.expert_count + 1) * sizeof(int)));
+  i.rcursors = static_cast<int*>(i.AllocBytes(c.expert_count * sizeof(int)));
+  {
+    const std::size_t rows =
+        gufo::models::qwen38_flash_next::rocm::RoutedCompactRows(
+            b * c.expert_used, c.expert_count);
+    i.rrows_token = static_cast<int*>(i.AllocBytes(rows * sizeof(int)));
+    i.rrows_slot = static_cast<int*>(i.AllocBytes(rows * sizeof(int)));
+  }
   i.xq = static_cast<signed char*>(
       i.AllocBytes(static_cast<std::size_t>(kWmmaMinTokens) * c.expert_used *
                    std::max<std::size_t>(c.hidden_size, 3072) * 2));
