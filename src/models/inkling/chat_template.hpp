@@ -29,6 +29,9 @@ struct ChatTool {
 
 struct ChatTemplateOptions {
   bool enable_thinking{true};
+  // The model's effort number when thinking is on ("0.1", "0.2", "0.7", "0.9"
+  // or "0.99"); empty keeps the template default, 0.9.
+  std::string effort;
   std::vector<ChatTool> tools;
 };
 

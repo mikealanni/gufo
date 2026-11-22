@@ -100,7 +100,10 @@ std::string RenderPrompt(const std::vector<ChatMessage>& messages,
     out += "<|message_system|>";
     out += kText;
     out += "Thinking effort level: ";
-    out += options.enable_thinking ? kThinkingEffort : kNoEffort;
+    out += options.enable_thinking
+               ? (options.effort.empty() ? std::string(kThinkingEffort)
+                                         : options.effort)
+               : std::string(kNoEffort);
     out += kEnd;
   };
   if (!options.tools.empty()) {
