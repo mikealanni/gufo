@@ -217,6 +217,13 @@ looped 3x -> 5.4B effective active; 24 physical layers, middle core looped).
 - Decode attention (2026-11-22): n=1 decode used the 128-query prefill flash kernel; a dedicated split-key kernel
   (DecodeAttn, 256 keys per block, 16 lanes per key row) raised plain decode 23.0 -> 28.2 tok/s at 4k, 19.6 -> 23.3 at
   16k. Full-attention layers still ~1 ms each at 16k (~60 GB/s), room left.
+- Serve with thinking off (text channel forced after the model role token; the model otherwise thinks even at effort 0):
+  code 67 tok/s, JSON 62 tok/s, 76-82% of drafted tokens accepted, draft width gated per step by top-1 confidence >= 0.75
+  (up to 7). 37k context: decode 38.5 tok/s, prefill 1433. Tried and reverted: multi-row DecodeAttn for verify (slower
+  than the prefill flash tile at every depth), verify graph capture (no change: GPU-side launch gaps are the same).
+  Greedy argmax runs on the device per verify row; logits are downloaded lazily.
+- GPU-only pp (bench, 2026-11-22): 2k 1652, 4k 1745, 8k 1715, 16k 1670, 32k 1536 (sparse 1619), 128k ~1035. At 32k the
+  busy time is routed experts 5.4 s, flash attention 5.0 s, dense Q8 WMMA 4.2 s of 22.8 s.
 - Verify cost (2026-11-22): verify-4 ~52 ms = routed NVFP4 experts 24 ms (4 rows touch ~22.7 distinct experts per
   layer, 5 GB at ~205 GB/s, same rate as the plain step's 8.4 ms) + dense Q8 9 ms (same bytes as plain) + ~10 ms of
   small kernels. The expert term is bandwidth-bound by distinct experts and cannot shrink; fusing the loop control step
