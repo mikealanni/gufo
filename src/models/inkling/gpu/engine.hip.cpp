@@ -1060,7 +1060,18 @@ __global__ void SortItems(const int* ids, int items, int ne, int* sorted,
   }
 }
 
-constexpr int kFlashQ = 64;
+constexpr int kSparseSink = 2;
+constexpr int kSparseLocal = 16;
+constexpr int kSparseTop = 256;
+constexpr bool kGroupBound = false;
+constexpr int kListCap = kSparseSink + kSparseLocal + kSparseTop + 4;
+constexpr int kBlockKeys = 64;
+constexpr int kMaxSparseBlocks = 2048;
+constexpr std::uint32_t kSparseAutoContext = 65536;
+
+constexpr int kFlashWaves = 8;
+constexpr int kFlashThreads = 32 * kFlashWaves;
+constexpr int kFlashQ = 16 * kFlashWaves;
 constexpr int kFlashK = 64;
 constexpr int kKStride = 136;
 constexpr int kVStride = 72;
@@ -1073,15 +1084,16 @@ constexpr float kNegInf = -1e30F;
 
 // Flash attention with relative bias and a zero sink logit. One block: 64
 // queries of one head; 4 waves x 16 query rows.
-__global__ void __launch_bounds__(128)
+__global__ void __launch_bounds__(kFlashThreads)
     FlashRel(AttnArgs a, const float* q, const float* r, const float* sink,
              const __half* kc, const __half* vc, const __half* bias, float* out,
              int n, int nsplit, int split_keys, float* pm, float* pl, float* po,
              const int* blist, const int* bcount, int list_cap) {
   __shared__ __half Ks[kFlashK][kKStride];
   __shared__ __half Vt[kFlashHd][kVStride];
-  __shared__ __half Ps[kFlashQ][kPStride];
-  __shared__ __half Zs[4][16][kZStride];
+  // per wave: the bias rows Z (consumed by the score epilogue) and then the P
+  // rows share one region
+  __shared__ __half PZ[kFlashWaves][16 * kZStride];
   const int tid = threadIdx.x;
   const int wave = tid >> 5;
   const int lane = tid & 31;
@@ -1153,25 +1165,33 @@ __global__ void __launch_bounds__(128)
         list != nullptr ? list[it] * kFlashK : kb_begin + it * kFlashK;
     __syncthreads();
     {
-      const int key = tid >> 1;
-      const int half = tid & 1;
+      constexpr int kKPer = kFlashThreads / kFlashK;  // threads per key
+      constexpr int kKU4 = kFlashHd / kKPer / 8;      // uint4 per thread
+      const int key = tid / kKPer;
+      const int part = tid % kKPer;
       const int j = kb + key;
       const bool ok = j <= qmax_pos;
       const std::size_t jr = a.ring > 0 ? j % a.ring : j;
       const uint4* ks = reinterpret_cast<const uint4*>(
-          kc + jr * kvdim + g * kFlashHd + half * 64);
-      uint4* kd = reinterpret_cast<uint4*>(&Ks[key][half * 64]);
-      for (int i = 0; i < 8; ++i)
+          kc + jr * kvdim + g * kFlashHd + part * (kFlashHd / kKPer));
+      uint4* kd = reinterpret_cast<uint4*>(&Ks[key][part * (kFlashHd / kKPer)]);
+      for (int i = 0; i < kKU4; ++i)
         kd[i] = ok ? ks[i] : make_uint4(0, 0, 0, 0);
-      // V^T tile: one head-dimension row of 64 keys per thread (keys past the
-      // causal limit get zero probability, the cache is zero-initialised)
+      // V^T tile: rows of 64 keys per head dimension (keys past the causal
+      // limit get zero probability, the cache is zero-initialised)
+      constexpr int kVPer = kFlashThreads / kFlashHd;  // threads per row
+      constexpr int kVU4 = 8 / kVPer;
+      const int vrow = tid / kVPer;
+      const int vpart = tid % kVPer;
       const int vb = (a.ring > 0 ? (kb % a.ring) : kb) >> 6;
-      const uint4* vsrc = reinterpret_cast<const uint4*>(
-          vc +
-          ((static_cast<std::size_t>(g) * a.vblocks + vb) * kFlashHd + tid) *
-              64);
-      uint4* vdst = reinterpret_cast<uint4*>(&Vt[tid][0]);
-      for (int i = 0; i < 8; ++i)
+      const uint4* vsrc =
+          reinterpret_cast<const uint4*>(
+              vc + ((static_cast<std::size_t>(g) * a.vblocks + vb) * kFlashHd +
+                    vrow) *
+                       64) +
+          vpart * kVU4;
+      uint4* vdst = reinterpret_cast<uint4*>(&Vt[vrow][0]) + vpart * kVU4;
+      for (int i = 0; i < kVU4; ++i)
         vdst[i] = vsrc[i];
     }
     {
@@ -1186,7 +1206,7 @@ __global__ void __launch_bounds__(128)
         V8f z = {};
         z = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(rf, bt, z);
         for (int i = 0; i < 8; ++i)
-          Zs[wave][2 * i + (lane >> 4)][nt * 16 + (lane & 15)] =
+          PZ[wave][(2 * i + (lane >> 4)) * kZStride + nt * 16 + (lane & 15)] =
               __float2half(z[i]);
       }
     }
@@ -1212,8 +1232,8 @@ __global__ void __launch_bounds__(128)
           const int lr = 2 * i + (lane >> 4);
           const float b =
               dist < a.extent
-                  ? __half2float(
-                        Zs[wave][lr][dist - (qp0 - (kb + kFlashK - 1))])
+                  ? __half2float(PZ[wave][lr * kZStride + dist -
+                                          (qp0 - (kb + kFlashK - 1))])
                   : 0.0F;
           v = sc[ni][i] * a.scale + b - sinkv[i];
         }
@@ -1235,14 +1255,15 @@ __global__ void __launch_bounds__(128)
       for (int i = 0; i < 8; ++i) {
         const float pv = sc[ni][i] <= kNegInf ? 0.0F : expf(sc[ni][i] - m[i]);
         l[i] += pv;
-        Ps[wave * 16 + 2 * i + (lane >> 4)][ni * 16 + (lane & 15)] =
+        PZ[wave][(2 * i + (lane >> 4)) * kPStride + ni * 16 + (lane & 15)] =
             __float2half(pv);
       }
     }
     __syncthreads();
     for (int c = 0; c < 4; ++c) {
       V16h pf;
-      std::memcpy(&pf, &Ps[wave * 16 + (lane & 15)][c * 16], sizeof(V16h));
+      std::memcpy(&pf, &PZ[wave][(lane & 15) * kPStride + c * 16],
+                  sizeof(V16h));
       for (int ni = 0; ni < 8; ++ni) {
         V16h vf;
         std::memcpy(&vf, &Vt[ni * 16 + (lane & 15)][c * 16], sizeof(V16h));
@@ -1275,14 +1296,6 @@ __global__ void __launch_bounds__(128)
   }
 }
 
-constexpr int kSparseSink = 2;
-constexpr int kSparseLocal = 16;
-constexpr int kSparseTop = 256;
-constexpr int kListCap = kSparseSink + kSparseLocal + kSparseTop + 4;
-constexpr int kBlockKeys = 64;
-constexpr int kMaxSparseBlocks = 2048;
-constexpr std::uint32_t kSparseAutoContext = 65536;
-
 // pooled per-block key bounds: kmm[b][g][0|1][128] = min / max over the 64 keys
 __global__ void PoolKeys(const __half* kc, __half* kmm, const int* pos0, int n,
                          int nkv) {
@@ -1313,6 +1326,8 @@ __global__ void SelectBlocks(const float* q, const __half* kmm, const int* pos0,
                              int n, int nh, int nkv, int* blist, int* bcount) {
   extern __shared__ float score[];
   __shared__ float qbar[kFlashHd];
+  __shared__ float qlo[kFlashHd];
+  __shared__ float qhi[kFlashHd];
   __shared__ int taken;
   __shared__ float lo_t;
   __shared__ float hi_t;
@@ -1331,11 +1346,19 @@ __global__ void SelectBlocks(const float* q, const __half* kmm, const int* pos0,
   int* out = blist + static_cast<std::size_t>(tile * nh + h) * kListCap;
   for (int d = threadIdx.x; d < kFlashHd; d += blockDim.x) {
     float a = 0.0F;
-    for (int t = 0; t < rows; ++t)
-      a +=
+    float lo = 1e30F;
+    float hi = -1e30F;
+    for (int t = 0; t < rows; ++t) {
+      const float v =
           q[(static_cast<std::size_t>(tile * kFlashQ + t) * nh + h) * kFlashHd +
             d];
+      a += v;
+      lo = fminf(lo, v);
+      hi = fmaxf(hi, v);
+    }
     qbar[d] = a / rows;
+    qlo[d] = lo;
+    qhi[d] = hi;
   }
   if (threadIdx.x == 0) {
     taken = 0;
@@ -1358,9 +1381,15 @@ __global__ void SelectBlocks(const float* q, const __half* kmm, const int* pos0,
                     kFlashHd;
       float sc = 0.0F;
       for (int d = 0; d < kFlashHd; ++d) {
-        const float qd = qbar[d];
-        sc += fmaxf(qd * __half2float(mm[d]),
-                    qd * __half2float(mm[kFlashHd + d]));
+        const float k0 = __half2float(mm[d]);
+        const float k1 = __half2float(mm[kFlashHd + d]);
+        if constexpr (kGroupBound) {
+          sc += fmaxf(fmaxf(qlo[d] * k0, qlo[d] * k1),
+                      fmaxf(qhi[d] * k0, qhi[d] * k1));
+        } else {
+          const float qd = qbar[d];
+          sc += fmaxf(qd * k0, qd * k1);
+        }
       }
       score[i] = sc;
     }
@@ -1659,6 +1688,7 @@ struct Session::Impl {
   float *split_m{nullptr}, *split_l{nullptr}, *split_o{nullptr};
   int *blist{nullptr}, *bcount{nullptr};
   bool sparse{false};
+  bool no_dp4{std::getenv("INKLING_NO_DP4") != nullptr};
   int *ids{nullptr}, *xrow{nullptr}, *xrow_token{nullptr}, *xrow_item{nullptr},
       *d_pos{nullptr};
   hipStream_t stream{nullptr};
@@ -1697,7 +1727,7 @@ struct Session::Impl {
              std::size_t ldy, int n, int rows = -1,
              const __half* xhin = nullptr) {
     const int nrows = rows < 0 ? static_cast<int>(w.rows) : rows;
-    if (n == 1 && w.type == kTypeQ8 && ldx == w.cols) {
+    if (n == 1 && w.type == kTypeQ8 && ldx == w.cols && !no_dp4) {
       QuantRows<<<dim3(1, w.cols / 32), 32, 0, stream>>>(
           xin, xq, xqs, static_cast<int>(w.cols));
       const int rpb8 = kThreads * 2 / 32;
@@ -2015,9 +2045,10 @@ struct Session::Impl {
         SelectBlocks<<<dim3(ntile, nh), 256, kMaxSparseBlocks * sizeof(float),
                        stream>>>(q, sl.kmm, d_pos, n, nh, nkv, blist, bcount);
         const int nsp = n < kWmmaMinTokens ? 8 : 1;
-        FlashRel<<<dim3(ntile, nh, nsp), 128, 0, stream>>>(
-            aa, q, r, sink, sl.k, sl.v, bias_w, att, n, nsp, kSplitKeys,
-            split_m, split_l, split_o, blist, bcount, kListCap);
+        FlashRel<<<dim3((n + kFlashQ - 1) / kFlashQ, nh, nsp), kFlashThreads, 0,
+                   stream>>>(aa, q, r, sink, sl.k, sl.v, bias_w, att, n, nsp,
+                             kSplitKeys, split_m, split_l, split_o, blist,
+                             bcount, kListCap);
         if (nsp > 1)
           FlashCombine<<<dim3(n, nh), 128, 0, stream>>>(split_m, split_l,
                                                         split_o, att, nh, nsp);
@@ -2025,10 +2056,10 @@ struct Session::Impl {
         const bool split = n < kWmmaMinTokens && !swa && ctx > kSplitKeys;
         const int nsplit =
             split ? static_cast<int>((ctx + kSplitKeys - 1) / kSplitKeys) : 1;
-        FlashRel<<<dim3((n + kFlashQ - 1) / kFlashQ, nh, nsplit), 128, 0,
-                   stream>>>(aa, q, r, sink, sl.k, sl.v, bias_w, att, n, nsplit,
-                             kSplitKeys, split_m, split_l, split_o, nullptr,
-                             nullptr, 0);
+        FlashRel<<<dim3((n + kFlashQ - 1) / kFlashQ, nh, nsplit), kFlashThreads,
+                   0, stream>>>(aa, q, r, sink, sl.k, sl.v, bias_w, att, n,
+                                nsplit, kSplitKeys, split_m, split_l, split_o,
+                                nullptr, nullptr, 0);
         if (nsplit > 1)
           FlashCombine<<<dim3(n, nh), 128, 0, stream>>>(
               split_m, split_l, split_o, att, nh, nsplit);
