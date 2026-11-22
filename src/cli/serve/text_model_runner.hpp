@@ -281,6 +281,9 @@ public:
       const {
     return sampling::JsonConstraint::ToolFormat::kJson;
   }
+  /// True when the chat template declares tools and the model answers in its
+  /// own tool dialect, so the server adds no tool grammar or instruction.
+  [[nodiscard]] virtual bool ToolsHandledByTemplate() const { return false; }
   /// Reuse a compiled grammar bound to this runner's vocabulary.
   [[nodiscard]] std::shared_ptr<const sampling::TokenConstraint> BindConstraint(
       std::shared_ptr<const sampling::JsonConstraint> grammar) const;

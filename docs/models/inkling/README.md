@@ -41,12 +41,23 @@ forces it).
   whose routing weight share is below the threshold in few-row steps. It changes
   outputs; measurements are in [QUALITY.md](QUALITY.md).
 
+## Chat, reasoning and tools
+
+The chat template follows the model's own: effort header, tool declarations
+(`tool_declare`), reasoning, tool calls and tool results. Generated channel tokens
+are translated for the shared response layer: the thinking channel is returned as
+`reasoning_content`, the text channel as `content`, and each
+`<|content_invoke_tool_json|>` message as an OpenAI `tool_calls` entry (parallel
+calls and streaming included). The server adds no tool grammar or instruction for
+this model (`ToolsHandledByTemplate`). `tool_choice: required` cannot be enforced;
+a turn without a call fails as unsatisfied.
+
 ## Status and gaps
 
-Control tokens (`<|content_thinking|>`, `<|end_message|>`) are returned as plain
-text; there is no reasoning split, no snapshot or disk cache, and no tool calling.
-Sampled (temperature above zero) speculation uses the same exact-match rule as
-greedy and therefore accepts fewer drafts.
+There is no snapshot or disk cache and no image input. Structured output
+(`response_format`) constrains the raw channel text, so it only applies in the
+text channel (`--think off`). Sampled (temperature above zero) speculation uses
+the same exact-match rule as greedy and therefore accepts fewer drafts.
 
 The CPU reference (`reference.cpp`, `gufo_inkling_ref_check`) is complete but runs
 at about 13 s per token; the GPU engine matches it to about four digits.
