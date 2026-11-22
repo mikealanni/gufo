@@ -148,7 +148,6 @@ public:
             TextPrefillPolicy prefill_policy = {},
             TextSchedulerPolicy scheduler_policy = {},
             std::size_t draft_width = 0,
-            TextDiskCacheConfig disk_cache_config = {},
             TextRunnerRamCacheOptions ram_cache_config = {});
   /// Installs a previously loaded Laguna model with request-owned sessions.
   /// No disk-cache snapshot support yet (the engine has none).

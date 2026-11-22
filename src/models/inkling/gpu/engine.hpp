@@ -3,7 +3,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -28,19 +27,10 @@ public:
 
   [[nodiscard]] std::uint64_t SizeBytes() const noexcept;
   [[nodiscard]] std::uint32_t position() const noexcept;
-  /// Versioned byte form for disk: header and logits, then the cache bytes.
-  static constexpr std::uint32_t kPayloadVersion = 1;
-  [[nodiscard]] std::uint64_t PayloadBytes() const noexcept;
-  /// Hands the payload to `sink` in two spans without copying it.
-  void StreamPayload(
-      const std::function<void(std::span<const std::uint8_t>)>& sink) const;
-  [[nodiscard]] bool CopyPayloadTo(
-      std::span<std::uint8_t> destination) const noexcept;
-
-  struct Data;  // engine-internal
 
 private:
   SessionSnapshot();
+  struct Data;
   std::unique_ptr<Data> data_;
   friend class Session;
 };
@@ -66,9 +56,6 @@ public:
   [[nodiscard]] std::unique_ptr<SessionSnapshot> SaveSnapshot(
       std::string* error_msg = nullptr);
   [[nodiscard]] bool RestoreSnapshot(const SessionSnapshot& snapshot,
-                                     std::string* error_msg = nullptr);
-  /// Restores a payload written by SessionSnapshot::StreamPayload.
-  [[nodiscard]] bool RestoreSnapshot(std::span<const std::uint8_t> payload,
                                      std::string* error_msg = nullptr);
   [[nodiscard]] std::span<const float> Logits() const noexcept;
   [[nodiscard]] std::span<const float> Logits(std::uint32_t row) const noexcept;
