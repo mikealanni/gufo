@@ -770,11 +770,15 @@ __global__ void __launch_bounds__(kControlWaves * 32)
   const int lane = threadIdx.x & 31;
   const float* c = cur + static_cast<std::size_t>(row) * h;
   const float* m = msg + static_cast<std::size_t>(row) * h;
+  const float4* c4 = reinterpret_cast<const float4*>(c);
+  const float4* m4 = reinterpret_cast<const float4*>(m);
   float sc = 0.0F;
   float sm = 0.0F;
-  for (int i = threadIdx.x; i < h; i += blockDim.x) {
-    sc += c[i] * c[i];
-    sm += m[i] * m[i];
+  for (int i = threadIdx.x; i < h / 4; i += blockDim.x) {
+    const float4 cv = c4[i];
+    const float4 mv = m4[i];
+    sc += cv.x * cv.x + cv.y * cv.y + cv.z * cv.z + cv.w * cv.w;
+    sm += mv.x * mv.x + mv.y * mv.y + mv.z * mv.z + mv.w * mv.w;
   }
   for (int off = 16; off > 0; off >>= 1) {
     sc += __shfl_xor(sc, off);
@@ -795,9 +799,17 @@ __global__ void __launch_bounds__(kControlWaves * 32)
   const float im = rsqrtf(tm / static_cast<float>(h) + eps);
   const int r = blockIdx.y * kControlWaves + wave;
   const float* w = down + static_cast<std::size_t>(r) * 2 * h;
+  const float4* wa = reinterpret_cast<const float4*>(w);
+  const float4* wb = reinterpret_cast<const float4*>(w + h);
   float acc = 0.0F;
-  for (int i = lane; i < h; i += 32)
-    acc += w[i] * c[i] * ic + w[h + i] * m[i] * im;
+  for (int i = lane; i < h / 4; i += 32) {
+    const float4 a = wa[i];
+    const float4 b = wb[i];
+    const float4 cv = c4[i];
+    const float4 mv = m4[i];
+    acc += (a.x * cv.x + a.y * cv.y + a.z * cv.z + a.w * cv.w) * ic +
+           (b.x * mv.x + b.y * mv.y + b.z * mv.z + b.w * mv.w) * im;
+  }
   for (int off = 16; off > 0; off >>= 1)
     acc += __shfl_xor(acc, off);
   if (lane == 0)
