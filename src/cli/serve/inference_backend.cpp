@@ -3995,6 +3995,7 @@ constexpr std::string_view kInklingStateAbi = "inkling-rocm-session-v1";
 
 using InklingModel = models::inkling::gpu::Model;
 using InklingSession = models::inkling::gpu::Session;
+using InklingSessionSnapshot = models::inkling::gpu::SessionSnapshot;
 
 std::vector<std::int32_t> InklingEngineTokens(
     std::span<const TextRunnerToken> tokens) {
@@ -4080,6 +4081,26 @@ private:
 
   Phase phase_{Phase::kNone};
   std::string tool_;
+};
+
+class InklingTextRunnerSnapshot final : public TextRunnerSnapshot {
+public:
+  InklingTextRunnerSnapshot(std::shared_ptr<InklingModel> model,
+                            std::unique_ptr<InklingSessionSnapshot> snapshot,
+                            std::size_t position)
+      : model(std::move(model)),
+        snapshot(std::move(snapshot)),
+        position(position) {}
+
+  [[nodiscard]] std::size_t PayloadBytes() const noexcept override {
+    return snapshot == nullptr
+               ? 0
+               : static_cast<std::size_t>(snapshot->SizeBytes());
+  }
+
+  std::shared_ptr<InklingModel> model;
+  std::unique_ptr<InklingSessionSnapshot> snapshot;
+  std::size_t position;
 };
 
 class InklingTextRunnerState final : public TextRunnerState {
@@ -4169,6 +4190,8 @@ public:
       Logger::Warn("loader", "event=session_probe_failed reason=" + error);
       return;
     }
+    if (draft_width_ > 0)
+      probe->PrepareDraft();
     session_bytes_ = probe->AllocatedBytes();
   }
 
@@ -4227,8 +4250,8 @@ public:
         .capabilities =
             TextRunnerCapabilities{
                 .incremental_prefill = true,
-                .snapshot = false,
-                .fork = false,
+                .snapshot = true,
+                .fork = true,
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
                 .multi_token_decode = draft_width_ > 0,
@@ -4249,6 +4272,8 @@ public:
         .state_capacity_bytes = capacity,
         .per_request_state_bytes = session_bytes_,
         .temporary_scratch_bytes = 0,
+        .retained_snapshot_capacity_bytes = HostSnapshotBudgetBytes(),
+        .retained_snapshot_ceiling_bytes = HostSnapshotCeilingBytes(),
         .requires_device_runtime_lock = true,
     };
   }
@@ -4478,6 +4503,47 @@ public:
     inkling.draft_yield +=
         kYieldSmoothing * (static_cast<double>(kept) - inkling.draft_yield);
     return step;
+  }
+
+  [[nodiscard]] std::size_t SnapshotPayloadBytes(
+      const TextRunnerState& state) const override {
+    return static_cast<std::size_t>(
+        RequireInklingState(state).session().SnapshotBytes());
+  }
+
+  [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Snapshot(
+      const TextRunnerState& state) const override {
+    const auto& inkling = RequireInklingState(state);
+    std::string error;
+    auto snapshot = inkling.session().SaveSnapshot(&error);
+    if (snapshot == nullptr)
+      throw std::runtime_error("Inkling snapshot failed: " + error);
+    return std::make_unique<InklingTextRunnerSnapshot>(
+        model_, std::move(snapshot), inkling.position());
+  }
+
+  [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> SnapshotForPersistence(
+      const TextRunnerState& state) const override {
+    return Snapshot(state);
+  }
+
+  void RestoreOrFork(TextRunnerState& state,
+                     const TextRunnerSnapshot& snapshot) const override {
+    const auto* restored =
+        dynamic_cast<const InklingTextRunnerSnapshot*>(&snapshot);
+    if (restored == nullptr || restored->model.get() != model_.get() ||
+        restored->snapshot == nullptr) {
+      throw std::invalid_argument(
+          "Inkling snapshot does not belong to this model");
+    }
+    auto& inkling = RequireInklingState(state);
+    std::string error;
+    if (!inkling.session().RestoreSnapshot(*restored->snapshot, &error)) {
+      inkling.Invalidate();
+      throw std::runtime_error("Inkling snapshot restore failed: " + error);
+    }
+    inkling.set_position(restored->position);
+    inkling.translator = {};
   }
 
   [[nodiscard]] std::size_t CheckpointPosition(

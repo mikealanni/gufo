@@ -243,6 +243,68 @@ int main(int argc, char** argv) {
     }
     return 0;
   }
+  if (argc >= 4 && std::string(argv[2]) == "--snap") {
+    // --snap <text file> [drafter gguf]: a snapshot restored into a fresh
+    // session and into the advanced original continues token for token
+    std::string err;
+    auto reader = gufo::core::GgufReader::OpenFile(argv[1], &err);
+    auto tok = gufo::tokenization::QwenTokenizer::CreateFromGguf(*reader, &err);
+    std::ifstream in(argv[3]);
+    std::stringstream ss;
+    ss << in.rdbuf();
+    const auto ids = tok->Encode(ss.str(), {});
+    const int prefix_len = std::getenv("INKLING_PREFIX") != nullptr
+                               ? std::atoi(std::getenv("INKLING_PREFIX"))
+                               : 1500;
+    auto model = gufo::models::inkling::gpu::Model::Load(argv[1], &err);
+    if (argc >= 5 && !model->LoadDrafter(argv[4], &err)) {
+      std::fprintf(stderr, "drafter load failed: %s\n", err.c_str());
+      return 1;
+    }
+    const std::uint32_t ctx = std::max<std::uint32_t>(4096, kContext);
+    auto a = model->CreateSession(ctx, &err);
+    std::vector<std::int32_t> prefix;
+    for (int i = 0; i < prefix_len; ++i)
+      prefix.push_back(static_cast<std::int32_t>(ids[i]));
+    (void)a->Append(prefix, &err);
+    const auto argmax_of = [](gufo::models::inkling::gpu::Session& s) {
+      return s.Argmax();
+    };
+    const auto t0 = std::chrono::steady_clock::now();
+    auto snapshot = a->SaveSnapshot(&err);
+    const double save_ms = std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - t0)
+                               .count();
+    std::printf("snapshot %.1f MB saved in %.0f ms (declared %.1f MB)\n",
+                static_cast<double>(snapshot->SizeBytes()) / 1e6, save_ms,
+                static_cast<double>(a->SnapshotBytes()) / 1e6);
+    const auto generate = [&](gufo::models::inkling::gpu::Session& s) {
+      std::vector<std::int32_t> out;
+      for (int i = 0; i < 48; ++i) {
+        const std::int32_t t = argmax_of(s);
+        out.push_back(t);
+        (void)s.Append(std::span(&t, 1), &err);
+      }
+      return out;
+    };
+    const auto first = generate(*a);
+    auto b = model->CreateSession(ctx, &err);
+    const auto t1 = std::chrono::steady_clock::now();
+    const bool ok_b = b->RestoreSnapshot(*snapshot, &err);
+    const double restore_ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t1)
+                                  .count();
+    const auto second = generate(*b);
+    const bool ok_a = a->RestoreSnapshot(*snapshot, &err);
+    const auto third = generate(*a);
+    std::printf("restore into fresh session: %s in %.0f ms, tokens %s\n",
+                ok_b ? "ok" : "FAILED", restore_ms,
+                first == second ? "IDENTICAL" : "DIFFERENT");
+    std::printf("restore into advanced session: %s, tokens %s\n",
+                ok_a ? "ok" : "FAILED",
+                first == third ? "IDENTICAL" : "DIFFERENT");
+    return first == second && first == third && ok_a && ok_b ? 0 : 1;
+  }
   if (argc >= 4 && std::string(argv[2]) == "--vtime") {
     // --vtime <text file> <k>: time of a k-row verify and a single step at
     // INKLING_PREFIX tokens of context
