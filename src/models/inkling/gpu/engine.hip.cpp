@@ -1898,10 +1898,10 @@ __device__ float Fp4Value(int nib) {
 // Q8 rows (repacked: [qs cols][fp16 scales cols/32]) -> NVFP4 rows (repacked:
 // [nibbles cols/2][ue4m3 scales cols/16]); one 16-element group per thread
 __global__ void Q8ToNvfp4(const unsigned char* src, std::size_t src_stride,
-                          unsigned char* dst, std::size_t dst_stride,
-                          int cols) {
-  const unsigned char* in =
-      src + static_cast<std::size_t>(blockIdx.x) * src_stride;
+                          unsigned char* dst, std::size_t dst_stride, int cols,
+                          const int* ids = nullptr) {
+  const std::size_t srow = ids != nullptr ? ids[blockIdx.x] : blockIdx.x;
+  const unsigned char* in = src + srow * src_stride;
   unsigned char* out = dst + static_cast<std::size_t>(blockIdx.x) * dst_stride;
   for (int gidx = threadIdx.x; gidx < cols / 16; gidx += blockDim.x) {
     float x[16];
@@ -2675,6 +2675,7 @@ struct Session::Impl : Scratch {
   static constexpr int kDraftSplit = 64;
   static constexpr int kDraftShortlistMax = 65536;
   unsigned char* dhead{nullptr};
+  std::size_t dhead_stride{0};
   int* dmap{nullptr};
   float* dconf{nullptr};
   int* dstop{nullptr};
@@ -3824,13 +3825,15 @@ struct Session::Impl : Scratch {
                                   static_cast<int>(m->draft_rank.size()));
       kDraftShortlist = n;
       dmap = static_cast<int*>(AllocBytes(static_cast<std::size_t>(n) * 4));
+      const std::size_t hc = m->config.hidden_size;
+      dhead_stride = (hc / 2 + hc / 16 + 15) / 16 * 16;
       dhead = static_cast<unsigned char*>(
-          AllocBytes(static_cast<std::size_t>(n) * head.row_bytes));
+          AllocBytes(static_cast<std::size_t>(n) * dhead_stride));
       HIP_OK(hipMemcpy(dmap, m->draft_rank.data(),
                        static_cast<std::size_t>(n) * 4, hipMemcpyHostToDevice));
-      GatherRows<<<n, 256, 0, stream>>>(
-          static_cast<const unsigned char*>(head.dev), head.row_bytes, dmap,
-          dhead);
+      Q8ToNvfp4<<<n, 128, 0, stream>>>(
+          static_cast<const unsigned char*>(head.dev), head.row_bytes, dhead,
+          dhead_stride, static_cast<int>(hc), dmap);
       HIP_OK(hipStreamSynchronize(stream));
     }
     dprev = static_cast<int*>(AllocBytes(4));
@@ -3936,12 +3939,14 @@ struct Session::Impl : Scratch {
                                               dstate, dlatent, 256);
       DraftBf16Gemv<<<h / 4, 128, 0, stream>>>(how, dlatent, deff, 256, h, cur,
                                                DW("dspark_hidden_out.bias"));
-      Tensor sub = head;
-      sub.dev = dhead;
-      sub.rows = static_cast<std::size_t>(kDraftShortlist);
-      gemm_skip = stop_conf > 0.0F ? dstop : nullptr;
-      Dense(sub, deff, h, dlog, kDraftShortlist, 1, kDraftShortlist);
-      gemm_skip = nullptr;
+      QuantRows<<<dim3(1, h / 32), 32, 0, stream>>>(deff, xq, xqs, h);
+      {
+        const int rpb8 = kThreads * 2 / 32;
+        GemmDp4<kTypeNvfp4><<<dim3((kDraftShortlist + rpb8 - 1) / rpb8, 1),
+                              kThreads * 2, 0, stream>>>(
+            dhead, dhead_stride, h, kDraftShortlist, nullptr, nullptr, nullptr,
+            xq, xqs, dlog, stop_conf > 0.0F ? dstop : nullptr);
+      }
       ArgMaxRow<<<1, 256, 0, stream>>>(
           dlog, kDraftShortlist, dprev, dout + (s - 1), dmap, dconf + (s - 1),
           stop_conf > 0.0F ? dstop : nullptr, stop_conf);
