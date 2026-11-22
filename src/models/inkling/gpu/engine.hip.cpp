@@ -2215,63 +2215,74 @@ __global__ void DraftAttnPartial(const float* q, const float* kb,
   const int g = h / 3;
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
+  const int slot = lane & 7;
+  const int chunk = lane >> 3;
   const int nctx = P - lo;
   const int total = nctx + kDraftSlots;
-  const int chunk = (total + nsplit - 1) / nsplit;
-  const int st = split * chunk;
-  const int en = min(total, st + chunk);
+  const int per = (total + nsplit - 1) / nsplit;
+  const int st = split * per;
+  const int en = min(total, st + per);
   constexpr float scale = 0.08838834764831843F;
-  float q4[kDraftSlots][4];
-  float m[kDraftSlots], l[kDraftSlots], o4[kDraftSlots][4];
-  for (int s = 0; s < kDraftSlots; ++s) {
+  float q32[32];
+  float o32[32];
+  {
     const float* qp =
-        q + (static_cast<std::size_t>(s) * 24 + h) * 128 + lane * 4;
-    for (int t = 0; t < 4; ++t) {
-      q4[s][t] = qp[t] * scale;
-      o4[s][t] = 0.0F;
+        q + (static_cast<std::size_t>(slot) * 24 + h) * 128 + chunk * 32;
+    for (int t = 0; t < 32; ++t) {
+      q32[t] = qp[t] * scale;
+      o32[t] = 0.0F;
     }
-    m[s] = -3.0e38F;
-    l[s] = 0.0F;
   }
+  float m = -3.0e38F;
+  float l = 0.0F;
   for (int j = st + warp; j < en; j += 4) {
-    float k4[4], v4[4];
+    float k32[32], v32[32];
     if (j < nctx) {
-      const std::size_t base =
-          static_cast<std::size_t>((lo + j) % cap) * 1024 + g * 128 + lane * 4;
-      for (int t = 0; t < 4; ++t) {
-        k4[t] = __half2float(kc[base + t]);
-        v4[t] = __half2float(vc[base + t]);
+      const std::size_t base = static_cast<std::size_t>((lo + j) % cap) * 1024 +
+                               g * 128 + chunk * 32;
+      const uint4* kp = reinterpret_cast<const uint4*>(kc + base);
+      const uint4* vp = reinterpret_cast<const uint4*>(vc + base);
+      for (int u = 0; u < 4; ++u) {
+        const uint4 kw = kp[u];
+        const uint4 vw = vp[u];
+        const __half2* kh = reinterpret_cast<const __half2*>(&kw);
+        const __half2* vh = reinterpret_cast<const __half2*>(&vw);
+        for (int e = 0; e < 4; ++e) {
+          const float2 kf = __half22float2(kh[e]);
+          const float2 vf = __half22float2(vh[e]);
+          k32[u * 8 + e * 2] = kf.x;
+          k32[u * 8 + e * 2 + 1] = kf.y;
+          v32[u * 8 + e * 2] = vf.x;
+          v32[u * 8 + e * 2 + 1] = vf.y;
+        }
       }
     } else {
       const std::size_t base =
-          (static_cast<std::size_t>(j - nctx) * 8 + g) * 128 + lane * 4;
-      for (int t = 0; t < 4; ++t) {
-        k4[t] = kb[base + t];
-        v4[t] = vb[base + t];
+          (static_cast<std::size_t>(j - nctx) * 8 + g) * 128 + chunk * 32;
+      for (int t = 0; t < 32; ++t) {
+        k32[t] = kb[base + t];
+        v32[t] = vb[base + t];
       }
     }
-    for (int s = 0; s < kDraftSlots; ++s) {
-      float dot = q4[s][0] * k4[0] + q4[s][1] * k4[1] + q4[s][2] * k4[2] +
-                  q4[s][3] * k4[3];
-      for (int off = 16; off > 0; off >>= 1)
-        dot += __shfl_xor(dot, off);
-      const float mn = fmaxf(m[s], dot);
-      const float a = expf(m[s] - mn);
-      const float p = expf(dot - mn);
-      l[s] = l[s] * a + p;
-      for (int t = 0; t < 4; ++t)
-        o4[s][t] = o4[s][t] * a + p * v4[t];
-      m[s] = mn;
-    }
+    float dot = 0.0F;
+    for (int t = 0; t < 32; ++t)
+      dot += q32[t] * k32[t];
+    dot += __shfl_xor(dot, 8);
+    dot += __shfl_xor(dot, 16);
+    const float mn = fmaxf(m, dot);
+    const float al = expf(m - mn);
+    const float pr = expf(dot - mn);
+    l = l * al + pr;
+    for (int t = 0; t < 32; ++t)
+      o32[t] = o32[t] * al + pr * v32[t];
+    m = mn;
   }
-  for (int s = 0; s < kDraftSlots; ++s) {
-    if (lane == 0) {
-      sm[warp][s] = m[s];
-      sl[warp][s] = l[s];
-    }
-    for (int t = 0; t < 4; ++t)
-      so[warp][s][lane * 4 + t] = o4[s][t];
+  if (chunk == 0) {
+    sm[warp][slot] = m;
+    sl[warp][slot] = l;
   }
+  for (int t = 0; t < 32; ++t)
+    so[warp][slot][chunk * 32 + t] = o32[t];
   __syncthreads();
   for (int idx = threadIdx.x; idx < kDraftSlots * 128; idx += blockDim.x) {
     const int s = idx >> 7;
