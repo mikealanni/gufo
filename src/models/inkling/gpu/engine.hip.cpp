@@ -25,7 +25,7 @@ constexpr int kTokenTile = 8;
 constexpr int kMaxStates = 8;
 constexpr int kConvTaps = 4;
 constexpr int kHistory = 3;
-constexpr int kMaxBatch = 2048;
+constexpr int kMaxBatch = 4096;
 constexpr int kWmmaMinTokens = 32;
 constexpr float kMixEps = 1e-6F;
 constexpr int kTypeF32 = 0;
@@ -2101,7 +2101,7 @@ struct Session::Impl {
                  stream>>>(x, xh, static_cast<std::size_t>(n) * h);
         xmoe = xh;
       }
-      const int bn = n >= 512 ? 128 : 48;
+      const int bn = n >= 2048 ? 192 : (n >= 512 ? 128 : 48);
       int ntiles = 0;
       const int* tmap = TileMap(n, bn, &ntiles);
       const bool ok1 = qfn::RoutedF16Gemm(
