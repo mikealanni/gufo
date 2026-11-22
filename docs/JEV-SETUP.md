@@ -50,7 +50,7 @@ curl -s http://127.0.0.1:8900/jev-guard/status
 | `--max-hold` | `7200` s | Longest a request is held while gufo is stopped. |
 | `--start-timeout` | `420` s | Time allowed for gufo to become ready. |
 | `--stop-timeout` | `120` s | Time allowed for gufo to stop. |
-| `--active-window` | `600` s | How long after the last request opencode counts as active. |
+| `--active-window` | `600` s | Seconds after the last generation request that opencode counts as using gufo. |
 | `--jev-log` | `~/.gufo/jev-log/jev.sqlite3` | Decision log. |
 
 Run `python3 tools/jev/guard.py --help` for the full list on your version.
@@ -122,7 +122,7 @@ alias opencode='opencode --standalone' # make it the default (~/.bashrc)
 | `JEV_GUARD_URL` | Guard address (default `http://127.0.0.1:8900`). |
 | `JEV_LOG_DIR` | Directory for plugin state (default `~/.gufo/jev-log`). |
 | `JEV_GUFO_PROVIDERS` | Provider ids treated as gufo (default `local-gufo`). |
-| `JEV_HEAVY_GATE` | Turns the heavy-command gate on or off. |
+| `JEV_HEAVY_GATE=off` | Turns the heavy-command gate off (on by default). |
 | `JEV_PLUGIN_COMMAND` | Path of the `/jev` command helper. |
 
 ### `/jev` and `jev` commands
@@ -168,7 +168,8 @@ variables below; keep your own copy beside your weights paths.
 | `GUFO_CACHE_STRIDE` | `32768` | Disk checkpoint spacing in tokens. |
 | `GUFO_BIN`, `GUFO_DIR` | the repo build | Binary and checkout to run. |
 | `GUFO_LOG` | `~/gufo.log` | Server log. |
-| `GUFO_GUARD`, `GUFO_JEV` | `1` | `0` runs without the guard or without jev. |
+| `GUFO_GUARD` | `1` | `0` runs plain gufo with no guard. |
+| `GUFO_JEV` | `1` | Flash-Next only: `0` turns off the in-engine jev features. |
 | `FORCE=1` | unset | Skips the free-RAM check before starting. |
 
 Memory per model is the weights plus the KV cache for every session, so `JOBS`
@@ -177,7 +178,7 @@ about 18 GB, a Flash-Next session about 83 GB in total with its weights.
 
 ## Stop and troubleshoot
 
-- Stop everything with `~/jev-stop.sh` (the supervisor and gufo), then start again.
+- Stop the guard and gufo (stop the script, or `kill` the guard process), then start again.
 - Requests that never answer while a heavy command runs are held by the guard
   until gufo is back (`--max-hold`).
 - If the model loads slowly, check that the weights are in the page cache and
