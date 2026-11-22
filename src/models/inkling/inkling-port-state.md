@@ -260,3 +260,8 @@ looped 3x -> 5.4B effective active; 24 physical layers, middle core looped).
   0.03: 0.0016 / 98.8% / 63.5 / 31.2 ms; 0.06: 0.0067 / 96.9% / 60.8 / 30.3; 0.08 (renormalised) 0.026 / 95%; 0.10: 0.040 /
   94.5% / 48.9 / 27.7; 0.12 renormalised: 0.165 / 86% / 42.7 / 26.5 (baseline 63.5 / 31.5). Renormalising the kept
   weights made KL worse at every threshold. Drafter head is NVFP4 (32768 ranked rows, draft 5.4 -> 4.3 ms).
+- Lossless stack status (2026-11-22, serve, greedy, thinking off): code 74.6, JSON 71.1 tok/s; 63k 53.7/60.9/55.1; 37k 54-59.
+  Vectorised loop-control kernel (-1.6 ms per step), quantised-activation reuse across projections (-0.2 ms). Profile of a
+  verify step: experts 60% (at ~223 GB/s, the bandwidth floor), dense Q8 ~14% (bandwidth), the rest ~25% is many 4-15 us
+  kernels; each launch removed is worth only ~2 us. Remaining lossless items are 0.2-0.5 ms each; JSON 100 needs fewer
+  expert bytes per row (pruning/lower-bit, both lossy).
