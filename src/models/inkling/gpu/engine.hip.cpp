@@ -29,6 +29,7 @@ constexpr int kHistory = 3;
 constexpr int kMaxBatch = 4096;
 constexpr std::uint32_t kNpuTokens = 2048;
 constexpr std::size_t kBankRows = 2048;
+constexpr std::size_t kBankMin = 512;
 constexpr std::uint32_t kNpuSlice = 1024;
 constexpr int kFlashHd = 128;
 constexpr int kWmmaMinTokens = 32;
@@ -1966,6 +1967,8 @@ struct Session::Impl : Scratch {
     const float* dk{nullptr};
     const float* dv{nullptr};
     float* vtmp{nullptr};
+    std::uint64_t ticket{0};
+    bool npu_on{false};
   };
 
   void BeginLayer(LayerCtx& L, std::uint32_t slot, std::uint32_t ip, const float* msgs_, int n) {
@@ -2077,7 +2080,9 @@ struct Session::Impl : Scratch {
     }
   }
 
-  void NpuQkv(LayerCtx& L) {
+  // Encode the layer inputs and queue the q/gate/k/v slices on the NPU (first row
+  // chunk); NpuQkvEnd waits for them and decodes the results.
+  void NpuQkvBegin(LayerCtx& L, int r0) {
     namespace rocm = gufo::models::qwen38_flash_next::rocm;
     auto& npu = *m->npu;
     const std::uint32_t h = m->config.hidden_size;
@@ -2088,48 +2093,55 @@ struct Session::Impl : Scratch {
     const auto& wv = m->npu_w.at(m->P(L.p, "attn_v.weight"));
     const bool k_shared = L.inp[1] == L.inp[0];
     const bool v_shared = L.inp[2] == L.inp[0];
-    const int qd = static_cast<int>(wq.size()) * static_cast<int>(kNpuSlice);
-    for (int r0 = 0; r0 < n; r0 += static_cast<int>(kNpuTokens)) {
-      const int rows = std::min<int>(kNpuTokens, n - r0);
-      const std::uint32_t enc = static_cast<std::uint32_t>((rows + 127) / 128 * 128);
-      rocm::NpuEncodeActivations(L.inh[0] + static_cast<std::size_t>(r0) * h, h, enc, h, 0, h, npu.Device(npu_a[0]), stream);
-      if (!k_shared)
-        rocm::NpuEncodeActivations(L.inh[1] + static_cast<std::size_t>(r0) * h, h, enc, h, 0, h, npu.Device(npu_a[1]), stream);
-      if (!v_shared)
-        rocm::NpuEncodeActivations(L.inh[2] + static_cast<std::size_t>(r0) * h, h, enc, h, 0, h, npu.Device(npu_a[2]), stream);
-      std::vector<int> b;
-      std::vector<int> c;
-      for (std::size_t i = 0; i < wq.size(); ++i) {
-        b.push_back(wq[i]);
-        c.push_back(npu_c[i]);
-      }
-      for (std::size_t i = 0; i < wg.size(); ++i) {
-        b.push_back(wg[i]);
-        c.push_back(npu_c[3 + i]);
-      }
-      if (k_shared) {
-        b.push_back(wk[0]);
-        c.push_back(npu_c[6]);
-      }
-      if (v_shared) {
-        b.push_back(wv[0]);
-        c.push_back(npu_c[7]);
-      }
-      npu.Submit(stream, npu_a[0], b.data(), c.data(), static_cast<int>(b.size()));
-      if (!k_shared) npu.Submit(stream, npu_a[1], &wk[0], &npu_c[6], 1);
-      if (!v_shared) npu.Submit(stream, npu_a[2], &wv[0], &npu_c[7], 1);
-      npu.Wait(stream);
-      for (std::size_t i = 0; i < wq.size(); ++i)
-        rocm::NpuDecodeOutput(npu.Staged(stream, npu_c[i]), q + static_cast<std::size_t>(r0) * qd, rows, kNpuSlice, qd, i * kNpuSlice, false, stream);
-      for (std::size_t i = 0; i < wg.size(); ++i)
-        rocm::NpuDecodeOutput(npu.Staged(stream, npu_c[3 + i]), gate + static_cast<std::size_t>(r0) * qd, rows, kNpuSlice, qd, i * kNpuSlice, false, stream);
-      rocm::NpuDecodeOutput(npu.Staged(stream, npu_c[6]), tmp + static_cast<std::size_t>(r0) * kNpuSlice, rows, kNpuSlice, kNpuSlice, 0, false, stream);
-      rocm::NpuDecodeOutput(npu.Staged(stream, npu_c[7]), v + static_cast<std::size_t>(r0) * kNpuSlice, rows, kNpuSlice, kNpuSlice, 0, false, stream);
+    const int rows = std::min<int>(kNpuTokens, n - r0);
+    const std::uint32_t enc = static_cast<std::uint32_t>((rows + 127) / 128 * 128);
+    rocm::NpuEncodeActivations(L.inh[0] + static_cast<std::size_t>(r0) * h, h, enc, h, 0, h, npu.Device(npu_a[0]), stream);
+    if (!k_shared)
+      rocm::NpuEncodeActivations(L.inh[1] + static_cast<std::size_t>(r0) * h, h, enc, h, 0, h, npu.Device(npu_a[1]), stream);
+    if (!v_shared)
+      rocm::NpuEncodeActivations(L.inh[2] + static_cast<std::size_t>(r0) * h, h, enc, h, 0, h, npu.Device(npu_a[2]), stream);
+    std::vector<int> b;
+    std::vector<int> c;
+    for (std::size_t i = 0; i < wq.size(); ++i) {
+      b.push_back(wq[i]);
+      c.push_back(npu_c[i]);
     }
+    for (std::size_t i = 0; i < wg.size(); ++i) {
+      b.push_back(wg[i]);
+      c.push_back(npu_c[3 + i]);
+    }
+    if (k_shared) {
+      b.push_back(wk[0]);
+      c.push_back(npu_c[6]);
+    }
+    if (v_shared) {
+      b.push_back(wv[0]);
+      c.push_back(npu_c[7]);
+    }
+    npu.Submit(stream, npu_a[0], b.data(), c.data(), static_cast<int>(b.size()));
+    if (!k_shared) npu.Submit(stream, npu_a[1], &wk[0], &npu_c[6], 1);
+    if (!v_shared) npu.Submit(stream, npu_a[2], &wv[0], &npu_c[7], 1);
+    L.ticket = npu.Ticket();
+  }
+
+  void NpuQkvEnd(LayerCtx& L, int r0) {
+    namespace rocm = gufo::models::qwen38_flash_next::rocm;
+    auto& npu = *m->npu;
+    const int rows = std::min<int>(kNpuTokens, L.n - r0);
+    const auto& wq = m->npu_w.at(m->P(L.p, "attn_q.weight"));
+    const auto& wg = m->npu_w.at(m->P(L.p, "attn_gate.weight"));
+    const int qd = static_cast<int>(wq.size()) * static_cast<int>(kNpuSlice);
+    npu.Wait(stream, L.ticket);
+    for (std::size_t i = 0; i < wq.size(); ++i)
+      rocm::NpuDecodeOutput(npu.Staged(stream, npu_c[i]), q + static_cast<std::size_t>(r0) * qd, rows, kNpuSlice, qd, i * kNpuSlice, false, stream);
+    for (std::size_t i = 0; i < wg.size(); ++i)
+      rocm::NpuDecodeOutput(npu.Staged(stream, npu_c[3 + i]), gate + static_cast<std::size_t>(r0) * qd, rows, kNpuSlice, qd, i * kNpuSlice, false, stream);
+    rocm::NpuDecodeOutput(npu.Staged(stream, npu_c[6]), tmp + static_cast<std::size_t>(r0) * kNpuSlice, rows, kNpuSlice, kNpuSlice, 0, false, stream);
+    rocm::NpuDecodeOutput(npu.Staged(stream, npu_c[7]), v + static_cast<std::size_t>(r0) * kNpuSlice, rows, kNpuSlice, kNpuSlice, 0, false, stream);
   }
 
   // stage 2: q/k/v/gate/rel/sink projections (GPU or NPU)
-  void LayerQkv(LayerCtx& L) {
+  void LayerQkvBegin(LayerCtx& L) {
     const Config& c = m->config;
     const int h = c.hidden_size, nh = c.num_heads, nkv = c.num_kv,
               hd = c.head_dim, nrel = c.relative_length;
@@ -2143,10 +2155,10 @@ struct Session::Impl : Scratch {
     __half* const* inh = L.inh;
     const float* msgs_ = L.msgs;
     (void)c; (void)h; (void)nh; (void)nkv; (void)hd; (void)nrel; (void)p; (void)swa; (void)sl; (void)n; (void)nh_; (void)big; (void)inp; (void)inh; (void)msgs_;
-    const bool npu_on = npu_a[0] >= 0 && big &&
-                        m->npu_w.count(m->P(p, "attn_q.weight")) != 0;
-    if (npu_on) {
-      NpuQkv(L);
+    L.npu_on = npu_a[0] >= 0 && big &&
+               m->npu_w.count(m->P(p, "attn_q.weight")) != 0;
+    if (L.npu_on) {
+      NpuQkvBegin(L, 0);
     } else {
       Dense(m->T(m->P(p, "attn_q.weight")), inp[0], h, q, nh * hd, n, -1, inh[0]);
       Dense(m->T(m->P(p, "attn_k.weight")), inp[1], h, tmp, nkv * hd, n, -1,
@@ -2166,9 +2178,32 @@ struct Session::Impl : Scratch {
     }
     Dense(m->T(m->P(p, "attn_sink_proj.weight")), inp[0], h, sink, nh, n, -1,
           inh[0]);
-    if (!npu_on)
+  }
+
+  void LayerQkvEnd(LayerCtx& L) {
+    const Config& c = m->config;
+    const int h = c.hidden_size, nh = c.num_heads, nkv = c.num_kv,
+              hd = c.head_dim, nrel = c.relative_length;
+    const std::uint32_t p = L.p;
+    const bool swa = L.swa;
+    Slot& sl = slots[L.slot];
+    const int n = L.n;
+    const std::size_t nh_ = L.nh_;
+    const bool big = L.big;
+    float* const* inp = L.inp;
+    __half* const* inh = L.inh;
+    const float* msgs_ = L.msgs;
+    (void)c; (void)h; (void)nh; (void)nkv; (void)hd; (void)nrel; (void)p; (void)swa; (void)sl; (void)n; (void)nh_; (void)big; (void)inp; (void)inh; (void)msgs_;
+    if (L.npu_on) {
+      NpuQkvEnd(L, 0);
+      for (int r0 = static_cast<int>(kNpuTokens); r0 < n; r0 += static_cast<int>(kNpuTokens)) {
+        NpuQkvBegin(L, r0);
+        NpuQkvEnd(L, r0);
+      }
+    } else {
       Dense(m->T(m->P(p, "attn_gate.weight")), inp[0], h, gate, nh * hd, n, -1,
             inh[0]);
+    }
   }
 
   // stage 3: convolutions, clipping, KV store, attention -> att / atth
@@ -2268,7 +2303,7 @@ struct Session::Impl : Scratch {
   }
 
   // stage 4: output projection, residual, FFN mix, MoE -> cur
-  void LayerOut(LayerCtx& L, std::vector<const float*>& blocks) {
+  void LayerOut1(LayerCtx& L, std::vector<const float*>& blocks) {
     const Config& c = m->config;
     const int h = c.hidden_size, nh = c.num_heads, nkv = c.num_kv,
               hd = c.head_dim, nrel = c.relative_length;
@@ -2294,6 +2329,22 @@ struct Session::Impl : Scratch {
       HIP_OK(hipMemcpyAsync(b, cur, nh_ * 4, hipMemcpyDeviceToDevice, stream));
       blocks.push_back(b);
     }
+  }
+
+  void LayerOut2(LayerCtx& L, std::vector<const float*>& blocks) {
+    const Config& c = m->config;
+    const int h = c.hidden_size, nh = c.num_heads, nkv = c.num_kv,
+              hd = c.head_dim, nrel = c.relative_length;
+    const std::uint32_t p = L.p;
+    const bool swa = L.swa;
+    Slot& sl = slots[L.slot];
+    const int n = L.n;
+    const std::size_t nh_ = L.nh_;
+    const bool big = L.big;
+    float* const* inp = L.inp;
+    __half* const* inh = L.inh;
+    const float* msgs_ = L.msgs;
+    (void)c; (void)h; (void)nh; (void)nkv; (void)hd; (void)nrel; (void)p; (void)swa; (void)sl; (void)n; (void)nh_; (void)big; (void)inp; (void)inh; (void)msgs_;
     const float* ffn_w =
         static_cast<const float*>(m->T(m->P(p, "ffn_norm.weight")).dev);
     const float* ffn_q =
@@ -2320,9 +2371,11 @@ struct Session::Impl : Scratch {
     LayerCtx L;
     BeginLayer(L, slot, ip, msgs_, n);
     LayerFront(L, blocks);
-    LayerQkv(L);
+    LayerQkvBegin(L);
+    LayerQkvEnd(L);
     LayerAttn(L);
-    LayerOut(L, blocks);
+    LayerOut1(L, blocks);
+    LayerOut2(L, blocks);
   }
 
   void Moe(std::uint32_t p, int n, const __half* xhx_in = nullptr) {
@@ -2439,13 +2492,18 @@ struct Session::Impl : Scratch {
   }
 
   void Forward(std::span<const std::int32_t> tokens) {
+    Activate(0);
     const Config& c = m->config;
     const int n = static_cast<int>(tokens.size());
     HIP_OK(hipMemcpy(d_tokens, tokens.data(), n * 4, hipMemcpyHostToDevice));
     const int pos = static_cast<int>(position);
     pos_base = position;
     HIP_OK(hipMemcpy(d_pos, &pos, 4, hipMemcpyHostToDevice));
-    if (n == 1) {
+    Activate(0);
+    if (banked && n >= static_cast<int>(kBankMin) &&
+        n <= static_cast<int>(2 * kBankRows)) {
+      BodyBanks(tokens);
+    } else if (n == 1) {
       if (graph_exec == nullptr) {
         HIP_OK(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal));
         Body(1);
@@ -2461,6 +2519,149 @@ struct Session::Impl : Scratch {
     HIP_OK(hipMemcpy(logits.data(), d_logits, c.vocab_unpadded * 4,
                      hipMemcpyDeviceToHost));
     position += n;
+  }
+
+  struct BankRun {
+    int n{0};
+    std::uint32_t pos{0};
+    std::vector<const float*> blocks, prelude_blocks, bank;
+    LayerCtx L;
+  };
+  struct StepDesc {
+    std::uint32_t il, ip;
+    int pass;
+  };
+
+  std::vector<StepDesc> BuildSteps() const {
+    const Config& c = m->config;
+    const std::uint32_t start = c.loop_core_start, end = c.loop_core_end;
+    std::vector<StepDesc> steps;
+    for (std::uint32_t il = 0; il < start; ++il)
+      steps.push_back({il, il, -1});
+    for (std::uint32_t pass = 0; pass < c.loop_num_loops; ++pass) {
+      for (std::uint32_t ip = start; ip < end; ++ip) {
+        const std::uint32_t il =
+            pass == 0 ? ip
+                      : m->n_phys + (pass - 1) * (end - start) + (ip - start);
+        steps.push_back({il, ip, static_cast<int>(pass)});
+      }
+    }
+    for (std::uint32_t il = end; il < m->n_phys; ++il)
+      steps.push_back({il, il, -1});
+    return steps;
+  }
+
+  void BankFront(int b, BankRun& R, const StepDesc& st) {
+    Activate(b);
+    const Config& c = m->config;
+    const int h = c.hidden_size;
+    const std::size_t nh_ = static_cast<std::size_t>(R.n) * h;
+    const std::uint32_t start = c.loop_core_start;
+    if (st.pass == 0 && st.ip == start) {
+      HIP_OK(hipMemcpyAsync(prelude, cur, nh_ * 4, hipMemcpyDeviceToDevice, stream));
+      R.prelude_blocks = R.blocks;
+    }
+    if (st.pass > 0 && st.ip == start) {
+      R.bank.assign(R.blocks.begin() + R.prelude_blocks.size() + 1, R.blocks.end());
+      HIP_OK(hipMemcpyAsync(bank_out, cur, nh_ * 4, hipMemcpyDeviceToDevice, stream));
+      HIP_OK(hipMemcpyAsync(cur, prelude, nh_ * 4, hipMemcpyDeviceToDevice, stream));
+      R.blocks = R.prelude_blocks;
+    }
+    const float* msgs_ = nullptr;
+    if (st.pass > 0) {
+      const std::uint32_t cc = st.ip - start;
+      const float* res = static_cast<const float*>(m->T("loop_res_query.weight").dev);
+      const float* kv = static_cast<const float*>(m->T("loop_kv_res_query.weight").dev);
+      float* mq = low;
+      HIP_OK(hipMemcpyAsync(mq, res + 2 * cc * h, h * 4, hipMemcpyDeviceToDevice, stream));
+      HIP_OK(hipMemcpyAsync(mq + h, kv + 2 * cc * h, h * 4, hipMemcpyDeviceToDevice, stream));
+      HIP_OK(hipMemcpyAsync(mq + 2 * h, kv + (2 * cc + 1) * h, h * 4, hipMemcpyDeviceToDevice, stream));
+      HIP_OK(hipMemcpyAsync(mq + 3 * h, res + (2 * cc + 1) * h, h * 4, hipMemcpyDeviceToDevice, stream));
+      Mixer(R.bank, bank_out, mq, 4, R.n, msgs);
+      msgs_ = msgs;
+    }
+    BeginLayer(R.L, st.il, st.ip, msgs_, R.n);
+    LayerFront(R.L, R.blocks);
+  }
+
+  // Two token banks, interleaved so one bank's NPU projections overlap the other
+  // bank's GPU work: A.front A.qkv-begin | B.moe | A.qkv-end A.attn A.out1 | B.front
+  // B.qkv-begin | A.moe | B.qkv-end B.attn B.out1 | ...
+  void DebugSync(const char* what, int t) {
+    static const bool on = std::getenv("INKLING_DEBUG_SYNC") != nullptr;
+    if (!on)
+      return;
+    const hipError_t e = hipStreamSynchronize(stream);
+    if (e != hipSuccess) {
+      std::fprintf(stderr, "bank debug: failure after %s at step %d: %s\n", what, t, hipGetErrorString(e));
+      std::abort();
+    }
+  }
+
+  void BodyBanks(std::span<const std::int32_t> tokens) {
+    const Config& c = m->config;
+    const int h = c.hidden_size;
+    const int total = static_cast<int>(tokens.size());
+    const int na = std::min<int>(static_cast<int>(kBankRows), (total / 2 + 127) / 128 * 128);
+    const int nb = total - na;
+    BankRun R[2];
+    R[0].n = na;
+    R[1].n = nb;
+    R[0].pos = position;
+    R[1].pos = position + na;
+    for (int b = 0; b < 2; ++b) {
+      Activate(b);
+      pos_base = R[b].pos;
+      pool_used = 0;
+      const int pos = static_cast<int>(R[b].pos);
+      HIP_OK(hipMemcpy(d_pos, &pos, 4, hipMemcpyHostToDevice));
+      HIP_OK(hipMemcpy(d_tokens, tokens.data() + (b == 0 ? 0 : na), R[b].n * 4, hipMemcpyHostToDevice));
+      const Tensor& emb = m->T("token_embd.weight");
+      EmbedQ8<<<R[b].n, 256, 0, stream>>>(static_cast<const unsigned char*>(emb.dev), emb.row_bytes, d_tokens, cur, h);
+      RmsRows(cur, static_cast<const float*>(m->T("token_embd_norm.weight").dev), cur, R[b].n, h, h, h);
+    }
+    const std::vector<StepDesc> steps = BuildSteps();
+    const int T = static_cast<int>(steps.size());
+    for (int t = 0; t < T; ++t) {
+      BankFront(0, R[0], steps[t]);
+      DebugSync("BankFront(0, R[0], steps[t]);", t);
+      LayerQkvBegin(R[0].L);
+      DebugSync("LayerQkvBegin(R[0].L);", t);
+      if (t > 0) {
+        Activate(1);
+        LayerOut2(R[1].L, R[1].blocks);
+      DebugSync("LayerOut2(R[1].L, R[1].blocks);", t);
+      }
+      Activate(0);
+      LayerQkvEnd(R[0].L);
+      DebugSync("LayerQkvEnd(R[0].L);", t);
+      LayerAttn(R[0].L);
+      DebugSync("LayerAttn(R[0].L);", t);
+      LayerOut1(R[0].L, R[0].blocks);
+      DebugSync("LayerOut1(R[0].L, R[0].blocks);", t);
+      BankFront(1, R[1], steps[t]);
+      DebugSync("BankFront(1, R[1], steps[t]);", t);
+      LayerQkvBegin(R[1].L);
+      DebugSync("LayerQkvBegin(R[1].L);", t);
+      Activate(0);
+      LayerOut2(R[0].L, R[0].blocks);
+      DebugSync("LayerOut2(R[0].L, R[0].blocks);", t);
+      Activate(1);
+      LayerQkvEnd(R[1].L);
+      DebugSync("LayerQkvEnd(R[1].L);", t);
+      LayerAttn(R[1].L);
+      DebugSync("LayerAttn(R[1].L);", t);
+      LayerOut1(R[1].L, R[1].blocks);
+      DebugSync("LayerOut1(R[1].L, R[1].blocks);", t);
+    }
+    Activate(1);
+    LayerOut2(R[1].L, R[1].blocks);
+    const int n = R[1].n;
+    Mixer(R[1].blocks, cur, static_cast<const float*>(m->T("output_res_query.weight").dev), 1, n, x);
+    RmsRows(x, static_cast<const float*>(m->T("output_norm.weight").dev), x, n, h, h, h);
+    const Tensor& out = m->T("output.weight");
+    Dense(out, x + static_cast<std::size_t>(n - 1) * h, h, d_logits, c.vocab_unpadded, 1, static_cast<int>(c.vocab_unpadded));
+    Softcap<<<(c.vocab_unpadded + 255) / 256, 256, 0, stream>>>(d_logits, c.vocab_unpadded, c.final_logit_softcapping);
   }
 
   void Body(int n) {
@@ -2670,8 +2871,8 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
     const std::size_t rows =
         gufo::models::qwen38_flash_next::rocm::RoutedCompactRows(
             b * c.expert_used, c.expert_count);
-    i.rrows_token = static_cast<int*>(i.AllocBytes(rows * sizeof(int)));
-    i.rrows_slot = static_cast<int*>(i.AllocBytes(rows * sizeof(int)));
+    sc.rrows_token = static_cast<int*>(i.AllocBytes(rows * sizeof(int)));
+    sc.rrows_slot = static_cast<int*>(i.AllocBytes(rows * sizeof(int)));
     }
     sc.xq = static_cast<signed char*>(
       i.AllocBytes(static_cast<std::size_t>(kWmmaMinTokens) * c.expert_used *
@@ -2685,9 +2886,9 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
       static_cast<std::size_t>(kMaxBatch / kFlashQ) * c.num_heads * 4));
     {
     const std::size_t splits = (max_context + kSplitKeys - 1) / kSplitKeys;
-    i.split_m = i.Alloc(kWmmaMinTokens * c.num_heads * splits);
-    i.split_l = i.Alloc(kWmmaMinTokens * c.num_heads * splits);
-    i.split_o = i.Alloc(kWmmaMinTokens * c.num_heads * splits * kFlashHd);
+    sc.split_m = i.Alloc(kWmmaMinTokens * c.num_heads * splits);
+    sc.split_l = i.Alloc(kWmmaMinTokens * c.num_heads * splits);
+    sc.split_o = i.Alloc(kWmmaMinTokens * c.num_heads * splits * kFlashHd);
     }
     sc.xh = static_cast<__half*>(
       i.AllocBytes(b * std::max<std::size_t>(qd, 2 * h) * 2));
