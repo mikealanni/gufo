@@ -1062,7 +1062,7 @@ __global__ void SortItems(const int* ids, int items, int ne, int* sorted,
 
 constexpr int kSparseSink = 2;
 constexpr int kSparseLocal = 16;
-constexpr int kSparseTop = 256;
+constexpr int kSparseTop = 192;
 constexpr bool kGroupBound = false;
 constexpr int kListCap = kSparseSink + kSparseLocal + kSparseTop + 4;
 constexpr int kBlockKeys = 64;
