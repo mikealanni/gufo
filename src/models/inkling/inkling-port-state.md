@@ -217,6 +217,10 @@ looped 3x -> 5.4B effective active; 24 physical layers, middle core looped).
 - Decode attention (2026-11-22): n=1 decode used the 128-query prefill flash kernel; a dedicated split-key kernel
   (DecodeAttn, 256 keys per block, 16 lanes per key row) raised plain decode 23.0 -> 28.2 tok/s at 4k, 19.6 -> 23.3 at
   16k. Full-attention layers still ~1 ms each at 16k (~60 GB/s), room left.
+- Verify cost (2026-11-22): verify-4 ~52 ms = routed NVFP4 experts 24 ms (4 rows touch ~22.7 distinct experts per
+  layer, 5 GB at ~205 GB/s, same rate as the plain step's 8.4 ms) + dense Q8 9 ms (same bytes as plain) + ~10 ms of
+  small kernels. The expert term is bandwidth-bound by distinct experts and cannot shrink; fusing the loop control step
+  (6 launches -> 2) saved only ~0.7 ms. Each extra verify row costs ~7 ms, so width 3 is the optimum.
 
 ## Open questions / next steps (skill default order)
 
