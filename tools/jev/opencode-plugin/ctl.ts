@@ -25,7 +25,7 @@ export const HELP = [
   "   levels: none (no thinking) minimal low medium high xhigh max",
   "/jev switch <model>",
   "   reload gufo as another model",
-  "   models: flash-next 27b 35b glm flint laguna inkling",
+  "   models: flash-next 27b 35b glm glm-coder flint laguna inkling",
   "/jev goal [text]",
   "   keep the agent working until the task is done",
   "   (no text = the current task; max 3 pushes)",

@@ -38,7 +38,7 @@ python3 tools/jev/guard.py --gufo-bin build/release/gufo --run-script ~/run-gufo
 ```
 
 Point clients at `http://127.0.0.1:8900/v1`. The run script starts gufo and
-reads `GUFO_MODEL` (`flash-next`, `27b`, `35b`, `glm`, `flint`, `laguna`, `inkling`) and
+reads `GUFO_MODEL` (`flash-next`, `27b`, `35b`, `glm`, `glm-coder`, `flint`, `laguna`, `inkling`) and
 optionally `GUFO_MODEL_PATH` for the weights file. `GUFO_KIND` is still read
 as the old name.
 

@@ -68,7 +68,7 @@ HEAVY_RES = [
 ]
 assert len(HEAVY_RES) == len(HEAVY), "HEAVY and HEAVY_RES must stay parallel"
 # Models ~/run-gufo.sh can start (GUFO_MODEL).
-MODEL_KINDS = ("flash-next", "27b", "35b", "glm", "flint", "laguna", "inkling")
+MODEL_KINDS = ("flash-next", "27b", "35b", "glm", "glm-coder", "flint", "laguna", "inkling")
 # Launch variables that belong to one model; they must not leak into another model when switching.
 MODEL_SPECIFIC_ENV = ("GUFO_MODEL_PATH", "GUFO_DFLASH", "GUFO_MTP", "GUFO_DIR", "GUFO_BIN", "CTX")
 MODEL_EXT = (".gguf", ".safetensors", ".bin")

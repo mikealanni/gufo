@@ -59,7 +59,7 @@ Run `python3 tools/jev/guard.py --help` for the full list on your version.
 
 | Variable | Effect |
 | --- | --- |
-| `GUFO_MODEL` | Model to load: `flash-next`, `27b`, `35b`, `glm`, `flint`, `laguna`, `inkling`. |
+| `GUFO_MODEL` | Model to load: `flash-next`, `27b`, `35b`, `glm`, `glm-coder`, `flint`, `laguna`, `inkling`. |
 | `GUFO_MODEL_PATH` | Weights file for that model. |
 | `GUFO_THINK=off` | Thinking is off for every request; clients cannot turn it back on. |
 | `GUFO_EFFORT` | Default reasoning effort (`low` if unset). |
