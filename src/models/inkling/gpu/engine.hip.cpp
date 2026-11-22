@@ -500,7 +500,7 @@ __global__ void ConvHist(const float* cur, float* hist, int ch, int n) {
 
 constexpr int kTapCount = 4;
 inline int g_tap_layers[kTapCount] = {
-    4, 22, 40, 47};  // virtual layers whose outputs feed the drafter
+    4, 22, 40, 48};  // virtual layers whose outputs feed the drafter
 
 // feature rows of the drafter: feat[pos][tap][h] as F16
 __global__ void TapStore(const float* cur, __half* feat, const int* pos0,
@@ -1798,7 +1798,8 @@ struct ModelState {
   std::vector<void*> allocations;
   std::size_t resident_bytes{0};
   bool has_draft{false};
-  float draft_fuse[4][4]{};  // softmax of every row of dspark_fuse
+  float draft_fuse[4][4]{};     // softmax of every row of dspark_fuse
+  std::vector<int> draft_rank;  // token ids by descending markov_w1 row norm
   // optional NPU offload of the q / gate / k / v projections (INKLING_NPU=1)
   std::unique_ptr<gufo::models::qwen38_flash_next::rocm::NpuGemm> npu;
   int npu_prog_o{-1},
@@ -2305,7 +2306,18 @@ __global__ void DraftBf16Gemv(const unsigned short* w, const float* x, float* y,
         acc + (a1 != nullptr ? a1[r] : 0.0F) + (a2 != nullptr ? a2[r] : 0.0F);
 }
 
-__global__ void ArgMaxRow(const float* x, int n, int* out, int* out2) {
+__global__ void GatherRows(const unsigned char* src, std::size_t row_bytes,
+                           const int* ids, unsigned char* dst) {
+  const uint4* in = reinterpret_cast<const uint4*>(
+      src + static_cast<std::size_t>(ids[blockIdx.x]) * row_bytes);
+  uint4* out = reinterpret_cast<uint4*>(
+      dst + static_cast<std::size_t>(blockIdx.x) * row_bytes);
+  for (std::size_t i = threadIdx.x; i < row_bytes / 16; i += blockDim.x)
+    out[i] = in[i];
+}
+
+__global__ void ArgMaxRow(const float* x, int n, int* out, int* out2,
+                          const int* map = nullptr) {
   __shared__ float bv[256];
   __shared__ int bi[256];
   float best = -3.0e38F;
@@ -2329,8 +2341,9 @@ __global__ void ArgMaxRow(const float* x, int n, int* out, int* out2) {
     __syncthreads();
   }
   if (threadIdx.x == 0) {
-    *out = bi[0];
-    *out2 = bi[0];
+    const int id = map != nullptr ? map[bi[0]] : bi[0];
+    *out = id;
+    *out2 = id;
   }
 }
 
@@ -2397,9 +2410,11 @@ struct Session::Impl : Scratch {
   static constexpr int kDraftWarmChunk = 256;
   static constexpr int kDraftSplit = 64;
   static constexpr int kDraftShortlistMax = 65536;
+  unsigned char* dhead{nullptr};
+  int* dmap{nullptr};
   int kDraftShortlist{std::getenv("INKLING_SHORTLIST") != nullptr
                           ? std::atoi(std::getenv("INKLING_SHORTLIST"))
-                          : 8192};
+                          : 32768};
   HistEntry* hist_entries{nullptr};
   int n_hist_entries{0};
   int last_rows{0};
@@ -3472,6 +3487,21 @@ struct Session::Impl : Scratch {
     dlog = f(kDraftShortlistMax);
     dw = f(16);
     HIP_OK(hipMemcpy(dw, m->draft_fuse, 16 * 4, hipMemcpyHostToDevice));
+    {
+      const Tensor& head = m->T("output.weight");
+      const int n = std::min<int>(kDraftShortlist,
+                                  static_cast<int>(m->draft_rank.size()));
+      kDraftShortlist = n;
+      dmap = static_cast<int*>(AllocBytes(static_cast<std::size_t>(n) * 4));
+      dhead = static_cast<unsigned char*>(
+          AllocBytes(static_cast<std::size_t>(n) * head.row_bytes));
+      HIP_OK(hipMemcpy(dmap, m->draft_rank.data(),
+                       static_cast<std::size_t>(n) * 4, hipMemcpyHostToDevice));
+      GatherRows<<<n, 256, 0, stream>>>(
+          static_cast<const unsigned char*>(head.dev), head.row_bytes, dmap,
+          dhead);
+      HIP_OK(hipStreamSynchronize(stream));
+    }
     dprev = static_cast<int*>(AllocBytes(4));
     dtok = static_cast<int*>(AllocBytes(4));
     dout = static_cast<int*>(AllocBytes(8 * 4));
@@ -3573,9 +3603,12 @@ struct Session::Impl : Scratch {
                                               dstate, dlatent, 256);
       DraftBf16Gemv<<<h / 4, 128, 0, stream>>>(how, dlatent, deff, 256, h, cur,
                                                DW("dspark_hidden_out.bias"));
-      Dense(head, deff, h, dlog, kDraftShortlist, 1, kDraftShortlist);
+      Tensor sub = head;
+      sub.dev = dhead;
+      sub.rows = static_cast<std::size_t>(kDraftShortlist);
+      Dense(sub, deff, h, dlog, kDraftShortlist, 1, kDraftShortlist);
       ArgMaxRow<<<1, 256, 0, stream>>>(dlog, kDraftShortlist, dprev,
-                                       dout + (s - 1));
+                                       dout + (s - 1), dmap);
     }
     HIP_OK(hipMemcpyAsync(out, dout, steps * 4, hipMemcpyDeviceToHost, stream));
     HIP_OK(hipStreamSynchronize(stream));
@@ -3746,9 +3779,9 @@ struct Session::Impl : Scratch {
     Mixer(R[1].blocks, cur,
           static_cast<const float*>(m->T("output_res_query.weight").dev), 1, n,
           x);
-    Tap(48, n, x);
     RmsRows(x, static_cast<const float*>(m->T("output_norm.weight").dev), x, n,
             h, h, h);
+    Tap(48, n, x);
     const Tensor& out = m->T("output.weight");
     Dense(out, x + static_cast<std::size_t>(n - 1) * h, h, d_logits,
           c.vocab_unpadded, 1, static_cast<int>(c.vocab_unpadded));
@@ -3823,9 +3856,9 @@ struct Session::Impl : Scratch {
     Mixer(blocks, cur,
           static_cast<const float*>(m->T("output_res_query.weight").dev), 1, n,
           x);
-    Tap(48, n, x);
     RmsRows(x, static_cast<const float*>(m->T("output_norm.weight").dev), x, n,
             h, h, h);
+    Tap(48, n, x);
     const Tensor& out = m->T("output.weight");
     if (all_rows && n <= static_cast<int>(kMaxVerifyRows)) {
       Dense(out, x, h, d_logits, c.vocab_unpadded, n,
@@ -3999,6 +4032,32 @@ bool Model::LoadDrafter(const std::string& path, std::string* error) {
         for (int k = 0; k < 4; ++k)
           st.draft_fuse[r][k] = std::exp(f[r * 4 + k] - mx) / sum;
       }
+    }
+    if (info.name == "markov_w1.weight" && t.type == kTypeBf16) {
+      const auto* raw = static_cast<const unsigned short*>(info.data);
+      const std::size_t rows = t.rows;
+      std::vector<std::pair<float, int>> norms(rows);
+      for (std::size_t r = 0; r < rows; ++r) {
+        double sum = 0.0;
+        for (std::size_t c = 0; c < t.cols; ++c) {
+          const std::uint32_t bits =
+              static_cast<std::uint32_t>(raw[r * t.cols + c]) << 16;
+          float v;
+          std::memcpy(&v, &bits, 4);
+          sum += static_cast<double>(v) * v;
+        }
+        norms[r] = {static_cast<float>(sum), static_cast<int>(r)};
+      }
+      const std::size_t keep = std::min<std::size_t>(65536, rows);
+      std::partial_sort(norms.begin(), norms.begin() + keep, norms.end(),
+                        [](const auto& a, const auto& b) {
+                          return a.first > b.first ||
+                                 (a.first == b.first && a.second < b.second);
+                        });
+      st.draft_rank.clear();
+      for (std::size_t i = 0; i < keep; ++i)
+        if (norms[i].second < static_cast<int>(st.config.vocab_unpadded))
+          st.draft_rank.push_back(norms[i].second);
     }
     st.tensors.emplace(name, t);
   }

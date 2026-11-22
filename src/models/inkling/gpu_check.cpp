@@ -100,9 +100,11 @@ int main(int argc, char** argv) {
     const int gen = std::getenv("INKLING_GEN") != nullptr
                         ? std::atoi(std::getenv("INKLING_GEN"))
                         : 128;
-    const int kPrefix = std::getenv("INKLING_PREFIX") != nullptr
-                            ? std::atoi(std::getenv("INKLING_PREFIX"))
-                            : 600;
+    int kPrefix = std::getenv("INKLING_PREFIX") != nullptr
+                      ? std::atoi(std::getenv("INKLING_PREFIX"))
+                      : 600;
+    if (kPrefix <= 0 || kPrefix > static_cast<int>(ids.size()))
+      kPrefix = static_cast<int>(ids.size());
     auto model = gufo::models::inkling::gpu::Model::Load(argv[1], &err);
     if (!model->LoadDrafter(argv[4], &err)) {
       std::fprintf(stderr, "drafter load failed: %s\n", err.c_str());
@@ -165,6 +167,13 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 40 && i < static_cast<int>(stream.size()); ++i)
       std::printf("%d ", stream[i]);
     std::printf("\n");
+    if (std::getenv("INKLING_SHOW") != nullptr) {
+      for (const int t : stream)
+        std::printf("%s", tok->DecodeTokenCopy(
+                                 static_cast<gufo::tokenization::TokenId>(t))
+                              .c_str());
+      std::printf("\n");
+    }
     return 0;
   }
   if (argc >= 4 && std::string(argv[2]) == "--verify") {
