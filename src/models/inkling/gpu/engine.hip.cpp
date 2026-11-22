@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/core/hip/weight_upload.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/npu_gemm.hpp"
 
@@ -2110,6 +2111,31 @@ std::shared_ptr<Model> Model::Load(const std::string& path,
       std::fprintf(stderr, "inkling: NPU unavailable: %s\n", npu_error.c_str());
     }
   }
+  const auto mapped_regions = reader->GetMappedRegions();
+  const std::vector<gufo::core::GgufMappedRegion> shards(mapped_regions.begin(),
+                                                         mapped_regions.end());
+  std::string upload_error;
+  const auto stager = gufo::hip::WeightUpload::Create(shards, &upload_error);
+  const auto upload = [&](const gufo::core::GgufTensorInfo& info,
+                          void* device) -> hipError_t {
+    const auto* at = static_cast<const char*>(info.data);
+    if (stager != nullptr) {
+      for (std::uint32_t shard = 0; shard < shards.size(); ++shard) {
+        const auto* base = static_cast<const char*>(shards[shard].data);
+        if (at < base || at + info.size_bytes > base + shards[shard].size)
+          continue;
+        std::string copy_error;
+        if (stager->Copy(shard, static_cast<std::uint64_t>(at - base),
+                         info.size_bytes, device, &copy_error) &&
+            stager->Finish(&copy_error))
+          return hipSuccess;
+        std::fprintf(stderr, "inkling: staged upload failed (%s), copying\n",
+                     copy_error.c_str());
+        break;
+      }
+    }
+    return hipMemcpy(device, info.data, info.size_bytes, hipMemcpyHostToDevice);
+  };
   const auto npu_name = [](std::string_view n) {
     for (const char* suffix :
          {".attn_q.weight", ".attn_attn_gate.weight", ".attn_gate.weight",
@@ -2150,7 +2176,7 @@ std::shared_ptr<Model> Model::Load(const std::string& path,
     if (repack) {
       void* tmp = nullptr;
       HIP_OK(hipMalloc(&tmp, info.size_bytes));
-      HIP_OK(hipMemcpy(tmp, info.data, info.size_bytes, hipMemcpyHostToDevice));
+      HIP_OK(upload(info, tmp));
       if (state->npu && t.type == kTypeQ8 && t.cols == cfg->hidden_size &&
           npu_name(info.name)) {
         std::vector<int> ids;
@@ -2240,7 +2266,7 @@ std::shared_ptr<Model> Model::Load(const std::string& path,
       continue;
     }
     HIP_OK(hipMalloc(&t.dev, info.size_bytes));
-    HIP_OK(hipMemcpy(t.dev, info.data, info.size_bytes, hipMemcpyHostToDevice));
+    HIP_OK(upload(info, t.dev));
     state->allocations.push_back(t.dev);
     state->resident_bytes += info.size_bytes;
     state->tensors.emplace(std::string(info.name), t);
