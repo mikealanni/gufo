@@ -4010,6 +4010,78 @@ std::vector<std::int32_t> InklingEngineTokens(
   return converted;
 }
 
+// Maps the model's channel tokens to the reasoning and tool-call framing the
+// shared response parsers read: `<|content_thinking|>` ... `<|end_message|>`
+// becomes `<think>` ... `</think>`, and `<|content_invoke_tool_json|>{"name":
+// ..,"args":{..}}<|end_message|>` becomes a native tool call.
+class InklingOutputTranslator {
+public:
+  std::string Feed(std::string_view piece) {
+    if (piece == "<|content_thinking|>") {
+      phase_ = Phase::kThinking;
+      return "<think>\n";
+    }
+    if (piece == "<|content_text|>") {
+      phase_ = Phase::kText;
+      return {};
+    }
+    if (piece == "<|content_invoke_tool_json|>") {
+      phase_ = Phase::kTool;
+      tool_.clear();
+      return {};
+    }
+    if (piece == "<|end_message|>") {
+      const Phase ended = phase_;
+      phase_ = Phase::kNone;
+      if (ended == Phase::kThinking)
+        return "\n</think>\n\n";
+      if (ended == Phase::kTool)
+        return NativeCall();
+      return {};
+    }
+    if (piece == "<|message_model|>" || piece == "<|message_tool|>") {
+      phase_ = Phase::kHeader;
+      return {};
+    }
+    if (piece.size() > 4 && piece.starts_with("<|") && piece.ends_with("|>"))
+      return {};
+    if (phase_ == Phase::kHeader)
+      return {};
+    if (phase_ == Phase::kTool) {
+      tool_ += piece;
+      return {};
+    }
+    return std::string(piece);
+  }
+
+private:
+  enum class Phase : std::uint8_t { kNone, kHeader, kThinking, kText, kTool };
+
+  [[nodiscard]] std::string NativeCall() const {
+    try {
+      const auto call = gufo::json::parse(tool_);
+      const auto* name = call.find("name");
+      if (name == nullptr || !name->is_string())
+        return tool_;
+      std::string out = "<tool_call>\n<function=" + name->get_str() + ">\n";
+      if (const auto* args = call.find("args");
+          args != nullptr && args->is_object()) {
+        for (const auto& [key, value] : args->members()) {
+          out += "<parameter=" + key + ">\n";
+          out += value.is_string() ? value.get_str() : value.dump();
+          out += "\n</parameter>\n";
+        }
+      }
+      return out + "</function>\n</tool_call>";
+    } catch (const std::exception&) {
+      return tool_;
+    }
+  }
+
+  Phase phase_{Phase::kNone};
+  std::string tool_;
+};
+
 class InklingTextRunnerState final : public TextRunnerState {
 public:
   InklingTextRunnerState(const std::shared_ptr<InklingModel>& model,
@@ -4037,6 +4109,7 @@ public:
   /// Running mean of tokens produced per drafted step; steers drafting.
   double draft_yield{2.0};
   std::size_t plain_steps{0};
+  InklingOutputTranslator translator;
 
 private:
   std::unique_ptr<InklingSession> session_;
@@ -4180,6 +4253,8 @@ public:
     };
   }
 
+  [[nodiscard]] bool ToolsHandledByTemplate() const override { return true; }
+
   [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
     return {{.kind = TextExecutionPlanKind::kSerial, .physical_width = 1}};
   }
@@ -4200,14 +4275,6 @@ public:
 
   [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
       const ChatRequest& request) const override {
-    // Inkling has no tool-call rendering yet. Reject only when the caller
-    // actually requires a tool call (we cannot satisfy that); clients that
-    // merely attach a tool list with tool_choice=auto (opencode does this
-    // on every request) proceed with tools silently ignored.
-    if (!request.tools.empty() &&
-        request.tool_choice == ChatRequest::ToolChoice::kRequired) {
-      throw std::invalid_argument("Inkling does not support tools yet");
-    }
     std::vector<models::inkling::ChatMessage> messages;
     messages.reserve(request.messages.size());
     for (const auto& message : request.messages) {
@@ -4215,12 +4282,35 @@ public:
         throw std::invalid_argument("Inkling does not support image input");
       messages.push_back({std::string(tokenization::ToString(message.role)),
                           message.content + message.framing_suffix,
-                          message.thought});
+                          message.thought,
+                          message.name,
+                          message.tool_call_id,
+                          {}});
       if (message.role == tokenization::ChatRole::kDeveloper)
         messages.back().role = "developer";
+      for (const auto& call : message.tool_calls) {
+        auto args = gufo::json::Value::object();
+        for (const auto& argument : call.arguments) {
+          if (argument.is_string) {
+            args[argument.name] = argument.value;
+            continue;
+          }
+          try {
+            args[argument.name] = gufo::json::parse(argument.value);
+          } catch (const std::exception&) {
+            args[argument.name] = argument.value;
+          }
+        }
+        messages.back().tool_calls.push_back({call.id, call.name, args.dump()});
+      }
     }
     models::inkling::ChatTemplateOptions chat_options;
     chat_options.enable_thinking = request.reasoning.enabled.value_or(true);
+    if (request.tool_choice != ChatRequest::ToolChoice::kNone) {
+      for (const auto& tool : request.tools)
+        chat_options.tools.push_back(
+            {tool.name, tool.description, tool.parameters_json});
+    }
     tokenization::TokenizerOptions options;
     options.parse_special_tokens = true;
     return tokenizer_->Encode(
@@ -4241,6 +4331,7 @@ public:
       std::span<const TextRunnerToken> prefix) const override {
     if (RequireInklingState(state).position() != prefix.size())
       throw std::logic_error("Inkling reused prefix does not match checkpoint");
+    RequireInklingState(state).translator = {};
   }
 
   [[nodiscard]] TextPrefillStep Prefill(
@@ -4249,6 +4340,7 @@ public:
     auto& inkling = RequireInklingState(state);
     if (offset != inkling.position())
       throw std::logic_error("Inkling prefill offset does not match state");
+    inkling.translator = {};
     if (offset >= prompt.size())
       throw std::logic_error("Inkling prefill has no remaining input");
     const std::size_t consumed = std::min<std::size_t>(
@@ -4280,7 +4372,10 @@ public:
       return {.stop = true, .token = 0, .piece = {}};
     return {.stop = false,
             .token = static_cast<TextRunnerToken>(token),
-            .piece = std::string(tokenizer_->DecodeToken(token))};
+            .piece = [&] {
+              auto peek = inkling.translator;
+              return peek.Feed(tokenizer_->DecodeToken(token));
+            }()};
   }
 
   void Advance(TextRunnerState& state, TextRunnerToken token) const override {
@@ -4292,6 +4387,7 @@ public:
       throw std::runtime_error("Inkling decode failed: " + error);
     }
     inkling.set_position(inkling.position() + 1);
+    inkling.translator.Feed(tokenizer_->DecodeToken(token));
   }
 
   [[nodiscard]] std::optional<TextDecodeSelection> PreviewFirstToken(
@@ -4349,7 +4445,7 @@ public:
     step.selections.push_back(
         {.stop = false,
          .token = static_cast<TextRunnerToken>(anchor),
-         .piece = std::string(tokenizer_->DecodeToken(anchor))});
+         .piece = inkling.translator.Feed(tokenizer_->DecodeToken(anchor))});
     working.Accept(static_cast<sampling::TokenId>(anchor));
     std::size_t kept = 1;
     bool stopped = false;
@@ -4368,7 +4464,7 @@ public:
       step.selections.push_back(
           {.stop = false,
            .token = static_cast<TextRunnerToken>(sampled),
-           .piece = std::string(tokenizer_->DecodeToken(sampled))});
+           .piece = inkling.translator.Feed(tokenizer_->DecodeToken(sampled))});
       working.Accept(static_cast<sampling::TokenId>(sampled));
       ++kept;
     }

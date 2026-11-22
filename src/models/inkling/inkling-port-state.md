@@ -67,5 +67,6 @@ the artifact facts, engine design and what was learned, for the next person touc
 - The model thinks at effort 0; benchmark code and JSON with the text channel forced.
 - Greedy speculation can differ from plain decode at near ties because the verify path uses f32 batch
   kernels while decode uses int8 activations.
-- Open: other-model regression for the shared-kernel edits (NVFP4 weight type, routed empty-tile return,
-  tokenizer pattern), snapshots/disk cache, tools, reasoning split.
+- Chat layer: `chat_template.cpp` mirrors the GGUF template including tools; `InklingOutputTranslator` in
+  `inference_backend.cpp` maps channel tokens to `<think>` and native tool-call framing for the shared parsers.
+- Open: snapshots/disk cache, image input, enforcing `tool_choice: required`.

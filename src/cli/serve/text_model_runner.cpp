@@ -27,16 +27,17 @@ std::optional<ChatRequest> ConstrainChatRequest(
   // (for example Qwen's whitespace boundary after </think>).
   if (tool_format)
     *tool_format = runner.ToolFormat();
-  if (!request.response_format &&
-      (request.tools.empty() ||
-       request.tool_choice == ChatRequest::ToolChoice::kNone))
+  const bool tool_constraints =
+      !request.tools.empty() &&
+      request.tool_choice != ChatRequest::ToolChoice::kNone &&
+      !runner.ToolsHandledByTemplate();
+  if (!request.response_format && !tool_constraints)
     return std::nullopt;
   auto constrained = request;
   auto instruction = request.response_format ? request.response_format->prompt()
                                              : std::string();
   auto grammar = request.response_format;
-  if (!request.tools.empty() &&
-      request.tool_choice != ChatRequest::ToolChoice::kNone) {
+  if (tool_constraints) {
     std::vector<sampling::JsonConstraint::Tool> tools;
     const bool required =
         request.tool_choice == ChatRequest::ToolChoice::kRequired;
