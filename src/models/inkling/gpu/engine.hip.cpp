@@ -1866,6 +1866,93 @@ __global__ void FlashCombine(const float* pm, const float* pl, const float* po,
 
 // Q8_0 (34 B blocks) / NVFP4 (36 B blocks) rows -> [qs][scales] rows padded to
 // 16 bytes
+__device__ float Ue4m3Raw(int code) {
+  const int e = (code >> 3) & 0xF;
+  const int m = code & 7;
+  return e == 0 ? ldexpf(static_cast<float>(m), -9)
+                : ldexpf(1.0F + static_cast<float>(m) / 8.0F, e - 7);
+}
+
+// true E2M1 magnitudes {0, .5, 1, 1.5, 2, 3, 4, 6}; returns the nibble
+__device__ int Fp4Nearest(float v) {
+  const float a = fabsf(v);
+  int best = 0;
+  float err = a;
+  const float levels[8] = {0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F};
+  for (int i = 1; i < 8; ++i) {
+    const float d = fabsf(a - levels[i]);
+    if (d < err) {
+      err = d;
+      best = i;
+    }
+  }
+  return best | (v < 0.0F ? 8 : 0);
+}
+
+__device__ float Fp4Value(int nib) {
+  const float levels[8] = {0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F};
+  const float v = levels[nib & 7];
+  return (nib & 8) != 0 ? -v : v;
+}
+
+// Q8 rows (repacked: [qs cols][fp16 scales cols/32]) -> NVFP4 rows (repacked:
+// [nibbles cols/2][ue4m3 scales cols/16]); one 16-element group per thread
+__global__ void Q8ToNvfp4(const unsigned char* src, std::size_t src_stride,
+                          unsigned char* dst, std::size_t dst_stride,
+                          int cols) {
+  const unsigned char* in =
+      src + static_cast<std::size_t>(blockIdx.x) * src_stride;
+  unsigned char* out = dst + static_cast<std::size_t>(blockIdx.x) * dst_stride;
+  for (int gidx = threadIdx.x; gidx < cols / 16; gidx += blockDim.x) {
+    float x[16];
+    const float d = __half2float(
+        *reinterpret_cast<const __half*>(in + cols + (gidx / 2) * 2));
+    float amax = 0.0F;
+    for (int i = 0; i < 16; ++i) {
+      x[i] =
+          d * static_cast<float>(static_cast<signed char>(in[gidx * 16 + i]));
+      amax = fmaxf(amax, fabsf(x[i]));
+    }
+    int best_code = 0;
+    float best_err = 3.0e38F;
+    if (amax > 0.0F) {
+      const float ideal = amax / 6.0F;
+      int c0 = 1;
+      float bd = 3.0e38F;
+      for (int c = 1; c < 0x7F; ++c) {
+        const float dd = fabsf(Ue4m3Raw(c) - ideal);
+        if (dd < bd) {
+          bd = dd;
+          c0 = c;
+        }
+      }
+      for (int c = max(1, c0 - 1); c <= min(0x7E, c0 + 1); ++c) {
+        const float sc = Ue4m3Raw(c);
+        float err = 0.0F;
+        for (int i = 0; i < 16; ++i) {
+          const float q = Fp4Value(Fp4Nearest(x[i] / sc)) * sc;
+          err += (q - x[i]) * (q - x[i]);
+        }
+        if (err < best_err) {
+          best_err = err;
+          best_code = c;
+        }
+      }
+    }
+    const float sc = best_code != 0 ? Ue4m3Raw(best_code) : 1.0F;
+    out[cols / 2 + gidx] = static_cast<unsigned char>(best_code);
+    const int block = gidx / 4;
+    const int unit = (gidx % 4) / 2;
+    const int half = gidx % 2;
+    unsigned char* nib = out + block * 32 + unit * 16 + half * 8;
+    for (int i = 0; i < 8; ++i) {
+      const int lo = Fp4Nearest(x[i] / sc);
+      const int hi = Fp4Nearest(x[i + 8] / sc);
+      nib[i] = static_cast<unsigned char>(lo | (hi << 4));
+    }
+  }
+}
+
 __global__ void RepackRows(const unsigned char* src, std::size_t src_stride,
                            unsigned char* dst, std::size_t dst_stride, int cols,
                            bool nvfp4) {
@@ -2098,6 +2185,31 @@ std::shared_ptr<Model> Model::Load(const std::string& path,
       HIP_OK(hipDeviceSynchronize());
       HIP_OK(hipFree(tmp));
       t.row_bytes = stride;
+      const bool expert_name =
+          info.name.size() > 12 &&
+          info.name.substr(info.name.size() - 12) == "_exps.weight";
+      static const bool expert_nvfp4 =
+          std::getenv("INKLING_EXPERT_NVFP4") == nullptr ||
+          std::getenv("INKLING_EXPERT_NVFP4")[0] != '0';
+      if (expert_nvfp4 && expert_name && t.type == kTypeQ8 &&
+          t.cols % 64 == 0) {
+        const std::size_t nstride = (t.cols / 2 + t.cols / 16 + 15) / 16 * 16;
+        void* nv = nullptr;
+        HIP_OK(hipMalloc(&nv, nstride * t.rows));
+        HIP_OK(hipMemset(nv, 0, nstride * t.rows));
+        Q8ToNvfp4<<<static_cast<unsigned>(t.rows), 128>>>(
+            static_cast<const unsigned char*>(t.dev), stride,
+            static_cast<unsigned char*>(nv), nstride, static_cast<int>(t.cols));
+        HIP_OK(hipDeviceSynchronize());
+        HIP_OK(hipFree(t.dev));
+        t.dev = nv;
+        t.type = kTypeNvfp4;
+        t.row_bytes = nstride;
+        state->allocations.push_back(t.dev);
+        state->resident_bytes += nstride * t.rows;
+        state->tensors.emplace(std::string(info.name), t);
+        continue;
+      }
       state->allocations.push_back(t.dev);
       state->resident_bytes += stride * t.rows;
       state->tensors.emplace(std::string(info.name), t);
