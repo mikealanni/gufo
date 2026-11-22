@@ -1417,6 +1417,183 @@ __global__ void __launch_bounds__(kFlashThreads)
   }
 }
 
+constexpr int kDecThreads = 256;
+constexpr int kDecKeys = 256;
+constexpr int kDecMaxGh = 8;
+
+// Single-token attention: one block per (key split, kv group); the group's
+// query heads share every K/V load. Writes unnormalised partials for
+// FlashCombine.
+__global__ void __launch_bounds__(kDecThreads)
+    DecodeAttn(AttnArgs a, const float* q, const float* r, const float* sink,
+               const __half* kc, const __half* vc, const __half* bias,
+               float* pm, float* pl, float* po, int nsplit) {
+  __shared__ float qs[kDecMaxGh][kFlashHd];
+  __shared__ float rs[kDecMaxGh][kFlashRel];
+  __shared__ float sks[kDecMaxGh];
+  __shared__ float sc[kDecMaxGh][kDecKeys];
+  __shared__ float red[kDecThreads / 32][kDecMaxGh];
+  __shared__ float ost[kDecMaxGh][kFlashHd];
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int wave = tid >> 5;
+  const int split = blockIdx.x;
+  const int g = blockIdx.y;
+  const int gh = a.nh / a.nkv;
+  const int pos = *a.pos0;
+  const int first = a.window > 0 ? max(0, pos - a.window + 1) : 0;
+  const int lo = first + split * kDecKeys;
+  const int hi = min(pos, lo + kDecKeys - 1);
+  const int nk = hi >= lo ? hi - lo + 1 : 0;
+  const int kvdim = a.nkv * kFlashHd;
+  for (int i = tid; i < gh * kFlashHd; i += kDecThreads)
+    qs[i / kFlashHd][i % kFlashHd] = __half2float(
+        __float2half(q[static_cast<std::size_t>(g * gh) * kFlashHd + i]));
+  for (int i = tid; i < gh * kFlashRel; i += kDecThreads)
+    rs[i / kFlashRel][i % kFlashRel] = __half2float(
+        __float2half(r[static_cast<std::size_t>(g * gh) * kFlashRel + i]));
+  if (tid < gh)
+    sks[tid] = sink[g * gh + tid];
+  __syncthreads();
+  float pmax[kDecMaxGh];
+  for (int h = 0; h < kDecMaxGh; ++h)
+    pmax[h] = kNegInf;
+  const int l16 = tid & 15;
+  const int kslot = tid >> 4;
+  float qreg[kDecMaxGh][8];
+  float rreg[kDecMaxGh];
+  for (int h = 0; h < kDecMaxGh; ++h) {
+    rreg[h] = h < gh ? rs[h][l16] : 0.0F;
+    for (int e = 0; e < 8; ++e)
+      qreg[h][e] = h < gh ? qs[h][l16 * 8 + e] : 0.0F;
+  }
+  for (int base = 0; base < nk; base += 16) {
+    const int kk = base + kslot;
+    const bool valid = kk < nk;
+    const int j = lo + (valid ? kk : 0);
+    const std::size_t jr = a.ring > 0 ? j % a.ring : j;
+    const uint4 w =
+        reinterpret_cast<const uint4*>(kc + jr * kvdim + g * kFlashHd)[l16];
+    const __half2* hp = reinterpret_cast<const __half2*>(&w);
+    float kf[8];
+    for (int e = 0; e < 4; ++e) {
+      const float2 f = __half22float2(hp[e]);
+      kf[2 * e] = f.x;
+      kf[2 * e + 1] = f.y;
+    }
+    const int dist = pos - j;
+    const float bv =
+        dist < a.extent
+            ? __half2float(
+                  bias[static_cast<std::size_t>(dist) * kFlashRel + l16])
+            : 0.0F;
+    float acc[kDecMaxGh];
+    float z[kDecMaxGh];
+    for (int h = 0; h < kDecMaxGh; ++h) {
+      float t = 0.0F;
+      for (int e = 0; e < 8; ++e)
+        t += qreg[h][e] * kf[e];
+      acc[h] = t;
+      z[h] = rreg[h] * bv;
+    }
+    for (int off = 8; off > 0; off >>= 1) {
+      for (int h = 0; h < kDecMaxGh; ++h) {
+        acc[h] += __shfl_xor(acc[h], off);
+        z[h] += __shfl_xor(z[h], off);
+      }
+    }
+    for (int h = 0; h < kDecMaxGh; ++h) {
+      if (h >= gh || !valid)
+        continue;
+      const float b = dist < a.extent ? __half2float(__float2half(z[h])) : 0.0F;
+      const float v = acc[h] * a.scale + b - sks[h];
+      if (l16 == h)
+        sc[h][kk] = v;
+      pmax[h] = fmaxf(pmax[h], v);
+    }
+  }
+  for (int h = 0; h < kDecMaxGh; ++h) {
+    float v = pmax[h];
+    for (int off = 16; off > 0; off >>= 1)
+      v = fmaxf(v, __shfl_xor(v, off));
+    if (lane == 0)
+      red[wave][h] = v;
+  }
+  __syncthreads();
+  float m[kDecMaxGh];
+  for (int h = 0; h < kDecMaxGh; ++h) {
+    float v = split == 0 ? 0.0F : kNegInf;
+    for (int w = 0; w < kDecThreads / 32; ++w)
+      v = fmaxf(v, red[w][h]);
+    m[h] = v;
+  }
+  __syncthreads();
+  float lsum[kDecMaxGh] = {};
+  for (int kk = tid; kk < nk; kk += kDecThreads) {
+    for (int h = 0; h < kDecMaxGh; ++h) {
+      if (h >= gh)
+        continue;
+      const float p = expf(sc[h][kk] - m[h]);
+      lsum[h] += p;
+      sc[h][kk] = __half2float(__float2half(p));
+    }
+  }
+  for (int h = 0; h < kDecMaxGh; ++h) {
+    float v = lsum[h];
+    for (int off = 16; off > 0; off >>= 1)
+      v += __shfl_xor(v, off);
+    if (lane == 0)
+      red[wave][h] = v;
+  }
+  __syncthreads();
+  float l[kDecMaxGh];
+  for (int h = 0; h < kDecMaxGh; ++h) {
+    float v = split == 0 ? expf(-m[h]) : 0.0F;
+    for (int w = 0; w < kDecThreads / 32; ++w)
+      v += red[w][h];
+    l[h] = v;
+  }
+  const int d = tid & (kFlashHd - 1);
+  const int part = tid / kFlashHd;
+  float o[kDecMaxGh] = {};
+#pragma unroll 4
+  for (int jb = ((lo >> 3) << 3) + part * 8; jb <= hi; jb += 16) {
+    const std::size_t jr = a.ring > 0 ? jb % a.ring : jb;
+    const uint4 w = *reinterpret_cast<const uint4*>(
+        vc +
+        ((static_cast<std::size_t>(g) * a.vblocks + (jr >> 6)) * kFlashHd + d) *
+            64 +
+        (jr & 63));
+    const __half* hv = reinterpret_cast<const __half*>(&w);
+    for (int e = 0; e < 8; ++e) {
+      const int j = jb + e;
+      if (j < lo || j > hi)
+        continue;
+      const float vv = __half2float(hv[e]);
+      for (int h = 0; h < kDecMaxGh; ++h)
+        if (h < gh)
+          o[h] += sc[h][j - lo] * vv;
+    }
+  }
+  if (part == 1)
+    for (int h = 0; h < kDecMaxGh; ++h)
+      ost[h][d] = o[h];
+  __syncthreads();
+  if (part == 0) {
+    for (int h = 0; h < kDecMaxGh; ++h) {
+      if (h >= gh)
+        continue;
+      const std::size_t idx =
+          static_cast<std::size_t>(g * gh + h) * nsplit + split;
+      po[idx * kFlashHd + d] = o[h] + ost[h][d];
+      if (d == 0) {
+        pm[idx] = m[h];
+        pl[idx] = l[h];
+      }
+    }
+  }
+}
+
 // pooled per-block key bounds: kmm[b][g][0|1][128] = min / max over the 64 keys
 __global__ void PoolKeys(const __half* kc, __half* kmm, const int* pos0, int n,
                          int nkv) {
@@ -2888,7 +3065,13 @@ struct Session::Impl : Scratch {
         PoolKeys<<<dim3((n + kBlockKeys - 1) / kBlockKeys + 1, nkv), kFlashHd,
                    0, stream>>>(sl.k, sl.kmm, d_pos, n, nkv);
       }
-      if (sparse_now) {
+      if (n == 1 && !sparse_now && nh / nkv <= kDecMaxGh) {
+        const int nsd = (span + kDecKeys - 1) / kDecKeys;
+        DecodeAttn<<<dim3(nsd, nkv), kDecThreads, 0, stream>>>(
+            aa, q, r, sink, sl.k, sl.v, bias_w, split_m, split_l, split_o, nsd);
+        FlashCombine<<<dim3(1, nh), 128, 0, stream>>>(split_m, split_l, split_o,
+                                                      att, nh, nsd);
+      } else if (sparse_now) {
         const int ntile = (n + kFlashQ - 1) / kFlashQ;
         SelectBlocks<<<dim3(ntile, nh), 256, kMaxSparseBlocks * sizeof(float),
                        stream>>>(q, sl.kmm, d_pos, n, nh, nkv, blist, bcount);
