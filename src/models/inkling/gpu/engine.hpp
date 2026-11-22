@@ -29,6 +29,9 @@ public:
   static constexpr std::uint32_t kMaxVerifyRows = 8;
   [[nodiscard]] std::span<const float> Logits() const noexcept;
   [[nodiscard]] std::span<const float> Logits(std::uint32_t row) const noexcept;
+  /// After AppendAll: keeps only the first `keep` rows (cache rows past them are overwritten by the
+  /// next append and the convolution history is rewound to that point).
+  void KeepRows(std::uint32_t keep);
   /// Drops cache rows past `position`; later appends overwrite them.
   void Rewind(std::uint32_t position) noexcept;
   [[nodiscard]] std::uint32_t Position() const noexcept;

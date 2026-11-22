@@ -28,6 +28,7 @@ constexpr int kConvTaps = 4;
 constexpr int kHistory = 3;
 constexpr int kMaxBatch = 4096;
 constexpr std::size_t kBankMin = 3072;
+constexpr int kWinLen = 3 + 8;  // history + up to 8 verification inputs per channel
 constexpr std::size_t kMaxVerifyRows = 8;
 constexpr std::uint32_t kNpuSlice = 1024;
 constexpr int kFlashHd = 128;
@@ -368,39 +369,45 @@ __global__ void TauScale(float* x, int per_token, const int* pos0,
 
 __global__ void Conv(const float* cur, const float* w, const float* dyn,
                      int heads, float* hist, float* out, int ch, int n,
-                     const float* add) {
+                     const float* add, float* win) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= ch)
     return;
   const int per = dyn != nullptr ? ch / heads : ch;
   const float norm =
       rsqrtf(static_cast<float>((dyn != nullptr ? 2 : 1) * kConvTaps + 1));
-  float win[kConvTaps];
+  float wn[kConvTaps];
   for (int k = 0; k < kHistory; ++k)
-    win[k] = hist[c * kHistory + k];
+    wn[k] = hist[c * kHistory + k];
+  if (win != nullptr) {
+    for (int k = 0; k < kHistory; ++k)
+      win[c * kWinLen + k] = wn[k];
+  }
   float wt[kConvTaps];
   for (int j = 0; j < kConvTaps; ++j)
     wt[j] = w[c * kConvTaps + j];
   for (int t = 0; t < n; ++t) {
     const float x = cur[static_cast<std::size_t>(t) * ch + c];
-    win[kHistory] = x;
+    wn[kHistory] = x;
+    if (win != nullptr)
+      win[c * kWinLen + kHistory + t] = x;
     float o = 0.0F;
     for (int j = 0; j < kConvTaps; ++j)
-      o += wt[j] * win[j];
+      o += wt[j] * wn[j];
     if (dyn != nullptr) {
       const float* d = dyn + static_cast<std::size_t>(t) * heads * kConvTaps +
                        (c / per) * kConvTaps;
       for (int lag = 0; lag < kConvTaps; ++lag)
-        o += d[lag] * win[kHistory - lag];
+        o += d[lag] * wn[kHistory - lag];
     }
     out[static_cast<std::size_t>(t) * ch + c] =
         (x + o) * norm +
         (add != nullptr ? add[static_cast<std::size_t>(t) * ch + c] : 0.0F);
     for (int k = 0; k < kHistory; ++k)
-      win[k] = win[k + 1];
+      wn[k] = wn[k + 1];
   }
   for (int k = 0; k < kHistory; ++k)
-    hist[c * kHistory + k] = win[k];
+    hist[c * kHistory + k] = wn[k];
 }
 
 __global__ void ConvT(const float* cur, const float* w, const float* dyn,
@@ -444,6 +451,25 @@ __global__ void ConvHist(const float* cur, float* hist, int ch, int n) {
   }
   for (int k = 0; k < kHistory; ++k)
     hist[c * kHistory + k] = nh[k];
+}
+
+struct HistEntry {
+  float* hist;
+  int ch;
+};
+
+// after a verification batch: history = the window after `keep` of the batch's inputs
+__global__ void FixHist(const HistEntry* entries, int keep) {
+  const HistEntry e = entries[blockIdx.y];
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= e.ch)
+    return;
+  const float* win = e.hist + static_cast<std::size_t>(e.ch) * kHistory;
+  float v[kHistory];
+  for (int m = 0; m < kHistory; ++m)
+    v[m] = win[c * kWinLen + keep + m];
+  for (int m = 0; m < kHistory; ++m)
+    e.hist[c * kHistory + m] = v[m];
 }
 
 struct StatePtrs {
@@ -1801,6 +1827,10 @@ struct Session::Impl : Scratch {
   };
   std::vector<Slot> slots;
   bool banked{false};
+  HistEntry* hist_entries{nullptr};
+  int n_hist_entries{0};
+  int last_rows{0};
+  std::uint32_t pos_before_last{0};
   int n_logit_rows{1};
   bool all_rows{false};  // keep the logits of every row (verification batches)
   std::size_t bank_rows{2048};
@@ -2039,7 +2069,7 @@ struct Session::Impl : Scratch {
     }
     Conv<<<(ch + 127) / 128, 128, 0, stream>>>(
         in_, static_cast<const float*>(w.dev), dyn, heads, hist, out, ch, n,
-        add);
+        add, all_rows && n <= static_cast<int>(kMaxVerifyRows) ? hist + static_cast<std::size_t>(ch) * kHistory : nullptr);
   }
   float* Pool() { return block_pool[pool_used++]; }
 
@@ -3052,10 +3082,23 @@ bool Session::AppendAll(std::span<const std::int32_t> tokens, std::string* error
       *error = "verification batch must be 1..8 tokens within the context";
     return false;
   }
+  impl_->pos_before_last = impl_->position;
+  impl_->last_rows = static_cast<int>(tokens.size());
   impl_->all_rows = true;
   impl_->Forward(tokens);
   impl_->all_rows = false;
   return true;
+}
+
+void Session::KeepRows(std::uint32_t keep) {
+  auto& i = *impl_;
+  if (static_cast<int>(keep) >= i.last_rows)
+    return;
+  const int max_ch = std::max<int>(static_cast<int>(i.m->config.hidden_size), static_cast<int>(i.m->config.num_kv * i.m->config.head_dim));
+  FixHist<<<dim3((max_ch + 255) / 256, i.n_hist_entries), 256, 0, i.stream>>>(i.hist_entries, static_cast<int>(keep));
+  HIP_OK(hipStreamSynchronize(i.stream));
+  i.position = i.pos_before_last + keep;
+  i.last_rows = static_cast<int>(keep);
 }
 
 void Session::Rewind(std::uint32_t position) noexcept {
@@ -3128,10 +3171,10 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
                        c.num_kv * 2 * kFlashHd * 2));
     }
     sl.v = static_cast<__half*>(i.AllocBytes(rows * kv * 2));
-    sl.hist_k = static_cast<float*>(i.AllocBytes(kv * kHistory * 4));
-    sl.hist_v = static_cast<float*>(i.AllocBytes(kv * kHistory * 4));
-    sl.hist_attn = static_cast<float*>(i.AllocBytes(h * kHistory * 4));
-    sl.hist_ffn = static_cast<float*>(i.AllocBytes(h * kHistory * 4));
+    sl.hist_k = static_cast<float*>(i.AllocBytes(kv * (kHistory + kWinLen) * 4));
+    sl.hist_v = static_cast<float*>(i.AllocBytes(kv * (kHistory + kWinLen) * 4));
+    sl.hist_attn = static_cast<float*>(i.AllocBytes(h * (kHistory + kWinLen) * 4));
+    sl.hist_ffn = static_cast<float*>(i.AllocBytes(h * (kHistory + kWinLen) * 4));
   }
   const std::size_t qd = static_cast<std::size_t>(c.num_heads) * c.head_dim;
   auto alloc_scratch = [&](Scratch& sc, std::size_t b) {
@@ -3248,6 +3291,18 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
                      hipMemcpyHostToDevice));
   }
   HIP_OK(hipStreamCreateWithFlags(&i.stream, hipStreamNonBlocking));
+  {
+    std::vector<HistEntry> entries;
+    for (auto& sl : i.slots) {
+      entries.push_back({sl.hist_k, static_cast<int>(kv)});
+      entries.push_back({sl.hist_v, static_cast<int>(kv)});
+      entries.push_back({sl.hist_attn, static_cast<int>(h)});
+      entries.push_back({sl.hist_ffn, static_cast<int>(h)});
+    }
+    i.hist_entries = static_cast<HistEntry*>(i.AllocBytes(entries.size() * sizeof(HistEntry)));
+    HIP_OK(hipMemcpy(i.hist_entries, entries.data(), entries.size() * sizeof(HistEntry), hipMemcpyHostToDevice));
+    i.n_hist_entries = static_cast<int>(entries.size());
+  }
   if (state_->npu || std::getenv("INKLING_BANKS") != nullptr) {
     i.banked = true;
     i.bank_rows = state_->npu ? state_->npu_tokens : 2048;

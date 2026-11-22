@@ -127,6 +127,25 @@ int main(int argc, char** argv) {
       }
       std::printf("row %d: max |dlogit| %.4f, argmax batch %d seq %d\n", i, maxd, a0, a1);
     }
+    // KeepRows: batch of k, keep j, then one more token must match j sequential steps + that token
+    const std::int32_t extra = static_cast<std::int32_t>(ids[kPrefix + k]);
+    for (int j = 1; j < k; ++j) {
+      session->Reset();
+      (void)session->Append(prefix, &err);
+      for (int i = 0; i < j; ++i) (void)session->Append(std::span(&next[i], 1), &err);
+      (void)session->Append(std::span(&extra, 1), &err);
+      const auto ref_l = session->Logits();
+      const std::vector<float> ref(ref_l.begin(), ref_l.end());
+      session->Reset();
+      (void)session->Append(prefix, &err);
+      (void)session->AppendAll(next, &err);
+      session->KeepRows(static_cast<std::uint32_t>(j));
+      (void)session->Append(std::span(&extra, 1), &err);
+      const auto got = session->Logits();
+      double maxd = 0.0;
+      for (std::size_t q = 0; q < got.size(); ++q) maxd = std::max(maxd, std::fabs(static_cast<double>(got[q]) - ref[q]));
+      std::printf("keep %d of %d then +1 token: max |dlogit| %.4f (position %u)\n", j, k, maxd, session->Position());
+    }
     return 0;
   }
   if (argc < 3)
