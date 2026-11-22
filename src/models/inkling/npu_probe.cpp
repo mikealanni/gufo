@@ -65,14 +65,17 @@ int main(int argc, char** argv) {
   (void)hipMemcpy(d_q8, wq->data, wq->size_bytes, hipMemcpyHostToDevice);
 
   const int a_id = npu->NewBuffer(npu->ABytes(), &error);
+  const int a_lo = npu->NewBuffer(npu->ABytes(), &error);
   std::vector<int> b_ids;
   std::vector<int> c_ids;
+  std::vector<int> c_lo;
   for (std::uint32_t i = 0; i < kSlices; ++i) {
     const int b = npu->NewBuffer(npu->BBytes(), &error);
     rocm::NpuEncodeWeights(d_q8, kK, i * kSlice, kSlice, kK, 0, kK,
                            npu->Device(b), stream);
     b_ids.push_back(b);
     c_ids.push_back(npu->NewBuffer(npu->CBytes(), &error));
+    c_lo.push_back(npu->NewBuffer(npu->CBytes(), &error));
   }
   (void)hipStreamSynchronize(stream);
   for (const int b : b_ids)
@@ -115,7 +118,8 @@ int main(int argc, char** argv) {
     std::printf("run %d: %.2f ms (encode+3 slices+wait+decode)\n", run, ms);
   }
 
-  std::vector<float> out(static_cast<std::size_t>(kTokens) * kSlice * kSlices);
+  auto evaluate = [&](const char* label) {
+    std::vector<float> out(static_cast<std::size_t>(kTokens) * kSlice * kSlices);
   (void)hipMemcpy(out.data(), d_out, out.size() * sizeof(float),
                   hipMemcpyDeviceToHost);
   // CPU reference: Q8_0 rows, F16 activations, first kCheckTokens tokens
@@ -148,9 +152,20 @@ int main(int argc, char** argv) {
           std::max(max_rel, std::fabs(got - acc) / (std::fabs(acc) + 1.0));
     }
   }
+    std::printf("%s: rel RMS error %.5f; max rel %.4f\n", label, std::sqrt(sq_err / sq_ref), max_rel);
+  };
+  // hi pass only, then hi+lo
+  for (std::uint32_t i = 0; i < kSlices; ++i) {
+    rocm::NpuDecodeOutput(npu->Staged(stream, c_ids[i]), d_out, kTokens, kSlice, kSlice * kSlices, i * kSlice, false, stream);
+  }
+  (void)hipStreamSynchronize(stream);
+  evaluate("hi only");
+  for (std::uint32_t i = 0; i < kSlices; ++i) {
+    rocm::NpuDecodeOutput(npu->Staged(stream, c_lo[i]), d_out, kTokens, kSlice, kSlice * kSlices, i * kSlice, true, stream);
+  }
+  (void)hipStreamSynchronize(stream);
+  evaluate("hi + lo");
   const double flops = 2.0 * kTokens * kK * kSlice * kSlices;
-  std::printf("best %.2f ms = %.2f TFLOPs; rel RMS error %.4f; max rel %.4f\n",
-              best_ms, flops / best_ms / 1e9, std::sqrt(sq_err / sq_ref),
-              max_rel);
+  std::printf("best %.2f ms = %.2f TFLOPs\n", best_ms, flops / best_ms / 1e9);
   return 0;
 }

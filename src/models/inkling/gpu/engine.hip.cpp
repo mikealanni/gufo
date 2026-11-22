@@ -14,6 +14,7 @@
 
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/npu_gemm.hpp"
 
 namespace gufo::models::inkling::gpu {
 namespace {
@@ -26,6 +27,8 @@ constexpr int kMaxStates = 8;
 constexpr int kConvTaps = 4;
 constexpr int kHistory = 3;
 constexpr int kMaxBatch = 4096;
+constexpr std::uint32_t kNpuTokens = 2048;
+constexpr std::uint32_t kNpuSlice = 1024;
 constexpr int kFlashHd = 128;
 constexpr int kWmmaMinTokens = 32;
 constexpr float kMixEps = 1e-6F;
@@ -1499,7 +1502,11 @@ struct ModelState {
   std::unordered_map<std::string, Tensor> tensors;
   std::vector<void*> allocations;
   std::size_t resident_bytes{0};
+  // optional NPU offload of the q / gate / k / v projections (INKLING_NPU=1)
+  std::unique_ptr<gufo::models::qwen38_flash_next::rocm::NpuGemm> npu;
+  std::unordered_map<std::string, std::vector<int>> npu_w;  // tensor -> 1024-row slices
   ~ModelState() {
+    npu.reset();
     for (void* p : allocations)
       (void)hipFree(p);
   }
@@ -1538,6 +1545,30 @@ std::shared_ptr<Model> Model::Load(const std::string& path,
   state->n_phys =
       cfg->num_layers -
       (cfg->loop_num_loops - 1) * (cfg->loop_core_end - cfg->loop_core_start);
+  hipStream_t npu_stream = nullptr;
+  if (const char* dir = std::getenv("GUFO_NPU_DIR");
+      dir != nullptr && std::getenv("INKLING_NPU") != nullptr) {
+    gufo::models::qwen38_flash_next::rocm::NpuGemm::Config nc;
+    nc.xclbin = std::string(dir) + "/runtime_mk/final_4096xKx1024_128x64x128.xclbin";
+    nc.insts = std::string(dir) + "/runtime_mk/insts_2048x" +
+               std::to_string(cfg->hidden_size) + "x1024_128x64x128.txt";
+    nc.tokens = kNpuTokens;
+    nc.k = cfg->hidden_size;
+    nc.n = kNpuSlice;
+    std::string npu_error;
+    state->npu = gufo::models::qwen38_flash_next::rocm::NpuGemm::Create(nc, &npu_error);
+    if (state->npu) {
+      HIP_OK(hipStreamCreate(&npu_stream));
+    } else {
+      std::fprintf(stderr, "inkling: NPU unavailable: %s\n", npu_error.c_str());
+    }
+  }
+  const auto npu_name = [](std::string_view n) {
+    for (const char* suffix : {".attn_q.weight", ".attn_attn_gate.weight", ".attn_gate.weight", ".attn_k.weight", ".attn_v.weight"}) {
+      if (n.size() > std::strlen(suffix) && n.substr(n.size() - std::strlen(suffix)) == suffix) return true;
+    }
+    return false;
+  };
   for (const auto& info : reader->GetTensors()) {
     Tensor t;
     switch (info.type) {
@@ -1569,6 +1600,21 @@ std::shared_ptr<Model> Model::Load(const std::string& path,
       void* tmp = nullptr;
       HIP_OK(hipMalloc(&tmp, info.size_bytes));
       HIP_OK(hipMemcpy(tmp, info.data, info.size_bytes, hipMemcpyHostToDevice));
+      if (state->npu && t.type == kTypeQ8 && t.cols == cfg->hidden_size &&
+          npu_name(info.name)) {
+        std::vector<int> ids;
+        for (std::uint64_t r0 = 0; r0 < t.rows; r0 += kNpuSlice) {
+          const int id = state->npu->NewBuffer(state->npu->BBytes(), error);
+          gufo::models::qwen38_flash_next::rocm::NpuEncodeWeights(
+              tmp, static_cast<std::uint32_t>(t.cols), static_cast<std::uint32_t>(r0), kNpuSlice,
+              static_cast<std::uint32_t>(t.cols), 0, static_cast<std::uint32_t>(t.cols),
+              state->npu->Device(id), npu_stream);
+          ids.push_back(id);
+        }
+        HIP_OK(hipStreamSynchronize(npu_stream));
+        for (const int id : ids) state->npu->FinalizeWeights(id);
+        state->npu_w.emplace(std::string(info.name), std::move(ids));
+      }
       const std::size_t qs_bytes = t.type == kTypeQ8 ? t.cols : t.cols / 2;
       const std::size_t sc_bytes =
           t.type == kTypeQ8 ? (t.cols / 32) * 2 : t.cols / 16;
@@ -2018,6 +2064,62 @@ struct Session::Impl : Scratch {
     }
   }
 
+  // NPU buffers of this session: activation streams for the three layer inputs and
+  // eight 1024-column result slices (q x3, gate x3, k, v)
+  int npu_a[3]{-1, -1, -1};
+  int npu_c[8]{-1, -1, -1, -1, -1, -1, -1, -1};
+
+  void NpuQkv(LayerCtx& L) {
+    namespace rocm = gufo::models::qwen38_flash_next::rocm;
+    auto& npu = *m->npu;
+    const std::uint32_t h = m->config.hidden_size;
+    const int n = L.n;
+    const auto& wq = m->npu_w.at(m->P(L.p, "attn_q.weight"));
+    const auto& wg = m->npu_w.at(m->P(L.p, "attn_gate.weight"));
+    const auto& wk = m->npu_w.at(m->P(L.p, "attn_k.weight"));
+    const auto& wv = m->npu_w.at(m->P(L.p, "attn_v.weight"));
+    const bool k_shared = L.inp[1] == L.inp[0];
+    const bool v_shared = L.inp[2] == L.inp[0];
+    const int qd = static_cast<int>(wq.size()) * static_cast<int>(kNpuSlice);
+    for (int r0 = 0; r0 < n; r0 += static_cast<int>(kNpuTokens)) {
+      const int rows = std::min<int>(kNpuTokens, n - r0);
+      const std::uint32_t enc = static_cast<std::uint32_t>((rows + 127) / 128 * 128);
+      rocm::NpuEncodeActivations(L.inh[0] + static_cast<std::size_t>(r0) * h, h, enc, h, 0, h, npu.Device(npu_a[0]), stream);
+      if (!k_shared)
+        rocm::NpuEncodeActivations(L.inh[1] + static_cast<std::size_t>(r0) * h, h, enc, h, 0, h, npu.Device(npu_a[1]), stream);
+      if (!v_shared)
+        rocm::NpuEncodeActivations(L.inh[2] + static_cast<std::size_t>(r0) * h, h, enc, h, 0, h, npu.Device(npu_a[2]), stream);
+      std::vector<int> b;
+      std::vector<int> c;
+      for (std::size_t i = 0; i < wq.size(); ++i) {
+        b.push_back(wq[i]);
+        c.push_back(npu_c[i]);
+      }
+      for (std::size_t i = 0; i < wg.size(); ++i) {
+        b.push_back(wg[i]);
+        c.push_back(npu_c[3 + i]);
+      }
+      if (k_shared) {
+        b.push_back(wk[0]);
+        c.push_back(npu_c[6]);
+      }
+      if (v_shared) {
+        b.push_back(wv[0]);
+        c.push_back(npu_c[7]);
+      }
+      npu.Submit(stream, npu_a[0], b.data(), c.data(), static_cast<int>(b.size()));
+      if (!k_shared) npu.Submit(stream, npu_a[1], &wk[0], &npu_c[6], 1);
+      if (!v_shared) npu.Submit(stream, npu_a[2], &wv[0], &npu_c[7], 1);
+      npu.Wait(stream);
+      for (std::size_t i = 0; i < wq.size(); ++i)
+        rocm::NpuDecodeOutput(npu.Staged(stream, npu_c[i]), q + static_cast<std::size_t>(r0) * qd, rows, kNpuSlice, qd, i * kNpuSlice, false, stream);
+      for (std::size_t i = 0; i < wg.size(); ++i)
+        rocm::NpuDecodeOutput(npu.Staged(stream, npu_c[3 + i]), gate + static_cast<std::size_t>(r0) * qd, rows, kNpuSlice, qd, i * kNpuSlice, false, stream);
+      rocm::NpuDecodeOutput(npu.Staged(stream, npu_c[6]), tmp + static_cast<std::size_t>(r0) * kNpuSlice, rows, kNpuSlice, kNpuSlice, 0, false, stream);
+      rocm::NpuDecodeOutput(npu.Staged(stream, npu_c[7]), v + static_cast<std::size_t>(r0) * kNpuSlice, rows, kNpuSlice, kNpuSlice, 0, false, stream);
+    }
+  }
+
   // stage 2: q/k/v/gate/rel/sink projections (GPU or NPU)
   void LayerQkv(LayerCtx& L) {
     const Config& c = m->config;
@@ -2033,11 +2135,17 @@ struct Session::Impl : Scratch {
     __half* const* inh = L.inh;
     const float* msgs_ = L.msgs;
     (void)c; (void)h; (void)nh; (void)nkv; (void)hd; (void)nrel; (void)p; (void)swa; (void)sl; (void)n; (void)nh_; (void)big; (void)inp; (void)inh; (void)msgs_;
-    Dense(m->T(m->P(p, "attn_q.weight")), inp[0], h, q, nh * hd, n, -1, inh[0]);
-    Dense(m->T(m->P(p, "attn_k.weight")), inp[1], h, tmp, nkv * hd, n, -1,
-          inh[1]);
-    Dense(m->T(m->P(p, "attn_v.weight")), inp[2], h, v, nkv * hd, n, -1,
-          inh[2]);
+    const bool npu_on = npu_a[0] >= 0 && big &&
+                        m->npu_w.count(m->P(p, "attn_q.weight")) != 0;
+    if (npu_on) {
+      NpuQkv(L);
+    } else {
+      Dense(m->T(m->P(p, "attn_q.weight")), inp[0], h, q, nh * hd, n, -1, inh[0]);
+      Dense(m->T(m->P(p, "attn_k.weight")), inp[1], h, tmp, nkv * hd, n, -1,
+            inh[1]);
+      Dense(m->T(m->P(p, "attn_v.weight")), inp[2], h, v, nkv * hd, n, -1,
+            inh[2]);
+    }
     Dense(m->T(m->P(p, "attn_rel.weight")), inp[0], h, r, nrel * nh, n, -1,
           inh[0]);
     if (!swa) {
@@ -2050,8 +2158,9 @@ struct Session::Impl : Scratch {
     }
     Dense(m->T(m->P(p, "attn_sink_proj.weight")), inp[0], h, sink, nh, n, -1,
           inh[0]);
-    Dense(m->T(m->P(p, "attn_gate.weight")), inp[0], h, gate, nh * hd, n, -1,
-          inh[0]);
+    if (!npu_on)
+      Dense(m->T(m->P(p, "attn_gate.weight")), inp[0], h, gate, nh * hd, n, -1,
+            inh[0]);
   }
 
   // stage 3: convolutions, clipping, KV store, attention -> att / atth
@@ -2532,6 +2641,11 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
   i.bank_out = i.Alloc(b * h);
   i.d_logits = i.Alloc(c.vocab_padded);
   i.d_pos = static_cast<int*>(i.AllocBytes(4));
+  if (state_->npu) {
+    std::string npu_error;
+    for (int j = 0; j < 3; ++j) i.npu_a[j] = state_->npu->NewBuffer(state_->npu->ABytes(), &npu_error);
+    for (int j = 0; j < 8; ++j) i.npu_c[j] = state_->npu->NewBuffer(state_->npu->CBytes(), &npu_error);
+  }
   i.xh0 = static_cast<__half*>(i.AllocBytes(b * h * 2));
   i.xh1 = static_cast<__half*>(i.AllocBytes(b * h * 2));
   i.xh2 = static_cast<__half*>(i.AllocBytes(b * h * 2));
