@@ -114,6 +114,23 @@ looped 3x -> 5.4B effective active; 24 physical layers, middle core looped).
   3k needs the NPU and/or int4 WMMA (iu4 skill) for experts. DSpark drafter (3 dense layers, block 8,
   markov head, arch `dflash`) downloaded to the hf cache; upstream spec: upstream src/models/dflash.cpp.
 
+## Prefill push (2026-11-21, real prose, GPU only)
+
+| ctx | pp tok/s | notes |
+| 2k | 1492 | was 1289; shared NVFP4 routed gemm, fused rms/half/conv-add, WMMA rel-bias flash |
+| 8k | 1393 | |
+| 32k | 1107 | sparse top-256 automatic at ctx >= 64k sessions |
+| 128k | 1035 | dense was 545 |
+
+- Profile at 2k (busy 1.37 s): routed experts 0.50 s (shared kernel, new NVFP4 type), dense WMMA 0.31 s,
+  flash ~0.10 s, ~0.38 s in bandwidth-bound elementwise passes (each [2k x 2304] f32 pass ~0.1 ms).
+- NPU: runtime M/K xclbin is reused; only instruction streams were generated
+  (tools/npu/runtime_mk/insts_2048x2304x1024 and insts_2048x3072x1024). Dense offload cannot carry the
+  model: NPU ~6x slower per GEMM at 2k tokens (LEARNINGS, Flint), so expected gain <= ~5%.
+- Reference point from the user: another Strix Halo engine runs this model at ~50 tg with its own drafter
+  head and ~1,000 tok/s prompts (19.6 GB NVFP4/MXFP8/BF16 weights).
+- Open: DSpark drafter (tg), F16 activation storage / more fusion (elementwise ~28%), dense gemm tile.
+
 ## Open questions / next steps (skill default order)
 
 1. CPU reference (`src/models/inkling/reference.cpp`) + config parser.
