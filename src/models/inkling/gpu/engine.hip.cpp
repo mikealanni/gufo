@@ -1638,7 +1638,7 @@ struct Session::Impl {
   }
   int *sorted{nullptr}, *tiles{nullptr};
   __half *xh{nullptr}, *act16{nullptr}, *xh0{nullptr}, *xh1{nullptr},
-      *xh2{nullptr}, *xhx{nullptr}, *atth{nullptr};
+      *xh2{nullptr}, *xhx{nullptr}, *atth{nullptr}, *cath{nullptr};
   signed char* xq{nullptr};
   float* xqs{nullptr};
   float *split_m{nullptr}, *split_l{nullptr}, *split_o{nullptr};
@@ -1816,12 +1816,14 @@ struct Session::Impl {
   void ControlStep(float* cur_, const float* message, std::uint32_t phys,
                    const char* group, int n) {
     const int h = static_cast<int>(m->config.hidden_size);
-    RmsRows(cur_, nullptr, cat, n, h, h, 2 * h);
-    RmsRows(message, nullptr, cat + h, n, h, h, 2 * h);
+    const bool big = n >= kWmmaMinTokens;
+    RmsRows(cur_, nullptr, cat, n, h, h, 2 * h, big ? cath : nullptr);
+    RmsRows(message, nullptr, cat + h, n, h, h, 2 * h,
+            big ? cath + h : nullptr);
     const std::string base =
         "blk." + std::to_string(phys) + ".loop_" + group + "_";
     Dense(m->T(base + "down.weight"), cat, 2 * h, low, m->config.loop_gate_rank,
-          n);
+          n, -1, big ? cath : nullptr);
     Dense(m->T(base + "gain.weight"), low, m->config.loop_gate_rank, gain, h,
           n);
     Dense(m->T(base + "forget.weight"), low, m->config.loop_gate_rank, forget,
@@ -2066,7 +2068,8 @@ struct Session::Impl {
     const Config& c = m->config;
     const int h = c.hidden_size, ne = c.expert_count, nu = c.expert_used,
               ff = c.expert_ff;
-    Dense(m->T(m->P(p, "ffn_gate_inp.weight")), x, h, router, ne, n);
+    Dense(m->T(m->P(p, "ffn_gate_inp.weight")), x, h, router, ne, n, -1,
+          xhx_in);
     Route<<<n, 256, 0, stream>>>(
         router,
         static_cast<const float*>(m->T(m->P(p, "exp_probs_b.bias")).dev), ne,
@@ -2387,6 +2390,7 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
   i.xh2 = static_cast<__half*>(i.AllocBytes(b * h * 2));
   i.xhx = static_cast<__half*>(i.AllocBytes(b * h * 2));
   i.atth = static_cast<__half*>(i.AllocBytes(b * qd * 2));
+  i.cath = static_cast<__half*>(i.AllocBytes(b * h * 4));
   i.rcounts = static_cast<unsigned int*>(
       i.AllocBytes(c.expert_count * sizeof(unsigned int)));
   i.rbounds =
