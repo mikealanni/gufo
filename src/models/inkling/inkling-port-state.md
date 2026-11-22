@@ -96,6 +96,24 @@ looped 3x -> 5.4B effective active; 24 physical layers, middle core looped).
   the content and generation does not stop at the final `<|end_message|>`; needs reasoning split + stop handling.
   No `~/run-gufo.sh` KIND yet; no snapshots (RAM/disk cache), no tools.
 
+## Depth and sparse attention (2026-11-21, real prose, GPU only)
+
+| depth | dense pp | dense tg | sparse(top256) pp | sparse tg |
+| 2k | 1289 | 24 | - | - |
+| 32k | 996 | 14.6 | 957 | 17.0 |
+| 64k | 809 | 10.8 | ~930 | ~17 |
+| 128k | 545 | 7.2 | 905 | 16.8 |
+
+- Sparse = sink 2 + local 16 + top-256 older 64-key blocks (Quest bound of the tile's mean query), only
+  the 8 full-attention slots; exact until ~17.7k tokens; automatic when session context >= 64k
+  (INKLING_SPARSE=0/1 forces). SWA slots use 3072-row ring buffers. Decode attention is split-K flash.
+- Needle (passphrase) retrieval at 128k: 50% and 90% depth found by dense and sparse; 10% depth fails
+  in BOTH (model/prompt limit, not sparse). Top 128 missed the 50% needle; 512 gave no gain and was slower.
+- Shared Flash-Next `DenseF16Gemm` for Q8 dense = same speed as the own WMMA dense (A/B, real prose).
+- GPU-only f16 ceiling: ~9.2 GFLOP/token at ~24 TFLOPs (best shared-kernel level) = ~2.6k tok/s at 2k;
+  3k needs the NPU and/or int4 WMMA (iu4 skill) for experts. DSpark drafter (3 dense layers, block 8,
+  markov head, arch `dflash`) downloaded to the hf cache; upstream spec: upstream src/models/dflash.cpp.
+
 ## Open questions / next steps (skill default order)
 
 1. CPU reference (`src/models/inkling/reference.cpp`) + config parser.
