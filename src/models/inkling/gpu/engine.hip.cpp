@@ -224,6 +224,50 @@ __global__ void GemmDp4(const unsigned char* w, std::size_t row_bytes, int cols,
         acc * (scale != nullptr ? scale[g] : 1.0F);
 }
 
+// Y[t][r] = W[r] . x[t] for NT tokens with int8 activations; the weight row is
+// read once.
+template<int NT>
+__global__ void GemmDp4Q8N(const unsigned char* w, std::size_t row_bytes,
+                           int cols, int rows, const signed char* xq,
+                           const float* xs, float* y, std::size_t ldy) {
+  const int lane = threadIdx.x % warpSize;
+  const int r = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
+  if (r >= rows)
+    return;
+  const unsigned char* row = w + static_cast<std::size_t>(r) * row_bytes;
+  float acc[NT] = {};
+  for (int u = lane; u < cols / 32; u += warpSize) {
+    const float d =
+        __half2float(*reinterpret_cast<const __half*>(row + cols + u * 2));
+    const uint4* wv = reinterpret_cast<const uint4*>(row + u * 32);
+    const uint4 w0 = wv[0];
+    const uint4 w1 = wv[1];
+    for (int t = 0; t < NT; ++t) {
+      const uint4* xv = reinterpret_cast<const uint4*>(
+          xq + static_cast<std::size_t>(t) * cols + u * 32);
+      const uint4 x0 = xv[0];
+      const uint4 x1 = xv[1];
+      int a = Dot4(w0.x, x0.x, 0);
+      a = Dot4(w0.y, x0.y, a);
+      a = Dot4(w0.z, x0.z, a);
+      a = Dot4(w0.w, x0.w, a);
+      a = Dot4(w1.x, x1.x, a);
+      a = Dot4(w1.y, x1.y, a);
+      a = Dot4(w1.z, x1.z, a);
+      a = Dot4(w1.w, x1.w, a);
+      acc[t] += static_cast<float>(a) * d *
+                xs[static_cast<std::size_t>(t) * (cols / 32) + u];
+    }
+  }
+  for (int t = 0; t < NT; ++t) {
+    float a = acc[t];
+    for (int off = warpSize / 2; off > 0; off >>= 1)
+      a += __shfl_down(a, off);
+    if (lane == 0)
+      y[static_cast<std::size_t>(t) * ldy + r] = a;
+  }
+}
+
 // Y[t][r] = W[r] . X[t]; one wave per output row, kTokenTile tokens per launch
 // row.
 template<int TY>
@@ -500,24 +544,23 @@ __global__ void Mix(StatePtrs blocks, const float* cur, const float* query,
                     int nq, int h, int n, float* out) {
   __shared__ float inv[kMaxStates];
   __shared__ float score[4][kMaxStates];
+  __shared__ float wgt[4][kMaxStates];
   const int t = blockIdx.x;
   const int ns = blocks.count + 1;
   const int wave = threadIdx.x / warpSize;
   const int lane = threadIdx.x % warpSize;
-  const float* st[kMaxStates];
-  for (int s = 0; s < blocks.count; ++s)
-    st[s] = blocks.p[s] + static_cast<std::size_t>(t) * h;
-  st[blocks.count] = cur + static_cast<std::size_t>(t) * h;
+  const std::size_t toff = static_cast<std::size_t>(t) * h;
   if (wave < ns) {
-    const float* x = st[0];
-    for (int s = 1; s <= wave; ++s)
-      x = st[s];
+    const float4* x = reinterpret_cast<const float4*>(
+        (wave < blocks.count ? blocks.p[wave] : cur) + toff);
     float acc[5] = {};
-    for (int i = lane; i < h; i += warpSize) {
-      const float v = x[i];
-      acc[0] += v * v;
-      for (int q = 0; q < nq; ++q)
-        acc[1 + q] += v * query[q * h + i];
+    for (int i = lane; i < h / 4; i += warpSize) {
+      const float4 v = x[i];
+      acc[0] += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+      for (int q = 0; q < nq; ++q) {
+        const float4 w = reinterpret_cast<const float4*>(query + q * h)[i];
+        acc[1 + q] += v.x * w.x + v.y * w.y + v.z * w.z + v.w * w.w;
+      }
     }
     for (int k = 0; k < 5; ++k) {
       for (int off = warpSize / 2; off > 0; off >>= 1)
@@ -530,22 +573,29 @@ __global__ void Mix(StatePtrs blocks, const float* cur, const float* query,
     }
   }
   __syncthreads();
-  for (int q = 0; q < nq; ++q) {
+  if (threadIdx.x < nq) {
+    const int q = threadIdx.x;
     float mx = -1e30F;
     for (int s = 0; s < ns; ++s)
       mx = fmaxf(mx, score[q][s]);
-    float e[kMaxStates];
     float den = 0.0F;
     for (int s = 0; s < ns; ++s) {
-      e[s] = expf(score[q][s] - mx);
-      den += e[s];
+      wgt[q][s] = expf(score[q][s] - mx);
+      den += wgt[q][s];
     }
-    for (int i = threadIdx.x; i < h; i += blockDim.x) {
-      float a = 0.0F;
-      for (int s = 0; s < ns; ++s)
-        a += e[s] / den * st[s][i] * inv[s];
-      out[(static_cast<std::size_t>(q) * n + t) * h + i] = a;
+    for (int s = 0; s < ns; ++s)
+      wgt[q][s] = wgt[q][s] / den * inv[s];
+  }
+  __syncthreads();
+  for (int i = threadIdx.x; i < h; i += blockDim.x) {
+    float a[4] = {};
+    for (int s = 0; s < ns; ++s) {
+      const float v = (s < blocks.count ? blocks.p[s] : cur)[toff + i];
+      for (int q = 0; q < nq; ++q)
+        a[q] += wgt[q][s] * v;
     }
+    for (int q = 0; q < nq; ++q)
+      out[(static_cast<std::size_t>(q) * n + t) * h + i] = a[q];
   }
 }
 
@@ -2262,6 +2312,30 @@ struct Session::Impl : Scratch {
               static_cast<int>(w.cols), nrows, nullptr, nullptr, nullptr, xq,
               xqs, yout);
       return;
+    }
+    if (n >= 2 && n <= 8 && w.type == kTypeQ8 && ldx == w.cols && !no_dp4) {
+      QuantRows<<<dim3(n, w.cols / 32), 32, 0, stream>>>(
+          xin, xq, xqs, static_cast<int>(w.cols));
+      const int rpb8 = kThreads * 2 / 32;
+      const dim3 g8((nrows + rpb8 - 1) / rpb8);
+      const auto* wp = static_cast<const unsigned char*>(w.dev);
+#define INKLING_DP4N(NT)                                                       \
+  case NT:                                                                     \
+    GemmDp4Q8N<NT><<<g8, kThreads * 2, 0, stream>>>(                           \
+        wp, w.row_bytes, static_cast<int>(w.cols), nrows, xq, xqs, yout, ldy); \
+    return;
+      switch (n) {
+        INKLING_DP4N(2)
+        INKLING_DP4N(3)
+        INKLING_DP4N(4)
+        INKLING_DP4N(5)
+        INKLING_DP4N(6)
+        INKLING_DP4N(7)
+        INKLING_DP4N(8)
+        default:
+          break;
+      }
+#undef INKLING_DP4N
     }
     if (n >= kWmmaMinTokens && nrows % kTileN == 0 &&
         ldy == static_cast<std::size_t>(nrows) &&
