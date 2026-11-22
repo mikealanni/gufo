@@ -4057,8 +4057,8 @@ const InklingTextRunnerState& RequireInklingState(
 
 class InklingTextRunner final : public HipTextModelRunner {
 public:
-  static constexpr std::size_t kPrefillChunk = 4096;
-  static constexpr std::size_t kWarmupTokens = 2048;
+  static constexpr std::size_t kPrefillChunk = 8192;
+  static constexpr std::size_t kWarmupTokens = 8192;
 
   InklingTextRunner(std::shared_ptr<InklingModel> model,
                     std::unique_ptr<tokenization::QwenTokenizer> tokenizer,
@@ -4145,7 +4145,7 @@ public:
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
                 .prefix_reuse = true,
-                .prefill_grid_tokens = 4096,
+                .prefill_grid_tokens = 8192,
             },
     };
   }

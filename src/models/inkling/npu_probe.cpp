@@ -119,49 +119,53 @@ int main(int argc, char** argv) {
   }
 
   auto evaluate = [&](const char* label) {
-    std::vector<float> out(static_cast<std::size_t>(kTokens) * kSlice * kSlices);
-  (void)hipMemcpy(out.data(), d_out, out.size() * sizeof(float),
-                  hipMemcpyDeviceToHost);
-  // CPU reference: Q8_0 rows, F16 activations, first kCheckTokens tokens
-  const auto* q8 = static_cast<const std::uint8_t*>(wq->data);
-  double max_rel = 0.0;
-  double sq_err = 0.0;
-  double sq_ref = 0.0;
-  const std::size_t row_bytes = kK / 32 * 34;
-  for (std::uint32_t r = 0; r < kSlice * kSlices && r < rows; ++r) {
-    std::vector<float> w(kK);
-    for (std::uint32_t b = 0; b < kK / 32; ++b) {
-      const std::uint8_t* blk = q8 + r * row_bytes + b * 34;
-      __half hh;
-      std::memcpy(&hh, blk, 2);
-      const float d = __half2float(hh);
-      for (int i = 0; i < 32; ++i)
-        w[b * 32 + i] =
-            d * static_cast<float>(static_cast<std::int8_t>(blk[2 + i]));
+    std::vector<float> out(static_cast<std::size_t>(kTokens) * kSlice *
+                           kSlices);
+    (void)hipMemcpy(out.data(), d_out, out.size() * sizeof(float),
+                    hipMemcpyDeviceToHost);
+    // CPU reference: Q8_0 rows, F16 activations, first kCheckTokens tokens
+    const auto* q8 = static_cast<const std::uint8_t*>(wq->data);
+    double max_rel = 0.0;
+    double sq_err = 0.0;
+    double sq_ref = 0.0;
+    const std::size_t row_bytes = kK / 32 * 34;
+    for (std::uint32_t r = 0; r < kSlice * kSlices && r < rows; ++r) {
+      std::vector<float> w(kK);
+      for (std::uint32_t b = 0; b < kK / 32; ++b) {
+        const std::uint8_t* blk = q8 + r * row_bytes + b * 34;
+        __half hh;
+        std::memcpy(&hh, blk, 2);
+        const float d = __half2float(hh);
+        for (int i = 0; i < 32; ++i)
+          w[b * 32 + i] =
+              d * static_cast<float>(static_cast<std::int8_t>(blk[2 + i]));
+      }
+      for (int t = 0; t < kCheckTokens; ++t) {
+        double acc = 0.0;
+        for (std::uint32_t k = 0; k < kK; ++k)
+          acc += static_cast<double>(w[k]) *
+                 __half2float(host_x[static_cast<std::size_t>(t) * kK + k]);
+        const double got =
+            out[static_cast<std::size_t>(t) * kSlice * kSlices + r];
+        sq_err += (got - acc) * (got - acc);
+        sq_ref += acc * acc;
+        max_rel =
+            std::max(max_rel, std::fabs(got - acc) / (std::fabs(acc) + 1.0));
+      }
     }
-    for (int t = 0; t < kCheckTokens; ++t) {
-      double acc = 0.0;
-      for (std::uint32_t k = 0; k < kK; ++k)
-        acc += static_cast<double>(w[k]) *
-               __half2float(host_x[static_cast<std::size_t>(t) * kK + k]);
-      const double got =
-          out[static_cast<std::size_t>(t) * kSlice * kSlices + r];
-      sq_err += (got - acc) * (got - acc);
-      sq_ref += acc * acc;
-      max_rel =
-          std::max(max_rel, std::fabs(got - acc) / (std::fabs(acc) + 1.0));
-    }
-  }
-    std::printf("%s: rel RMS error %.5f; max rel %.4f\n", label, std::sqrt(sq_err / sq_ref), max_rel);
+    std::printf("%s: rel RMS error %.5f; max rel %.4f\n", label,
+                std::sqrt(sq_err / sq_ref), max_rel);
   };
   // hi pass only, then hi+lo
   for (std::uint32_t i = 0; i < kSlices; ++i) {
-    rocm::NpuDecodeOutput(npu->Staged(stream, c_ids[i]), d_out, kTokens, kSlice, kSlice * kSlices, i * kSlice, false, stream);
+    rocm::NpuDecodeOutput(npu->Staged(stream, c_ids[i]), d_out, kTokens, kSlice,
+                          kSlice * kSlices, i * kSlice, false, stream);
   }
   (void)hipStreamSynchronize(stream);
   evaluate("hi only");
   for (std::uint32_t i = 0; i < kSlices; ++i) {
-    rocm::NpuDecodeOutput(npu->Staged(stream, c_lo[i]), d_out, kTokens, kSlice, kSlice * kSlices, i * kSlice, true, stream);
+    rocm::NpuDecodeOutput(npu->Staged(stream, c_lo[i]), d_out, kTokens, kSlice,
+                          kSlice * kSlices, i * kSlice, true, stream);
   }
   (void)hipStreamSynchronize(stream);
   evaluate("hi + lo");

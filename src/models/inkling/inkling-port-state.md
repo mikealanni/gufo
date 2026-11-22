@@ -131,6 +131,26 @@ looped 3x -> 5.4B effective active; 24 physical layers, middle core looped).
   head and ~1,000 tok/s prompts (19.6 GB NVFP4/MXFP8/BF16 weights).
 - Open: DSpark drafter (tg), F16 activation storage / more fusion (elementwise ~28%), dense gemm tile.
 
+## NPU two-bank prefill (2026-11-21)
+
+- NPU (shared runtime-M/K block-float GEMM, single pass, ~1.3% RMS per projection) takes q/gate/k/v
+  (3+3+1+1 slices of 1024 rows, K=2304) and the attention output (3 slices, K=3072 program) per bank-layer.
+  Weights encoded from the original Q8_0 at load. Probe: 3 slices at M=2048 = 1.6 ms (same as GPU).
+- Two token banks (own scratch, interleaved per layer: A.qkv-begin | B.moe | A.qkv-end A.attn A.out |
+  B.front B.qkv-begin | A.moe ...) so one bank's NPU work hides behind the other's MoE. Banks of 2048 rows
+  cost the GPU path ~6% (expert tile fill) and the NPU gives ~9% back; 4096-row banks (M=4096 program,
+  batches 3072-8192) remove the penalty. Batches < 3072 stay on the plain GPU path.
+- Results (real prose, release-npu build, INKLING_NPU=1 INKLING_NPU_M=4096): 4k 1697, 8k ~1786, 32k 1656,
+  64k ~1590, 128k 1584 tok/s; 2k stays ~1500 (GPU path). `gufo serve` (NPU env via ~/run-gufo.sh kind
+  inkling, 8192 prefill chunks): 18.7k-token prompt 1631 tok/s, coherent.
+- Quality: KL(GPU||NPU) of the last-token distribution over 12 prose windows of 4096 tokens: mean 0.0026,
+  max 0.0149, top-1 agree 12/12. NPU memory traffic slows the expert GEMMs ~15% (why the net gain is ~9-10%).
+- Env: INKLING_NPU=1, GUFO_NPU_DIR=<repo>/tools/npu, INKLING_NPU_M=2048|4096, INKLING_NPU_PARTS bitmask
+  (1 q, 2 gate, 4 k, 8 v), INKLING_NPU_OUT=0 disables the output projection. Build: cmake -B build/release-npu
+  --preset release -DGUFO_ENABLE_NPU=ON -DGUFO_XRT_INCLUDE_DIR=.../xrt/include.
+- Not done: other-model regression for the shared-kernel edits (NVFP4 weight type, routed empty-tile
+  return); merge.
+
 ## Open questions / next steps (skill default order)
 
 1. CPU reference (`src/models/inkling/reference.cpp`) + config parser.

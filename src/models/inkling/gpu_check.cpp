@@ -55,6 +55,36 @@ int main(int argc, char** argv) {
     std::printf("\n");
     return 0;
   }
+  if (argc >= 6 && std::string(argv[2]) == "--windows") {
+    // --windows <text file> <count> <len> <out.bin>: final-token logits of
+    // count prose windows
+    std::string err;
+    auto reader = gufo::core::GgufReader::OpenFile(argv[1], &err);
+    auto tok = gufo::tokenization::QwenTokenizer::CreateFromGguf(*reader, &err);
+    std::ifstream in(argv[3]);
+    std::stringstream ss;
+    ss << in.rdbuf();
+    const auto ids = tok->Encode(ss.str(), {});
+    const int count = std::atoi(argv[4]);
+    const int len = std::atoi(argv[5]);
+    std::ofstream out(argv[6], std::ios::binary);
+    auto model = gufo::models::inkling::gpu::Model::Load(argv[1], &err);
+    auto session =
+        model->CreateSession(static_cast<std::uint32_t>(len) + 16, &err);
+    for (int w = 0; w < count; ++w) {
+      session->Reset();
+      std::vector<std::int32_t> win;
+      for (int i = 0; i < len; ++i)
+        win.push_back(static_cast<std::int32_t>(
+            ids[(static_cast<std::size_t>(w) * len + i) % ids.size()]));
+      if (!session->Append(win, &err))
+        return 1;
+      const auto l = session->Logits();
+      out.write(reinterpret_cast<const char*>(l.data()),
+                static_cast<std::streamsize>(l.size() * sizeof(float)));
+    }
+    return 0;
+  }
   if (argc < 3)
     return 2;
   std::string error;

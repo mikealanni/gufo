@@ -1504,10 +1504,13 @@ struct ModelState {
   std::size_t resident_bytes{0};
   // optional NPU offload of the q / gate / k / v projections (INKLING_NPU=1)
   std::unique_ptr<gufo::models::qwen38_flash_next::rocm::NpuGemm> npu;
-  int npu_prog_o{-1}, npu_prog_o_small{-1};  // K=3072 programs for the attention output
-  int npu_prog_small{-1};  // M=2048 program for banks of at most 2048 rows
-  std::uint32_t npu_tokens{2048};  // rows of the runtime-M program = rows of one bank
-  std::unordered_map<std::string, std::vector<int>> npu_w;  // tensor -> 1024-row slices
+  int npu_prog_o{-1},
+      npu_prog_o_small{-1};  // K=3072 programs for the attention output
+  int npu_prog_small{-1};    // M=2048 program for banks of at most 2048 rows
+  std::uint32_t npu_tokens{
+      2048};  // rows of the runtime-M program = rows of one bank
+  std::unordered_map<std::string, std::vector<int>>
+      npu_w;  // tensor -> 1024-row slices
   ~ModelState() {
     npu.reset();
     for (void* p : allocations)
@@ -1554,35 +1557,47 @@ std::shared_ptr<Model> Model::Load(const std::string& path,
     gufo::models::qwen38_flash_next::rocm::NpuGemm::Config nc;
     if (const char* mm = std::getenv("INKLING_NPU_M"))
       state->npu_tokens = static_cast<std::uint32_t>(std::atoi(mm));
-    nc.xclbin = std::string(dir) + "/runtime_mk/final_4096xKx1024_128x64x128.xclbin";
-    nc.insts = std::string(dir) + "/runtime_mk/insts_" + std::to_string(state->npu_tokens) + "x" +
+    nc.xclbin =
+        std::string(dir) + "/runtime_mk/final_4096xKx1024_128x64x128.xclbin";
+    nc.insts = std::string(dir) + "/runtime_mk/insts_" +
+               std::to_string(state->npu_tokens) + "x" +
                std::to_string(cfg->hidden_size) + "x1024_128x64x128.txt";
     nc.tokens = state->npu_tokens;
     nc.k = cfg->hidden_size;
     nc.n = kNpuSlice;
     std::string npu_error;
-    state->npu = gufo::models::qwen38_flash_next::rocm::NpuGemm::Create(nc, &npu_error);
+    state->npu =
+        gufo::models::qwen38_flash_next::rocm::NpuGemm::Create(nc, &npu_error);
     if (state->npu) {
       if (state->npu_tokens > 2048) {
         std::string add_error;
         state->npu_prog_small = state->npu->AddProgram(
-            std::string(dir) + "/runtime_mk/insts_2048x" + std::to_string(cfg->hidden_size) + "x1024_128x64x128.txt",
+            std::string(dir) + "/runtime_mk/insts_2048x" +
+                std::to_string(cfg->hidden_size) + "x1024_128x64x128.txt",
             &add_error);
       }
       std::string out_error;
       state->npu_prog_o = state->npu->AddProgram(
-          std::string(dir) + "/runtime_mk/insts_" + std::to_string(state->npu_tokens) + "x3072x1024_128x64x128.txt", &out_error);
+          std::string(dir) + "/runtime_mk/insts_" +
+              std::to_string(state->npu_tokens) + "x3072x1024_128x64x128.txt",
+          &out_error);
       if (state->npu_tokens > 2048)
         state->npu_prog_o_small = state->npu->AddProgram(
-            std::string(dir) + "/runtime_mk/insts_2048x3072x1024_128x64x128.txt", &out_error);
+            std::string(dir) +
+                "/runtime_mk/insts_2048x3072x1024_128x64x128.txt",
+            &out_error);
       HIP_OK(hipStreamCreate(&npu_stream));
     } else {
       std::fprintf(stderr, "inkling: NPU unavailable: %s\n", npu_error.c_str());
     }
   }
   const auto npu_name = [](std::string_view n) {
-    for (const char* suffix : {".attn_q.weight", ".attn_attn_gate.weight", ".attn_gate.weight", ".attn_k.weight", ".attn_v.weight"}) {
-      if (n.size() > std::strlen(suffix) && n.substr(n.size() - std::strlen(suffix)) == suffix) return true;
+    for (const char* suffix :
+         {".attn_q.weight", ".attn_attn_gate.weight", ".attn_gate.weight",
+          ".attn_k.weight", ".attn_v.weight"}) {
+      if (n.size() > std::strlen(suffix) &&
+          n.substr(n.size() - std::strlen(suffix)) == suffix)
+        return true;
     }
     return false;
   };
@@ -1623,32 +1638,42 @@ std::shared_ptr<Model> Model::Load(const std::string& path,
         for (std::uint64_t r0 = 0; r0 < t.rows; r0 += kNpuSlice) {
           const int id = state->npu->NewBuffer(state->npu->BBytes(), error);
           gufo::models::qwen38_flash_next::rocm::NpuEncodeWeights(
-              tmp, static_cast<std::uint32_t>(t.cols), static_cast<std::uint32_t>(r0), kNpuSlice,
-              static_cast<std::uint32_t>(t.cols), 0, static_cast<std::uint32_t>(t.cols),
-              state->npu->Device(id), npu_stream);
+              tmp, static_cast<std::uint32_t>(t.cols),
+              static_cast<std::uint32_t>(r0), kNpuSlice,
+              static_cast<std::uint32_t>(t.cols), 0,
+              static_cast<std::uint32_t>(t.cols), state->npu->Device(id),
+              npu_stream);
           ids.push_back(id);
         }
         HIP_OK(hipStreamSynchronize(npu_stream));
-        for (const int id : ids) state->npu->FinalizeWeights(id);
+        for (const int id : ids)
+          state->npu->FinalizeWeights(id);
         state->npu_w.emplace(std::string(info.name), std::move(ids));
       }
-      const bool out_name = info.name.size() > 19 && info.name.substr(info.name.size() - 19) == ".attn_output.weight";
-      if (state->npu && state->npu_prog_o >= 0 && t.type == kTypeQ8 && out_name && t.cols == 3072) {
+      const bool out_name =
+          info.name.size() > 19 &&
+          info.name.substr(info.name.size() - 19) == ".attn_output.weight";
+      if (state->npu && state->npu_prog_o >= 0 && t.type == kTypeQ8 &&
+          out_name && t.cols == 3072) {
         // rows are padded to a multiple of the slice with zeros
-        const std::uint64_t rows_pad = (t.rows + kNpuSlice - 1) / kNpuSlice * kNpuSlice;
+        const std::uint64_t rows_pad =
+            (t.rows + kNpuSlice - 1) / kNpuSlice * kNpuSlice;
         void* padded = nullptr;
         HIP_OK(hipMalloc(&padded, rows_pad * t.row_bytes));
         HIP_OK(hipMemset(padded, 0, rows_pad * t.row_bytes));
-        HIP_OK(hipMemcpy(padded, tmp, info.size_bytes, hipMemcpyDeviceToDevice));
+        HIP_OK(
+            hipMemcpy(padded, tmp, info.size_bytes, hipMemcpyDeviceToDevice));
         std::vector<int> ids;
         for (std::uint64_t r0 = 0; r0 < rows_pad; r0 += kNpuSlice) {
           const int id = state->npu->NewBuffer(state->npu->BBytes(3072), error);
           gufo::models::qwen38_flash_next::rocm::NpuEncodeWeights(
-              padded, 3072, static_cast<std::uint32_t>(r0), kNpuSlice, 3072, 0, 3072, state->npu->Device(id), npu_stream);
+              padded, 3072, static_cast<std::uint32_t>(r0), kNpuSlice, 3072, 0,
+              3072, state->npu->Device(id), npu_stream);
           ids.push_back(id);
         }
         HIP_OK(hipStreamSynchronize(npu_stream));
-        for (const int id : ids) state->npu->FinalizeWeights(id);
+        for (const int id : ids)
+          state->npu->FinalizeWeights(id);
         state->npu_w.emplace(std::string(info.name), std::move(ids));
         HIP_OK(hipFree(padded));
       }
@@ -1757,8 +1782,10 @@ struct Session::Impl : Scratch {
   std::vector<Slot> slots;
   bool banked{false};
   std::size_t bank_rows{2048};
-  int npu_mask{std::getenv("INKLING_NPU_PARTS") != nullptr ? std::atoi(std::getenv("INKLING_NPU_PARTS")) : 15};  // 1=q 2=gate 4=k 8=v
-  Scratch saved[2];  // bank scratch while another bank is active
+  int npu_mask{std::getenv("INKLING_NPU_PARTS") != nullptr
+                   ? std::atoi(std::getenv("INKLING_NPU_PARTS"))
+                   : 15};  // 1=q 2=gate 4=k 8=v
+  Scratch saved[2];        // bank scratch while another bank is active
   int active{0};
   void Activate(int bank) {
     if (bank == active)
@@ -2010,7 +2037,8 @@ struct Session::Impl : Scratch {
     bool out_npu{false};
   };
 
-  void BeginLayer(LayerCtx& L, std::uint32_t slot, std::uint32_t ip, const float* msgs_, int n) {
+  void BeginLayer(LayerCtx& L, std::uint32_t slot, std::uint32_t ip,
+                  const float* msgs_, int n) {
     L.slot = slot;
     L.ip = ip;
     L.p = m->Phys(slot);
@@ -2034,7 +2062,19 @@ struct Session::Impl : Scratch {
     const std::size_t nh_ = L.nh_;
     const bool big = L.big;
     const float* msgs_ = L.msgs;
-    (void)c; (void)h; (void)nh; (void)nkv; (void)hd; (void)nrel; (void)p; (void)swa; (void)sl; (void)n; (void)nh_; (void)big; (void)msgs_;
+    (void)c;
+    (void)h;
+    (void)nh;
+    (void)nkv;
+    (void)hd;
+    (void)nrel;
+    (void)p;
+    (void)swa;
+    (void)sl;
+    (void)n;
+    (void)nh_;
+    (void)big;
+    (void)msgs_;
     float* inp[3] = {in[0], in[1], in[2]};
     const bool has_res = m->Has(m->P(p, "attn_res_query.weight"));
     __half* inh[3] = {big ? xh0 : nullptr, big ? xh1 : nullptr,
@@ -2119,8 +2159,8 @@ struct Session::Impl : Scratch {
     }
   }
 
-  // Encode the layer inputs and queue the q/gate/k/v slices on the NPU (first row
-  // chunk); NpuQkvEnd waits for them and decodes the results.
+  // Encode the layer inputs and queue the q/gate/k/v slices on the NPU (first
+  // row chunk); NpuQkvEnd waits for them and decodes the results.
   void NpuQkvBegin(LayerCtx& L, int r0) {
     namespace rocm = gufo::models::qwen38_flash_next::rocm;
     auto& npu = *m->npu;
@@ -2133,12 +2173,16 @@ struct Session::Impl : Scratch {
     const bool k_shared = L.inp[1] == L.inp[0];
     const bool v_shared = L.inp[2] == L.inp[0];
     const int rows = std::min<int>(m->npu_tokens, n - r0);
-    const std::uint32_t enc = static_cast<std::uint32_t>((rows + 127) / 128 * 128);
-    rocm::NpuEncodeActivations(L.inh[0] + static_cast<std::size_t>(r0) * h, h, enc, h, 0, h, npu.Device(npu_a[0]), stream);
+    const std::uint32_t enc =
+        static_cast<std::uint32_t>((rows + 127) / 128 * 128);
+    rocm::NpuEncodeActivations(L.inh[0] + static_cast<std::size_t>(r0) * h, h,
+                               enc, h, 0, h, npu.Device(npu_a[0]), stream);
     if (!k_shared)
-      rocm::NpuEncodeActivations(L.inh[1] + static_cast<std::size_t>(r0) * h, h, enc, h, 0, h, npu.Device(npu_a[1]), stream);
+      rocm::NpuEncodeActivations(L.inh[1] + static_cast<std::size_t>(r0) * h, h,
+                                 enc, h, 0, h, npu.Device(npu_a[1]), stream);
     if (!v_shared)
-      rocm::NpuEncodeActivations(L.inh[2] + static_cast<std::size_t>(r0) * h, h, enc, h, 0, h, npu.Device(npu_a[2]), stream);
+      rocm::NpuEncodeActivations(L.inh[2] + static_cast<std::size_t>(r0) * h, h,
+                                 enc, h, 0, h, npu.Device(npu_a[2]), stream);
     std::vector<int> b;
     std::vector<int> c;
     if ((npu_mask & 1) != 0) {
@@ -2161,10 +2205,15 @@ struct Session::Impl : Scratch {
       b.push_back(wv[0]);
       c.push_back(npu_c[7]);
     }
-    const int prog = (rows <= 2048 && m->npu_prog_small >= 0) ? m->npu_prog_small : 0;
-    if (!b.empty()) npu.Submit(stream, npu_a[0], b.data(), c.data(), static_cast<int>(b.size()), prog);
-    if (!k_shared && (npu_mask & 4) != 0) npu.Submit(stream, npu_a[1], &wk[0], &npu_c[6], 1, prog);
-    if (!v_shared && (npu_mask & 8) != 0) npu.Submit(stream, npu_a[2], &wv[0], &npu_c[7], 1, prog);
+    const int prog =
+        (rows <= 2048 && m->npu_prog_small >= 0) ? m->npu_prog_small : 0;
+    if (!b.empty())
+      npu.Submit(stream, npu_a[0], b.data(), c.data(),
+                 static_cast<int>(b.size()), prog);
+    if (!k_shared && (npu_mask & 4) != 0)
+      npu.Submit(stream, npu_a[1], &wk[0], &npu_c[6], 1, prog);
+    if (!v_shared && (npu_mask & 8) != 0)
+      npu.Submit(stream, npu_a[2], &wv[0], &npu_c[7], 1, prog);
     L.ticket = npu.Ticket();
   }
 
@@ -2178,14 +2227,22 @@ struct Session::Impl : Scratch {
     npu.Wait(stream, L.ticket);
     if ((npu_mask & 1) != 0)
       for (std::size_t i = 0; i < wq.size(); ++i)
-        rocm::NpuDecodeOutput(npu.Staged(stream, npu_c[i]), q + static_cast<std::size_t>(r0) * qd, rows, kNpuSlice, qd, i * kNpuSlice, false, stream);
+        rocm::NpuDecodeOutput(npu.Staged(stream, npu_c[i]),
+                              q + static_cast<std::size_t>(r0) * qd, rows,
+                              kNpuSlice, qd, i * kNpuSlice, false, stream);
     if ((npu_mask & 2) != 0)
       for (std::size_t i = 0; i < wg.size(); ++i)
-        rocm::NpuDecodeOutput(npu.Staged(stream, npu_c[3 + i]), gate + static_cast<std::size_t>(r0) * qd, rows, kNpuSlice, qd, i * kNpuSlice, false, stream);
+        rocm::NpuDecodeOutput(npu.Staged(stream, npu_c[3 + i]),
+                              gate + static_cast<std::size_t>(r0) * qd, rows,
+                              kNpuSlice, qd, i * kNpuSlice, false, stream);
     if ((npu_mask & 4) != 0)
-      rocm::NpuDecodeOutput(npu.Staged(stream, npu_c[6]), tmp + static_cast<std::size_t>(r0) * kNpuSlice, rows, kNpuSlice, kNpuSlice, 0, false, stream);
+      rocm::NpuDecodeOutput(npu.Staged(stream, npu_c[6]),
+                            tmp + static_cast<std::size_t>(r0) * kNpuSlice,
+                            rows, kNpuSlice, kNpuSlice, 0, false, stream);
     if ((npu_mask & 8) != 0)
-      rocm::NpuDecodeOutput(npu.Staged(stream, npu_c[7]), v + static_cast<std::size_t>(r0) * kNpuSlice, rows, kNpuSlice, kNpuSlice, 0, false, stream);
+      rocm::NpuDecodeOutput(npu.Staged(stream, npu_c[7]),
+                            v + static_cast<std::size_t>(r0) * kNpuSlice, rows,
+                            kNpuSlice, kNpuSlice, 0, false, stream);
   }
 
   // stage 2: q/k/v/gate/rel/sink projections (GPU or NPU)
@@ -2202,13 +2259,28 @@ struct Session::Impl : Scratch {
     float* const* inp = L.inp;
     __half* const* inh = L.inh;
     const float* msgs_ = L.msgs;
-    (void)c; (void)h; (void)nh; (void)nkv; (void)hd; (void)nrel; (void)p; (void)swa; (void)sl; (void)n; (void)nh_; (void)big; (void)inp; (void)inh; (void)msgs_;
-    L.npu_on = npu_a[0] >= 0 && big &&
-               m->npu_w.count(m->P(p, "attn_q.weight")) != 0;
+    (void)c;
+    (void)h;
+    (void)nh;
+    (void)nkv;
+    (void)hd;
+    (void)nrel;
+    (void)p;
+    (void)swa;
+    (void)sl;
+    (void)n;
+    (void)nh_;
+    (void)big;
+    (void)inp;
+    (void)inh;
+    (void)msgs_;
+    L.npu_on =
+        npu_a[0] >= 0 && big && m->npu_w.count(m->P(p, "attn_q.weight")) != 0;
     if (L.npu_on)
       NpuQkvBegin(L, 0);
     if (!L.npu_on || (npu_mask & 1) == 0)
-      Dense(m->T(m->P(p, "attn_q.weight")), inp[0], h, q, nh * hd, n, -1, inh[0]);
+      Dense(m->T(m->P(p, "attn_q.weight")), inp[0], h, q, nh * hd, n, -1,
+            inh[0]);
     if (!L.npu_on || (npu_mask & 4) == 0)
       Dense(m->T(m->P(p, "attn_k.weight")), inp[1], h, tmp, nkv * hd, n, -1,
             inh[1]);
@@ -2242,10 +2314,25 @@ struct Session::Impl : Scratch {
     float* const* inp = L.inp;
     __half* const* inh = L.inh;
     const float* msgs_ = L.msgs;
-    (void)c; (void)h; (void)nh; (void)nkv; (void)hd; (void)nrel; (void)p; (void)swa; (void)sl; (void)n; (void)nh_; (void)big; (void)inp; (void)inh; (void)msgs_;
+    (void)c;
+    (void)h;
+    (void)nh;
+    (void)nkv;
+    (void)hd;
+    (void)nrel;
+    (void)p;
+    (void)swa;
+    (void)sl;
+    (void)n;
+    (void)nh_;
+    (void)big;
+    (void)inp;
+    (void)inh;
+    (void)msgs_;
     if (L.npu_on) {
       NpuQkvEnd(L, 0);
-      for (int r0 = static_cast<int>(m->npu_tokens); r0 < n; r0 += static_cast<int>(m->npu_tokens)) {
+      for (int r0 = static_cast<int>(m->npu_tokens); r0 < n;
+           r0 += static_cast<int>(m->npu_tokens)) {
         NpuQkvBegin(L, r0);
         NpuQkvEnd(L, r0);
       }
@@ -2269,7 +2356,21 @@ struct Session::Impl : Scratch {
     float* const* inp = L.inp;
     __half* const* inh = L.inh;
     const float* msgs_ = L.msgs;
-    (void)c; (void)h; (void)nh; (void)nkv; (void)hd; (void)nrel; (void)p; (void)swa; (void)sl; (void)n; (void)nh_; (void)big; (void)inp; (void)inh; (void)msgs_;
+    (void)c;
+    (void)h;
+    (void)nh;
+    (void)nkv;
+    (void)hd;
+    (void)nrel;
+    (void)p;
+    (void)swa;
+    (void)sl;
+    (void)n;
+    (void)nh_;
+    (void)big;
+    (void)inp;
+    (void)inh;
+    (void)msgs_;
     Convolve(tmp, m->T(m->P(p, "attn_k_conv.weight")), L.dk, nkv, sl.hist_k, k,
              nkv * hd, n);
     float* vtmp = tmp;
@@ -2352,7 +2453,8 @@ struct Session::Impl : Scratch {
   }
 
   // stage 4: output projection, residual, FFN mix, MoE -> cur
-  // attention output projection: queue on the NPU (INKLING_NPU_OUT=1) or compute on the GPU
+  // attention output projection: queue on the NPU (INKLING_NPU_OUT=1) or
+  // compute on the GPU
   void LayerOut1a(LayerCtx& L) {
     const Config& c = m->config;
     const int h = c.hidden_size, nh = c.num_heads, nkv = c.num_kv,
@@ -2366,7 +2468,21 @@ struct Session::Impl : Scratch {
     float* const* inp = L.inp;
     __half* const* inh = L.inh;
     const float* msgs_ = L.msgs;
-    (void)c; (void)h; (void)nh; (void)nkv; (void)hd; (void)nrel; (void)p; (void)swa; (void)sl; (void)n; (void)nh_; (void)big; (void)inp; (void)inh; (void)msgs_;
+    (void)c;
+    (void)h;
+    (void)nh;
+    (void)nkv;
+    (void)hd;
+    (void)nrel;
+    (void)p;
+    (void)swa;
+    (void)sl;
+    (void)n;
+    (void)nh_;
+    (void)big;
+    (void)inp;
+    (void)inh;
+    (void)msgs_;
     static const bool out_on = [] {
       const char* e = std::getenv("INKLING_NPU_OUT");
       return e == nullptr || e[0] != '0';
@@ -2377,10 +2493,15 @@ struct Session::Impl : Scratch {
       namespace rocm = gufo::models::qwen38_flash_next::rocm;
       auto& npu = *m->npu;
       const auto& wo = m->npu_w.at(m->P(p, "attn_output.weight"));
-      const std::uint32_t enc = static_cast<std::uint32_t>((n + 127) / 128 * 128);
-      rocm::NpuEncodeActivations(atth, nh * hd, enc, nh * hd, 0, nh * hd, npu.Device(npu_ao), stream);
-      const int prog = (n <= 2048 && m->npu_prog_o_small >= 0) ? m->npu_prog_o_small : m->npu_prog_o;
-      npu.Submit(stream, npu_ao, wo.data(), npu_c, static_cast<int>(wo.size()), prog);
+      const std::uint32_t enc =
+          static_cast<std::uint32_t>((n + 127) / 128 * 128);
+      rocm::NpuEncodeActivations(atth, nh * hd, enc, nh * hd, 0, nh * hd,
+                                 npu.Device(npu_ao), stream);
+      const int prog = (n <= 2048 && m->npu_prog_o_small >= 0)
+                           ? m->npu_prog_o_small
+                           : m->npu_prog_o;
+      npu.Submit(stream, npu_ao, wo.data(), npu_c, static_cast<int>(wo.size()),
+                 prog);
       L.ticket = npu.Ticket();
     }
   }
@@ -2398,15 +2519,31 @@ struct Session::Impl : Scratch {
     float* const* inp = L.inp;
     __half* const* inh = L.inh;
     const float* msgs_ = L.msgs;
-    (void)c; (void)h; (void)nh; (void)nkv; (void)hd; (void)nrel; (void)p; (void)swa; (void)sl; (void)n; (void)nh_; (void)big; (void)inp; (void)inh; (void)msgs_;
+    (void)c;
+    (void)h;
+    (void)nh;
+    (void)nkv;
+    (void)hd;
+    (void)nrel;
+    (void)p;
+    (void)swa;
+    (void)sl;
+    (void)n;
+    (void)nh_;
+    (void)big;
+    (void)inp;
+    (void)inh;
+    (void)msgs_;
     const std::uint32_t ip = L.ip;
     if (L.out_npu) {
       namespace rocm = gufo::models::qwen38_flash_next::rocm;
       auto& npu = *m->npu;
       npu.Wait(stream, L.ticket);
       for (int i = 0; i < 3; ++i) {
-        const std::uint32_t valid = (i == 2) ? static_cast<std::uint32_t>(h - 2 * 1024) : 0U;
-        rocm::NpuDecodeOutput(npu.Staged(stream, npu_c[i]), o, n, kNpuSlice, h, i * kNpuSlice, false, stream, valid);
+        const std::uint32_t valid =
+            (i == 2) ? static_cast<std::uint32_t>(h - 2 * 1024) : 0U;
+        rocm::NpuDecodeOutput(npu.Staged(stream, npu_c[i]), o, n, kNpuSlice, h,
+                              i * kNpuSlice, false, stream, valid);
       }
     } else {
       Dense(m->T(m->P(p, "attn_output.weight")), att, nh * hd, o, h, n, -1,
@@ -2436,7 +2573,21 @@ struct Session::Impl : Scratch {
     float* const* inp = L.inp;
     __half* const* inh = L.inh;
     const float* msgs_ = L.msgs;
-    (void)c; (void)h; (void)nh; (void)nkv; (void)hd; (void)nrel; (void)p; (void)swa; (void)sl; (void)n; (void)nh_; (void)big; (void)inp; (void)inh; (void)msgs_;
+    (void)c;
+    (void)h;
+    (void)nh;
+    (void)nkv;
+    (void)hd;
+    (void)nrel;
+    (void)p;
+    (void)swa;
+    (void)sl;
+    (void)n;
+    (void)nh_;
+    (void)big;
+    (void)inp;
+    (void)inh;
+    (void)msgs_;
     const float* ffn_w =
         static_cast<const float*>(m->T(m->P(p, "ffn_norm.weight")).dev);
     const float* ffn_q =
@@ -2459,7 +2610,8 @@ struct Session::Impl : Scratch {
   }
 
   // returns layer output in `cur`
-  void Layer(std::uint32_t slot, std::uint32_t ip, std::vector<const float*>& blocks, const float* msgs_, int n) {
+  void Layer(std::uint32_t slot, std::uint32_t ip,
+             std::vector<const float*>& blocks, const float* msgs_, int n) {
     LayerCtx L;
     BeginLayer(L, slot, ip, msgs_, n);
     LayerFront(L, blocks);
@@ -2652,25 +2804,35 @@ struct Session::Impl : Scratch {
     const std::size_t nh_ = static_cast<std::size_t>(R.n) * h;
     const std::uint32_t start = c.loop_core_start;
     if (st.pass == 0 && st.ip == start) {
-      HIP_OK(hipMemcpyAsync(prelude, cur, nh_ * 4, hipMemcpyDeviceToDevice, stream));
+      HIP_OK(hipMemcpyAsync(prelude, cur, nh_ * 4, hipMemcpyDeviceToDevice,
+                            stream));
       R.prelude_blocks = R.blocks;
     }
     if (st.pass > 0 && st.ip == start) {
-      R.bank.assign(R.blocks.begin() + R.prelude_blocks.size() + 1, R.blocks.end());
-      HIP_OK(hipMemcpyAsync(bank_out, cur, nh_ * 4, hipMemcpyDeviceToDevice, stream));
-      HIP_OK(hipMemcpyAsync(cur, prelude, nh_ * 4, hipMemcpyDeviceToDevice, stream));
+      R.bank.assign(R.blocks.begin() + R.prelude_blocks.size() + 1,
+                    R.blocks.end());
+      HIP_OK(hipMemcpyAsync(bank_out, cur, nh_ * 4, hipMemcpyDeviceToDevice,
+                            stream));
+      HIP_OK(hipMemcpyAsync(cur, prelude, nh_ * 4, hipMemcpyDeviceToDevice,
+                            stream));
       R.blocks = R.prelude_blocks;
     }
     const float* msgs_ = nullptr;
     if (st.pass > 0) {
       const std::uint32_t cc = st.ip - start;
-      const float* res = static_cast<const float*>(m->T("loop_res_query.weight").dev);
-      const float* kv = static_cast<const float*>(m->T("loop_kv_res_query.weight").dev);
+      const float* res =
+          static_cast<const float*>(m->T("loop_res_query.weight").dev);
+      const float* kv =
+          static_cast<const float*>(m->T("loop_kv_res_query.weight").dev);
       float* mq = low;
-      HIP_OK(hipMemcpyAsync(mq, res + 2 * cc * h, h * 4, hipMemcpyDeviceToDevice, stream));
-      HIP_OK(hipMemcpyAsync(mq + h, kv + 2 * cc * h, h * 4, hipMemcpyDeviceToDevice, stream));
-      HIP_OK(hipMemcpyAsync(mq + 2 * h, kv + (2 * cc + 1) * h, h * 4, hipMemcpyDeviceToDevice, stream));
-      HIP_OK(hipMemcpyAsync(mq + 3 * h, res + (2 * cc + 1) * h, h * 4, hipMemcpyDeviceToDevice, stream));
+      HIP_OK(hipMemcpyAsync(mq, res + 2 * cc * h, h * 4,
+                            hipMemcpyDeviceToDevice, stream));
+      HIP_OK(hipMemcpyAsync(mq + h, kv + 2 * cc * h, h * 4,
+                            hipMemcpyDeviceToDevice, stream));
+      HIP_OK(hipMemcpyAsync(mq + 2 * h, kv + (2 * cc + 1) * h, h * 4,
+                            hipMemcpyDeviceToDevice, stream));
+      HIP_OK(hipMemcpyAsync(mq + 3 * h, res + (2 * cc + 1) * h, h * 4,
+                            hipMemcpyDeviceToDevice, stream));
       Mixer(R.bank, bank_out, mq, 4, R.n, msgs);
       msgs_ = msgs;
     }
@@ -2678,16 +2840,17 @@ struct Session::Impl : Scratch {
     LayerFront(R.L, R.blocks);
   }
 
-  // Two token banks, interleaved so one bank's NPU projections overlap the other
-  // bank's GPU work: A.front A.qkv-begin | B.moe | A.qkv-end A.attn A.out1 | B.front
-  // B.qkv-begin | A.moe | B.qkv-end B.attn B.out1 | ...
+  // Two token banks, interleaved so one bank's NPU projections overlap the
+  // other bank's GPU work: A.front A.qkv-begin | B.moe | A.qkv-end A.attn
+  // A.out1 | B.front B.qkv-begin | A.moe | B.qkv-end B.attn B.out1 | ...
   void DebugSync(const char* what, int t) {
     static const bool on = std::getenv("INKLING_DEBUG_SYNC") != nullptr;
     if (!on)
       return;
     const hipError_t e = hipStreamSynchronize(stream);
     if (e != hipSuccess) {
-      std::fprintf(stderr, "bank debug: failure after %s at step %d: %s\n", what, t, hipGetErrorString(e));
+      std::fprintf(stderr, "bank debug: failure after %s at step %d: %s\n",
+                   what, t, hipGetErrorString(e));
       std::abort();
     }
   }
@@ -2696,7 +2859,8 @@ struct Session::Impl : Scratch {
     const Config& c = m->config;
     const int h = c.hidden_size;
     const int total = static_cast<int>(tokens.size());
-    const int na = std::min<int>(static_cast<int>(bank_rows), (total / 2 + 127) / 128 * 128);
+    const int na = std::min<int>(static_cast<int>(bank_rows),
+                                 (total / 2 + 127) / 128 * 128);
     const int nb = total - na;
     BankRun R[2];
     R[0].n = na;
@@ -2709,10 +2873,15 @@ struct Session::Impl : Scratch {
       pool_used = 0;
       const int pos = static_cast<int>(R[b].pos);
       HIP_OK(hipMemcpy(d_pos, &pos, 4, hipMemcpyHostToDevice));
-      HIP_OK(hipMemcpy(d_tokens, tokens.data() + (b == 0 ? 0 : na), R[b].n * 4, hipMemcpyHostToDevice));
+      HIP_OK(hipMemcpy(d_tokens, tokens.data() + (b == 0 ? 0 : na), R[b].n * 4,
+                       hipMemcpyHostToDevice));
       const Tensor& emb = m->T("token_embd.weight");
-      EmbedQ8<<<R[b].n, 256, 0, stream>>>(static_cast<const unsigned char*>(emb.dev), emb.row_bytes, d_tokens, cur, h);
-      RmsRows(cur, static_cast<const float*>(m->T("token_embd_norm.weight").dev), cur, R[b].n, h, h, h);
+      EmbedQ8<<<R[b].n, 256, 0, stream>>>(
+          static_cast<const unsigned char*>(emb.dev), emb.row_bytes, d_tokens,
+          cur, h);
+      RmsRows(cur,
+              static_cast<const float*>(m->T("token_embd_norm.weight").dev),
+              cur, R[b].n, h, h, h);
     }
     const std::vector<StepDesc> steps = BuildSteps();
     const int T = static_cast<int>(steps.size());
@@ -2746,11 +2915,16 @@ struct Session::Impl : Scratch {
     LayerOut1b(R[1].L, R[1].blocks);
     LayerOut2(R[1].L, R[1].blocks);
     const int n = R[1].n;
-    Mixer(R[1].blocks, cur, static_cast<const float*>(m->T("output_res_query.weight").dev), 1, n, x);
-    RmsRows(x, static_cast<const float*>(m->T("output_norm.weight").dev), x, n, h, h, h);
+    Mixer(R[1].blocks, cur,
+          static_cast<const float*>(m->T("output_res_query.weight").dev), 1, n,
+          x);
+    RmsRows(x, static_cast<const float*>(m->T("output_norm.weight").dev), x, n,
+            h, h, h);
     const Tensor& out = m->T("output.weight");
-    Dense(out, x + static_cast<std::size_t>(n - 1) * h, h, d_logits, c.vocab_unpadded, 1, static_cast<int>(c.vocab_unpadded));
-    Softcap<<<(c.vocab_unpadded + 255) / 256, 256, 0, stream>>>(d_logits, c.vocab_unpadded, c.final_logit_softcapping);
+    Dense(out, x + static_cast<std::size_t>(n - 1) * h, h, d_logits,
+          c.vocab_unpadded, 1, static_cast<int>(c.vocab_unpadded));
+    Softcap<<<(c.vocab_unpadded + 255) / 256, 256, 0, stream>>>(
+        d_logits, c.vocab_unpadded, c.final_logit_softcapping);
   }
 
   void Body(int n) {
@@ -2912,7 +3086,7 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
     sc.tmp = i.Alloc(b * std::max<std::size_t>(kv, h));
     sc.inp_sa = i.Alloc(b * h);
     for (auto& p : sc.in)
-    p = i.Alloc(b * h);
+      p = i.Alloc(b * h);
     sc.q = i.Alloc(b * qd);
     sc.k = i.Alloc(b * kv);
     sc.v = i.Alloc(b * kv);
@@ -2942,9 +3116,11 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
     sc.d_logits = i.Alloc(c.vocab_padded);
     sc.d_pos = static_cast<int*>(i.AllocBytes(4));
     if (state_->npu) {
-    std::string npu_error;
-    for (int j = 0; j < 3; ++j) i.npu_a[j] = state_->npu->NewBuffer(state_->npu->ABytes(), &npu_error);
-    for (int j = 0; j < 8; ++j) i.npu_c[j] = state_->npu->NewBuffer(state_->npu->CBytes(), &npu_error);
+      std::string npu_error;
+      for (int j = 0; j < 3; ++j)
+        i.npu_a[j] = state_->npu->NewBuffer(state_->npu->ABytes(), &npu_error);
+      for (int j = 0; j < 8; ++j)
+        i.npu_c[j] = state_->npu->NewBuffer(state_->npu->CBytes(), &npu_error);
     }
     sc.xh0 = static_cast<__half*>(i.AllocBytes(b * h * 2));
     sc.xh1 = static_cast<__half*>(i.AllocBytes(b * h * 2));
@@ -2953,44 +3129,44 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
     sc.atth = static_cast<__half*>(i.AllocBytes(b * qd * 2));
     sc.cath = static_cast<__half*>(i.AllocBytes(b * h * 4));
     sc.rcounts = static_cast<unsigned int*>(
-      i.AllocBytes(c.expert_count * sizeof(unsigned int)));
+        i.AllocBytes(c.expert_count * sizeof(unsigned int)));
     sc.rbounds =
-      static_cast<int*>(i.AllocBytes((c.expert_count + 1) * sizeof(int)));
+        static_cast<int*>(i.AllocBytes((c.expert_count + 1) * sizeof(int)));
     sc.rcursors = static_cast<int*>(i.AllocBytes(c.expert_count * sizeof(int)));
     {
-    const std::size_t rows =
-        gufo::models::qwen38_flash_next::rocm::RoutedCompactRows(
-            b * c.expert_used, c.expert_count);
-    sc.rrows_token = static_cast<int*>(i.AllocBytes(rows * sizeof(int)));
-    sc.rrows_slot = static_cast<int*>(i.AllocBytes(rows * sizeof(int)));
+      const std::size_t rows =
+          gufo::models::qwen38_flash_next::rocm::RoutedCompactRows(
+              b * c.expert_used, c.expert_count);
+      sc.rrows_token = static_cast<int*>(i.AllocBytes(rows * sizeof(int)));
+      sc.rrows_slot = static_cast<int*>(i.AllocBytes(rows * sizeof(int)));
     }
     sc.xq = static_cast<signed char*>(
-      i.AllocBytes(static_cast<std::size_t>(kWmmaMinTokens) * c.expert_used *
-                   std::max<std::size_t>(c.hidden_size, 3072) * 2));
+        i.AllocBytes(static_cast<std::size_t>(kWmmaMinTokens) * c.expert_used *
+                     std::max<std::size_t>(c.hidden_size, 3072) * 2));
     sc.xqs = i.Alloc(static_cast<std::size_t>(kWmmaMinTokens) * c.expert_used *
-                  std::max<std::size_t>(c.hidden_size, 3072) / 16);
+                     std::max<std::size_t>(c.hidden_size, 3072) / 16);
     sc.blist = static_cast<int*>(
-      i.AllocBytes(static_cast<std::size_t>(kMaxBatch / kFlashQ) * c.num_heads *
-                   kListCap * 4));
+        i.AllocBytes(static_cast<std::size_t>(kMaxBatch / kFlashQ) *
+                     c.num_heads * kListCap * 4));
     sc.bcount = static_cast<int*>(i.AllocBytes(
-      static_cast<std::size_t>(kMaxBatch / kFlashQ) * c.num_heads * 4));
+        static_cast<std::size_t>(kMaxBatch / kFlashQ) * c.num_heads * 4));
     {
-    const std::size_t splits = (max_context + kSplitKeys - 1) / kSplitKeys;
-    sc.split_m = i.Alloc(kWmmaMinTokens * c.num_heads * splits);
-    sc.split_l = i.Alloc(kWmmaMinTokens * c.num_heads * splits);
-    sc.split_o = i.Alloc(kWmmaMinTokens * c.num_heads * splits * kFlashHd);
+      const std::size_t splits = (max_context + kSplitKeys - 1) / kSplitKeys;
+      sc.split_m = i.Alloc(kWmmaMinTokens * c.num_heads * splits);
+      sc.split_l = i.Alloc(kWmmaMinTokens * c.num_heads * splits);
+      sc.split_o = i.Alloc(kWmmaMinTokens * c.num_heads * splits * kFlashHd);
     }
     sc.xh = static_cast<__half*>(
-      i.AllocBytes(b * std::max<std::size_t>(qd, 2 * h) * 2));
+        i.AllocBytes(b * std::max<std::size_t>(qd, 2 * h) * 2));
     sc.act16 =
-      static_cast<__half*>(i.AllocBytes(b * c.expert_used * c.expert_ff * 2));
+        static_cast<__half*>(i.AllocBytes(b * c.expert_used * c.expert_ff * 2));
     sc.sorted = static_cast<int*>(i.AllocBytes(b * c.expert_used * 4));
     sc.tiles = static_cast<int*>(
-      i.AllocBytes((b * c.expert_used / kTileM + c.expert_count) * 3 * 4));
+        i.AllocBytes((b * c.expert_used / kTileM + c.expert_count) * 3 * 4));
     sc.ids = static_cast<int*>(i.AllocBytes(b * c.expert_used * 4));
     sc.xrow = static_cast<int*>(i.AllocBytes(b * c.expert_used * 4));
     for (auto& p : sc.block_pool)
-    p = i.Alloc(b * h);
+      p = i.Alloc(b * h);
     if (state_->npu) {
       std::string npu_error;
       for (int j = 0; j < 3; ++j)
