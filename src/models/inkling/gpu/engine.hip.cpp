@@ -12,7 +12,6 @@
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
-#include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
 namespace gufo::models::inkling::gpu {
 namespace {
@@ -55,12 +54,20 @@ __device__ float Ue4m3(unsigned char x) {
   return raw * 0.5F;
 }
 
+// E2M1 doubled value of a nibble: {0,1,2,3,4,6,8,12} with the sign in bit 3
+__device__ __forceinline__ float E2m1(unsigned int n) {
+  const int m = n & 7;
+  const int v = m < 4 ? m : (2 + (m & 1)) << ((m >> 1) - 1);
+  return (n & 8) != 0 ? -static_cast<float>(v) : static_cast<float>(v);
+}
+
 __device__ float Sigmoid(float x) {
   return 1.0F / (1.0F + expf(-x));
 }
 
 template<int TY>
-__device__ void Load32(const unsigned char* row, int chunk, float* w) {
+__device__ void Load32(const unsigned char* row, int chunk, float* w,
+                       int cols) {
   if constexpr (TY == kTypeF32) {
     const float* p = reinterpret_cast<const float*>(row) + chunk * 32;
     for (int i = 0; i < 32; ++i)
@@ -71,24 +78,30 @@ __device__ void Load32(const unsigned char* row, int chunk, float* w) {
     for (int i = 0; i < 32; ++i)
       w[i] = __uint_as_float(static_cast<unsigned>(p[i]) << 16);
   } else if constexpr (TY == kTypeQ8) {
-    const unsigned char* b = row + chunk * 34;
-    const float d = __half2float(*reinterpret_cast<const __half*>(b));
-    const signed char* q = reinterpret_cast<const signed char*>(b + 2);
-    for (int i = 0; i < 32; ++i)
-      w[i] = d * static_cast<float>(q[i]);
+    const float d =
+        __half2float(*reinterpret_cast<const __half*>(row + cols + chunk * 2));
+    const uint4* p = reinterpret_cast<const uint4*>(row + chunk * 32);
+    const uint4 v[2] = {p[0], p[1]};
+    for (int h = 0; h < 2; ++h) {
+      const unsigned int u[4] = {v[h].x, v[h].y, v[h].z, v[h].w};
+      for (int i = 0; i < 4; ++i) {
+        for (int k = 0; k < 4; ++k) {
+          w[h * 16 + i * 4 + k] =
+              d * static_cast<float>(
+                      static_cast<signed char>((u[i] >> (8 * k)) & 0xFF));
+        }
+      }
+    }
   } else {
-    const unsigned char* blk = row + (chunk >> 1) * 36;
-    const int hf = chunk & 1;
     for (int s2 = 0; s2 < 2; ++s2) {
-      const int s = hf * 2 + s2;
-      const float d = Ue4m3(blk[s]);
-      const unsigned int* qp =
-          reinterpret_cast<const unsigned int*>(blk + 4 + s * 8);
-      const unsigned int u[2] = {qp[0], qp[1]};
+      const int sb = chunk * 2 + s2;
+      const float d = Ue4m3(row[(cols >> 1) + sb]);
+      const uint2 u = *reinterpret_cast<const uint2*>(row + sb * 8);
+      const unsigned int uu[2] = {u.x, u.y};
       for (int j = 0; j < 8; ++j) {
-        const unsigned int byte = (u[j >> 2] >> ((j & 3) * 8)) & 0xFF;
-        w[s2 * 16 + j] = kE2m1[byte & 15] * d;
-        w[s2 * 16 + 8 + j] = kE2m1[byte >> 4] * d;
+        const unsigned int byte = (uu[j >> 2] >> ((j & 3) * 8)) & 0xFF;
+        w[s2 * 16 + j] = E2m1(byte & 15) * d;
+        w[s2 * 16 + 8 + j] = E2m1(byte >> 4) * d;
       }
     }
   }
@@ -107,6 +120,101 @@ __device__ float BlockSum(float v, float* sh) {
   return r;
 }
 
+__device__ __forceinline__ int Dot4(unsigned int a, unsigned int b, int c) {
+  return __builtin_amdgcn_sudot4(true, static_cast<int>(a), true,
+                                 static_cast<int>(b), c, false);
+}
+
+// four E2M1 nibbles (one per byte, 0..15) -> four signed int8 values (doubled
+// E2M1)
+__device__ __forceinline__ unsigned int Nib4(unsigned int n) {
+  const unsigned int mag = n & 0x07070707U;
+  const unsigned int pos = __builtin_amdgcn_perm(0x0C080604U, 0x03020100U, mag);
+  const unsigned int neg = __builtin_amdgcn_perm(0xF4F8FAFCU, 0xFDFEFF00U, mag);
+  const unsigned int m = ((n >> 3) & 0x01010101U) * 0xFFU;
+  return (neg & m) | (pos & ~m);
+}
+
+// x rows -> int8 per 32-block (scale = amax / 127)
+__global__ void QuantRows(const float* x, signed char* xq, float* xs,
+                          int cols) {
+  const int row = blockIdx.x;
+  const int unit = blockIdx.y;
+  const int lane = threadIdx.x;
+  const float v = x[static_cast<std::size_t>(row) * cols + unit * 32 + lane];
+  float amax = fabsf(v);
+  for (int off = 16; off > 0; off >>= 1)
+    amax = fmaxf(amax, __shfl_xor(amax, off));
+  const float sc = amax / 127.0F;
+  const float q = sc > 0.0F ? roundf(v / sc) : 0.0F;
+  xq[static_cast<std::size_t>(row) * cols + unit * 32 + lane] =
+      static_cast<signed char>(q);
+  if (lane == 0)
+    xs[static_cast<std::size_t>(row) * (cols / 32) + unit] = sc;
+}
+
+// Item i: Y[i][r] = scale[g] * W[g*rows + r] . x[xrow[i]] with int8
+// activations; one wave per row.
+template<int TY>
+__global__ void GemmDp4(const unsigned char* w, std::size_t row_bytes, int cols,
+                        int rows, const int* group, const int* xrow,
+                        const float* scale, const signed char* xq,
+                        const float* xs, float* y) {
+  const int lane = threadIdx.x % warpSize;
+  const int r = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
+  if (r >= rows)
+    return;
+  const int i = blockIdx.y;
+  const int g = group != nullptr ? group[i] : 0;
+  const int xr = xrow != nullptr ? xrow[i] : 0;
+  const unsigned char* row =
+      w + (static_cast<std::size_t>(g) * rows + r) * row_bytes;
+  const signed char* xp = xq + static_cast<std::size_t>(xr) * cols;
+  const float* xsp = xs + static_cast<std::size_t>(xr) * (cols / 32);
+  float acc = 0.0F;
+  for (int u = lane; u < cols / 32; u += warpSize) {
+    const uint4* xv = reinterpret_cast<const uint4*>(xp + u * 32);
+    const uint4 x0 = xv[0];
+    const uint4 x1 = xv[1];
+    if constexpr (TY == kTypeQ8) {
+      const float d =
+          __half2float(*reinterpret_cast<const __half*>(row + cols + u * 2));
+      const uint4* wv = reinterpret_cast<const uint4*>(row + u * 32);
+      const uint4 w0 = wv[0];
+      const uint4 w1 = wv[1];
+      int a = Dot4(w0.x, x0.x, 0);
+      a = Dot4(w0.y, x0.y, a);
+      a = Dot4(w0.z, x0.z, a);
+      a = Dot4(w0.w, x0.w, a);
+      a = Dot4(w1.x, x1.x, a);
+      a = Dot4(w1.y, x1.y, a);
+      a = Dot4(w1.z, x1.z, a);
+      a = Dot4(w1.w, x1.w, a);
+      acc += static_cast<float>(a) * d * xsp[u];
+    } else {
+      const uint4 q = *reinterpret_cast<const uint4*>(row + u * 16);
+      const float d0 = Ue4m3(row[(cols >> 1) + u * 2]);
+      const float d1 = Ue4m3(row[(cols >> 1) + u * 2 + 1]);
+      const unsigned int lo = 0x0F0F0F0FU;
+      int s0 = Dot4(Nib4(q.x & lo), x0.x, 0);
+      s0 = Dot4(Nib4(q.y & lo), x0.y, s0);
+      s0 = Dot4(Nib4((q.x >> 4) & lo), x0.z, s0);
+      s0 = Dot4(Nib4((q.y >> 4) & lo), x0.w, s0);
+      int s1 = Dot4(Nib4(q.z & lo), x1.x, 0);
+      s1 = Dot4(Nib4(q.w & lo), x1.y, s1);
+      s1 = Dot4(Nib4((q.z >> 4) & lo), x1.z, s1);
+      s1 = Dot4(Nib4((q.w >> 4) & lo), x1.w, s1);
+      acc +=
+          (static_cast<float>(s0) * d0 + static_cast<float>(s1) * d1) * xsp[u];
+    }
+  }
+  for (int off = warpSize / 2; off > 0; off >>= 1)
+    acc += __shfl_down(acc, off);
+  if (lane == 0)
+    y[static_cast<std::size_t>(i) * rows + r] =
+        acc * (scale != nullptr ? scale[g] : 1.0F);
+}
+
 // Y[t][r] = W[r] . X[t]; one wave per output row, kTokenTile tokens per launch
 // row.
 template<int TY>
@@ -123,7 +231,7 @@ __global__ void GemmDense(const unsigned char* w, std::size_t row_bytes,
   float acc[kTokenTile] = {};
   float wv[32];
   for (int c = lane; c < cols / 32; c += warpSize) {
-    Load32<TY>(row, c, wv);
+    Load32<TY>(row, c, wv, cols);
     for (int t = 0; t < tn; ++t) {
       const float4* x4 =
           reinterpret_cast<const float4*>(x + (t0 + t) * ldx + c * 32);
@@ -167,7 +275,7 @@ __global__ void GemmRouted(const unsigned char* w, std::size_t row_bytes,
   float wv[32];
   float acc = 0.0F;
   for (int c = lane; c < cols / 32; c += warpSize) {
-    Load32<TY>(row, c, wv);
+    Load32<TY>(row, c, wv, cols);
     const float4* x4 = reinterpret_cast<const float4*>(xp + c * 32);
     for (int k = 0; k < 8; ++k) {
       const float4 xv = x4[k];
@@ -319,43 +427,42 @@ struct StatePtrs {
 };
 
 // states = rms(blocks..., cur); out[q][t] = softmax(states . query[q] /
-// sqrt(h)) mixture of normalized states
+// sqrt(h)) mixture of normalized states. One wave per state computes its norm
+// and dots in parallel.
 __global__ void Mix(StatePtrs blocks, const float* cur, const float* query,
                     int nq, int h, int n, float* out) {
-  __shared__ float red[256][5];
   __shared__ float inv[kMaxStates];
   __shared__ float score[4][kMaxStates];
   const int t = blockIdx.x;
   const int ns = blocks.count + 1;
+  const int wave = threadIdx.x / warpSize;
+  const int lane = threadIdx.x % warpSize;
   const float* st[kMaxStates];
   for (int s = 0; s < blocks.count; ++s)
     st[s] = blocks.p[s] + static_cast<std::size_t>(t) * h;
   st[blocks.count] = cur + static_cast<std::size_t>(t) * h;
-  for (int s = 0; s < ns; ++s) {
+  if (wave < ns) {
+    const float* x = st[0];
+    for (int s = 1; s <= wave; ++s)
+      x = st[s];
     float acc[5] = {};
-    for (int i = threadIdx.x; i < h; i += blockDim.x) {
-      const float v = st[s][i];
+    for (int i = lane; i < h; i += warpSize) {
+      const float v = x[i];
       acc[0] += v * v;
       for (int q = 0; q < nq; ++q)
         acc[1 + q] += v * query[q * h + i];
     }
-    for (int k = 0; k < 5; ++k)
-      red[threadIdx.x][k] = acc[k];
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-      if (threadIdx.x < stride) {
-        for (int k = 0; k < 5; ++k)
-          red[threadIdx.x][k] += red[threadIdx.x + stride][k];
-      }
-      __syncthreads();
+    for (int k = 0; k < 5; ++k) {
+      for (int off = warpSize / 2; off > 0; off >>= 1)
+        acc[k] += __shfl_xor(acc[k], off);
     }
-    if (threadIdx.x == 0) {
-      inv[s] = rsqrtf(red[0][0] / static_cast<float>(h) + kMixEps);
+    if (lane == 0) {
+      inv[wave] = rsqrtf(acc[0] / static_cast<float>(h) + kMixEps);
       for (int q = 0; q < nq; ++q)
-        score[q][s] = red[0][1 + q] * inv[s] * rsqrtf(static_cast<float>(h));
+        score[q][wave] = acc[1 + q] * inv[wave] * rsqrtf(static_cast<float>(h));
     }
-    __syncthreads();
   }
+  __syncthreads();
   for (int q = 0; q < nq; ++q) {
     float mx = -1e30F;
     for (int s = 0; s < ns; ++s)
@@ -610,7 +717,8 @@ struct WmmaArgs {
 
 // 16 consecutive K elements [k0, k0 + 16) of one weight row as F16.
 template<int TY>
-__device__ void LoadB16(const unsigned char* row, int k0, __half* dst) {
+__device__ void LoadB16(const unsigned char* row, int k0, __half* dst,
+                        int cols) {
   if constexpr (TY == kTypeF32) {
     const float* p = reinterpret_cast<const float*>(row) + k0;
     for (int i = 0; i < 16; ++i)
@@ -620,28 +728,26 @@ __device__ void LoadB16(const unsigned char* row, int k0, __half* dst) {
     for (int i = 0; i < 16; ++i)
       dst[i] = __float2half(__uint_as_float(static_cast<unsigned>(p[i]) << 16));
   } else if constexpr (TY == kTypeQ8) {
-    const unsigned char* b = row + (k0 >> 5) * 34;
-    const float d = __half2float(*reinterpret_cast<const __half*>(b));
-    const unsigned short* q =
-        reinterpret_cast<const unsigned short*>(b + 2) + ((k0 & 31) >> 1);
-    for (int i = 0; i < 8; ++i) {
-      const unsigned short v = q[i];
-      dst[2 * i] = __float2half(
-          d * static_cast<float>(static_cast<signed char>(v & 0xFF)));
-      dst[2 * i + 1] = __float2half(
-          d * static_cast<float>(static_cast<signed char>(v >> 8)));
+    const float d = __half2float(
+        *reinterpret_cast<const __half*>(row + cols + (k0 >> 5) * 2));
+    const uint4 v = *reinterpret_cast<const uint4*>(row + k0);
+    const unsigned int u[4] = {v.x, v.y, v.z, v.w};
+    for (int i = 0; i < 4; ++i) {
+      for (int k = 0; k < 4; ++k) {
+        dst[4 * i + k] =
+            __float2half(d * static_cast<float>(static_cast<signed char>(
+                                 (u[i] >> (8 * k)) & 0xFF)));
+      }
     }
   } else {
-    const unsigned char* blk = row + (k0 >> 6) * 36;
-    const int s = (k0 >> 4) & 3;
-    const float d = Ue4m3(blk[s]);
-    const unsigned int* qp =
-        reinterpret_cast<const unsigned int*>(blk + 4 + s * 8);
-    const unsigned int u[2] = {qp[0], qp[1]};
+    const int sb = k0 >> 4;
+    const float d = Ue4m3(row[(cols >> 1) + sb]);
+    const uint2 q = *reinterpret_cast<const uint2*>(row + sb * 8);
+    const unsigned int u[2] = {q.x, q.y};
     for (int j = 0; j < 8; ++j) {
       const unsigned int byte = (u[j >> 2] >> ((j & 3) * 8)) & 0xFF;
-      dst[j] = __float2half(kE2m1[byte & 15] * d);
-      dst[8 + j] = __float2half(kE2m1[byte >> 4] * d);
+      dst[j] = __float2half(E2m1(byte & 15) * d);
+      dst[8 + j] = __float2half(E2m1(byte >> 4) * d);
     }
   }
 }
@@ -691,7 +797,7 @@ __global__ void __launch_bounds__(kWmmaThreads) WmmaGemm(WmmaArgs a) {
       ad[0] = make_uint4(0, 0, 0, 0);
       ad[1] = make_uint4(0, 0, 0, 0);
     }
-    LoadB16<TY>(wr, k0 + lh * 16, &Bs[lr][lh * 16]);
+    LoadB16<TY>(wr, k0 + lh * 16, &Bs[lr][lh * 16], a.cols);
     __syncthreads();
     for (int kk = 0; kk < 2; ++kk) {
       V16h af[2];
@@ -1115,6 +1221,33 @@ __global__ void FlashCombine(const float* pm, const float* pl, const float* po,
   }
 }
 
+// Q8_0 (34 B blocks) / NVFP4 (36 B blocks) rows -> [qs][scales] rows padded to
+// 16 bytes
+__global__ void RepackRows(const unsigned char* src, std::size_t src_stride,
+                           unsigned char* dst, std::size_t dst_stride, int cols,
+                           bool nvfp4) {
+  const unsigned char* in =
+      src + static_cast<std::size_t>(blockIdx.x) * src_stride;
+  unsigned char* out = dst + static_cast<std::size_t>(blockIdx.x) * dst_stride;
+  if (!nvfp4) {
+    const int nb = cols / 32;
+    for (int b = threadIdx.x; b < nb; b += blockDim.x) {
+      out[cols + b * 2] = in[b * 34];
+      out[cols + b * 2 + 1] = in[b * 34 + 1];
+      for (int i = 0; i < 32; ++i)
+        out[b * 32 + i] = in[b * 34 + 2 + i];
+    }
+  } else {
+    const int nb = cols / 64;
+    for (int b = threadIdx.x; b < nb; b += blockDim.x) {
+      for (int i = 0; i < 4; ++i)
+        out[cols / 2 + b * 4 + i] = in[b * 36 + i];
+      for (int i = 0; i < 32; ++i)
+        out[b * 32 + i] = in[b * 36 + 4 + i];
+    }
+  }
+}
+
 struct Tensor {
   void* dev{nullptr};
   int type{kTypeF32};
@@ -1195,6 +1328,30 @@ std::shared_ptr<Model> Model::Load(const std::string& path,
     for (std::size_t d = 1; d < info.dimensions.size(); ++d)
       t.rows *= info.dimensions[d];
     t.row_bytes = info.size_bytes / t.rows;
+    const bool repack = (t.type == kTypeQ8 || t.type == kTypeNvfp4) &&
+                        info.name != "token_embd.weight";
+    if (repack) {
+      void* tmp = nullptr;
+      HIP_OK(hipMalloc(&tmp, info.size_bytes));
+      HIP_OK(hipMemcpy(tmp, info.data, info.size_bytes, hipMemcpyHostToDevice));
+      const std::size_t qs_bytes = t.type == kTypeQ8 ? t.cols : t.cols / 2;
+      const std::size_t sc_bytes =
+          t.type == kTypeQ8 ? (t.cols / 32) * 2 : t.cols / 16;
+      const std::size_t stride = (qs_bytes + sc_bytes + 15) / 16 * 16;
+      HIP_OK(hipMalloc(&t.dev, stride * t.rows));
+      HIP_OK(hipMemset(t.dev, 0, stride * t.rows));
+      RepackRows<<<static_cast<unsigned>(t.rows), 256>>>(
+          static_cast<const unsigned char*>(tmp), t.row_bytes,
+          static_cast<unsigned char*>(t.dev), stride, static_cast<int>(t.cols),
+          t.type == kTypeNvfp4);
+      HIP_OK(hipDeviceSynchronize());
+      HIP_OK(hipFree(tmp));
+      t.row_bytes = stride;
+      state->allocations.push_back(t.dev);
+      state->resident_bytes += stride * t.rows;
+      state->tensors.emplace(std::string(info.name), t);
+      continue;
+    }
     HIP_OK(hipMalloc(&t.dev, info.size_bytes));
     HIP_OK(hipMemcpy(t.dev, info.data, info.size_bytes, hipMemcpyHostToDevice));
     state->allocations.push_back(t.dev);
@@ -1243,6 +1400,8 @@ struct Session::Impl {
       *moe{nullptr}, *prelude{nullptr}, *bank_out{nullptr}, *d_logits{nullptr};
   int *sorted{nullptr}, *tiles{nullptr};
   __half *xh{nullptr}, *act16{nullptr};
+  signed char* xq{nullptr};
+  float* xqs{nullptr};
   float *split_m{nullptr}, *split_l{nullptr}, *split_o{nullptr};
   int *blist{nullptr}, *bcount{nullptr};
   bool sparse{false};
@@ -1283,17 +1442,22 @@ struct Session::Impl {
   void Dense(const Tensor& w, const float* xin, std::size_t ldx, float* yout,
              std::size_t ldy, int n, int rows = -1) {
     const int nrows = rows < 0 ? static_cast<int>(w.rows) : rows;
+    if (n == 1 && w.type == kTypeQ8 && ldx == w.cols) {
+      QuantRows<<<dim3(1, w.cols / 32), 32, 0, stream>>>(
+          xin, xq, xqs, static_cast<int>(w.cols));
+      const int rpb8 = kThreads * 2 / 32;
+      GemmDp4<kTypeQ8>
+          <<<dim3((nrows + rpb8 - 1) / rpb8, 1), kThreads * 2, 0, stream>>>(
+              static_cast<const unsigned char*>(w.dev), w.row_bytes,
+              static_cast<int>(w.cols), nrows, nullptr, nullptr, nullptr, xq,
+              xqs, yout);
+      return;
+    }
     if (n >= kWmmaMinTokens && nrows % kTileN == 0 &&
         ldy == static_cast<std::size_t>(nrows) &&
         static_cast<std::uint64_t>(nrows) <= w.rows) {
       const std::size_t xcount = static_cast<std::size_t>(n) * w.cols;
       ToHalf<<<(xcount + 255) / 256, 256, 0, stream>>>(xin, xh, xcount);
-      if (w.type == kTypeQ8 && ldx == w.cols &&
-          std::getenv("INKLING_SHARED_DENSE") != nullptr &&
-          gufo::models::qwen38_flash_next::rocm::DenseF16Gemm(
-              w.dev, xh, yout, n, nrows, w.cols, stream)) {
-        return;
-      }
       WmmaArgs wa{static_cast<const unsigned char*>(w.dev),
                   w.row_bytes,
                   static_cast<int>(w.cols),
@@ -1344,6 +1508,26 @@ struct Session::Impl {
   }
   void Routed(const Tensor& w, int rows, int items, const float* scale,
               const float* xin, float* yout) {
+    {
+      const int nx =
+          (xrow == xrow_token) ? items / m->config.expert_used : items;
+      QuantRows<<<dim3(nx, w.cols / 32), 32, 0, stream>>>(
+          xin, xq, xqs, static_cast<int>(w.cols));
+      const int rpb8 = kThreads * 2 / 32;
+      const dim3 g8((rows + rpb8 - 1) / rpb8, items);
+      if (w.type == kTypeNvfp4) {
+        GemmDp4<kTypeNvfp4><<<g8, kThreads * 2, 0, stream>>>(
+            static_cast<const unsigned char*>(w.dev), w.row_bytes,
+            static_cast<int>(w.cols), rows, ids_flat, xrow, scale, xq, xqs,
+            yout);
+      } else {
+        GemmDp4<kTypeQ8><<<g8, kThreads * 2, 0, stream>>>(
+            static_cast<const unsigned char*>(w.dev), w.row_bytes,
+            static_cast<int>(w.cols), rows, ids_flat, xrow, scale, xq, xqs,
+            yout);
+      }
+      return;
+    }
     const int rpb = kThreads * 2 / 32;
     const dim3 grid((rows + rpb - 1) / rpb, items);
     const auto* wp = static_cast<const unsigned char*>(w.dev);
@@ -1854,6 +2038,11 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
   i.bank_out = i.Alloc(b * h);
   i.d_logits = i.Alloc(c.vocab_padded);
   i.d_pos = static_cast<int*>(i.AllocBytes(4));
+  i.xq = static_cast<signed char*>(
+      i.AllocBytes(static_cast<std::size_t>(kWmmaMinTokens) * c.expert_used *
+                   std::max<std::size_t>(c.hidden_size, 3072) * 2));
+  i.xqs = i.Alloc(static_cast<std::size_t>(kWmmaMinTokens) * c.expert_used *
+                  std::max<std::size_t>(c.hidden_size, 3072) / 16);
   i.blist = static_cast<int*>(
       i.AllocBytes(static_cast<std::size_t>(kMaxBatch / kFlashQ) * c.num_heads *
                    kListCap * 4));
