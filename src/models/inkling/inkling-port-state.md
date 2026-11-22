@@ -176,6 +176,29 @@ looped 3x -> 5.4B effective active; 24 physical layers, middle core looped).
   depth 1. Needs: tap capture in the engine, an n=2..8 verify path (batched decode kernels + graph per width),
   drafter engine, acceptance logic and serve integration.
 
+## DSpark milestone 1 (2026-11-22): tap capture, verify path, keep-rows
+
+- `Session::AppendAll(1..8 tokens)` keeps the logits of every row (`Logits(row)`); argmax of every row matches
+  sequential single-token steps (max |dlogit| 0.4-1.4, int8-activation decode path vs f32 batch path).
+- `Session::KeepRows(k)` rewinds a verification batch to its first k rows: the short-convolution histories keep a
+  window of the batch inputs per channel (3 + 8 floats) and a fix-up kernel restores the history for k rows; cache rows
+  past k are overwritten by the next append. Checked: keep j of k then +1 token matches j sequential steps + 1.
+- Tap capture (INKLING_DRAFT=1): hidden state outputs of virtual layers 4, 22, 40, 47 (from drafter `target_layers`
+  [5, 23, 41, 48]; the off-by-one convention is to be confirmed by drafter acceptance) stored as F16 per position
+  (`feat[pos][tap][2304]`); works in the single, banked and graph paths.
+- Measured (eager, no graph): verify 2 rows 42.5 ms, 4 rows 58 ms, 8 rows 89 ms vs 35.4 ms per plain token. With ~60%
+  draft acceptance at depth 1 and a ~3 ms draft: ~35 tok/s eager, ~41 with a captured verify-2 graph; 50 needs a
+  cheaper n=2..4 verify (batched Q8/NVFP4 kernels for few rows) and/or depth 2-3 with higher acceptance.
+- Drafter recipe recovered from the reference runtime's `its program`: per drafter layer l, ctx feature = rmsnorm(sum_k softmax(
+  dspark_fuse[l])_k * tap_k) * dflare_norm_l -> K = attn_k_ctx(.) (rmsnorm attn_k_ctx_norm, rope theta 1e6 neox),
+  V = attn_v_ctx(.), stored in the drafter KV (layers 0 and 2 sliding 1024, layer 1 full); row 3 of dspark_fuse (+
+  dspark_norm) gives the carry feature for the Markov RNN head. Propose: block slots = target-embedded anchor token +
+  mask_embd for the rest, 3 layers (ffn 9216), output_norm, target lm head (the reference runtime uses a Q4_0 shortlist head) + Markov RNN
+  (markov_w1 [256, vocab], joint_proj [5120 -> 768] over [state, w1[prev], 2x2304 features], dspark_hidden_out); the
+  artifact has no markov_w2, so the vocab bias is probably tied to markov_w1 (to confirm in g_dsp_markov_*).
+- Next: drafter engine (warm: fuse/K/V ctx projections; propose: 3 layers + head + Markov chain), accept loop
+  (greedy first), captured verify graphs, serve integration.
+
 ## Open questions / next steps (skill default order)
 
 1. CPU reference (`src/models/inkling/reference.cpp`) + config parser.

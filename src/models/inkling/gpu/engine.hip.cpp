@@ -28,7 +28,8 @@ constexpr int kConvTaps = 4;
 constexpr int kHistory = 3;
 constexpr int kMaxBatch = 4096;
 constexpr std::size_t kBankMin = 3072;
-constexpr int kWinLen = 3 + 8;  // history + up to 8 verification inputs per channel
+constexpr int kWinLen =
+    3 + 8;  // history + up to 8 verification inputs per channel
 constexpr std::size_t kMaxVerifyRows = 8;
 constexpr std::uint32_t kNpuSlice = 1024;
 constexpr int kFlashHd = 128;
@@ -454,13 +455,17 @@ __global__ void ConvHist(const float* cur, float* hist, int ch, int n) {
 }
 
 constexpr int kTapCount = 4;
-constexpr int kTapLayers[kTapCount] = {4, 22, 40, 47};  // virtual layers whose outputs feed the drafter
+constexpr int kTapLayers[kTapCount] = {
+    4, 22, 40, 47};  // virtual layers whose outputs feed the drafter
 
 // feature rows of the drafter: feat[pos][tap][h] as F16
-__global__ void TapStore(const float* cur, __half* feat, const int* pos0, int tap, int h) {
-  const std::size_t dst = (static_cast<std::size_t>(*pos0 + blockIdx.x) * kTapCount + tap) * h;
+__global__ void TapStore(const float* cur, __half* feat, const int* pos0,
+                         int tap, int h) {
+  const std::size_t dst =
+      (static_cast<std::size_t>(*pos0 + blockIdx.x) * kTapCount + tap) * h;
   for (int i = threadIdx.x; i < h; i += blockDim.x)
-    feat[dst + i] = __float2half(cur[static_cast<std::size_t>(blockIdx.x) * h + i]);
+    feat[dst + i] =
+        __float2half(cur[static_cast<std::size_t>(blockIdx.x) * h + i]);
 }
 
 struct HistEntry {
@@ -468,7 +473,8 @@ struct HistEntry {
   int ch;
 };
 
-// after a verification batch: history = the window after `keep` of the batch's inputs
+// after a verification batch: history = the window after `keep` of the batch's
+// inputs
 __global__ void FixHist(const HistEntry* entries, int keep) {
   const HistEntry e = entries[blockIdx.y];
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -900,20 +906,27 @@ __global__ void SituHalf(const float* gu, const int* group, const float* scale,
   }
 }
 
-__global__ void SituHalfIn(const __half* gu, __half* act, int ff, float beta, float lb) {
+__global__ void SituHalfIn(const __half* gu, __half* act, int ff, float beta,
+                           float lb) {
   const int item = blockIdx.x;
   for (int j = threadIdx.x; j < ff; j += blockDim.x) {
-    const float g = __half2float(gu[static_cast<std::size_t>(item) * 2 * ff + j]);
-    const float u = __half2float(gu[static_cast<std::size_t>(item) * 2 * ff + ff + j]);
-    act[static_cast<std::size_t>(item) * ff + j] = __float2half(beta * tanhf(g / beta) * Sigmoid(g) * lb * tanhf(u / lb));
+    const float g =
+        __half2float(gu[static_cast<std::size_t>(item) * 2 * ff + j]);
+    const float u =
+        __half2float(gu[static_cast<std::size_t>(item) * 2 * ff + ff + j]);
+    act[static_cast<std::size_t>(item) * ff + j] =
+        __float2half(beta * tanhf(g / beta) * Sigmoid(g) * lb * tanhf(u / lb));
   }
 }
 
-__global__ void CombineHalf(const __half* y, const float* wts, float* out, int nu, int h) {
+__global__ void CombineHalf(const __half* y, const float* wts, float* out,
+                            int nu, int h) {
   for (int i = threadIdx.x; i < h; i += blockDim.x) {
     float a = 0.0F;
     for (int k = 0; k < nu; ++k)
-      a += wts[blockIdx.x * nu + k] * __half2float(y[(static_cast<std::size_t>(blockIdx.x) * nu + k) * h + i]);
+      a += wts[blockIdx.x * nu + k] *
+           __half2float(
+               y[(static_cast<std::size_t>(blockIdx.x) * nu + k) * h + i]);
     out[static_cast<std::size_t>(blockIdx.x) * h + i] = a;
   }
 }
@@ -1837,7 +1850,8 @@ struct Session::Impl : Scratch {
   };
   std::vector<Slot> slots;
   bool banked{false};
-  __half* feat{nullptr};  // tapped hidden states per position (drafter features), when enabled
+  __half* feat{nullptr};  // tapped hidden states per position (drafter
+                          // features), when enabled
   HistEntry* hist_entries{nullptr};
   int n_hist_entries{0};
   int last_rows{0};
@@ -2080,7 +2094,10 @@ struct Session::Impl : Scratch {
     }
     Conv<<<(ch + 127) / 128, 128, 0, stream>>>(
         in_, static_cast<const float*>(w.dev), dyn, heads, hist, out, ch, n,
-        add, all_rows && n <= static_cast<int>(kMaxVerifyRows) ? hist + static_cast<std::size_t>(ch) * kHistory : nullptr);
+        add,
+        all_rows && n <= static_cast<int>(kMaxVerifyRows)
+            ? hist + static_cast<std::size_t>(ch) * kHistory
+            : nullptr);
   }
   float* Pool() { return block_pool[pool_used++]; }
 
@@ -2726,16 +2743,17 @@ struct Session::Impl : Scratch {
       const int bn = n >= 2048 ? 192 : (n >= 512 ? 128 : 48);
       int ntiles = 0;
       const int* tmap = TileMap(n, bn, &ntiles);
-      const bool ok1 = qfn::RoutedNvfp4GemmF16(
-          wgu.dev, xmoe, tmap, ntiles, bn, rbounds, rrows_token, rrows_slot,
-          gu16, 2 * ff, h, s_gu, stream);
+      const bool ok1 = qfn::RoutedNvfp4GemmF16(wgu.dev, xmoe, tmap, ntiles, bn,
+                                               rbounds, rrows_token, rrows_slot,
+                                               gu16, 2 * ff, h, s_gu, stream);
       SituHalfIn<<<items, 256, 0, stream>>>(gu16, act16, ff, c.situ_beta,
                                             c.situ_linear_beta);
-      const bool ok2 = qfn::RoutedNvfp4GemmF16(
-          wdn.dev, act16, tmap, ntiles, bn, rbounds, rrows_slot, rrows_slot,
-          y16, h, ff, s_dn, stream);
+      const bool ok2 = qfn::RoutedNvfp4GemmF16(wdn.dev, act16, tmap, ntiles, bn,
+                                               rbounds, rrows_slot, rrows_slot,
+                                               y16, h, ff, s_dn, stream);
       if (!ok1 || !ok2) {
-        std::fprintf(stderr, "inkling: shared routed gemm rejected the launch\n");
+        std::fprintf(stderr,
+                     "inkling: shared routed gemm rejected the launch\n");
         std::abort();
       }
       CombineHalf<<<n, 256, 0, stream>>>(y16, wts, moe, nu, h);
@@ -2836,8 +2854,8 @@ struct Session::Impl : Scratch {
       return;
     for (int k = 0; k < kTapCount; ++k) {
       if (kTapLayers[k] == v)
-        TapStore<<<n, 256, 0, stream>>>(cur, feat, d_pos, k,
-                                        static_cast<int>(m->config.hidden_size));
+        TapStore<<<n, 256, 0, stream>>>(
+            cur, feat, d_pos, k, static_cast<int>(m->config.hidden_size));
     }
   }
 
@@ -3106,7 +3124,8 @@ std::span<const float> Session::Logits(std::uint32_t row) const noexcept {
   return std::span<const float>(impl_->logits).subspan(row * v, v);
 }
 
-bool Session::AppendAll(std::span<const std::int32_t> tokens, std::string* error) {
+bool Session::AppendAll(std::span<const std::int32_t> tokens,
+                        std::string* error) {
   if (tokens.empty() || tokens.size() > kMaxVerifyRows ||
       impl_->position + tokens.size() > impl_->ctx) {
     if (error != nullptr)
@@ -3125,8 +3144,11 @@ void Session::KeepRows(std::uint32_t keep) {
   auto& i = *impl_;
   if (static_cast<int>(keep) >= i.last_rows)
     return;
-  const int max_ch = std::max<int>(static_cast<int>(i.m->config.hidden_size), static_cast<int>(i.m->config.num_kv * i.m->config.head_dim));
-  FixHist<<<dim3((max_ch + 255) / 256, i.n_hist_entries), 256, 0, i.stream>>>(i.hist_entries, static_cast<int>(keep));
+  const int max_ch = std::max<int>(
+      static_cast<int>(i.m->config.hidden_size),
+      static_cast<int>(i.m->config.num_kv * i.m->config.head_dim));
+  FixHist<<<dim3((max_ch + 255) / 256, i.n_hist_entries), 256, 0, i.stream>>>(
+      i.hist_entries, static_cast<int>(keep));
   HIP_OK(hipStreamSynchronize(i.stream));
   i.position = i.pos_before_last + keep;
   i.last_rows = static_cast<int>(keep);
@@ -3202,10 +3224,14 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
                        c.num_kv * 2 * kFlashHd * 2));
     }
     sl.v = static_cast<__half*>(i.AllocBytes(rows * kv * 2));
-    sl.hist_k = static_cast<float*>(i.AllocBytes(kv * (kHistory + kWinLen) * 4));
-    sl.hist_v = static_cast<float*>(i.AllocBytes(kv * (kHistory + kWinLen) * 4));
-    sl.hist_attn = static_cast<float*>(i.AllocBytes(h * (kHistory + kWinLen) * 4));
-    sl.hist_ffn = static_cast<float*>(i.AllocBytes(h * (kHistory + kWinLen) * 4));
+    sl.hist_k =
+        static_cast<float*>(i.AllocBytes(kv * (kHistory + kWinLen) * 4));
+    sl.hist_v =
+        static_cast<float*>(i.AllocBytes(kv * (kHistory + kWinLen) * 4));
+    sl.hist_attn =
+        static_cast<float*>(i.AllocBytes(h * (kHistory + kWinLen) * 4));
+    sl.hist_ffn =
+        static_cast<float*>(i.AllocBytes(h * (kHistory + kWinLen) * 4));
   }
   const std::size_t qd = static_cast<std::size_t>(c.num_heads) * c.head_dim;
   auto alloc_scratch = [&](Scratch& sc, std::size_t b) {
@@ -3250,7 +3276,8 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
       for (int j = 0; j < 8; ++j)
         i.npu_c[j] = state_->npu->NewBuffer(state_->npu->CBytes(), &npu_error);
     }
-    sc.gu16 = static_cast<__half*>(i.AllocBytes(b * c.expert_used * 2 * c.expert_ff * 2));
+    sc.gu16 = static_cast<__half*>(
+        i.AllocBytes(b * c.expert_used * 2 * c.expert_ff * 2));
     sc.y16 = static_cast<__half*>(i.AllocBytes(b * c.expert_used * h * 2));
     sc.xh0 = static_cast<__half*>(i.AllocBytes(b * h * 2));
     sc.xh1 = static_cast<__half*>(i.AllocBytes(b * h * 2));
@@ -3323,7 +3350,8 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
   }
   HIP_OK(hipStreamCreateWithFlags(&i.stream, hipStreamNonBlocking));
   if (std::getenv("INKLING_DRAFT") != nullptr) {
-    i.feat = static_cast<__half*>(i.AllocBytes(static_cast<std::size_t>(max_context) * kTapCount * h * 2));
+    i.feat = static_cast<__half*>(i.AllocBytes(
+        static_cast<std::size_t>(max_context) * kTapCount * h * 2));
   }
   {
     std::vector<HistEntry> entries;
@@ -3333,8 +3361,11 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
       entries.push_back({sl.hist_attn, static_cast<int>(h)});
       entries.push_back({sl.hist_ffn, static_cast<int>(h)});
     }
-    i.hist_entries = static_cast<HistEntry*>(i.AllocBytes(entries.size() * sizeof(HistEntry)));
-    HIP_OK(hipMemcpy(i.hist_entries, entries.data(), entries.size() * sizeof(HistEntry), hipMemcpyHostToDevice));
+    i.hist_entries = static_cast<HistEntry*>(
+        i.AllocBytes(entries.size() * sizeof(HistEntry)));
+    HIP_OK(hipMemcpy(i.hist_entries, entries.data(),
+                     entries.size() * sizeof(HistEntry),
+                     hipMemcpyHostToDevice));
     i.n_hist_entries = static_cast<int>(entries.size());
   }
   if (state_->npu || std::getenv("INKLING_BANKS") != nullptr) {

@@ -87,7 +87,8 @@ int main(int argc, char** argv) {
     return 0;
   }
   if (argc >= 4 && std::string(argv[2]) == "--verify") {
-    // --verify <text file> <k>: AppendAll(k rows) must match k sequential single-token steps
+    // --verify <text file> <k>: AppendAll(k rows) must match k sequential
+    // single-token steps
     std::string err;
     auto reader = gufo::core::GgufReader::OpenFile(argv[1], &err);
     auto tok = gufo::tokenization::QwenTokenizer::CreateFromGguf(*reader, &err);
@@ -100,9 +101,11 @@ int main(int argc, char** argv) {
     auto model = gufo::models::inkling::gpu::Model::Load(argv[1], &err);
     auto session = model->CreateSession(2048, &err);
     std::vector<std::int32_t> prefix;
-    for (int i = 0; i < kPrefix; ++i) prefix.push_back(static_cast<std::int32_t>(ids[i]));
+    for (int i = 0; i < kPrefix; ++i)
+      prefix.push_back(static_cast<std::int32_t>(ids[i]));
     std::vector<std::int32_t> next;
-    for (int i = 0; i < k; ++i) next.push_back(static_cast<std::int32_t>(ids[kPrefix + i]));
+    for (int i = 0; i < k; ++i)
+      next.push_back(static_cast<std::int32_t>(ids[kPrefix + i]));
     (void)session->Append(prefix, &err);
     std::vector<std::vector<float>> seq;
     for (int i = 0; i < k; ++i) {
@@ -122,17 +125,47 @@ int main(int argc, char** argv) {
       int a0 = 0, a1 = 0;
       for (std::size_t j = 0; j < l.size(); ++j) {
         maxd = std::max(maxd, std::fabs(static_cast<double>(l[j]) - seq[i][j]));
-        if (l[j] > l[a0]) a0 = static_cast<int>(j);
-        if (seq[i][j] > seq[i][a1]) a1 = static_cast<int>(j);
+        if (l[j] > l[a0])
+          a0 = static_cast<int>(j);
+        if (seq[i][j] > seq[i][a1])
+          a1 = static_cast<int>(j);
       }
-      std::printf("row %d: max |dlogit| %.4f, argmax batch %d seq %d\n", i, maxd, a0, a1);
+      std::printf("row %d: max |dlogit| %.4f, argmax batch %d seq %d\n", i,
+                  maxd, a0, a1);
     }
-    // KeepRows: batch of k, keep j, then one more token must match j sequential steps + that token
+    {
+      constexpr int kReps = 30;
+      session->Reset();
+      (void)session->Append(prefix, &err);
+      auto t0 = std::chrono::steady_clock::now();
+      for (int r = 0; r < kReps; ++r) {
+        (void)session->AppendAll(next, &err);
+        session->Rewind(kPrefix);
+      }
+      const double ms_batch = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t0)
+                                  .count() /
+                              kReps;
+      t0 = std::chrono::steady_clock::now();
+      for (int r = 0; r < kReps; ++r) {
+        (void)session->Append(std::span(&next[0], 1), &err);
+        session->Rewind(kPrefix);
+      }
+      const double ms_one = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t0)
+                                .count() /
+                            kReps;
+      std::printf("verify %d rows: %.2f ms; single token step: %.2f ms\n", k,
+                  ms_batch, ms_one);
+    }
+    // KeepRows: batch of k, keep j, then one more token must match j sequential
+    // steps + that token
     const std::int32_t extra = static_cast<std::int32_t>(ids[kPrefix + k]);
     for (int j = 1; j < k; ++j) {
       session->Reset();
       (void)session->Append(prefix, &err);
-      for (int i = 0; i < j; ++i) (void)session->Append(std::span(&next[i], 1), &err);
+      for (int i = 0; i < j; ++i)
+        (void)session->Append(std::span(&next[i], 1), &err);
       (void)session->Append(std::span(&extra, 1), &err);
       const auto ref_l = session->Logits();
       const std::vector<float> ref(ref_l.begin(), ref_l.end());
@@ -143,8 +176,11 @@ int main(int argc, char** argv) {
       (void)session->Append(std::span(&extra, 1), &err);
       const auto got = session->Logits();
       double maxd = 0.0;
-      for (std::size_t q = 0; q < got.size(); ++q) maxd = std::max(maxd, std::fabs(static_cast<double>(got[q]) - ref[q]));
-      std::printf("keep %d of %d then +1 token: max |dlogit| %.4f (position %u)\n", j, k, maxd, session->Position());
+      for (std::size_t q = 0; q < got.size(); ++q)
+        maxd = std::max(maxd, std::fabs(static_cast<double>(got[q]) - ref[q]));
+      std::printf(
+          "keep %d of %d then +1 token: max |dlogit| %.4f (position %u)\n", j,
+          k, maxd, session->Position());
     }
     return 0;
   }
