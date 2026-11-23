@@ -278,6 +278,12 @@ __device__ __forceinline__ void GateUpBody(
   const int tb[2] = {fr0 >> 4, (ff + fr0) >> 4};
   const int mrow[2] = {fr0 + lr, ff + fr0 + lr};
 
+  // 16-token sub-tiles past the bucket's rows hold no work: skip their matrix
+  // work and fold (wave-uniform).
+  bool live_a[4];
+  for (int a = 0; a < 4; ++a)
+    live_a[a] = c0 + wth * 64 + a * 16 < c_end;
+
   float sum[4][2][8];
   for (int a = 0; a < 4; ++a)
     for (int b = 0; b < 2; ++b)
@@ -337,6 +343,8 @@ __device__ __forceinline__ void GateUpBody(
 #pragma unroll
     for (int a2 = 0; a2 < 2; ++a2) {
       const int a = 2 * h + a2;
+      if (!live_a[a])
+        continue;
       float scf[8];
       const float4 s0 = *reinterpret_cast<const float4*>(
           ssl + (wth * 64 + 16 * a + 8 * hi) * 4);
@@ -380,8 +388,9 @@ __device__ __forceinline__ void GateUpBody(
             (s & 1) ? i32x2{(int)wq.z, (int)wq.w} : i32x2{(int)wq.x, (int)wq.y};
 #pragma unroll
         for (int a2 = 0; a2 < 2; ++a2)
-          C[b][a2] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(
-              true, ar[a2], true, wv, s == 0 ? MagicInit() : C[b][a2], false);
+          if (live_a[2 * h + a2])
+            C[b][a2] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(
+                true, ar[a2], true, wv, s == 0 ? MagicInit() : C[b][a2], false);
       }
       if (reload && (s & 1)) {
         for (int b = 0; b < 2; ++b)
