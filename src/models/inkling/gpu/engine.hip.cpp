@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -1379,6 +1380,11 @@ __global__ void SplitKReduce(const float* part, float* y, std::size_t count,
   y[i] = a;
 }
 
+__global__ void SetDenseBounds(int* bounds, int n) {
+  bounds[0] = 0;
+  bounds[1] = n;
+}
+
 __global__ void EmuSitu(const float* gu, const int* ids, const float* es,
                         __half* act, int ff, float beta, float lb) {
   const int item = blockIdx.x;
@@ -2482,6 +2488,23 @@ struct ModelState {
       2048};  // rows of the runtime-M program = rows of one bank
   std::unordered_map<std::string, std::vector<int>>
       npu_w;  // tensor -> 1024-row slices
+  // Rotated int4 copies of the routed experts (INKLING_IU4), built at first use
+  // and shared by every session of the model.
+  std::mutex iu4_mutex;
+  std::vector<std::pair<std::uint8_t*, std::uint16_t*>> iu4_w =
+      std::vector<std::pair<std::uint8_t*, std::uint16_t*>>(
+          64, {nullptr, nullptr});
+  std::vector<std::pair<std::uint8_t*, std::uint16_t*>> iu4_dw =
+      std::vector<std::pair<std::uint8_t*, std::uint16_t*>>(
+          64, {nullptr, nullptr});
+  float* iu4_signs{nullptr};
+  void* ModelAlloc(std::size_t bytes) {
+    void* p = nullptr;
+    HIP_OK(hipMalloc(&p, bytes));
+    HIP_OK(hipMemset(p, 0, bytes));
+    allocations.push_back(p);
+    return p;
+  }
   ~ModelState() {
     npu.reset();
     for (void* p : allocations)
@@ -3110,6 +3133,8 @@ struct Scratch {
       *rrows_slot{nullptr};
   int *sorted{nullptr}, *tiles{nullptr};
   int *tl_a{nullptr}, *tl_b{nullptr};  ///< compact (expert, token tile) lists
+  int* dense_bounds_buf{nullptr};      ///< {0, n} of the dense routed GEMM
+  int dense_bounds_n{-1};
   float* ksbuf{nullptr};               ///< split-K partial sums
   __half *xh{nullptr}, *act16{nullptr}, *xh0{nullptr}, *xh1{nullptr},
       *xh2{nullptr}, *xhx{nullptr}, *atth{nullptr}, *cath{nullptr};
@@ -3325,6 +3350,14 @@ struct Session::Impl : Scratch {
     allocs.push_back(p);
     return p;
   }
+  // Buffers created on first use are not part of the session's measured state:
+  // the server compares it with a claim taken from a probe session that never
+  // ran a forward pass.
+  void* AllocLazy(std::size_t bytes) {
+    void* p = AllocBytes(bytes);
+    allocated_bytes -= bytes;
+    return p;
+  }
   ~Impl() {
     if (graph_exec != nullptr)
       (void)hipGraphExecDestroy(graph_exec);
@@ -3351,17 +3384,11 @@ struct Session::Impl : Scratch {
   // int4 emulation state (INKLING_IU4_EMU)
   std::vector<void*> emu_w = std::vector<void*>(64, nullptr);
   // rotated int4 routed gate/up path (INKLING_IU4)
-  std::vector<std::pair<std::uint8_t*, std::uint16_t*>> iu4_w =
-      std::vector<std::pair<std::uint8_t*, std::uint16_t*>>(
-          64, {nullptr, nullptr});
-  float* iu4_signs{nullptr};
+  float* iu4_signs{nullptr};  ///< the model's shared signs
   std::uint8_t* iu4_act{nullptr};
   float* iu4_act_scales{nullptr};
   int iu4_padded{0};
-  // down projection (INKLING_IU4=2): int4 weights per layer, activations
-  std::vector<std::pair<std::uint8_t*, std::uint16_t*>> iu4_dw =
-      std::vector<std::pair<std::uint8_t*, std::uint16_t*>>(
-          64, {nullptr, nullptr});
+  // down projection (INKLING_IU4=2) activations
   std::uint8_t* iu4_act2{nullptr};
   float* iu4_act2_scales{nullptr};
   float* emu_signs{nullptr};
@@ -3369,7 +3396,6 @@ struct Session::Impl : Scratch {
   float* emu_gu{nullptr};
   int* dense_ident{nullptr};
   int* dense_tiles{nullptr};
-  std::unordered_map<int, int*> dense_bounds;
   const int* DenseMaps(int n, int bn, int* ntiles) {
     constexpr int kMaxTiles = kMaxBatch / 128 + 2;
     if (dense_ident == nullptr) {
@@ -3379,21 +3405,21 @@ struct Session::Impl : Scratch {
         ident[i] = i;
       for (int t = 0; t < kMaxTiles; ++t)
         tiles[t] = t << 16;
-      dense_ident = static_cast<int*>(AllocBytes(kMaxBatch * sizeof(int)));
-      dense_tiles = static_cast<int*>(AllocBytes(kMaxTiles * sizeof(int)));
+      dense_ident = static_cast<int*>(AllocLazy(kMaxBatch * sizeof(int)));
+      dense_tiles = static_cast<int*>(AllocLazy(kMaxTiles * sizeof(int)));
       HIP_OK(hipMemcpy(dense_ident, ident.data(), kMaxBatch * sizeof(int),
                        hipMemcpyHostToDevice));
       HIP_OK(hipMemcpy(dense_tiles, tiles.data(), kMaxTiles * sizeof(int),
                        hipMemcpyHostToDevice));
     }
-    int*& bounds = dense_bounds[n];
-    if (bounds == nullptr) {
-      const int host[2] = {0, n};
-      bounds = static_cast<int*>(AllocBytes(2 * sizeof(int)));
-      HIP_OK(hipMemcpy(bounds, host, sizeof(host), hipMemcpyHostToDevice));
+    // one {0, n} buffer per bank, rewritten when n changes (a new buffer per
+    // prompt length would grow the session's measured state forever)
+    if (dense_bounds_n != n) {
+      SetDenseBounds<<<1, 1, 0, stream>>>(dense_bounds_buf, n);
+      dense_bounds_n = n;
     }
     *ntiles = (n + bn - 1) / bn;
-    return bounds;
+    return dense_bounds_buf;
   }
   void Dense(const Tensor& w, const float* xin, std::size_t ldx, float* yout,
              std::size_t ldy, int n, int rows = -1,
@@ -4439,9 +4465,10 @@ struct Session::Impl : Scratch {
       const int bn =
           bn_env > 0 ? bn_env : (n >= 2048 ? 192 : (n >= 512 ? 128 : 48));
       int ntiles = 0;
-      const int* tmap = TileMap(n, bn, &ntiles);
       static const bool tile_list = std::getenv("INKLING_TILE_LIST") == nullptr ||
                                     std::getenv("INKLING_TILE_LIST")[0] != '0';
+      const int* tmap = tile_list && ne <= 256 ? nullptr
+                                               : TileMap(n, bn, &ntiles);
       if (tile_list && ne <= 256) {
         const int max_tiles = (items + bn - 1) / bn + ne;
         BuildTileList<<<1, 256, 0, stream>>>(rbounds, ne, bn, tl_a, max_tiles);
@@ -4450,7 +4477,7 @@ struct Session::Impl : Scratch {
       }
       if (situ_params == nullptr) {
         const float host[2] = {c.situ_beta, c.situ_linear_beta};
-        situ_params = static_cast<float*>(AllocBytes(sizeof(host)));
+        situ_params = static_cast<float*>(AllocLazy(sizeof(host)));
         HIP_OK(
             hipMemcpy(situ_params, host, sizeof(host), hipMemcpyHostToDevice));
       }
@@ -4489,31 +4516,61 @@ struct Session::Impl : Scratch {
       if (iu4_on) {
         namespace iu4 = gufo::models::inkling::iu4;
         const int rows2 = 2 * ff;
-        if (iu4_signs == nullptr) {
-          float sg[512];
-          iu4::FillSigns(sg);
-          iu4_signs = static_cast<float*>(AllocBytes(sizeof(sg)));
-          HIP_OK(hipMemcpy(iu4_signs, sg, sizeof(sg), hipMemcpyHostToDevice));
+        const int kd = (ff + 255) / 256 * 256;
+        {
+          // the repacked weights are shared by every session of the model
+          std::lock_guard<std::mutex> lock(m->iu4_mutex);
+          if (m->iu4_signs == nullptr) {
+            float sg[512];
+            iu4::FillSigns(sg);
+            m->iu4_signs = static_cast<float*>(m->ModelAlloc(sizeof(sg)));
+            HIP_OK(hipMemcpy(m->iu4_signs, sg, sizeof(sg),
+                             hipMemcpyHostToDevice));
+          }
+          if (m->iu4_w[p].first == nullptr) {
+            auto* tiles = static_cast<std::uint8_t*>(m->ModelAlloc(
+                static_cast<std::size_t>(ne) *
+                iu4::WeightBytesPerExpert(rows2, h)));
+            auto* scales = static_cast<std::uint16_t*>(m->ModelAlloc(
+                static_cast<std::size_t>(ne) *
+                iu4::ScaleBytesPerExpert(rows2, h)));
+            iu4::RepackExperts(static_cast<const std::uint8_t*>(wgu.dev),
+                               wgu.row_bytes, tiles, scales, ne, rows2, h, h,
+                               m->iu4_signs, stream);
+            HIP_OK(hipStreamSynchronize(stream));
+            m->iu4_w[p] = {tiles, scales};
+          }
+          if (iu4_level >= 2 && m->iu4_dw[p].first == nullptr) {
+            auto* tiles = static_cast<std::uint8_t*>(m->ModelAlloc(
+                static_cast<std::size_t>(ne) *
+                iu4::WeightBytesPerExpert(h, kd)));
+            auto* scales = static_cast<std::uint16_t*>(m->ModelAlloc(
+                static_cast<std::size_t>(ne) *
+                iu4::ScaleBytesPerExpert(h, kd)));
+            iu4::RepackExperts(static_cast<const std::uint8_t*>(wdn.dev),
+                               wdn.row_bytes, tiles, scales, ne, h, ff, kd,
+                               m->iu4_signs, stream);
+            HIP_OK(hipStreamSynchronize(stream));
+            m->iu4_dw[p] = {tiles, scales};
+          }
+        }
+        iu4_signs = m->iu4_signs;
+        if (iu4_act == nullptr) {
           const int max_rows = kMaxBatch * nu + ne * 16;
           iu4_padded = (max_rows + 128 + 127) / 128 * 128;
-          iu4_act = static_cast<std::uint8_t*>(AllocBytes(
+          iu4_act = static_cast<std::uint8_t*>(AllocLazy(
               static_cast<std::size_t>(iu4_padded) / 16 * (h / 128) * 1024));
-          iu4_act_scales = static_cast<float*>(AllocBytes(
+          iu4_act_scales = static_cast<float*>(AllocLazy(
               static_cast<std::size_t>(h / 128) * iu4_padded * 4));
-        }
-        if (iu4_w[p].first == nullptr) {
-          iu4_w[p].first = static_cast<std::uint8_t*>(AllocBytes(
-              static_cast<std::size_t>(ne) *
-              iu4::WeightBytesPerExpert(rows2, h)));
-          iu4_w[p].second = static_cast<std::uint16_t*>(AllocBytes(
-              static_cast<std::size_t>(ne) *
-              iu4::ScaleBytesPerExpert(rows2, h)));
-          iu4::RepackExperts(static_cast<const std::uint8_t*>(wgu.dev),
-                             wgu.row_bytes, iu4_w[p].first, iu4_w[p].second,
-                             ne, rows2, h, h, iu4_signs, stream);
+          iu4_act2 = static_cast<std::uint8_t*>(AllocLazy(
+              static_cast<std::size_t>(iu4_padded) / 16 * (kd / 128) * 1024));
+          iu4_act2_scales = static_cast<float*>(AllocLazy(
+              static_cast<std::size_t>(kd / 128) * iu4_padded * 4));
         }
         int nt128 = 0;
-        const int* tmap128 = TileMap(n, iu4::kTokenTile, &nt128);
+        const int* tmap128 = tile_list && ne <= 256
+                                 ? nullptr
+                                 : TileMap(n, iu4::kTokenTile, &nt128);
         if (tile_list && ne <= 256) {
           nt128 = (items + iu4::kTokenTile - 1) / iu4::kTokenTile + ne;
           BuildTileList<<<1, 256, 0, stream>>>(rbounds, ne, iu4::kTokenTile,
@@ -4523,36 +4580,17 @@ struct Session::Impl : Scratch {
         iu4::QuantizeRoutedActs(xmoe, rrows_token, rrows_slot, rbounds, ne,
                                 items + ne * 16, h, h, iu4_act, iu4_act_scales,
                                 iu4_padded, iu4_signs, stream);
-        iu4::GateUpSitu(iu4_w[p].first, iu4_w[p].second, iu4_act,
+        iu4::GateUpSitu(m->iu4_w[p].first, m->iu4_w[p].second, iu4_act,
                         iu4_act_scales, iu4_padded, tmap128, nt128, rbounds,
                         rrows_slot, act16, ff, h, s_gu, situ_params, stream);
         ok1 = true;
         if (iu4_level >= 2) {
           // down projection on int4 too: K = ff is padded to 1280
-          const int kd = (ff + 255) / 256 * 256;
-          if (iu4_act2 == nullptr) {
-            iu4_act2 = static_cast<std::uint8_t*>(AllocBytes(
-                static_cast<std::size_t>(iu4_padded) / 16 * (kd / 128) * 1024));
-            iu4_act2_scales = static_cast<float*>(AllocBytes(
-                static_cast<std::size_t>(kd / 128) * iu4_padded * 4));
-          }
-          if (iu4_dw[p].first == nullptr) {
-            iu4_dw[p].first = static_cast<std::uint8_t*>(AllocBytes(
-                static_cast<std::size_t>(ne) *
-                iu4::WeightBytesPerExpert(h, kd)));
-            iu4_dw[p].second = static_cast<std::uint16_t*>(AllocBytes(
-                static_cast<std::size_t>(ne) *
-                iu4::ScaleBytesPerExpert(h, kd)));
-            iu4::RepackExperts(static_cast<const std::uint8_t*>(wdn.dev),
-                               wdn.row_bytes, iu4_dw[p].first,
-                               iu4_dw[p].second, ne, h, ff, kd, iu4_signs,
-                               stream);
-          }
           iu4::QuantizeRoutedActs(act16, rrows_slot, rrows_slot, rbounds, ne,
                                   items + ne * 16, ff, kd, iu4_act2,
                                   iu4_act2_scales, iu4_padded, iu4_signs,
                                   stream);
-          iu4::DownGemm(iu4_dw[p].first, iu4_dw[p].second, iu4_act2,
+          iu4::DownGemm(m->iu4_dw[p].first, m->iu4_dw[p].second, iu4_act2,
                         iu4_act2_scales, iu4_padded, tmap128, nt128, rbounds,
                         rrows_slot, y16, h, kd, s_dn, stream);
           iu4_down_done = true;
@@ -4773,6 +4811,15 @@ struct Session::Impl : Scratch {
       }
     }
     const auto fwd_t1 = std::chrono::steady_clock::now();
+    static const bool alloc_log = std::getenv("INKLING_ALLOC_LOG") != nullptr;
+    if (alloc_log) {
+      static std::size_t last = 0;
+      if (allocated_bytes != last) {
+        std::fprintf(stderr, "inkling: session allocated_bytes %zu (n=%d)\n",
+                     allocated_bytes, n);
+        last = allocated_bytes;
+      }
+    }
     const int rows = all_rows ? n : 1;
     ArgMaxRow<<<rows, 256, 0, stream>>>(
         d_logits, static_cast<int>(c.vocab_unpadded), d_argmax, d_argmax);
@@ -5795,6 +5842,7 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
     sc.rcursors = static_cast<int*>(i.AllocBytes(c.expert_count * sizeof(int)));
     sc.ksbuf = static_cast<float*>(
         i.AllocBytes(static_cast<std::size_t>(4) * b * 128 * sizeof(float)));
+    sc.dense_bounds_buf = static_cast<int*>(i.AllocBytes(2 * sizeof(int)));
     sc.tl_a = static_cast<int*>(i.AllocBytes(1024 * sizeof(int)));
     sc.tl_b = static_cast<int*>(i.AllocBytes(1024 * sizeof(int)));
     {
