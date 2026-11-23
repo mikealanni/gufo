@@ -2502,6 +2502,7 @@ struct ModelState {
     void* p = nullptr;
     HIP_OK(hipMalloc(&p, bytes));
     HIP_OK(hipMemset(p, 0, bytes));
+    HIP_OK(hipDeviceSynchronize());  // the zeroing must land before any stream writes
     allocations.push_back(p);
     return p;
   }
@@ -3355,6 +3356,7 @@ struct Session::Impl : Scratch {
   // ran a forward pass.
   void* AllocLazy(std::size_t bytes) {
     void* p = AllocBytes(bytes);
+    HIP_OK(hipDeviceSynchronize());  // the zeroing must land before any stream writes
     allocated_bytes -= bytes;
     return p;
   }
