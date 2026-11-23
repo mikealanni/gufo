@@ -28,6 +28,14 @@ __device__ __forceinline__ float SigmoidF(float x) {
   return 1.0f / (1.0f + __expf(-x));
 }
 
+// tanh(x) = sign(x) * (1 - e) / (1 + e), e = exp(-2|x|): a few instructions
+// instead of the libm routine, whose register footprint slowed the whole GEMM.
+__device__ __forceinline__ float FastTanh(float x) {
+  const float e = __expf(-2.0f * fabsf(x));
+  const float t = (1.0f - e) * __frcp_rn(1.0f + e);
+  return copysignf(t, x);
+}
+
 __device__ __forceinline__ float Ue4m3(unsigned b) {
   const unsigned e = (b >> 3) & 15U, m = b & 7U;
   if (b == 0x7F)
@@ -432,21 +440,36 @@ __device__ __forceinline__ void GateUpBody(
   if (kDefer)
     fold(1, Cp, scp, sslp);
 
-  // SiTU on the gate/up accumulators of the same feature, straight to F16.
-  const int f = fr0 + lr;
+  // Epilogue: gate and up go to LDS as F16 (the K loop's buffers are dead
+  // now), then every thread applies SiTU on coalesced rows. Keeping the
+  // transcendentals out of the accumulator-live region stops the register
+  // allocator from spilling the K loop.
+  __syncthreads();
+  __half* eg = reinterpret_cast<__half*>(lds);
+  const int fi = wf * 16 + lr;
+#pragma unroll
   for (int a = 0; a < 4; ++a)
+#pragma unroll
     for (int j = 0; j < 8; ++j) {
-      const int c = c0 + wth * 64 + a * 16 + 8 * hi + j;
-      if (c >= c_end)
-        continue;
-      const std::int32_t dst = rows_out[c];
-      if (dst < 0)
-        continue;
-      const float g = sum[a][0][j] * es;
-      const float u = sum[a][1][j] * es;
-      act[static_cast<std::size_t>(dst) * ff + f] = __float2half(
-          beta * tanhf(g / beta) * SigmoidF(g) * lb * tanhf(u / lb));
+      const int tl = wth * 64 + a * 16 + 8 * hi + j;
+#pragma unroll
+      for (int b = 0; b < 2; ++b)
+        eg[(tl * 2 + b) * 64 + fi] = __float2half(sum[a][b][j] * es);
     }
+  __syncthreads();
+  for (int idx = tid; idx < kTokenTile * 64; idx += 256) {
+    const int tl = idx >> 6, f2 = idx & 63;
+    const int c = c0 + tl;
+    if (c >= c_end)
+      continue;
+    const std::int32_t dst = rows_out[c];
+    if (dst < 0)
+      continue;
+    const float g = __half2float(eg[(tl * 2) * 64 + f2]);
+    const float u = __half2float(eg[(tl * 2 + 1) * 64 + f2]);
+    act[static_cast<std::size_t>(dst) * ff + f0 + f2] = __float2half(
+        beta * FastTanh(g / beta) * SigmoidF(g) * lb * FastTanh(u / lb));
+  }
 }
 
 __global__ void __launch_bounds__(256)
