@@ -5909,6 +5909,7 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
   constexpr bool kI2X = kType == WeightType::kIQ2_XXS;
   constexpr bool kI2S = kType == WeightType::kIQ2_S;
   constexpr bool kNV = kType == WeightType::kNVFP4;
+  static_assert(!kQ8R || BM == 128, "Q8Rep loads rows straight into registers");
   static_assert(!kNV || BM == 128,
                 "NVFP4 loads each wave's 16 rows straight into registers");
   constexpr bool kGrid = kI3 || kI2X || kI2S;
@@ -6029,6 +6030,9 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
   // straight from global memory into registers, bypassing LDS.
   uint4 w_code[2], cur_code[2];
   std::uint32_t w_sc = 0, cur_sc = 0;
+  // Q8Rep: the same direct path with two 32-code blocks per stage.
+  uint4 q_code[4], q_cur[4];
+  std::uint32_t q_sc = 0, q_cur_sc = 0;
   const int d_local =
       kPair ? (wave_id & 3) * 16 + sub_lane : wave_id * 16 + sub_lane;
   const int d_row = r_block + d_local;
@@ -6157,11 +6161,12 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
         // Repacked row: 32 code bytes per K block, then one fp16 scale per
         // block; every load is 16-byte aligned.
         const int j = kb0 + f_c;
-        f_codes[u] = *reinterpret_cast<const uint4*>(f_ptr[u] + (j * 32));
-        f_codes_hi[u] =
-            *reinterpret_cast<const uint4*>(f_ptr[u] + (j * 32) + 16);
-        f_dm[u] =
-            *reinterpret_cast<const std::uint16_t*>(f_ptr[u] + k + (j * 2));
+        (void)j;
+#pragma unroll
+        for (int c = 0; c < 4; ++c)
+          q_code[c] = *reinterpret_cast<const uint4*>(d_ptr + (kb0 * 32) +
+                                                      (c * 16));
+        q_sc = *reinterpret_cast<const std::uint32_t*>(d_ptr + k + (kb0 * 2));
       } else if constexpr (kQ8) {
         // block_q8_0 is 34 bytes, so the code loads are 2-byte aligned.
         const auto* blk = f_ptr[u] + ((kb0 + f_c) * 34);
@@ -6260,6 +6265,12 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
       cur_code[1] = w_code[1];
       cur_sc = w_sc;
     }
+    if constexpr (kQ8R) {
+#pragma unroll
+      for (int c = 0; c < 4; ++c)
+        q_cur[c] = q_code[c];
+      q_cur_sc = q_sc;
+    }
 #pragma unroll
     for (int u = 0; u < kWaveRowTiles; ++u) {
       const int row = (tid >> 1) + (u * 128);
@@ -6318,9 +6329,11 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
               __builtin_bit_cast(std::uint32_t, __floats2half2_rn(s0, s1));
         }
       } else if constexpr (kQ8) {
-        s_codes[swizzle(row, 2 * f_c)] = f_codes[u];
-        s_codes[swizzle(row, (2 * f_c) + 1)] = f_codes_hi[u];
-        scale_bias = f_live[u] ? f_dm[u] : 0U;  // half2 (d, 0)
+        if constexpr (!kQ8R) {
+          s_codes[swizzle(row, 2 * f_c)] = f_codes[u];
+          s_codes[swizzle(row, (2 * f_c) + 1)] = f_codes_hi[u];
+          scale_bias = f_live[u] ? f_dm[u] : 0U;  // half2 (d, 0)
+        }
       } else if constexpr (!kNV) {
         s_codes[swizzle(row, f_c)] = f_codes[u];
       }
@@ -6405,7 +6418,7 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
         scale_bias = __builtin_bit_cast(std::uint32_t,
                                         __floats2half2_rn(scale, -offset));
       }
-      if constexpr (!kQ3 && !kNV) {
+      if constexpr (!kQ3 && !kNV && !kQ8R) {
         s_scale[(f_c * BM) + row] = scale_bias;
       }
     }
@@ -6458,6 +6471,9 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
           const std::uint32_t dmw = (cur_sc >> (16 * kb)) & 0xFFFFU;
           sb = __floats2half2_rn(d_live ? Nv4Scale(dmw & 0xFFU) : 0.0F,
                                  d_live ? Nv4Scale(dmw >> 8U) : 0.0F);
+        } else if constexpr (kQ8R) {
+          const std::uint32_t dw = (q_cur_sc >> (16 * kb)) & 0xFFFFU;
+          sb = __builtin_bit_cast(__half2, d_live ? dw : 0U);
         } else {
           sb = __builtin_bit_cast(__half2, s_scale[(kb * BM) + row]);
         }
@@ -6521,8 +6537,10 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
           // Q8_0: the block's 32 signed bytes are chunks 2 kb and 2 kb + 1;
           // flipping the sign bit carries q + 128, which the 1152 magic
           // takes back out.
-          const uint4 c0 = s_codes[swizzle(row, 2 * kb)];
-          const uint4 c1 = s_codes[swizzle(row, (2 * kb) + 1)];
+          const uint4 c0 =
+              kQ8R ? q_cur[2 * kb] : s_codes[swizzle(row, 2 * kb)];
+          const uint4 c1 = kQ8R ? q_cur[(2 * kb) + 1]
+                               : s_codes[swizzle(row, (2 * kb) + 1)];
           const std::uint32_t words[8] = {c0.x, c0.y, c0.z, c0.w,
                                           c1.x, c1.y, c1.z, c1.w};
 #pragma unroll
