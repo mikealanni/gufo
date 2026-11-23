@@ -2983,6 +2983,40 @@ struct Session::Impl : Scratch {
   const float* xq_src{nullptr};
   int xq_n{0};
   int xq_cols{0};
+  // dense projections through the routed-GEMM kernel: one expert, identity rows
+  bool dense_routed{std::getenv("INKLING_DENSE_ROUTED") == nullptr ||
+                    std::getenv("INKLING_DENSE_ROUTED")[0] != '0'};
+  int dense_bn{std::getenv("INKLING_DENSE_BN") != nullptr
+                   ? std::atoi(std::getenv("INKLING_DENSE_BN"))
+                   : 192};
+  int* dense_ident{nullptr};
+  int* dense_tiles{nullptr};
+  std::unordered_map<int, int*> dense_bounds;
+  const int* DenseMaps(int n, int bn, int* ntiles) {
+    constexpr int kMaxTiles = kMaxBatch / 128 + 2;
+    if (dense_ident == nullptr) {
+      std::vector<int> ident(kMaxBatch);
+      std::vector<int> tiles(kMaxTiles);
+      for (int i = 0; i < kMaxBatch; ++i)
+        ident[i] = i;
+      for (int t = 0; t < kMaxTiles; ++t)
+        tiles[t] = t << 16;
+      dense_ident = static_cast<int*>(AllocBytes(kMaxBatch * sizeof(int)));
+      dense_tiles = static_cast<int*>(AllocBytes(kMaxTiles * sizeof(int)));
+      HIP_OK(hipMemcpy(dense_ident, ident.data(), kMaxBatch * sizeof(int),
+                       hipMemcpyHostToDevice));
+      HIP_OK(hipMemcpy(dense_tiles, tiles.data(), kMaxTiles * sizeof(int),
+                       hipMemcpyHostToDevice));
+    }
+    int*& bounds = dense_bounds[n];
+    if (bounds == nullptr) {
+      const int host[2] = {0, n};
+      bounds = static_cast<int*>(AllocBytes(2 * sizeof(int)));
+      HIP_OK(hipMemcpy(bounds, host, sizeof(host), hipMemcpyHostToDevice));
+    }
+    *ntiles = (n + bn - 1) / bn;
+    return bounds;
+  }
   void Dense(const Tensor& w, const float* xin, std::size_t ldx, float* yout,
              std::size_t ldy, int n, int rows = -1,
              const __half* xhin = nullptr) {
@@ -3040,6 +3074,17 @@ struct Session::Impl : Scratch {
       if (xsrc == nullptr || ldx != w.cols) {
         ToHalf<<<(xcount + 255) / 256, 256, 0, stream>>>(xin, xh, xcount);
         xsrc = xh;
+      }
+      if (w.type == kTypeQ8 && ldx == w.cols && w.cols % 64 == 0 &&
+          dense_routed) {
+        int ntiles = 0;
+        const int* bounds = DenseMaps(n, dense_bn, &ntiles);
+        if (gufo::models::qwen38_flash_next::rocm::RoutedQ8RepGemm(
+                w.dev, xsrc, dense_tiles, static_cast<std::uint32_t>(ntiles),
+                static_cast<std::uint32_t>(dense_bn), bounds, dense_ident,
+                dense_ident, yout, static_cast<std::size_t>(nrows), w.cols,
+                stream))
+          return;
       }
       WmmaArgs wa{static_cast<const unsigned char*>(w.dev),
                   w.row_bytes,
@@ -3913,7 +3958,11 @@ struct Session::Impl : Scratch {
                  stream>>>(x, xh, static_cast<std::size_t>(n) * h);
         xmoe = xh;
       }
-      const int bn = n >= 2048 ? 192 : (n >= 512 ? 128 : 48);
+      static const int bn_env = std::getenv("INKLING_BN") != nullptr
+                                    ? std::atoi(std::getenv("INKLING_BN"))
+                                    : 0;
+      const int bn =
+          bn_env > 0 ? bn_env : (n >= 2048 ? 192 : (n >= 512 ? 128 : 48));
       int ntiles = 0;
       const int* tmap = TileMap(n, bn, &ntiles);
       const bool ok1 = qfn::RoutedNvfp4GemmF16(wgu.dev, xmoe, tmap, ntiles, bn,

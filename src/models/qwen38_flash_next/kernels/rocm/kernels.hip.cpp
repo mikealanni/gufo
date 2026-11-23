@@ -5741,6 +5741,7 @@ __device__ __forceinline__ std::size_t RoutedF16RowBytes(std::size_t k) {
          : kType == WeightType::kIQ2_S   ? (k / 256) * 82
          : kType == WeightType::kIQ4_XS  ? (k / 256) * 136
          : kType == WeightType::kNVFP4   ? ((k / 2 + k / 16 + 15) / 16) * 16
+         : kType == WeightType::kQ8Rep   ? ((k + k / 16 + 15) / 16) * 16
                                          : (k / 32) * sizeof(Q8_0Block);
 }
 
@@ -5900,7 +5901,8 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
   constexpr bool kQ5 = kType == WeightType::kQ5_1;
   constexpr bool kQ5K = kType == WeightType::kQ5_K;
   constexpr bool kQ3 = kType == WeightType::kQ3_K;
-  constexpr bool kQ8 = kType == WeightType::kQ8_0;
+  constexpr bool kQ8R = kType == WeightType::kQ8Rep;
+  constexpr bool kQ8 = kType == WeightType::kQ8_0 || kQ8R;
   constexpr bool kNL = kType == WeightType::kIQ4_NL;
   constexpr bool kXs = kType == WeightType::kIQ4_XS;
   constexpr bool kI3 = kType == WeightType::kIQ3_S;
@@ -6130,6 +6132,15 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
         f_codes[u] = *reinterpret_cast<const uint4*>(f_ptr[u] + (j * 16));
         f_dm[u] = *reinterpret_cast<const std::uint16_t*>(f_ptr[u] + (k / 2) +
                                                           (j * 2));
+      } else if constexpr (kQ8R) {
+        // Repacked row: 32 code bytes per K block, then one fp16 scale per
+        // block; every load is 16-byte aligned.
+        const int j = kb0 + f_c;
+        f_codes[u] = *reinterpret_cast<const uint4*>(f_ptr[u] + (j * 32));
+        f_codes_hi[u] =
+            *reinterpret_cast<const uint4*>(f_ptr[u] + (j * 32) + 16);
+        f_dm[u] =
+            *reinterpret_cast<const std::uint16_t*>(f_ptr[u] + k + (j * 2));
       } else if constexpr (kQ8) {
         // block_q8_0 is 34 bytes, so the code loads are 2-byte aligned.
         const auto* blk = f_ptr[u] + ((kb0 + f_c) * 34);
@@ -8250,6 +8261,35 @@ bool RoutedNvfp4GemmF16(const void* w, const __half* x,
       return false;
   }
 #undef INKLING_NV_LAUNCH
+}
+
+bool RoutedQ8RepGemm(const void* w, const __half* x, const std::int32_t* tiles,
+                     std::uint32_t n_tiles, std::uint32_t tile_rows,
+                     const std::int32_t* pad_bounds,
+                     const std::int32_t* rows_in, const std::int32_t* rows_out,
+                     float* out, std::size_t m, std::size_t k,
+                     hipStream_t stream) {
+  if (m == 0 || k == 0 || k % 64 != 0 || n_tiles == 0 || out == nullptr)
+    return false;
+  constexpr int kBM = 128;
+  constexpr int kBK = 2;
+  const dim3 grid(static_cast<unsigned int>((m + kBM - 1) / kBM), n_tiles);
+#define INKLING_Q8R_LAUNCH(BN)                                                 \
+  hipLaunchKernelGGL((RoutedF16GEMMKernel<WeightType::kQ8Rep, kBM, BN, kBK>),  \
+                     grid, dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, \
+                     rows_in, rows_out, nullptr, out, nullptr, m, k, nullptr,  \
+                     nullptr, 1.0F, nullptr)
+  switch (tile_rows) {
+    case 128:
+      INKLING_Q8R_LAUNCH(128);
+      return true;
+    case 192:
+      INKLING_Q8R_LAUNCH(192);
+      return true;
+    default:
+      return false;
+  }
+#undef INKLING_Q8R_LAUNCH
 }
 
 // Additive experiment: RoutedF16GEMMKernel<kQ8_0, 128, 128, 2> directly,
