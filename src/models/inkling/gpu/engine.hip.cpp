@@ -4,6 +4,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -3842,6 +3843,8 @@ struct Session::Impl : Scratch {
   }
 
   void Forward(std::span<const std::int32_t> tokens) {
+    static const bool time_forward = std::getenv("INKLING_FWD_TIME") != nullptr;
+    const auto fwd_t0 = std::chrono::steady_clock::now();
     Activate(0);
     const Config& c = m->config;
     const int n = static_cast<int>(tokens.size());
@@ -3865,12 +3868,20 @@ struct Session::Impl : Scratch {
         Body(n);
       }
     }
+    const auto fwd_t1 = std::chrono::steady_clock::now();
     const int rows = all_rows ? n : 1;
     ArgMaxRow<<<rows, 256, 0, stream>>>(
         d_logits, static_cast<int>(c.vocab_unpadded), d_argmax, d_argmax);
     HIP_OK(hipMemcpyAsync(argmax_host, d_argmax, rows * 4,
                           hipMemcpyDeviceToHost, stream));
     HIP_OK(hipStreamSynchronize(stream));
+    if (time_forward) {
+      const auto fwd_t2 = std::chrono::steady_clock::now();
+      std::fprintf(
+          stderr, "forward n=%d: launch %.1f ms, wait %.1f ms\n", n,
+          std::chrono::duration<double, std::milli>(fwd_t1 - fwd_t0).count(),
+          std::chrono::duration<double, std::milli>(fwd_t2 - fwd_t1).count());
+    }
     logits_rows = rows;
     logits_last = rows - 1;
     logits_have.assign(static_cast<std::size_t>(rows), 0);
