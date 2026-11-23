@@ -31,3 +31,32 @@ default because it changes outputs.
 
 Known near-tie behaviour: greedy output with speculation can differ from plain
 decode at positions where the top two logits are within about 0.2.
+
+## Fast profile (int4 experts, opt-in)
+
+The expert weights are NVFP4 in the GGUF, so the int4 form is a second 4-bit
+quantization (rotated, symmetric, one scale per 128 values; activations are
+rotated and quantized per 128 as well). Measured as mean KL and top-1 of the last
+token of 48 windows of 1,024 tokens against the default engine (default against
+itself: KL 0, 48 of 48); the six-window versions of these runs were too noisy to
+rank settings.
+
+| Setting | Mean KL | Max KL | Top-1 |
+| --- | --- | --- | --- |
+| `INKLING_IU4=1` (gate/up) | 0.016 | 0.080 | 42/48 |
+| `INKLING_IU4=2` (gate/up and down) | 0.022 | 0.100 | 44/48 |
+| `INKLING_IU4=2`, weight scale by absmax / 7, activation scale 1.0 | 0.033 | 0.209 | 39/48 |
+| plus `INKLING_F16_BLOCKS=1` | 0.019 | 0.059 | 43/48 |
+
+The defaults of `INKLING_IU4` are the MSE-optimal weight scale (`INKLING_IU4_WCLIP`)
+and an activation scale of 0.9 times absmax / 7 (`INKLING_IU4_ACLIP`; 0.85 and 0.9
+are equal within noise, 0.8 is worse). Keeping any single layer on NVFP4
+(`INKLING_IU4_SKIP`) changes the KL by less than the run-to-run spread, so the error
+is spread over all layers. Next steps for quality: per-32 activation scales (the
+gate/up output error roughly halves in an emulation but the accumulator fold runs
+four times as often) and an int4 artifact made from higher-precision weights, which
+the model release does not provide.
+
+Other changes this round: split-K for the F32 GEMMs and the compact tile list keep
+the default engine at KL 0.0016 (floating-point reassociation) and 0 (bit-identical)
+respectively.

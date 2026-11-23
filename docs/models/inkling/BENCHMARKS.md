@@ -1,23 +1,27 @@
 # Inkling 2 Mini benchmarks
 
-Measured 2026-11-22 on one Strix Halo (gfx1151) machine, greedy, real text.
+Decode measured 2026-11-22 on one Strix Halo (gfx1151) machine, greedy, real text.
 Prefill is `gufo_inkling_gpu_check` `INKLING_BENCH=<n>` (single request, no
 cache); decode is `gufo serve` over HTTP with `--think off`, 400-token (short) or
 300-token (deep) replies, speculation on unless stated.
 
 ## Prefill
 
-| Prompt | GPU only | GPU + NPU |
-| --- | --- | --- |
-| 2k | 1,692 | 1,692 (below the 3,072-row NPU batch) |
-| 4k | 1,768 | 1,837 |
-| 8k | 1,715 | 1,851 |
-| 16k | 1,670 | 1,791 |
-| 32k | 1,536 (1,619 sparse) | 1,689 |
-| 128k | about 1,035 | 1,647 |
+Measured 2026-11-23 (`gufo_inkling_gpu_check`, `INKLING_BENCH=<n>`, warm, three
+repeats, greedy text). The default profile is lossless against the engine before
+these changes. The fast profile is opt-in (`INKLING_IU4=2 INKLING_F16_BLOCKS=1`) and
+changes outputs, see [QUALITY.md](QUALITY.md).
 
-The 8k to 128k rows predate the expert-layer conversion, which added about 2% at
-2k and 4k.
+| Prompt | Default GPU only | Default GPU + NPU | Fast GPU only | Fast GPU + NPU |
+| --- | --- | --- | --- | --- |
+| 2k | 2,065 | below the NPU batch | 2,499 | below the NPU batch |
+| 4k | 2,144 | 2,342 | 2,580 | 2,737 |
+| 8k | 2,075 | 2,382 | 2,466 | 2,822 |
+| 16k | 1,930 | 2,170 | 2,254 | 2,516 |
+
+Run-to-run spread is about 1% when nothing else uses the machine; background load
+costs more. The 32k and 128k rows of the earlier table (1,536 to 1,689 and about
+1,035 to 1,647 tok/s) have not been re-measured.
 
 ## Decode
 
