@@ -5909,6 +5909,8 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
   constexpr bool kI2X = kType == WeightType::kIQ2_XXS;
   constexpr bool kI2S = kType == WeightType::kIQ2_S;
   constexpr bool kNV = kType == WeightType::kNVFP4;
+  static_assert(!kNV || BM == 128,
+                "NVFP4 loads each wave's 16 rows straight into registers");
   constexpr bool kGrid = kI3 || kI2X || kI2S;
   // GLM-5.3 experts clamp the gate at 10 and the up projection to +-10.
   // IQ2_XXS always carried it; other types ask for it via kClampSwiglu.
