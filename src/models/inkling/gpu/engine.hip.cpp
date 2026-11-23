@@ -4125,6 +4125,51 @@ struct Session::Impl : Scratch {
                  stream>>>(x, xh, static_cast<std::size_t>(n) * h);
         xmoe = xh;
       }
+      static const char* const dump_layer = std::getenv("INKLING_DUMP_MOE");
+      static bool dumped = false;
+      if (dump_layer != nullptr && !dumped &&
+          p == static_cast<std::uint32_t>(std::atoi(dump_layer)) && n >= 2048) {
+        dumped = true;
+        HIP_OK(hipStreamSynchronize(stream));
+        std::vector<int> hid(static_cast<std::size_t>(items));
+        HIP_OK(hipMemcpy(hid.data(), ids, hid.size() * 4,
+                         hipMemcpyDeviceToHost));
+        std::vector<int> cnt(ne, 0);
+        for (int v : hid)
+          if (v >= 0)
+            ++cnt[v];
+        std::vector<int> order(ne);
+        for (int i = 0; i < ne; ++i)
+          order[i] = i;
+        std::sort(order.begin(), order.end(),
+                  [&](int a, int b) { return cnt[a] > cnt[b]; });
+        const int pick = 4;
+        std::vector<__half> hx(static_cast<std::size_t>(n) * h);
+        HIP_OK(hipMemcpy(hx.data(), xmoe, hx.size() * 2,
+                         hipMemcpyDeviceToHost));
+        FILE* fo = std::fopen("/tmp/inkling_moe_dump.bin", "wb");
+        const std::int32_t hdr[6] = {n, h, nu, ne, ff, pick};
+        std::fwrite(hdr, 4, 6, fo);
+        std::fwrite(hid.data(), 4, hid.size(), fo);
+        std::fwrite(hx.data(), 2, hx.size(), fo);
+        const std::size_t gu_bytes =
+            static_cast<std::size_t>(2 * ff) * wgu.row_bytes;
+        const std::size_t dn_bytes =
+            static_cast<std::size_t>(h) * wdn.row_bytes;
+        std::vector<std::uint8_t> buf(std::max(gu_bytes, dn_bytes));
+        for (int i = 0; i < pick; ++i) {
+          const std::int32_t e = order[i];
+          std::fwrite(&e, 4, 1, fo);
+          HIP_OK(hipMemcpy(buf.data(),
+                           static_cast<const std::uint8_t*>(wgu.dev) +
+                               static_cast<std::size_t>(e) * gu_bytes,
+                           gu_bytes, hipMemcpyDeviceToHost));
+          std::fwrite(buf.data(), 1, gu_bytes, fo);
+        }
+        std::fclose(fo);
+        std::fprintf(stderr, "inkling: dumped moe layer %u (row_bytes %zu)\n",
+                     p, static_cast<std::size_t>(wgu.row_bytes));
+      }
       static const int bn_env = std::getenv("INKLING_BN") != nullptr
                                     ? std::atoi(std::getenv("INKLING_BN"))
                                     : 0;
