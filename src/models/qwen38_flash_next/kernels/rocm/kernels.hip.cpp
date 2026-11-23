@@ -9869,7 +9869,20 @@ __global__ void NpuDecodeOutputKernel(const std::uint8_t* __restrict__ in,
                                       bool accumulate,
                                       std::uint32_t valid_cols) {
   const std::size_t g = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
-  if (g >= std::size_t{NpuPaddedRows(tokens)} * cols / 8) {
+  const std::size_t total_groups = std::size_t{NpuPaddedRows(tokens)} * cols / 8;
+  // Blocks that lie fully inside the stream stage their 256 groups (2304
+  // bytes) with coalesced 16-byte loads instead of nine byte loads each.
+  __shared__ __align__(16) std::uint8_t staged[256 * 9];
+  const bool full_block =
+      (std::size_t{blockIdx.x} + 1) * blockDim.x <= total_groups;
+  if (full_block) {
+    const uint4* src = reinterpret_cast<const uint4*>(
+        in + std::size_t{blockIdx.x} * blockDim.x * 9);
+    if (threadIdx.x < 144) {
+      reinterpret_cast<uint4*>(staged)[threadIdx.x] = src[threadIdx.x];
+    }
+    __syncthreads();
+  } else if (g >= total_groups) {
     return;
   }
   constexpr std::uint32_t kGroupsPerTile = kNpuTileRowsC * kNpuTileN / 8;
@@ -9889,7 +9902,8 @@ __global__ void NpuDecodeOutputKernel(const std::uint8_t* __restrict__ in,
   if (row >= tokens || (valid_cols != 0 && col >= valid_cols)) {
     return;
   }
-  const std::uint8_t* p = in + g * 9;
+  const std::uint8_t* p =
+      full_block ? staged + threadIdx.x * 9 : in + g * 9;
   const float mult = ldexpf(1.0F, static_cast<int>(p[0]) - 127) / 64.0F;
   float* dst = out + row * out_pitch + col0 + col;
   if (((out_pitch | col0) & 3) != 0) {
