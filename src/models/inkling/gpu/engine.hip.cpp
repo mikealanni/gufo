@@ -1557,7 +1557,12 @@ __global__ void __launch_bounds__(WAVES * 32)
   const int gh = a.nh / a.nkv;
   const int pk = a.pack;
   const int h0 = blockIdx.y;
-  const int q0 = pk > 0 ? 0 : blockIdx.x * (WAVES * 16);
+  // Full-attention work grows with the query block: launch the longest first
+  // so no long block starts last.
+  const int qblock = (pk == 0 && blist == nullptr && a.window == 0)
+                         ? static_cast<int>(gridDim.x) - 1 - blockIdx.x
+                         : blockIdx.x;
+  const int q0 = pk > 0 ? 0 : qblock * (WAVES * 16);
   const int g = pk > 0 ? blockIdx.y : h0 / gh;
   const int nrows = pk > 0 ? n * gh : n;
   const auto row_tok = [&](int row) {
