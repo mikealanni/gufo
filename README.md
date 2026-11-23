@@ -70,6 +70,14 @@ text, with greedy chat requests to `gufo serve`. NPU numbers need the setup in
 | `-p 4096` | 636 | **795** (+25.0%) |
 | `-p 8192` | 629 | **806** (+28.2%) |
 
+The same model with the rotated int4 artifact (int4 x int4 WMMA, FFN split on the
+NPU), `-p 8192`, measured 2026-11-21:
+
+| Weights | Prefill, tok/s (GPU + NPU) | Plain decode, tok/s |
+| --- | --- | --- |
+| Q4_K_XL GGUF | 806 | 12.3 |
+| Rotated int4 artifact | **1,335** (+66%) | **14.7** |
+
 | Decode, tok/s | plain | DFlash2 | auto |
 | --- | --- | --- | --- |
 | code | 12.3 | **47.6** | 43 |
@@ -163,14 +171,19 @@ by native Q3_K WMMA expert GEMMs).
 | `-p 4096 -d 65536` | 560 | **633** (+13.0%) |
 | `-p 4096 -d 131072` | 511 | **571** (+11.8%) |
 
+Both checkpoints, GPU only against GPU + NPU:
+
+| Prefill, tok/s | AJ-IQ2_XXS (81 GiB) | RCO-152E Q3_K_M (69.9 GiB) |
+| --- | --- | --- |
+| `-p 4096` | 616 -> **689** | 623 -> **714** |
+| `-p 8192` | 613 -> **690** | 617 -> **706** |
+
 Every prompt of 4096 tokens or more runs a two-bank pair of 2048-token banks
 through the runtime-M/K program, at any context depth; smaller prompts and
 decode stay on the GPU at full speed. `GUFO_GLM53_NPU_M=4096` selects wide
 banks (same speed at 8192, no gain elsewhere). Moving the shared-expert down
 projection to the NPU as well (`GUFO_NPU_WHOLE=1`, implemented) measures zero
-net gain: the NPU queue is already balanced at 28 slices per bank. AJ-IQ2_XXS
-with the same path: pp4096 616 on GPU vs **689** with the NPU, pp8192 613 vs
-**690**.
+net gain: the NPU queue is already balanced at 28 slices per bank.
 
 | Decode, tok/s | plain | DFlash2 |
 | --- | --- | --- |
