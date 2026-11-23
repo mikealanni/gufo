@@ -46,6 +46,17 @@ Measured with `gufo bench` (three runs per prefill cell) and, for decode on real
 text, with greedy chat requests to `gufo serve`. NPU numbers need the setup in
 [Try it](#try-it); GPU-only numbers use the same binary without `GUFO_NPU_DIR`.
 
+### Same model, two weights
+
+Prefill at `-p 8192` with the NPU (GPU only in brackets):
+
+| Model and weights | Prefill, tok/s | Plain decode, tok/s |
+| --- | --- | --- |
+| Qwen3.8-27B, Q4_K_XL GGUF | 806 (629) | 12.3 |
+| Qwen3.8-27B, rotated int4 artifact (2026-11-21) | **1,335** | **14.7** |
+| GLM-5.3 Flash, AJ-IQ2_XXS (81 GiB) | 690 (613) | see the GLM section |
+| GLM-5.3 Flash, RCO-152E Q3_K_M (69.9 GiB) | **706** (617) | see the GLM section |
+
 ### Qwen3.6-35B-A3B
 
 | Prefill, tok/s | GPU only | GPU + NPU |
@@ -69,14 +80,6 @@ text, with greedy chat requests to `gufo serve`. NPU numbers need the setup in
 | `-p 2048` | 654 | **715** (+9.3%) |
 | `-p 4096` | 636 | **795** (+25.0%) |
 | `-p 8192` | 629 | **806** (+28.2%) |
-
-The same model with the rotated int4 artifact (int4 x int4 WMMA, FFN split on the
-NPU), `-p 8192`, measured 2026-11-21:
-
-| Weights | Prefill, tok/s (GPU + NPU) | Plain decode, tok/s |
-| --- | --- | --- |
-| Q4_K_XL GGUF | 806 | 12.3 |
-| Rotated int4 artifact | **1,335** (+66%) | **14.7** |
 
 | Decode, tok/s | plain | DFlash2 | auto |
 | --- | --- | --- | --- |
@@ -170,13 +173,6 @@ by native Q3_K WMMA expert GEMMs).
 | `-p 4096 -d 32768` | 584 | **665** (+13.9%) |
 | `-p 4096 -d 65536` | 560 | **633** (+13.0%) |
 | `-p 4096 -d 131072` | 511 | **571** (+11.8%) |
-
-Both checkpoints, GPU only against GPU + NPU:
-
-| Prefill, tok/s | AJ-IQ2_XXS (81 GiB) | RCO-152E Q3_K_M (69.9 GiB) |
-| --- | --- | --- |
-| `-p 4096` | 616 -> **689** | 623 -> **714** |
-| `-p 8192` | 613 -> **690** | 617 -> **706** |
 
 Every prompt of 4096 tokens or more runs a two-bank pair of 2048-token banks
 through the runtime-M/K program, at any context depth; smaller prompts and
