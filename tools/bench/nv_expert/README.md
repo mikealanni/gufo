@@ -15,3 +15,8 @@ global fetch alone -1.7 ms; removing fetch+commit (LDS writes) 8.6 ms (-27%); re
 no activation fragment reads -0.2 ms; one barrier less -0.1 ms. BN 96..256 are within 5%, BM=256 slower, double-buffered
 LDS slower (occupancy), waves_per_eu=7 +2% (removes a 32 B/lane spill). So the kernel is bound by its load/commit pipeline,
 not by dequantization or matrix math.
+
+Later findings (pair mode: add -DPAIRV; kernel_nvfp4_regdirect.inc = production register-direct variant):
+weights-only fetch removal -2.2 ms, activations-only removal -0.3 ms, so the weight stream (not activations) is the exposed cost.
+Prefetching weights 2 stages deep, or splitting the two 16-byte chunks across lane halves with a lane exchange: no gain / slower.
+Timings in this harness are bimodal; compare min of 5 runs, interleaved.
