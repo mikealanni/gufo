@@ -119,14 +119,15 @@ __device__ void Load32(const unsigned char* row, int chunk, float* w,
 }
 
 __device__ float BlockSum(float v, float* sh) {
-  sh[threadIdx.x] = v;
+  for (int off = 16; off > 0; off >>= 1)
+    v += __shfl_xor(v, off);
+  const int nw = (blockDim.x + 31) >> 5;
+  if ((threadIdx.x & 31) == 0)
+    sh[threadIdx.x >> 5] = v;
   __syncthreads();
-  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-    if (threadIdx.x < s)
-      sh[threadIdx.x] += sh[threadIdx.x + s];
-    __syncthreads();
-  }
-  const float r = sh[0];
+  float r = 0.0F;
+  for (int w = 0; w < nw; ++w)
+    r += sh[w];
   __syncthreads();
   return r;
 }
@@ -588,6 +589,67 @@ struct StatePtrs {
   int count;
 };
 
+// Norm and query scores of every state of one token in a single pass over the
+// row (128-bit loads, all states accumulated together, one cross-wave
+// reduction): inv[s] = 1 / rms(state s), score[q][s] = state . query[q] * inv[s]
+// / sqrt(h). The block is 256 threads.
+__device__ void MixScores(const float* const* st, int ns, const float* query,
+                          int nq, int h, float* inv, float (*score)[kMaxStates],
+                          float* sred) {
+  constexpr int kAcc = 5 * kMaxStates;
+  float acc[kAcc];
+#pragma unroll
+  for (int k = 0; k < kAcc; ++k)
+    acc[k] = 0.0F;
+  const int h4 = h / 4;
+  for (int i = threadIdx.x; i < h4; i += blockDim.x) {
+    float4 qv[4];
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      if (q < nq)
+        qv[q] = reinterpret_cast<const float4*>(query + q * h)[i];
+    }
+#pragma unroll
+    for (int s = 0; s < kMaxStates; ++s) {
+      if (s < ns) {
+        const float4 v = reinterpret_cast<const float4*>(st[s])[i];
+        acc[s * 5] += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          if (q < nq)
+            acc[s * 5 + 1 + q] += v.x * qv[q].x + v.y * qv[q].y +
+                                  v.z * qv[q].z + v.w * qv[q].w;
+        }
+      }
+    }
+  }
+  const int wave = threadIdx.x >> 5;
+#pragma unroll
+  for (int k = 0; k < kAcc; ++k) {
+    float v = acc[k];
+    for (int off = 16; off > 0; off >>= 1)
+      v += __shfl_xor(v, off);
+    if ((threadIdx.x & 31) == 0)
+      sred[wave * kAcc + k] = v;
+  }
+  __syncthreads();
+  if (threadIdx.x < ns * 5) {
+    float tot = 0.0F;
+    for (int w = 0; w < 8; ++w)
+      tot += sred[w * kAcc + threadIdx.x];
+    sred[8 * kAcc + threadIdx.x] = tot;
+  }
+  __syncthreads();
+  if (threadIdx.x < ns) {
+    const int s = threadIdx.x;
+    inv[s] = rsqrtf(sred[8 * kAcc + s * 5] / static_cast<float>(h) + kMixEps);
+    for (int q = 0; q < nq; ++q)
+      score[q][s] = sred[8 * kAcc + s * 5 + 1 + q] * inv[s] *
+                    rsqrtf(static_cast<float>(h));
+  }
+  __syncthreads();
+}
+
 // states = rms(blocks..., cur); out[q][t] = softmax(states . query[q] /
 // sqrt(h)) mixture of normalized states. One wave per state computes its norm
 // and dots in parallel.
@@ -654,7 +716,7 @@ __global__ void Mix(StatePtrs blocks, const float* cur, const float* query,
 // sqrt(h)) mixture of normalized states
 __global__ void MixBig(StatePtrs blocks, const float* cur, const float* query,
                        int nq, int h, int n, float* out) {
-  __shared__ float red[256][5];
+  __shared__ float sred[9 * 5 * kMaxStates];
   __shared__ float inv[kMaxStates];
   __shared__ float score[4][kMaxStates];
   const int t = blockIdx.x;
@@ -663,31 +725,7 @@ __global__ void MixBig(StatePtrs blocks, const float* cur, const float* query,
   for (int s = 0; s < blocks.count; ++s)
     st[s] = blocks.p[s] + static_cast<std::size_t>(t) * h;
   st[blocks.count] = cur + static_cast<std::size_t>(t) * h;
-  for (int s = 0; s < ns; ++s) {
-    float acc[5] = {};
-    for (int i = threadIdx.x; i < h; i += blockDim.x) {
-      const float v = st[s][i];
-      acc[0] += v * v;
-      for (int q = 0; q < nq; ++q)
-        acc[1 + q] += v * query[q * h + i];
-    }
-    for (int k = 0; k < 5; ++k)
-      red[threadIdx.x][k] = acc[k];
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-      if (threadIdx.x < stride) {
-        for (int k = 0; k < 5; ++k)
-          red[threadIdx.x][k] += red[threadIdx.x + stride][k];
-      }
-      __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-      inv[s] = rsqrtf(red[0][0] / static_cast<float>(h) + kMixEps);
-      for (int q = 0; q < nq; ++q)
-        score[q][s] = red[0][1 + q] * inv[s] * rsqrtf(static_cast<float>(h));
-    }
-    __syncthreads();
-  }
+  MixScores(st, ns, query, nq, h, inv, score, sred);
   for (int q = 0; q < nq; ++q) {
     float mx = -1e30F;
     for (int s = 0; s < ns; ++s)
@@ -718,7 +756,7 @@ struct NormPtrs {
 __global__ void MixRms(StatePtrs blocks, const float* cur, const float* query,
                        int nq, int h, int n, NormPtrs np, float eps) {
   extern __shared__ float mixbuf[];
-  __shared__ float red[256][5];
+  __shared__ float sred[9 * 5 * kMaxStates];
   __shared__ float inv[kMaxStates];
   __shared__ float score[4][kMaxStates];
   __shared__ float rsum[256];
@@ -728,31 +766,7 @@ __global__ void MixRms(StatePtrs blocks, const float* cur, const float* query,
   for (int s = 0; s < blocks.count; ++s)
     st[s] = blocks.p[s] + static_cast<std::size_t>(t) * h;
   st[blocks.count] = cur + static_cast<std::size_t>(t) * h;
-  for (int s = 0; s < ns; ++s) {
-    float acc[5] = {};
-    for (int i = threadIdx.x; i < h; i += blockDim.x) {
-      const float v = st[s][i];
-      acc[0] += v * v;
-      for (int q = 0; q < nq; ++q)
-        acc[1 + q] += v * query[q * h + i];
-    }
-    for (int k = 0; k < 5; ++k)
-      red[threadIdx.x][k] = acc[k];
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-      if (threadIdx.x < stride) {
-        for (int k = 0; k < 5; ++k)
-          red[threadIdx.x][k] += red[threadIdx.x + stride][k];
-      }
-      __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-      inv[s] = rsqrtf(red[0][0] / static_cast<float>(h) + kMixEps);
-      for (int q = 0; q < nq; ++q)
-        score[q][s] = red[0][1 + q] * inv[s] * rsqrtf(static_cast<float>(h));
-    }
-    __syncthreads();
-  }
+  MixScores(st, ns, query, nq, h, inv, score, sred);
   for (int q = 0; q < nq; ++q) {
     float mx = -1e30F;
     for (int s = 0; s < ns; ++s)
@@ -771,15 +785,7 @@ __global__ void MixRms(StatePtrs blocks, const float* cur, const float* query,
       mixbuf[q * h + i] = a;
       ss += a * a;
     }
-    rsum[threadIdx.x] = ss;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-      if (threadIdx.x < stride)
-        rsum[threadIdx.x] += rsum[threadIdx.x + stride];
-      __syncthreads();
-    }
-    const float r = rsqrtf(rsum[0] / static_cast<float>(h) + eps);
-    __syncthreads();
+    const float r = rsqrtf(BlockSum(ss, rsum) / static_cast<float>(h) + eps);
     for (int i = threadIdx.x; i < h; i += blockDim.x) {
       const float v = mixbuf[q * h + i] * r * np.w[q][i];
       const std::size_t at = static_cast<std::size_t>(t) * h + i;
@@ -1442,6 +1448,8 @@ constexpr int kZStride = 88;
 constexpr int kSplitKeys = 2048;
 constexpr int kFlashRel = 16;
 constexpr float kNegInf = -1e30F;
+constexpr float kLog2e = 1.4426950408889634F;
+constexpr float kLn2 = 0.6931471805599453F;
 
 // Flash attention with relative bias and a zero sink logit. One block: 64
 // queries of one head; 4 waves x 16 query rows.
@@ -1502,7 +1510,8 @@ __global__ void __launch_bounds__(WAVES * 32)
   for (int i = 0; i < 8; ++i) {
     const int row = wave * 16 + 2 * i + (lane >> 4);
     const int t = row_tok(row);
-    sinkv[i] = sink[static_cast<std::size_t>(t) * a.nh + row_head(row)];
+    sinkv[i] = sink[static_cast<std::size_t>(t) * a.nh + row_head(row)] *
+               kLog2e;
     qpos[i] = pos0 + (pk > 0 ? row / gh : q0 + row);
   }
   V8f o[8] = {};
@@ -1598,6 +1607,7 @@ __global__ void __launch_bounds__(WAVES * 32)
         sc[ni] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(qf[c], bf, sc[ni]);
       }
     }
+    const float scale_l2 = a.scale * kLog2e;
     float pmax[8];
     for (int i = 0; i < 8; ++i)
       pmax[i] = kNegInf;
@@ -1614,7 +1624,7 @@ __global__ void __launch_bounds__(WAVES * 32)
                   ? __half2float(PZ[wave][lr * kZStride + dist -
                                           (qp0 - (kb + kFlashK - 1))])
                   : 0.0F;
-          v = sc[ni][i] * a.scale + b - sinkv[i];
+          v = sc[ni][i] * scale_l2 + b * kLog2e - sinkv[i];
         }
         sc[ni][i] = v;
         pmax[i] = fmaxf(pmax[i], v);
@@ -1624,7 +1634,7 @@ __global__ void __launch_bounds__(WAVES * 32)
       for (int off = 8; off > 0; off >>= 1)
         pmax[i] = fmaxf(pmax[i], __shfl_xor(pmax[i], off));
       const float mn = fmaxf(m[i], pmax[i]);
-      const float alpha = expf(m[i] - mn);
+      const float alpha = exp2f(m[i] - mn);
       m[i] = mn;
       l[i] *= alpha;
       for (int ni = 0; ni < 8; ++ni)
@@ -1632,7 +1642,8 @@ __global__ void __launch_bounds__(WAVES * 32)
     }
     for (int ni = 0; ni < 4; ++ni) {
       for (int i = 0; i < 8; ++i) {
-        const float pv = sc[ni][i] <= kNegInf ? 0.0F : expf(sc[ni][i] - m[i]);
+        const float pv =
+            sc[ni][i] <= kNegInf ? 0.0F : exp2f(sc[ni][i] - m[i]);
         l[i] += pv;
         PZ[wave][(2 * i + (lane >> 4)) * kPStride + ni * 16 + (lane & 15)] =
             __float2half(pv);
@@ -1663,7 +1674,7 @@ __global__ void __launch_bounds__(WAVES * 32)
       const std::size_t part =
           (static_cast<std::size_t>(t) * a.nh + h) * nsplit + split;
       if ((lane & 15) == 0) {
-        pm[part] = m[i];
+        pm[part] = m[i] * kLn2;
         pl[part] = ls;
       }
       for (int ni = 0; ni < 8; ++ni)
