@@ -67,3 +67,8 @@ NVFP4): default engine 147/164 (89.6%); fast profile (`INKLING_IU4=2
 INKLING_F16_BLOCKS=1`) 149/164 (90.9%). Only 56 of the 164 completions are
 identical, so the numerics differ clearly, but four tasks flip (one lost, three
 gained), which is within the spread of a 164-task score.
+
+With thinking on (default reasoning, 6,000 new tokens, about 1,340 generated tokens
+per task, 63 minutes for the set) the fast profile scores 152/164 (92.7%). The
+default engine was not run with thinking on, so this is a check that long
+reasoning decodes after an int4 prefill stay coherent, not a comparison.
