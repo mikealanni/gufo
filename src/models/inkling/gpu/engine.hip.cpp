@@ -35,6 +35,8 @@ constexpr std::size_t kMaxVerifyRows = 8;
 constexpr std::uint32_t kNpuSlice = 1024;
 constexpr int kFlashHd = 128;
 constexpr int kWmmaMinTokens = 32;
+// rows in one batched step: up to 8 sessions x 4 verify rows
+constexpr int kMaxBatchRows = 32;
 constexpr float kMixEps = 1e-6F;
 constexpr int kTypeF32 = 0;
 constexpr int kTypeBf16 = 1;
@@ -2786,7 +2788,7 @@ struct Session::Impl : Scratch {
   std::vector<float> logits;  // host copy of rows fetched by Logits(row)
   std::vector<unsigned char> logits_have;
   int* d_argmax{nullptr};
-  int argmax_host[8]{};
+  int argmax_host[kMaxBatchRows]{};
   int logits_rows{0};
   int logits_last{0};
   std::size_t allocated_bytes{0};
@@ -2816,6 +2818,15 @@ struct Session::Impl : Scratch {
   }
   bool sparse{false};
   bool no_dp4{std::getenv("INKLING_NO_DP4") != nullptr};
+  // ---- batched decode: while set, row b of the forward belongs to brow[b]
+  // (brow[0] is this session, whose scratch carries the batch)
+  std::vector<Impl*> brow;       // sessions taking part, row groups in order
+  std::vector<int> brow_off;     // first scratch row of each group
+  std::vector<int> brow_n;       // rows in each group
+  [[nodiscard]] bool Batched() const noexcept { return !brow.empty(); }
+  [[nodiscard]] int GroupCount() const noexcept {
+    return static_cast<int>(brow.size());
+  }
   int *xrow_token{nullptr}, *xrow_item{nullptr};
   hipStream_t stream{nullptr};
   hipGraph_t graph{nullptr};
@@ -2856,6 +2867,19 @@ struct Session::Impl : Scratch {
              std::size_t ldy, int n, int rows = -1,
              const __half* xhin = nullptr) {
     const int nrows = rows < 0 ? static_cast<int>(w.rows) : rows;
+    // A batch of sessions with 9..31 rows would fall to the float kernel
+    // below, while each session's own verify (<= 8 rows) takes the int8 path.
+    // The int8 rows are independent of how they are grouped, so chunk the
+    // batch into <= 8-row int8 launches and keep it bit-exact with solo work.
+    if (Batched() && n > 8 && n < kWmmaMinTokens && w.type == kTypeQ8 &&
+        ldx == w.cols && !no_dp4) {
+      for (int t0 = 0; t0 < n; t0 += 8) {
+        const int c = std::min(8, n - t0);
+        Dense(w, xin + static_cast<std::size_t>(t0) * ldx, ldx,
+              yout + static_cast<std::size_t>(t0) * ldy, ldy, c, rows, nullptr);
+      }
+      return;
+    }
     if (n == 1 && w.type == kTypeQ8 && ldx == w.cols && !no_dp4) {
       if (!(xq_reuse && xin == xq_src && n == xq_n && w.cols == xq_cols)) {
         QuantRows<<<dim3(1, w.cols / 32), 32, 0, stream>>>(
@@ -3068,6 +3092,55 @@ struct Session::Impl : Scratch {
         all_rows && n <= static_cast<int>(kMaxVerifyRows)
             ? hist + static_cast<std::size_t>(ch) * kHistory
             : nullptr);
+  }
+  enum class Hist { kK, kV, kAttn, kFfn };
+  static float* HistOf(Slot& s, Hist which) {
+    switch (which) {
+      case Hist::kK:
+        return s.hist_k;
+      case Hist::kV:
+        return s.hist_v;
+      case Hist::kAttn:
+        return s.hist_attn;
+      case Hist::kFfn:
+        return s.hist_ffn;
+    }
+    return nullptr;
+  }
+  // Convolve with the history of `slot`; in a batch each row uses its own
+  // session's history (one-row launches, the same kernel as a solo decode).
+  void ConvolveSlot(const float* in_, const Tensor& w, const float* dyn,
+                    int heads, std::uint32_t slot, Hist which, float* out,
+                    int ch, int n, const float* add = nullptr) {
+    if (!Batched()) {
+      Convolve(in_, w, dyn, heads, HistOf(slots[slot], which), out, ch, n, add);
+      return;
+    }
+    const std::size_t dstride = static_cast<std::size_t>(heads) * kConvTaps;
+    for (int g = 0; g < GroupCount(); ++g) {
+      const std::size_t o = static_cast<std::size_t>(brow_off[g]) * ch;
+      Convolve(in_ + o, w, dyn != nullptr ? dyn + o / ch * dstride : nullptr,
+               heads, HistOf(brow[g]->slots[slot], which), out + o, ch,
+               brow_n[g], add != nullptr ? add + o : nullptr);
+    }
+  }
+  // Clip with the full-attention log-position scale; in a batch every row
+  // takes its own session's position.
+  void ClipTau(float* x, const float* scale, int heads, int dim, float thr,
+               bool swa, int n) {
+    const Config& c = m->config;
+    const float tau_floor = static_cast<float>(c.log_scale_floor);
+    if (swa || !Batched()) {
+      Clip<<<n * heads, 128, 0, stream>>>(x, scale, heads, dim, thr,
+                                         swa ? nullptr : d_pos, heads,
+                                         tau_floor, c.log_scale_alpha);
+      return;
+    }
+    for (int g = 0; g < GroupCount(); ++g) {
+      Clip<<<brow_n[g] * heads, 128, 0, stream>>>(
+          x + static_cast<std::size_t>(brow_off[g]) * heads * dim, scale, heads,
+          dim, thr, brow[g]->d_pos, heads, tau_floor, c.log_scale_alpha);
+    }
   }
   float* Pool() { return block_pool[pool_used++]; }
 
@@ -3397,6 +3470,128 @@ struct Session::Impl : Scratch {
             inh[0]);
   }
 
+  // KV store and attention for `n` rows starting at scratch row `row`, against
+  // the cache, position and context of `st` (this session, or one batch row's
+  // session); scratch buffers are always this session's.
+  void AttnCore(const LayerCtx& L, Impl& st, int row, int n) {
+    const Config& c = m->config;
+    const int nh = c.num_heads, nkv = c.num_kv, hd = c.head_dim,
+              nrel = c.relative_length;
+    const std::uint32_t p = L.p;
+    const bool swa = L.swa;
+    Slot& sl = st.slots[L.slot];
+    const std::uint32_t sctx = st.ctx;
+    const int* pos0 = st.d_pos;
+    const std::size_t qo = static_cast<std::size_t>(row) * nh * hd;
+    float* const q_ = q + qo;
+    float* const r_ = r + static_cast<std::size_t>(row) * nh * nrel;
+    float* const sink_ = sink + static_cast<std::size_t>(row) * nh;
+    float* const att_ = att + qo;
+    const float* const k_ = k + static_cast<std::size_t>(row) * nkv * hd;
+    const float* const vt_ = L.vtmp + static_cast<std::size_t>(row) * nkv * hd;
+    StoreKv<<<n, 256, 0, stream>>>(k_, vt_, sl.k, sl.v, nkv * hd, pos0,
+                                   sl.ring, sl.vblocks);
+    AttnArgs aa{nh,
+                nkv,
+                hd,
+                nrel,
+                static_cast<int>(c.relative_extent),
+                swa ? static_cast<int>(c.sliding_window) : 0,
+                sl.ring,
+                sl.vblocks,
+                pos0,
+                1.0F / std::sqrt(static_cast<float>(hd))};
+    const int span =
+        swa ? static_cast<int>(c.sliding_window) : static_cast<int>(sctx);
+    if (hd == kFlashHd && nrel == kFlashRel) {
+      const __half* bias_w = static_cast<const __half*>(
+          m->T(m->P(p, "attn_rel_bias.weight.h")).dev);
+      const bool sparse_now =
+          st.sparse && !swa &&
+          (n < kWmmaMinTokens ||
+           st.pos_base + n >
+               (kSparseSink + kSparseLocal + kSparseTop + 2) * kBlockKeys);
+      if (st.sparse && !swa) {
+        PoolKeys<<<dim3((n + kBlockKeys - 1) / kBlockKeys + 1, nkv), kFlashHd,
+                   0, stream>>>(sl.k, sl.kmm, pos0, n, nkv);
+      }
+      if (n <= static_cast<int>(kMaxVerifyRows) && !sparse_now &&
+          !(n == 1 && swa) && n * (nh / nkv) <= 128) {
+        AttnArgs pa = aa;
+        pa.pack = nh / nkv;
+        const int pk_keys = swa ? 256 : 512;
+        const int pk_split =
+            swa ? (span + 72 + pk_keys - 1) / pk_keys
+                : std::max(1, static_cast<int>((sctx + pk_keys - 1) / pk_keys));
+        FlashRel<kPackWaves>
+            <<<dim3(1, nkv, pk_split), kPackWaves * 32, 0, stream>>>(
+                pa, q_, r_, sink_, sl.k, sl.v, bias_w, att_, n, pk_split, pk_keys,
+                split_m, split_l, split_o, nullptr, nullptr, 0);
+        if (pk_split > 1)
+          FlashCombine<<<dim3(n, nh), 128, 0, stream>>>(
+              split_m, split_l, split_o, att_, nh, pk_split);
+      } else if (n == 1 && !sparse_now && nh / nkv <= kDecMaxGh) {
+        const int nsd = (span + kDecKeys - 1) / kDecKeys;
+        DecodeAttn<<<dim3(nsd, nkv), kDecThreads, 0, stream>>>(
+            aa, q_, r_, sink_, sl.k, sl.v, bias_w, split_m, split_l, split_o, nsd);
+        FlashCombine<<<dim3(1, nh), 128, 0, stream>>>(split_m, split_l, split_o,
+                                                      att_, nh, nsd);
+      } else if (sparse_now) {
+        const int ntile = (n + kFlashQ - 1) / kFlashQ;
+        const bool grouped = n <= static_cast<int>(kMaxVerifyRows) &&
+                             std::getenv("INKLING_SPARSE_PER_HEAD") == nullptr;
+        const int gh = nh / nkv;
+        SelectBlocks<<<dim3(ntile, grouped ? nkv : nh), 256,
+                       kMaxSparseBlocks * sizeof(float), stream>>>(
+            q_, sl.kmm, pos0, n, nh, nkv, blist, bcount, grouped ? gh : 0);
+        const int nsp = n < kWmmaMinTokens ? (grouped ? 64 : 32) : 1;
+        if (grouped) {
+          AttnArgs pa = aa;
+          pa.pack = gh;
+          FlashRel<kPackWaves>
+              <<<dim3(1, nkv, nsp), kPackWaves * 32, 0, stream>>>(
+                  pa, q_, r_, sink_, sl.k, sl.v, bias_w, att_, n, nsp, kSplitKeys,
+                  split_m, split_l, split_o, blist, bcount, kListCap);
+        } else if (n < kWmmaMinTokens) {
+          FlashRel<kPackWaves>
+              <<<dim3(1, nh, nsp), kPackWaves * 32, 0, stream>>>(
+                  aa, q_, r_, sink_, sl.k, sl.v, bias_w, att_, n, nsp, kSplitKeys,
+                  split_m, split_l, split_o, blist, bcount, kListCap);
+        } else {
+          FlashRel<8><<<dim3((n + kFlashQ - 1) / kFlashQ, nh, nsp),
+                        kFlashThreads, 0, stream>>>(
+              aa, q_, r_, sink_, sl.k, sl.v, bias_w, att_, n, nsp, kSplitKeys,
+              split_m, split_l, split_o, blist, bcount, kListCap);
+        }
+        if (nsp > 1)
+          FlashCombine<<<dim3(n, nh), 128, 0, stream>>>(split_m, split_l,
+                                                        split_o, att_, nh, nsp);
+      } else {
+        const int split_keys =
+            swa ? 256 : (n <= 8 ? kSplitKeys / 4 : kSplitKeys);
+        const bool split =
+            n < kWmmaMinTokens &&
+            (swa ? n <= 8 : sctx > static_cast<std::uint32_t>(split_keys));
+        const int nsplit =
+            !split ? 1
+            : swa  ? (span + 72 + split_keys - 1) / split_keys
+                   : static_cast<int>((sctx + split_keys - 1) / split_keys);
+        FlashRel<8><<<dim3((n + kFlashQ - 1) / kFlashQ, nh, nsplit),
+                      kFlashThreads, 0, stream>>>(
+            aa, q_, r_, sink_, sl.k, sl.v, bias_w, att_, n, nsplit, split_keys,
+            split_m, split_l, split_o, nullptr, nullptr, 0);
+        if (nsplit > 1)
+          FlashCombine<<<dim3(n, nh), 128, 0, stream>>>(
+              split_m, split_l, split_o, att_, nh, nsplit);
+      }
+    } else {
+      Attention<<<dim3(nh, n), kThreads, (span + 1) * sizeof(float), stream>>>(
+          aa, q_, r_, sink_, sl.k, sl.v,
+          static_cast<const float*>(m->T(m->P(p, "attn_rel_bias.weight")).dev),
+          att_);
+    }
+  }
+
   // stage 3: convolutions, clipping, KV store, attention -> att / atth
   void LayerAttn(LayerCtx& L) {
     const Config& c = m->config;
@@ -3426,122 +3621,24 @@ struct Session::Impl : Scratch {
     (void)inp;
     (void)inh;
     (void)msgs_;
-    Convolve(tmp, m->T(m->P(p, "attn_k_conv.weight")), L.dk, nkv, sl.hist_k, k,
-             nkv * hd, n);
+    ConvolveSlot(tmp, m->T(m->P(p, "attn_k_conv.weight")), L.dk, nkv, L.slot,
+                 Hist::kK, k, nkv * hd, n);
     float* vtmp = tmp;
     L.vtmp = vtmp;
-    Convolve(v, m->T(m->P(p, "attn_v_conv.weight")), L.dv, nkv, sl.hist_v, vtmp,
-             nkv * hd, n);
-    const int* tau_p = swa ? nullptr : d_pos;
-    const float tau_floor = static_cast<float>(c.log_scale_floor);
-    Clip<<<n * nh, 128, 0, stream>>>(
-        q, static_cast<const float*>(m->T(m->P(p, "attn_q_clip.weight")).dev),
-        nh, hd, c.qk_clip, tau_p, nh, tau_floor, c.log_scale_alpha);
+    ConvolveSlot(v, m->T(m->P(p, "attn_v_conv.weight")), L.dv, nkv, L.slot,
+                 Hist::kV, vtmp, nkv * hd, n);
+    ClipTau(q, static_cast<const float*>(m->T(m->P(p, "attn_q_clip.weight")).dev),
+            nh, hd, c.qk_clip, swa, n);
     Clip<<<n * nkv, 128, 0, stream>>>(k, nullptr, 1, hd, c.qk_clip);
     RmsRows(vtmp, nullptr, vtmp, n * nkv, hd, hd, hd);
-    Clip<<<n * nh, 128, 0, stream>>>(
-        r, static_cast<const float*>(m->T(m->P(p, "attn_rel_clip.weight")).dev),
-        nh, nrel, c.relative_clip, tau_p, nh, tau_floor, c.log_scale_alpha);
-    StoreKv<<<n, 256, 0, stream>>>(k, vtmp, sl.k, sl.v, nkv * hd, d_pos,
-                                   sl.ring, sl.vblocks);
-    AttnArgs aa{nh,
-                nkv,
-                hd,
-                nrel,
-                static_cast<int>(c.relative_extent),
-                swa ? static_cast<int>(c.sliding_window) : 0,
-                sl.ring,
-                sl.vblocks,
-                d_pos,
-                1.0F / std::sqrt(static_cast<float>(hd))};
-    const int span =
-        swa ? static_cast<int>(c.sliding_window) : static_cast<int>(ctx);
-    if (hd == kFlashHd && nrel == kFlashRel) {
-      const __half* bias_w = static_cast<const __half*>(
-          m->T(m->P(p, "attn_rel_bias.weight.h")).dev);
-      const bool sparse_now =
-          sparse && !swa &&
-          (n < kWmmaMinTokens ||
-           pos_base + n >
-               (kSparseSink + kSparseLocal + kSparseTop + 2) * kBlockKeys);
-      if (sparse && !swa) {
-        PoolKeys<<<dim3((n + kBlockKeys - 1) / kBlockKeys + 1, nkv), kFlashHd,
-                   0, stream>>>(sl.k, sl.kmm, d_pos, n, nkv);
-      }
-      if (n <= static_cast<int>(kMaxVerifyRows) && !sparse_now &&
-          !(n == 1 && swa) && n * (nh / nkv) <= 128) {
-        AttnArgs pa = aa;
-        pa.pack = nh / nkv;
-        const int pk_keys = swa ? 256 : 512;
-        const int pk_split =
-            swa ? (span + 72 + pk_keys - 1) / pk_keys
-                : std::max(1, static_cast<int>((ctx + pk_keys - 1) / pk_keys));
-        FlashRel<kPackWaves>
-            <<<dim3(1, nkv, pk_split), kPackWaves * 32, 0, stream>>>(
-                pa, q, r, sink, sl.k, sl.v, bias_w, att, n, pk_split, pk_keys,
-                split_m, split_l, split_o, nullptr, nullptr, 0);
-        if (pk_split > 1)
-          FlashCombine<<<dim3(n, nh), 128, 0, stream>>>(
-              split_m, split_l, split_o, att, nh, pk_split);
-      } else if (n == 1 && !sparse_now && nh / nkv <= kDecMaxGh) {
-        const int nsd = (span + kDecKeys - 1) / kDecKeys;
-        DecodeAttn<<<dim3(nsd, nkv), kDecThreads, 0, stream>>>(
-            aa, q, r, sink, sl.k, sl.v, bias_w, split_m, split_l, split_o, nsd);
-        FlashCombine<<<dim3(1, nh), 128, 0, stream>>>(split_m, split_l, split_o,
-                                                      att, nh, nsd);
-      } else if (sparse_now) {
-        const int ntile = (n + kFlashQ - 1) / kFlashQ;
-        const bool grouped = n <= static_cast<int>(kMaxVerifyRows) &&
-                             std::getenv("INKLING_SPARSE_PER_HEAD") == nullptr;
-        const int gh = nh / nkv;
-        SelectBlocks<<<dim3(ntile, grouped ? nkv : nh), 256,
-                       kMaxSparseBlocks * sizeof(float), stream>>>(
-            q, sl.kmm, d_pos, n, nh, nkv, blist, bcount, grouped ? gh : 0);
-        const int nsp = n < kWmmaMinTokens ? (grouped ? 64 : 32) : 1;
-        if (grouped) {
-          AttnArgs pa = aa;
-          pa.pack = gh;
-          FlashRel<kPackWaves>
-              <<<dim3(1, nkv, nsp), kPackWaves * 32, 0, stream>>>(
-                  pa, q, r, sink, sl.k, sl.v, bias_w, att, n, nsp, kSplitKeys,
-                  split_m, split_l, split_o, blist, bcount, kListCap);
-        } else if (n < kWmmaMinTokens) {
-          FlashRel<kPackWaves>
-              <<<dim3(1, nh, nsp), kPackWaves * 32, 0, stream>>>(
-                  aa, q, r, sink, sl.k, sl.v, bias_w, att, n, nsp, kSplitKeys,
-                  split_m, split_l, split_o, blist, bcount, kListCap);
-        } else {
-          FlashRel<8><<<dim3((n + kFlashQ - 1) / kFlashQ, nh, nsp),
-                        kFlashThreads, 0, stream>>>(
-              aa, q, r, sink, sl.k, sl.v, bias_w, att, n, nsp, kSplitKeys,
-              split_m, split_l, split_o, blist, bcount, kListCap);
-        }
-        if (nsp > 1)
-          FlashCombine<<<dim3(n, nh), 128, 0, stream>>>(split_m, split_l,
-                                                        split_o, att, nh, nsp);
-      } else {
-        const int split_keys =
-            swa ? 256 : (n <= 8 ? kSplitKeys / 4 : kSplitKeys);
-        const bool split =
-            n < kWmmaMinTokens &&
-            (swa ? n <= 8 : ctx > static_cast<std::uint32_t>(split_keys));
-        const int nsplit =
-            !split ? 1
-            : swa  ? (span + 72 + split_keys - 1) / split_keys
-                   : static_cast<int>((ctx + split_keys - 1) / split_keys);
-        FlashRel<8><<<dim3((n + kFlashQ - 1) / kFlashQ, nh, nsplit),
-                      kFlashThreads, 0, stream>>>(
-            aa, q, r, sink, sl.k, sl.v, bias_w, att, n, nsplit, split_keys,
-            split_m, split_l, split_o, nullptr, nullptr, 0);
-        if (nsplit > 1)
-          FlashCombine<<<dim3(n, nh), 128, 0, stream>>>(
-              split_m, split_l, split_o, att, nh, nsplit);
-      }
+    ClipTau(r,
+            static_cast<const float*>(m->T(m->P(p, "attn_rel_clip.weight")).dev),
+            nh, nrel, c.relative_clip, swa, n);
+    if (Batched()) {
+      for (int g = 0; g < GroupCount(); ++g)
+        AttnCore(L, *brow[g], brow_off[g], brow_n[g]);
     } else {
-      Attention<<<dim3(nh, n), kThreads, (span + 1) * sizeof(float), stream>>>(
-          aa, q, r, sink, sl.k, sl.v,
-          static_cast<const float*>(m->T(m->P(p, "attn_rel_bias.weight")).dev),
-          att);
+      AttnCore(L, *this, 0, n);
     }
     if (big) {
       SigmoidMulH<<<(n * nh * hd + 255) / 256, 256, 0, stream>>>(
@@ -3651,8 +3748,8 @@ struct Session::Impl : Scratch {
     }
     const bool push = ip % c.attn_res_block_size == 0;
     // ffn_inp = conv(o) (+ the layer input unless it starts a new block)
-    Convolve(o, m->T(m->P(p, "attn_post_conv.weight")), nullptr, 1,
-             sl.hist_attn, ffn_inp, h, n, push ? nullptr : cur);
+    ConvolveSlot(o, m->T(m->P(p, "attn_post_conv.weight")), nullptr, 1, L.slot,
+                 Hist::kAttn, ffn_inp, h, n, push ? nullptr : cur);
     if (push) {
       float* b = Pool();
       HIP_OK(hipMemcpyAsync(b, cur, nh_ * 4, hipMemcpyDeviceToDevice, stream));
@@ -3705,8 +3802,8 @@ struct Session::Impl : Scratch {
       RmsRows(x, ffn_w, x, n, h, h, h, big ? xhx : nullptr);
     }
     Moe(p, n, big ? xhx : nullptr);
-    Convolve(moe, m->T(m->P(p, "ffn_post_conv.weight")), nullptr, 1,
-             sl.hist_ffn, cur, h, n, ffn_inp);
+    ConvolveSlot(moe, m->T(m->P(p, "ffn_post_conv.weight")), nullptr, 1,
+                 L.slot, Hist::kFfn, cur, h, n, ffn_inp);
   }
 
   // returns layer output in `cur`
@@ -4065,6 +4162,21 @@ struct Session::Impl : Scratch {
     return true;
   }
   void Tap(int v, int n, const float* src = nullptr) {
+    if (Batched()) {
+      const int h = static_cast<int>(m->config.hidden_size);
+      const float* base = src != nullptr ? src : cur;
+      for (int k = 0; k < kTapCount; ++k) {
+        if (g_tap_layers[k] != v)
+          continue;
+        for (int g = 0; g < GroupCount(); ++g) {
+          if (brow[g]->feat != nullptr)
+            TapStore<<<brow_n[g], 256, 0, stream>>>(
+                base + static_cast<std::size_t>(brow_off[g]) * h, brow[g]->feat,
+                brow[g]->d_pos, k, h);
+        }
+      }
+      return;
+    }
     if (feat == nullptr)
       return;
     for (int k = 0; k < kTapCount; ++k) {
@@ -4310,7 +4422,7 @@ struct Session::Impl : Scratch {
             h, h, h);
     Tap(48, n, x);
     const Tensor& out = m->T("output.weight");
-    if (all_rows && n <= static_cast<int>(kMaxVerifyRows)) {
+    if ((all_rows || Batched()) && n <= kMaxBatchRows) {
       Dense(out, x, h, d_logits, c.vocab_unpadded, n,
             static_cast<int>(c.vocab_unpadded));
       Softcap<<<(static_cast<std::size_t>(n) * c.vocab_unpadded + 255) / 256,
@@ -4764,6 +4876,140 @@ bool Model::LoadDrafter(const std::string& path, std::string* error) {
   return true;
 }
 
+bool Model::StepBatch(std::span<Session* const> sessions,
+                      std::span<const std::uint32_t> rows,
+                      std::span<const std::int32_t> tokens,
+                      std::string* error) {
+  const auto fail = [&](const char* what) {
+    if (error != nullptr)
+      *error = what;
+    return false;
+  };
+  const std::size_t nb = sessions.size();
+  if (nb == 0 || nb != rows.size() || nb > kMaxDecodeBatch)
+    return fail("step batch needs 1..8 sessions and one row count each");
+  std::size_t total = 0;
+  for (std::uint32_t r : rows) {
+    if (r == 0 || r > kMaxVerifyRows)
+      return fail("step batch row count must be 1..8 per session");
+    total += r;
+  }
+  if (total != tokens.size())
+    return fail("step batch tokens must match the row counts");
+  // At kWmmaMinTokens rows the layers switch to the prefill (WMMA) kernels,
+  // whose rounding differs from the <= 8-row verify kernels each session
+  // would use alone. Split into groups of whole sessions below that size so
+  // batched verification stays bit-identical to solo verification.
+  if (nb > 1 && total >= static_cast<std::size_t>(kWmmaMinTokens)) {
+    std::size_t first = 0, tok = 0;
+    while (first < nb) {
+      std::size_t last = first, sum = 0;
+      while (last < nb &&
+             sum + rows[last] < static_cast<std::size_t>(kWmmaMinTokens))
+        sum += rows[last++];
+      if (!StepBatch(sessions.subspan(first, last - first),
+                     rows.subspan(first, last - first),
+                     tokens.subspan(tok, sum), error))
+        return false;
+      first = last;
+      tok += sum;
+    }
+    return true;
+  }
+  if (total > static_cast<std::size_t>(kMaxBatchRows))
+    return fail("step batch has more rows than the batch logits hold");
+  if (nb == 1 && rows[0] == 1)
+    return sessions[0]->Append(tokens, error);
+  static_assert(Model::kMaxDecodeBatch <= kMaxVerifyRows,
+                "batch logits use the verification rows");
+  std::vector<Session::Impl*> impls;
+  impls.reserve(nb);
+  for (Session* s : sessions) {
+    if (s == nullptr || s->impl_ == nullptr)
+      return fail("step batch got a null session");
+    Session::Impl* r = s->impl_.get();
+    if (r->m != state_)
+      return fail("step batch sessions must belong to this model");
+    if (std::find(impls.begin(), impls.end(), r) != impls.end())
+      return fail("step batch sessions must be distinct");
+    if (!impls.empty() &&
+        (r->ctx != impls[0]->ctx || r->sparse != impls[0]->sparse))
+      return fail("step batch sessions must share one context size");
+    impls.push_back(r);
+  }
+  for (std::size_t b = 0; b < nb; ++b) {
+    if (impls[b]->position + rows[b] > impls[b]->ctx)
+      return fail("context exceeded");
+  }
+  Session::Impl& lead = *impls[0];
+  lead.brow = impls;
+  // Verification rows: every Convolve records its session's history window so
+  // a later KeepRows(keep < rows) can rewind each session independently.
+  lead.all_rows = true;
+  lead.brow_off.assign(nb, 0);
+  lead.brow_n.assign(nb, 0);
+  int off = 0;
+  for (std::size_t b = 0; b < nb; ++b) {
+    Session::Impl& r = *impls[b];
+    r.Activate(0);
+    r.pos_base = r.position;
+    const int pos = static_cast<int>(r.position);
+    HIP_OK(hipMemcpy(r.d_pos, &pos, 4, hipMemcpyHostToDevice));
+    lead.brow_off[b] = off;
+    lead.brow_n[b] = static_cast<int>(rows[b]);
+    off += static_cast<int>(rows[b]);
+  }
+  HIP_OK(hipMemcpy(lead.d_tokens, tokens.data(), total * 4,
+                   hipMemcpyHostToDevice));
+  struct ClearRows {
+    Session::Impl& s;
+    ~ClearRows() {
+      s.all_rows = false;
+      s.brow.clear();
+      s.brow_off.clear();
+      s.brow_n.clear();
+    }
+  } clear_rows{lead};
+  lead.Body(static_cast<int>(total));
+  const Config& c = state_->config;
+  const std::size_t vocab = c.vocab_unpadded;
+  ArgMaxRow<<<static_cast<int>(total), 256, 0, lead.stream>>>(
+      lead.d_logits, static_cast<int>(vocab), lead.d_argmax, lead.d_argmax);
+  int argmax[kMaxVerifyRows * kMaxDecodeBatch]{};
+  static_assert(kMaxVerifyRows * kMaxDecodeBatch <= 64);
+  HIP_OK(hipMemcpyAsync(argmax, lead.d_argmax, total * 4,
+                        hipMemcpyDeviceToHost, lead.stream));
+  for (std::size_t b = 1; b < nb; ++b) {
+    HIP_OK(hipMemcpyAsync(
+        impls[b]->d_logits,
+        lead.d_logits + static_cast<std::size_t>(lead.brow_off[b]) * vocab,
+        static_cast<std::size_t>(rows[b]) * vocab * 4,
+        hipMemcpyDeviceToDevice, lead.stream));
+  }
+  HIP_OK(hipStreamSynchronize(lead.stream));
+  for (std::size_t b = 0; b < nb; ++b) {
+    Session::Impl& r = *impls[b];
+    const int count = static_cast<int>(rows[b]);
+    for (int i = 0; i < count; ++i)
+      r.argmax_host[i] = argmax[lead.brow_off[b] + i];
+    r.logits_rows = count;
+    r.logits_last = count - 1;
+    r.logits_have.assign(static_cast<std::size_t>(count), 0);
+    r.n_logit_rows = count;
+    r.pos_before_last = r.position;
+    r.last_rows = count;
+    r.position += rows[b];
+  }
+  return true;
+}
+
+bool Model::DecodeBatch(std::span<Session* const> sessions,
+                        std::span<const std::int32_t> tokens,
+                        std::string* error) {
+  std::vector<std::uint32_t> rows(sessions.size(), 1U);
+  return StepBatch(sessions, rows, tokens, error);
+}
+
 bool Model::HasDrafter() const noexcept {
   return state_->has_draft;
 }
@@ -4846,8 +5092,8 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
     sc.moe = i.Alloc(b * h);
     sc.prelude = i.Alloc(b * h);
     sc.bank_out = i.Alloc(b * h);
-    sc.d_logits = i.Alloc(kMaxVerifyRows * c.vocab_padded);
-    i.d_argmax = static_cast<int*>(i.AllocBytes(kMaxVerifyRows * 4));
+    sc.d_logits = i.Alloc(kMaxBatchRows * c.vocab_padded);
+    i.d_argmax = static_cast<int*>(i.AllocBytes(kMaxBatchRows * 4));
     sc.d_pos = static_cast<int*>(i.AllocBytes(4));
     if (state_->npu) {
       std::string npu_error;

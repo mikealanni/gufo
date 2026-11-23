@@ -1354,6 +1354,29 @@ struct TextGenerationScheduler::Impl {
   void StepDecode(const std::shared_ptr<ScheduledRequest>& request) {
     consecutive_active_prefill_chunks = 0;
     if (multi_token_decode) {
+      // A published token whose advance was deferred for snapshot capture has
+      // to be advanced first: the multi-token step refuses to run with a
+      // pending token, and the plain path below advances through
+      // PrepareDecode. Without this, a request that is briefly the only one
+      // decoding fails with "cannot decode a step with a pending token".
+      if (request->advance_pending) {
+        try {
+          const auto decode_start = PrepareDecode(request);
+          if (!decode_start.has_value())
+            return;
+          request->runner_request.Advance();
+          FinishAdvanced(request, *decode_start);
+        } catch (...) {
+          const auto failure = std::current_exception();
+          if (!CompleteIfStopped(request))
+            CompleteFailure(request, failure);
+          return;
+        }
+        if (CompleteIfStopped(request))
+          return;
+        if (request->result.tokens.size() >= request->token_limit)
+          return;
+      }
       StepMultiTokenDecode(request);
       return;
     }
