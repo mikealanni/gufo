@@ -6023,6 +6023,22 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
   uint4 f_q3_h[kWaveRowTiles];    ///< hmask bytes 16 f_c .. 16 f_c + 15
   constexpr int kActFetch = BN <= 64 ? 2 : BN <= 128 ? 4 : (BN * 8 + 255) / 256;
   uint4 a_data[kActFetch];
+  // NVFP4: each wave owns its 16 weight rows, so their codes and scales go
+  // straight from global memory into registers, bypassing LDS.
+  uint4 w_code[2], cur_code[2];
+  std::uint32_t w_sc = 0, cur_sc = 0;
+  const int d_local =
+      kPair ? (wave_id & 3) * 16 + sub_lane : wave_id * 16 + sub_lane;
+  const int d_row = r_block + d_local;
+  const bool d_live = d_row < m_i;
+  const std::uint8_t* d_base = w_expert;
+  if constexpr (kPair) {
+    if (wave_id >= 4)
+      d_base = static_cast<const std::uint8_t*>(w_up) +
+               static_cast<std::size_t>(expert) * expert_stride * row_bytes;
+  }
+  const std::uint8_t* d_ptr =
+      d_base + static_cast<std::size_t>(d_live ? d_row : m_i - 1) * row_bytes;
 
   // Activation fetch: BN tokens x (BK * 64) bytes per stage in 16-byte
   // chunks, eight per token; each thread fetches consecutive 256-chunk
@@ -6131,10 +6147,10 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
       } else if constexpr (kNV) {
         // Repacked row: 16 nibble bytes per 32-element block, then one UE4M3
         // scale byte per 16 elements.
-        const int j = kb0 + f_c;
-        f_codes[u] = *reinterpret_cast<const uint4*>(f_ptr[u] + (j * 16));
-        f_dm[u] = *reinterpret_cast<const std::uint16_t*>(f_ptr[u] + (k / 2) +
-                                                          (j * 2));
+        w_code[0] = *reinterpret_cast<const uint4*>(d_ptr + (kb0 * 16));
+        w_code[1] = *reinterpret_cast<const uint4*>(d_ptr + (kb0 * 16) + 16);
+        w_sc = *reinterpret_cast<const std::uint32_t*>(d_ptr + (k / 2) +
+                                                       (kb0 * 2));
       } else if constexpr (kQ8R) {
         // Repacked row: 32 code bytes per K block, then one fp16 scale per
         // block; every load is 16-byte aligned.
@@ -6237,6 +6253,11 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
   };
 
   const auto commit_stage = [&](int kb_commit) {
+    if constexpr (kNV) {
+      cur_code[0] = w_code[0];
+      cur_code[1] = w_code[1];
+      cur_sc = w_sc;
+    }
 #pragma unroll
     for (int u = 0; u < kWaveRowTiles; ++u) {
       const int row = (tid >> 1) + (u * 128);
@@ -6298,7 +6319,7 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
         s_codes[swizzle(row, 2 * f_c)] = f_codes[u];
         s_codes[swizzle(row, (2 * f_c) + 1)] = f_codes_hi[u];
         scale_bias = f_live[u] ? f_dm[u] : 0U;  // half2 (d, 0)
-      } else {
+      } else if constexpr (!kNV) {
         s_codes[swizzle(row, f_c)] = f_codes[u];
       }
       if constexpr (kQ5K) {
@@ -6382,7 +6403,7 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
         scale_bias = __builtin_bit_cast(std::uint32_t,
                                         __floats2half2_rn(scale, -offset));
       }
-      if constexpr (!kQ3) {
+      if constexpr (!kQ3 && !kNV) {
         s_scale[(f_c * BM) + row] = scale_bias;
       }
     }
@@ -6416,7 +6437,10 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
         const int row = (wave_id * 16) + (u * 128) + sub_lane;
 #pragma unroll
         for (int c = 0; c < BK; ++c) {
-          raw[u][c] = s_codes[swizzle(row, c)];
+          if constexpr (kNV)
+            raw[u][c] = cur_code[c];
+          else
+            raw[u][c] = s_codes[swizzle(row, c)];
         }
       }
     }
@@ -6427,8 +6451,14 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
 #pragma unroll
       for (int u = 0; u < kWaveRowTiles; ++u) {
         const int row = (wave_id * 16) + (u * 128) + sub_lane;
-        const __half2 sb =
-            __builtin_bit_cast(__half2, s_scale[(kb * BM) + row]);
+        __half2 sb;
+        if constexpr (kNV) {
+          const std::uint32_t dmw = (cur_sc >> (16 * kb)) & 0xFFFFU;
+          sb = __floats2half2_rn(d_live ? Nv4Scale(dmw & 0xFFU) : 0.0F,
+                                 d_live ? Nv4Scale(dmw >> 8U) : 0.0F);
+        } else {
+          sb = __builtin_bit_cast(__half2, s_scale[(kb * BM) + row]);
+        }
         const __half2 scale2 = __low2half2(sb);
         // IQ2_S and Q3_K carry one scale per 16 elements: (low, high).
         const __half2 scale_hi2 = kTwoScale ? __high2half2(sb) : scale2;
