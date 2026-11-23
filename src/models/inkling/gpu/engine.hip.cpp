@@ -591,8 +591,8 @@ struct StatePtrs {
 
 // Norm and query scores of every state of one token in a single pass over the
 // row (128-bit loads, all states accumulated together, one cross-wave
-// reduction): inv[s] = 1 / rms(state s), score[q][s] = state . query[q] * inv[s]
-// / sqrt(h). The block is 256 threads.
+// reduction): inv[s] = 1 / rms(state s), score[q][s] = state . query[q] *
+// inv[s] / sqrt(h). The block is 256 threads.
 __device__ void MixScores(const float* const* st, int ns, const float* query,
                           int nq, int h, float* inv, float (*score)[kMaxStates],
                           float* sred) {
@@ -617,8 +617,8 @@ __device__ void MixScores(const float* const* st, int ns, const float* query,
 #pragma unroll
         for (int q = 0; q < 4; ++q) {
           if (q < nq)
-            acc[s * 5 + 1 + q] += v.x * qv[q].x + v.y * qv[q].y +
-                                  v.z * qv[q].z + v.w * qv[q].w;
+            acc[s * 5 + 1 + q] +=
+                v.x * qv[q].x + v.y * qv[q].y + v.z * qv[q].z + v.w * qv[q].w;
         }
       }
     }
@@ -1510,8 +1510,8 @@ __global__ void __launch_bounds__(WAVES * 32)
   for (int i = 0; i < 8; ++i) {
     const int row = wave * 16 + 2 * i + (lane >> 4);
     const int t = row_tok(row);
-    sinkv[i] = sink[static_cast<std::size_t>(t) * a.nh + row_head(row)] *
-               kLog2e;
+    sinkv[i] =
+        sink[static_cast<std::size_t>(t) * a.nh + row_head(row)] * kLog2e;
     qpos[i] = pos0 + (pk > 0 ? row / gh : q0 + row);
   }
   V8f o[8] = {};
@@ -1642,8 +1642,7 @@ __global__ void __launch_bounds__(WAVES * 32)
     }
     for (int ni = 0; ni < 4; ++ni) {
       for (int i = 0; i < 8; ++i) {
-        const float pv =
-            sc[ni][i] <= kNegInf ? 0.0F : exp2f(sc[ni][i] - m[i]);
+        const float pv = sc[ni][i] <= kNegInf ? 0.0F : exp2f(sc[ni][i] - m[i]);
         l[i] += pv;
         PZ[wave][(2 * i + (lane >> 4)) * kPStride + ni * 16 + (lane & 15)] =
             __float2half(pv);
@@ -2869,6 +2868,8 @@ struct Session::Impl : Scratch {
   Scratch saved[2];        // bank scratch while another bank is active
   int active{0};
   void Activate(int bank) {
+    if (two_stream)
+      stream = bank == 0 ? stream0 : stream1;
     if (bank == active)
       return;
     saved[active] = static_cast<Scratch&>(*this);
@@ -2960,6 +2961,40 @@ struct Session::Impl : Scratch {
   bool no_dp4{std::getenv("INKLING_NO_DP4") != nullptr};
   int *xrow_token{nullptr}, *xrow_item{nullptr};
   hipStream_t stream{nullptr};
+  // GPU-only token banks run on two streams so one bank's memory-bound kernels
+  // overlap the other bank's matrix work; bank 1's attention waits for bank
+  // 0's keys, values and conv histories through ev_bank.
+  hipStream_t stream0{nullptr}, stream1{nullptr};
+  hipEvent_t ev_bank{nullptr};
+  bool two_stream{false};
+  // NPU submits and waits are host callbacks; with two compute streams they
+  // all go through one control stream (ordered by event) so a blocked wait can
+  // never sit in front of the submit it needs.
+  hipStream_t npu_ctl{nullptr};
+  hipEvent_t npu_ev[64]{};
+  unsigned npu_ev_i{0};
+  void NpuSubmit(int a, const int* b, const int* c, int count, int prog) {
+    auto& npu = *m->npu;
+    if (npu_ctl == nullptr) {
+      npu.Submit(stream, a, b, c, count, prog);
+      return;
+    }
+    const hipEvent_t e = npu_ev[npu_ev_i++ % 64];
+    HIP_OK(hipEventRecord(e, stream));
+    HIP_OK(hipStreamWaitEvent(npu_ctl, e, 0));
+    npu.Submit(npu_ctl, a, b, c, count, prog);
+  }
+  void NpuWaitFor(std::uint64_t ticket) {
+    auto& npu = *m->npu;
+    if (npu_ctl == nullptr) {
+      npu.Wait(stream, ticket);
+      return;
+    }
+    npu.Wait(npu_ctl, ticket);
+    const hipEvent_t e = npu_ev[npu_ev_i++ % 64];
+    HIP_OK(hipEventRecord(e, npu_ctl));
+    HIP_OK(hipStreamWaitEvent(stream, e, 0));
+  }
   hipGraph_t graph{nullptr};
   hipGraphExec_t graph_exec{nullptr};
 
@@ -3462,12 +3497,11 @@ struct Session::Impl : Scratch {
     const int prog =
         (rows <= 2048 && m->npu_prog_small >= 0) ? m->npu_prog_small : 0;
     if (!b.empty())
-      npu.Submit(stream, npu_a[0], b.data(), c.data(),
-                 static_cast<int>(b.size()), prog);
+      NpuSubmit(npu_a[0], b.data(), c.data(), static_cast<int>(b.size()), prog);
     if (!k_shared && (npu_mask & 4) != 0)
-      npu.Submit(stream, npu_a[1], &wk[0], &npu_c[6], 1, prog);
+      NpuSubmit(npu_a[1], &wk[0], &npu_c[6], 1, prog);
     if (!v_shared && (npu_mask & 8) != 0)
-      npu.Submit(stream, npu_a[2], &wv[0], &npu_c[7], 1, prog);
+      NpuSubmit(npu_a[2], &wv[0], &npu_c[7], 1, prog);
     L.ticket = npu.Ticket();
   }
 
@@ -3478,7 +3512,7 @@ struct Session::Impl : Scratch {
     const auto& wq = m->npu_w.at(m->P(L.p, "attn_q.weight"));
     const auto& wg = m->npu_w.at(m->P(L.p, "attn_gate.weight"));
     const int qd = static_cast<int>(wq.size()) * static_cast<int>(kNpuSlice);
-    npu.Wait(stream, L.ticket);
+    NpuWaitFor(L.ticket);
     if ((npu_mask & 1) != 0)
       for (std::size_t i = 0; i < wq.size(); ++i)
         rocm::NpuDecodeOutput(npu.Staged(stream, npu_c[i]),
@@ -3804,8 +3838,7 @@ struct Session::Impl : Scratch {
       const int prog = (n <= 2048 && m->npu_prog_o_small >= 0)
                            ? m->npu_prog_o_small
                            : m->npu_prog_o;
-      npu.Submit(stream, npu_ao, wo.data(), npu_c, static_cast<int>(wo.size()),
-                 prog);
+      NpuSubmit(npu_ao, wo.data(), npu_c, static_cast<int>(wo.size()), prog);
       L.ticket = npu.Ticket();
     }
   }
@@ -3842,7 +3875,7 @@ struct Session::Impl : Scratch {
     if (L.out_npu) {
       namespace rocm = gufo::models::qwen38_flash_next::rocm;
       auto& npu = *m->npu;
-      npu.Wait(stream, L.ticket);
+      NpuWaitFor(L.ticket);
       for (int i = 0; i < 3; ++i) {
         const std::uint32_t valid =
             (i == 2) ? static_cast<std::uint32_t>(h - 2 * 1024) : 0U;
@@ -4426,7 +4459,11 @@ struct Session::Impl : Scratch {
       LayerAttn(R[0].L);
       LayerOut1a(R[0].L);
       DebugSync("A.attn", t);
+      if (two_stream)
+        HIP_OK(hipEventRecord(ev_bank, stream0));
       BankFront(1, R[1], steps[t]);
+      if (two_stream)
+        HIP_OK(hipStreamWaitEvent(stream1, ev_bank, 0));
       LayerQkvBegin(R[1].L);
       Activate(0);
       LayerOut1b(R[0].L, R[0].blocks);
@@ -4439,7 +4476,11 @@ struct Session::Impl : Scratch {
       LayerOut1a(R[1].L);
       DebugSync("B.attn", t);
     }
+    if (two_stream)
+      HIP_OK(hipEventRecord(ev_bank, stream0));
     Activate(1);
+    if (two_stream)
+      HIP_OK(hipStreamWaitEvent(stream1, ev_bank, 0));
     LayerOut1b(R[1].L, R[1].blocks);
     LayerOut2(R[1].L, R[1].blocks);
     Tap(T - 1, R[1].n);
@@ -5174,6 +5215,20 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
     i.banked = true;
     i.bank_rows = state_->npu ? state_->npu_tokens : 2048;
     alloc_scratch(i.saved[1], i.bank_rows);
+    const char* streams_env = std::getenv("INKLING_BANK_STREAMS");
+    const bool want_streams =
+        streams_env != nullptr ? streams_env[0] != '0' : state_->npu != nullptr;
+    if (want_streams) {
+      i.stream0 = i.stream;
+      HIP_OK(hipStreamCreateWithFlags(&i.stream1, hipStreamNonBlocking));
+      HIP_OK(hipEventCreateWithFlags(&i.ev_bank, hipEventDisableTiming));
+      i.two_stream = true;
+      if (state_->npu) {
+        HIP_OK(hipStreamCreateWithFlags(&i.npu_ctl, hipStreamNonBlocking));
+        for (auto& e : i.npu_ev)
+          HIP_OK(hipEventCreateWithFlags(&e, hipEventDisableTiming));
+      }
+    }
   }
   return s;
 }
