@@ -8286,6 +8286,9 @@ bool RoutedQ8RepGemm(const void* w, const __half* x, const std::int32_t* tiles,
     case 192:
       INKLING_Q8R_LAUNCH(192);
       return true;
+    case 256:
+      INKLING_Q8R_LAUNCH(256);
+      return true;
     default:
       return false;
   }
