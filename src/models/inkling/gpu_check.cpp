@@ -506,6 +506,20 @@ int main(int argc, char** argv) {
     } else {
       prompt.assign(n, kBenchToken);
     }
+    const char* repeat_env = std::getenv("INKLING_BENCH_REPEAT");
+    for (int rep = 1; repeat_env != nullptr && rep < std::atoi(repeat_env);
+         ++rep) {
+      session->Reset();
+      const auto r0 = std::chrono::steady_clock::now();
+      if (!session->Append(prompt, &error)) {
+        std::fprintf(stderr, "bench prefill failed: %s\n", error.c_str());
+        return 1;
+      }
+      const auto r1 = std::chrono::steady_clock::now();
+      std::printf("warm pp %d: %.1f tok/s\n", n,
+                  n / std::chrono::duration<double>(r1 - r0).count());
+    }
+    session->Reset();
     const auto t0 = std::chrono::steady_clock::now();
     if (!session->Append(prompt, &error)) {
       std::fprintf(stderr, "bench prefill failed: %s\n", error.c_str());
