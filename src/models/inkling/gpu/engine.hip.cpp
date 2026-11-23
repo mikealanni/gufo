@@ -661,15 +661,42 @@ __global__ void FixHist(const HistEntry* entries, int keep) {
 struct StatePtrs {
   const float* p[kMaxStates];
   int count;
+  bool half_blocks;  ///< the block states are FP16 rows (cur is always F32)
 };
+
+__device__ __forceinline__ float4 StateRow4(const void* row, bool half,
+                                            int i) {
+  if (!half)
+    return reinterpret_cast<const float4*>(row)[i];
+  const uint2 u = reinterpret_cast<const uint2*>(row)[i];
+  const float2 a = __half22float2(__builtin_bit_cast(__half2, u.x));
+  const float2 b = __half22float2(__builtin_bit_cast(__half2, u.y));
+  return make_float4(a.x, a.y, b.x, b.y);
+}
+
+__device__ __forceinline__ float StateAt(const void* row, bool half, int i) {
+  return half ? __half2float(reinterpret_cast<const __half*>(row)[i])
+              : reinterpret_cast<const float*>(row)[i];
+}
+
+__device__ __forceinline__ const void* StateRowPtr(const StatePtrs& blocks,
+                                                   const float* cur, int s,
+                                                   std::size_t t, int h) {
+  if (s == blocks.count)
+    return cur + t * h;
+  return blocks.half_blocks
+             ? static_cast<const void*>(
+                   reinterpret_cast<const __half*>(blocks.p[s]) + t * h)
+             : static_cast<const void*>(blocks.p[s] + t * h);
+}
 
 // Norm and query scores of every state of one token in a single pass over the
 // row (128-bit loads, all states accumulated together, one cross-wave
 // reduction): inv[s] = 1 / rms(state s), score[q][s] = state . query[q] *
 // inv[s] / sqrt(h). The block is 256 threads.
-__device__ void MixScores(const float* const* st, int ns, const float* query,
-                          int nq, int h, float* inv, float (*score)[kMaxStates],
-                          float* sred) {
+__device__ void MixScores(const void* const* st, int ns, bool half_blocks,
+                          const float* query, int nq, int h, float* inv,
+                          float (*score)[kMaxStates], float* sred) {
   constexpr int kAcc = 5 * kMaxStates;
   float acc[kAcc];
 #pragma unroll
@@ -686,7 +713,7 @@ __device__ void MixScores(const float* const* st, int ns, const float* query,
 #pragma unroll
     for (int s = 0; s < kMaxStates; ++s) {
       if (s < ns) {
-        const float4 v = reinterpret_cast<const float4*>(st[s])[i];
+        const float4 v = StateRow4(st[s], half_blocks && s < ns - 1, i);
         acc[s * 5] += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
 #pragma unroll
         for (int q = 0; q < 4; ++q) {
@@ -795,11 +822,10 @@ __global__ void MixBig(StatePtrs blocks, const float* cur, const float* query,
   __shared__ float score[4][kMaxStates];
   const int t = blockIdx.x;
   const int ns = blocks.count + 1;
-  const float* st[kMaxStates];
-  for (int s = 0; s < blocks.count; ++s)
-    st[s] = blocks.p[s] + static_cast<std::size_t>(t) * h;
-  st[blocks.count] = cur + static_cast<std::size_t>(t) * h;
-  MixScores(st, ns, query, nq, h, inv, score, sred);
+  const void* st[kMaxStates];
+  for (int s = 0; s < ns; ++s)
+    st[s] = StateRowPtr(blocks, cur, s, t, h);
+  MixScores(st, ns, blocks.half_blocks, query, nq, h, inv, score, sred);
   for (int q = 0; q < nq; ++q) {
     float mx = -1e30F;
     for (int s = 0; s < ns; ++s)
@@ -813,7 +839,8 @@ __global__ void MixBig(StatePtrs blocks, const float* cur, const float* query,
     for (int i = threadIdx.x; i < h; i += blockDim.x) {
       float a = 0.0F;
       for (int s = 0; s < ns; ++s)
-        a += e[s] / den * st[s][i] * inv[s];
+        a += e[s] / den * StateAt(st[s], blocks.half_blocks && s < ns - 1, i) *
+             inv[s];
       out[(static_cast<std::size_t>(q) * n + t) * h + i] = a;
     }
   }
@@ -836,11 +863,10 @@ __global__ void MixRms(StatePtrs blocks, const float* cur, const float* query,
   __shared__ float rsum[256];
   const int t = blockIdx.x;
   const int ns = blocks.count + 1;
-  const float* st[kMaxStates];
-  for (int s = 0; s < blocks.count; ++s)
-    st[s] = blocks.p[s] + static_cast<std::size_t>(t) * h;
-  st[blocks.count] = cur + static_cast<std::size_t>(t) * h;
-  MixScores(st, ns, query, nq, h, inv, score, sred);
+  const void* st[kMaxStates];
+  for (int s = 0; s < ns; ++s)
+    st[s] = StateRowPtr(blocks, cur, s, t, h);
+  MixScores(st, ns, blocks.half_blocks, query, nq, h, inv, score, sred);
   for (int q = 0; q < nq; ++q) {
     float mx = -1e30F;
     for (int s = 0; s < ns; ++s)
@@ -855,7 +881,8 @@ __global__ void MixRms(StatePtrs blocks, const float* cur, const float* query,
     for (int i = threadIdx.x; i < h; i += blockDim.x) {
       float a = 0.0F;
       for (int s = 0; s < ns; ++s)
-        a += e[s] / den * st[s][i] * inv[s];
+        a += e[s] / den * StateAt(st[s], blocks.half_blocks && s < ns - 1, i) *
+             inv[s];
       mixbuf[q * h + i] = a;
       ss += a * a;
     }
@@ -3462,6 +3489,7 @@ struct Session::Impl : Scratch {
     sp.count = static_cast<int>(blocks.size());
     for (std::size_t i = 0; i < blocks.size(); ++i)
       sp.p[i] = blocks[i];
+    sp.half_blocks = F16Blocks(n);
     if (n >= kWmmaMinTokens) {
       MixBig<<<n, 256, 0, stream>>>(
           sp, cur_, query, nq, static_cast<int>(m->config.hidden_size), n, out);
@@ -3476,6 +3504,7 @@ struct Session::Impl : Scratch {
     sp.count = static_cast<int>(blocks.size());
     for (std::size_t i = 0; i < blocks.size(); ++i)
       sp.p[i] = blocks[i];
+    sp.half_blocks = F16Blocks(n);
     const int hh = static_cast<int>(m->config.hidden_size);
     MixRms<<<n, 256, nq * hh * sizeof(float), stream>>>(
         sp, cur_, query, nq, hh, n, np, m->config.rms_eps);
@@ -3540,6 +3569,13 @@ struct Session::Impl : Scratch {
             : nullptr);
   }
   float* Pool() { return block_pool[pool_used++]; }
+  // Opt-in fast profile (INKLING_F16_BLOCKS=1): prefill block states live as
+  // FP16 rows, the large reads of MixBig/MixRms (logits KL ~2.7e-3).
+  static bool F16Blocks(int n) {
+    static const bool on = std::getenv("INKLING_F16_BLOCKS") != nullptr &&
+                           std::getenv("INKLING_F16_BLOCKS")[0] != '0';
+    return on && n >= kWmmaMinTokens;
+  }
 
   struct LayerCtx {
     std::uint32_t slot{0}, ip{0}, p{0};
@@ -4143,7 +4179,13 @@ struct Session::Impl : Scratch {
              sl.hist_attn, ffn_inp, h, n, push ? nullptr : cur);
     if (push) {
       float* b = Pool();
-      HIP_OK(hipMemcpyAsync(b, cur, nh_ * 4, hipMemcpyDeviceToDevice, stream));
+      if (F16Blocks(n)) {
+        ToHalf<<<(nh_ + 255) / 256, 256, 0, stream>>>(
+            cur, reinterpret_cast<__half*>(b), nh_);
+      } else {
+        HIP_OK(
+            hipMemcpyAsync(b, cur, nh_ * 4, hipMemcpyDeviceToDevice, stream));
+      }
       blocks.push_back(b);
     }
   }
