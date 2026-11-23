@@ -1201,13 +1201,25 @@ __global__ void SituHalfIn(const __half* gu, __half* act, int ff, float beta,
 
 __global__ void CombineHalf(const __half* y, const float* wts, float* out,
                             int nu, int h) {
-  for (int i = threadIdx.x; i < h; i += blockDim.x) {
-    float a = 0.0F;
-    for (int k = 0; k < nu; ++k)
-      a += wts[blockIdx.x * nu + k] *
-           __half2float(
-               y[(static_cast<std::size_t>(blockIdx.x) * nu + k) * h + i]);
-    out[static_cast<std::size_t>(blockIdx.x) * h + i] = a;
+  const int h8 = h / 8;
+  for (int i = threadIdx.x; i < h8; i += blockDim.x) {
+    float a[8] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
+    for (int k = 0; k < nu; ++k) {
+      const float w = wts[blockIdx.x * nu + k];
+      const uint4 raw = reinterpret_cast<const uint4*>(
+          y + (static_cast<std::size_t>(blockIdx.x) * nu + k) * h)[i];
+      const __half2* pr = reinterpret_cast<const __half2*>(&raw);
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const float2 f = __half22float2(pr[j]);
+        a[2 * j] += w * f.x;
+        a[2 * j + 1] += w * f.y;
+      }
+    }
+    float4* o = reinterpret_cast<float4*>(
+        out + static_cast<std::size_t>(blockIdx.x) * h) + 2 * i;
+    o[0] = make_float4(a[0], a[1], a[2], a[3]);
+    o[1] = make_float4(a[4], a[5], a[6], a[7]);
   }
 }
 
