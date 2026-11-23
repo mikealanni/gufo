@@ -1366,6 +1366,19 @@ __global__ void BuildTileList(const int* bounds, int ne, int bn, int* out,
   }
 }
 
+// Sums the split-K slices in a fixed order.
+__global__ void SplitKReduce(const float* part, float* y, std::size_t count,
+                             int slices) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= count)
+    return;
+  float a = part[i];
+  for (int z = 1; z < slices; ++z)
+    a += part[static_cast<std::size_t>(z) * count + i];
+  y[i] = a;
+}
+
 __global__ void EmuSitu(const float* gu, const int* ids, const float* es,
                         __half* act, int ff, float beta, float lb) {
   const int item = blockIdx.x;
@@ -1443,6 +1456,8 @@ struct WmmaArgs {
   const int* tiles;
   const int* sorted;
   int n;
+  int ksplit{1};  ///< split-K slices (grid z); partial sums go to y + z * n * rows
+  int kchunk{0};  ///< K per slice
 };
 
 // 16 consecutive K elements [k0, k0 + 16) of one weight row as F16.
@@ -1517,7 +1532,13 @@ __global__ void __launch_bounds__(kWmmaThreads) WmmaGemm(WmmaArgs a) {
   V8f acc[2][2] = {};
   const int wm = wave >> 1;
   const int wn = wave & 1;
-  for (int k0 = 0; k0 < a.cols; k0 += 32) {
+  const int kbeg = a.ksplit > 1 ? static_cast<int>(blockIdx.z) * a.kchunk : 0;
+  const int kend = a.ksplit > 1 ? min(a.cols, kbeg + a.kchunk) : a.cols;
+  float* const yout = a.ksplit > 1
+                          ? a.y + static_cast<std::size_t>(blockIdx.z) *
+                                      a.n * a.rows
+                          : a.y;
+  for (int k0 = kbeg; k0 < kend; k0 += 32) {
     uint4* ad = reinterpret_cast<uint4*>(&As[lr][lh * 16]);
     if (xr != nullptr) {
       const uint4* xs = reinterpret_cast<const uint4*>(xr + k0 + lh * 16);
@@ -1560,7 +1581,7 @@ __global__ void __launch_bounds__(kWmmaThreads) WmmaGemm(WmmaArgs a) {
           continue;
         const int out_item =
             a.sorted != nullptr ? a.sorted[start + m] : start + m;
-        a.y[static_cast<std::size_t>(out_item) * a.rows + nn] =
+        yout[static_cast<std::size_t>(out_item) * a.rows + nn] =
             acc[mi][ni][i] * sc;
       }
     }
@@ -3089,6 +3110,7 @@ struct Scratch {
       *rrows_slot{nullptr};
   int *sorted{nullptr}, *tiles{nullptr};
   int *tl_a{nullptr}, *tl_b{nullptr};  ///< compact (expert, token tile) lists
+  float* ksbuf{nullptr};               ///< split-K partial sums
   __half *xh{nullptr}, *act16{nullptr}, *xh0{nullptr}, *xh1{nullptr},
       *xh2{nullptr}, *xhx{nullptr}, *atth{nullptr}, *cath{nullptr};
   signed char* xq{nullptr};
@@ -3456,9 +3478,27 @@ struct Session::Impl : Scratch {
       const dim3 wg(nrows / kTileN, (n + kTileM - 1) / kTileM);
       if (ldx == w.cols) {
         switch (w.type) {
-          case kTypeF32:
+          case kTypeF32: {
+            static const bool split_on =
+                std::getenv("INKLING_SPLITK") == nullptr ||
+                std::getenv("INKLING_SPLITK")[0] != '0';
+            constexpr int kSplit = 4;
+            if (split_on && nrows <= 128 && w.cols >= 2048 &&
+                w.cols % (32 * kSplit) == 0 && n >= kWmmaMinTokens &&
+                ksbuf != nullptr) {
+              wa.ksplit = kSplit;
+              wa.kchunk = static_cast<int>(w.cols) / kSplit;
+              wa.y = ksbuf;
+              const dim3 wgs(wg.x, wg.y, kSplit);
+              WmmaGemm<kTypeF32><<<wgs, kWmmaThreads, 0, stream>>>(wa);
+              const std::size_t count = static_cast<std::size_t>(n) * nrows;
+              SplitKReduce<<<(count + 255) / 256, 256, 0, stream>>>(
+                  ksbuf, yout, count, kSplit);
+              return;
+            }
             WmmaGemm<kTypeF32><<<wg, kWmmaThreads, 0, stream>>>(wa);
             return;
+          }
           case kTypeBf16:
             WmmaGemm<kTypeBf16><<<wg, kWmmaThreads, 0, stream>>>(wa);
             return;
@@ -5734,6 +5774,8 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
     sc.rbounds =
         static_cast<int*>(i.AllocBytes((c.expert_count + 1) * sizeof(int)));
     sc.rcursors = static_cast<int*>(i.AllocBytes(c.expert_count * sizeof(int)));
+    sc.ksbuf = static_cast<float*>(
+        i.AllocBytes(static_cast<std::size_t>(4) * b * 128 * sizeof(float)));
     sc.tl_a = static_cast<int*>(i.AllocBytes(1024 * sizeof(int)));
     sc.tl_b = static_cast<int*>(i.AllocBytes(1024 * sizeof(int)));
     {
