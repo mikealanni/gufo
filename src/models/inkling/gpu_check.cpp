@@ -115,8 +115,20 @@ int main(int argc, char** argv) {
       for (int i = 0; i < len; ++i)
         win.push_back(static_cast<std::int32_t>(
             ids[(static_cast<std::size_t>(w) * len + i) % ids.size()]));
-      if (!session->Append(win, &err))
+      if (std::getenv("INKLING_PRINT_IDS") != nullptr) {
+        for (const auto id : win)
+          std::printf("%d ", id);
+        std::printf("\n");
+      }
+      if (std::getenv("INKLING_WINDOW_SERIAL") != nullptr) {
+        // one token per step: the decode kernels (fp32 loop control)
+        for (const auto token : win) {
+          if (!session->Append(std::span(&token, 1), &err))
+            return 1;
+        }
+      } else if (!session->Append(win, &err)) {
         return 1;
+      }
       const auto l = session->Logits();
       out.write(reinterpret_cast<const char*>(l.data()),
                 static_cast<std::streamsize>(l.size() * sizeof(float)));

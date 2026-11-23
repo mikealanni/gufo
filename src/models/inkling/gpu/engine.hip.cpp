@@ -378,9 +378,51 @@ __global__ void Rms(const float* in, const float* w, float* out, int dim,
   const float inv = rsqrtf(s / static_cast<float>(dim) + eps);
   for (int i = threadIdx.x; i < dim; i += blockDim.x) {
     const float v = x[i] * inv * (w != nullptr ? w[i] : 1.0F);
-    out[blockIdx.x * ld_out + i] = v;
+    if (out != nullptr)
+      out[blockIdx.x * ld_out + i] = v;
     if (out_h != nullptr)
       out_h[blockIdx.x * ld_out + i] = __float2half(v);
+  }
+}
+
+// Wide-row RMS norm: one pass over 128-bit loads, the row kept in registers
+// (dim <= 3072 and 16-byte aligned rows), fp32 and/or fp16 outputs.
+constexpr int kRmsVecMaxDim = 3072;
+__global__ void __launch_bounds__(256)
+    RmsVec(const float* in, const float* w, float* out, int dim,
+           std::size_t ld_in, std::size_t ld_out, float eps, __half* out_h) {
+  __shared__ float red[256];
+  constexpr int kPer = kRmsVecMaxDim / 4 / 256;
+  const float4* x4 = reinterpret_cast<const float4*>(in + blockIdx.x * ld_in);
+  const int n4 = dim / 4;
+  float4 v[kPer];
+  float s = 0.0F;
+  for (int k = 0; k < kPer; ++k) {
+    const int i = threadIdx.x + k * 256;
+    if (i < n4) {
+      v[k] = x4[i];
+      s +=
+          v[k].x * v[k].x + v[k].y * v[k].y + v[k].z * v[k].z + v[k].w * v[k].w;
+    }
+  }
+  s = BlockSum(s, red);
+  const float inv = rsqrtf(s / static_cast<float>(dim) + eps);
+  const float4* w4 = reinterpret_cast<const float4*>(w);
+  float4* o4 = reinterpret_cast<float4*>(out + blockIdx.x * ld_out);
+  __half2* h2 = reinterpret_cast<__half2*>(out_h + blockIdx.x * ld_out);
+  for (int k = 0; k < kPer; ++k) {
+    const int i = threadIdx.x + k * 256;
+    if (i >= n4)
+      continue;
+    const float4 wv = w != nullptr ? w4[i] : make_float4(1.F, 1.F, 1.F, 1.F);
+    const float4 r = make_float4(v[k].x * inv * wv.x, v[k].y * inv * wv.y,
+                                 v[k].z * inv * wv.z, v[k].w * inv * wv.w);
+    if (out != nullptr)
+      o4[i] = r;
+    if (out_h != nullptr) {
+      h2[2 * i] = __floats2half2_rn(r.x, r.y);
+      h2[2 * i + 1] = __floats2half2_rn(r.z, r.w);
+    }
   }
 }
 
@@ -1249,6 +1291,94 @@ __global__ void __launch_bounds__(kWmmaThreads) WmmaGemm(WmmaArgs a) {
             a.sorted != nullptr ? a.sorted[start + m] : start + m;
         a.y[static_cast<std::size_t>(out_item) * a.rows + nn] =
             acc[mi][ni][i] * sc;
+      }
+    }
+  }
+}
+
+// Prefill loop control with the gain and forget GEMMs (K = kControlRank, F32
+// weights) fused with the update cur += -tanh(forget) * cur + tanh(gain) * msg:
+// same fp16 operands and fp32 accumulation as two WmmaGemm launches, without
+// writing and re-reading the two fp32 tensors.
+__global__ void __launch_bounds__(kWmmaThreads)
+    ControlGemm(const __half* x, const float* gw, const float* fw, float* cur,
+                const float* msg, int h, int n) {
+  __shared__ __half As[kTileM][kLdsStride];
+  __shared__ __half Bg[kTileN][kLdsStride];
+  __shared__ __half Bf[kTileN][kLdsStride];
+  const int tid = threadIdx.x;
+  const int wave = tid >> 5;
+  const int lane = tid & 31;
+  const int n0 = blockIdx.x * kTileN;
+  const int start = blockIdx.y * kTileM;
+  const int cnt = min(kTileM, n - start);
+  if (cnt <= 0)
+    return;
+  const int lr = tid >> 1;
+  const int lh = tid & 1;
+  const __half* xr =
+      lr < cnt ? x + static_cast<std::size_t>(start + lr) * kControlRank
+               : nullptr;
+  const unsigned char* gr = reinterpret_cast<const unsigned char*>(
+      gw + static_cast<std::size_t>(n0 + lr) * kControlRank);
+  const unsigned char* fr = reinterpret_cast<const unsigned char*>(
+      fw + static_cast<std::size_t>(n0 + lr) * kControlRank);
+  V8f ag[2][2] = {};
+  V8f af_[2][2] = {};
+  const int wm = wave >> 1;
+  const int wn = wave & 1;
+  for (int k0 = 0; k0 < kControlRank; k0 += 32) {
+    uint4* ad = reinterpret_cast<uint4*>(&As[lr][lh * 16]);
+    if (xr != nullptr) {
+      const uint4* xs = reinterpret_cast<const uint4*>(xr + k0 + lh * 16);
+      ad[0] = xs[0];
+      ad[1] = xs[1];
+    } else {
+      ad[0] = make_uint4(0, 0, 0, 0);
+      ad[1] = make_uint4(0, 0, 0, 0);
+    }
+    LoadB16<kTypeF32>(gr, k0 + lh * 16, &Bg[lr][lh * 16], kControlRank);
+    LoadB16<kTypeF32>(fr, k0 + lh * 16, &Bf[lr][lh * 16], kControlRank);
+    __syncthreads();
+    for (int kk = 0; kk < 2; ++kk) {
+      V16h xa[2];
+      V16h bg[2];
+      V16h bf[2];
+      for (int mi = 0; mi < 2; ++mi) {
+        const __half* p = &As[wm * 32 + mi * 16 + (lane & 15)][kk * 16];
+        for (int i = 0; i < 16; ++i)
+          xa[mi][i] = static_cast<_Float16>(__half2float(p[i]));
+      }
+      for (int ni = 0; ni < 2; ++ni) {
+        const __half* pg = &Bg[wn * 32 + ni * 16 + (lane & 15)][kk * 16];
+        const __half* pf = &Bf[wn * 32 + ni * 16 + (lane & 15)][kk * 16];
+        for (int i = 0; i < 16; ++i) {
+          bg[ni][i] = static_cast<_Float16>(__half2float(pg[i]));
+          bf[ni][i] = static_cast<_Float16>(__half2float(pf[i]));
+        }
+      }
+      for (int mi = 0; mi < 2; ++mi) {
+        for (int ni = 0; ni < 2; ++ni) {
+          ag[mi][ni] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+              xa[mi], bg[ni], ag[mi][ni]);
+          af_[mi][ni] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+              xa[mi], bf[ni], af_[mi][ni]);
+        }
+      }
+    }
+    __syncthreads();
+  }
+  for (int mi = 0; mi < 2; ++mi) {
+    for (int ni = 0; ni < 2; ++ni) {
+      for (int i = 0; i < 8; ++i) {
+        const int m = wm * 32 + mi * 16 + 2 * i + (lane >> 4);
+        const int nn = n0 + wn * 32 + ni * 16 + (lane & 15);
+        if (m >= cnt)
+          continue;
+        const std::size_t idx = static_cast<std::size_t>(start + m) * h + nn;
+        const float c = cur[idx];
+        cur[idx] = c - tanhf(af_[mi][ni][i] * 1.0F) * c +
+                   tanhf(ag[mi][ni][i] * 1.0F) * msg[idx];
       }
     }
   }
@@ -2995,6 +3125,12 @@ struct Session::Impl : Scratch {
   int* ids_flat{nullptr};
   void RmsRows(const float* in_, const float* w, float* out, int rows, int dim,
                std::size_t ld_in, std::size_t ld_out, __half* out_h = nullptr) {
+    if (dim >= 1024 && dim <= kRmsVecMaxDim && dim % 4 == 0 && ld_in % 4 == 0 &&
+        ld_out % 4 == 0) {
+      RmsVec<<<rows, 256, 0, stream>>>(in_, w, out, dim, ld_in, ld_out,
+                                       m->config.rms_eps, out_h);
+      return;
+    }
     Rms<<<rows, 256, 0, stream>>>(in_, w, out, dim, ld_in, ld_out,
                                   m->config.rms_eps, out_h);
   }
@@ -3040,13 +3176,24 @@ struct Session::Impl : Scratch {
           static_cast<const float*>(m->T(fb + "forget.weight").dev), h);
       return;
     }
-    RmsRows(cur_, nullptr, cat, n, h, h, 2 * h, big ? cath : nullptr);
-    RmsRows(message, nullptr, cat + h, n, h, h, 2 * h,
+    RmsRows(cur_, nullptr, big ? nullptr : cat, n, h, h, 2 * h,
+            big ? cath : nullptr);
+    RmsRows(message, nullptr, big ? nullptr : cat + h, n, h, h, 2 * h,
             big ? cath + h : nullptr);
     const std::string base =
         "blk." + std::to_string(phys) + ".loop_" + group + "_";
     Dense(m->T(base + "down.weight"), cat, 2 * h, low, m->config.loop_gate_rank,
           n, -1, big ? cath : nullptr);
+    if (big && m->config.loop_gate_rank == kControlRank && h % kTileN == 0) {
+      const std::size_t lowcount = static_cast<std::size_t>(n) * kControlRank;
+      ToHalf<<<(lowcount + 255) / 256, 256, 0, stream>>>(low, xh, lowcount);
+      ControlGemm<<<dim3(h / kTileN, (n + kTileM - 1) / kTileM), kWmmaThreads,
+                    0, stream>>>(
+          xh, static_cast<const float*>(m->T(base + "gain.weight").dev),
+          static_cast<const float*>(m->T(base + "forget.weight").dev), cur_,
+          message, h, n);
+      return;
+    }
     Dense(m->T(base + "gain.weight"), low, m->config.loop_gate_rank, gain, h,
           n);
     Dense(m->T(base + "forget.weight"), low, m->config.loop_gate_rank, forget,
