@@ -6,8 +6,10 @@
 #   sudo install -m 755 scripts/gufo-mem-prep.sh /usr/local/sbin/gufo-mem-prep
 #   echo "$USER ALL=(root) NOPASSWD: /usr/local/sbin/gufo-mem-prep" | sudo tee /etc/sudoers.d/gufo-mem
 #
-# Environment: GUFO_MEM_SWAP_MARGIN_MB (default 8192) is the free headroom that must remain
-# before swap is emptied; GUFO_MEM_DROP_CACHE=0 keeps the page cache.
+# Settings only by default: it never drops the page cache (that makes the next model load read the
+# weights from disk again) and never empties swap (swapoff of several GB takes minutes).
+# Opt in from the root shell: GUFO_MEM_DROP_CACHE=1 (drop the page cache), GUFO_MEM_SWAP_RESET=1
+# (swapoff/swapon when the swapped pages fit back into RAM with GUFO_MEM_SWAP_MARGIN_MB, default 8192).
 set -u
 [ "$(id -u)" = 0 ] || { echo "gufo-mem-prep: run as root" >&2; exit 1; }
 
@@ -19,14 +21,14 @@ done
 echo 0 > /sys/kernel/mm/transparent_hugepage/khugepaged/defrag 2> /dev/null || true
 
 sync
-[ "${GUFO_MEM_DROP_CACHE:-1}" = 0 ] || echo 3 > /proc/sys/vm/drop_caches
+[ "${GUFO_MEM_DROP_CACHE:-0}" = 1 ] && echo 3 > /proc/sys/vm/drop_caches
 echo 1 > /proc/sys/vm/compact_memory
 
 # Empty swap only when the pages fit back into RAM with a safety margin.
 swap_used=$(awk '/SwapTotal/{t=$2} /SwapFree/{f=$2} END{print int((t-f)/1024)}' /proc/meminfo)
 avail=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
 margin=${GUFO_MEM_SWAP_MARGIN_MB:-8192}
-if [ "$swap_used" -gt 0 ] && [ $((avail - swap_used)) -ge "$margin" ]; then
+if [ "${GUFO_MEM_SWAP_RESET:-0}" = 1 ] && [ "$swap_used" -gt 0 ] && [ $((avail - swap_used)) -ge "$margin" ]; then
   swapoff -a && swapon -a
 fi
 
