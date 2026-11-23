@@ -60,3 +60,10 @@ the model release does not provide.
 Other changes this round: split-K for the F32 GEMMs and the compact tile list keep
 the default engine at KL 0.0016 (floating-point reassociation) and 0 (bit-identical)
 respectively.
+
+HumanEval (164 tasks, greedy, thinking off, 1,024 new tokens, `gufo serve` on GPU
+only with speculation; int4 applies to the prefill of each prompt and decode stays
+NVFP4): default engine 147/164 (89.6%); fast profile (`INKLING_IU4=2
+INKLING_F16_BLOCKS=1`) 149/164 (90.9%). Only 56 of the 164 completions are
+identical, so the numerics differ clearly, but four tasks flip (one lost, three
+gained), which is within the spread of a 164-task score.
