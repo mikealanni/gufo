@@ -5870,13 +5870,12 @@ __device__ __forceinline__ std::uint32_t Nv4Bytes(std::uint32_t nibbles) {
 /// UE4M3 scale byte of an NVFP4 sub-block (includes the 0.5 of the doubled
 /// E2M1 values).
 __device__ __forceinline__ float Nv4Scale(std::uint32_t x) {
-  if (x == 0 || x == 0x7F)
-    return 0.0F;
-  const int e = static_cast<int>((x >> 3) & 0xF);
-  const int m = static_cast<int>(x & 7);
-  const float raw = e == 0 ? ldexpf(static_cast<float>(m), -9)
-                           : ldexpf(1.0F + static_cast<float>(m) / 8.0F, e - 7);
-  return raw * 0.5F;
+  const std::uint32_t e = (x >> 3) & 0xFU;
+  const std::uint32_t m = x & 7U;
+  const float normal = __uint_as_float(((e + 119U) << 23) | (m << 20));
+  const float sub = static_cast<float>(m) * 0.0009765625F;
+  const float v = e == 0 ? sub : normal;
+  return x == 0x7F ? 0.0F : v;
 }
 
 template<WeightType kType, int BM, int BN, int BK, bool kPair = false,
