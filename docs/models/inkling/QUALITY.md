@@ -72,3 +72,8 @@ With thinking on (default reasoning, 6,000 new tokens, about 1,340 generated tok
 per task, 63 minutes for the set) the fast profile scores 152/164 (92.7%). The
 default engine was not run with thinking on, so this is a check that long
 reasoning decodes after an int4 prefill stay coherent, not a comparison.
+
+Method: `gufo_inkling_gpu_check <gguf> --windows <text> 48 1024 <out.bin>` writes the
+last-token logits of 48 windows; `tools/bench/inkling_kl.py base.bin test.bin` reports KL
+and top-1 agreement.
+

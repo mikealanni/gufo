@@ -40,7 +40,8 @@ forces it).
   down projection on them too; `INKLING_F16_BLOCKS=1` keeps the prefill block states
   as FP16. The NVFP4 experts are repacked to int4 at first use of each layer
   (about 28 ms per layer, one-off), so the int4 copy costs extra memory (about
-  340 MB per layer for gate/up, 190 MB for down). It applies to prefill batches of 32 rows
+  340 MB per layer for gate/up, 190 MB for down; one copy per model, shared by all
+  sessions). It applies to prefill batches of 32 rows
   or more and is off by default because it changes outputs, see
   [QUALITY.md](QUALITY.md). `INKLING_IU4_WCLIP=0` and `INKLING_IU4_ACLIP=<x>` tune the
   scale choice, `INKLING_IU4_SKIP=<layers>` keeps listed physical layers on NVFP4.
@@ -75,3 +76,10 @@ the same exact-match rule as greedy and therefore accepts fewer drafts.
 
 The CPU reference (`reference.cpp`, `gufo_inkling_ref_check`) is complete but runs
 at about 13 s per token; the GPU engine matches it to about four digits.
+
+## Planned
+
+- Prefill attention on the NPU (attention is
+  23 to 27% of GPU time at 8K): the full task description for a kernel and its engine hook is
+  [../../plans/inkling-npu-attention-kernel.md](../../plans/inkling-npu-attention-kernel.md).
+- Per-32 activation scales for the int4 fast profile (quality), see [QUALITY.md](QUALITY.md).

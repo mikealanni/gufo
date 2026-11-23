@@ -45,3 +45,20 @@ Rejected (no gain or worse):
 - Q8 activation fusion into norms: about 2 microseconds saved per launch removed.
 - Wider drafts than the confidence gate allows: each extra verify row costs about
   7 ms because it touches more distinct experts.
+
+Open:
+
+- NPU prefill attention (relative bias, sink, 24 heads over 8 KV heads): not started,
+  specification in [../../plans/inkling-npu-attention-kernel.md](../../plans/inkling-npu-attention-kernel.md).
+
+Server notes learned while testing:
+
+- The serve runner compares each session's measured device bytes with a claim taken
+  from a probe session that never ran a forward pass. Buffers created on first use
+  (and anything allocated per prompt length) must not count as session state
+  (`AllocLazy`), or every request fails with HTTP 500 once they exceed the claim.
+- Newly allocated device buffers are zeroed with `hipMemset`; synchronize before a
+  stream writes into them, or results differ from run to run.
+- Disk cache directories grow to the full budget (240 GB by default); give test runs a
+  separate `GUFO_CACHE_DIR` and a small `GUFO_CACHE_BYTES`.
+
