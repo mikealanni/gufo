@@ -454,6 +454,80 @@ __global__ void Clip(float* x, const float* scale, int scale_rows, int dim,
     p[i] *= f;
 }
 
+// Warp-per-row variants of Clip and the per-head RMS norm for short rows
+// (dim <= 128): eight rows per 256-thread block, one shuffle reduction per row.
+__global__ void __launch_bounds__(256)
+    ClipWave(float* x, const float* scale, int scale_rows, int dim,
+             float threshold, const int* tau_pos, int rows_per_token,
+             float tau_floor, float tau_alpha, int rows) {
+  const int wave = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int row = blockIdx.x * 8 + wave;
+  if (row >= rows)
+    return;
+  float* p = x + static_cast<std::size_t>(row) * dim;
+  const int sr = scale != nullptr ? row % scale_rows : 0;
+  float vals[4];
+  float s = 0.0F;
+#pragma unroll
+  for (int k = 0; k < 4; ++k) {
+    const int i = lane + 32 * k;
+    vals[k] = 0.0F;
+    if (i < dim) {
+      float v = p[i];
+      if (scale != nullptr)
+        v *= scale[sr * dim + i];
+      vals[k] = v;
+      s += v * v;
+    }
+  }
+  for (int off = 16; off > 0; off >>= 1)
+    s += __shfl_xor(s, off);
+  float f = fminf(1.0F, threshold / (sqrtf(s) + 1e-6F));
+  if (tau_pos != nullptr) {
+    const int token = row / rows_per_token;
+    f *= 1.0F +
+         tau_alpha * logf(fmaxf(1.0F, static_cast<float>(*tau_pos + token + 1) /
+                                          tau_floor));
+  }
+#pragma unroll
+  for (int k = 0; k < 4; ++k) {
+    const int i = lane + 32 * k;
+    if (i < dim)
+      p[i] = vals[k] * f;
+  }
+}
+
+__global__ void __launch_bounds__(256)
+    RmsWave(const float* in, float* out, int dim, int rows, float eps) {
+  const int wave = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int row = blockIdx.x * 8 + wave;
+  if (row >= rows)
+    return;
+  const float* x = in + static_cast<std::size_t>(row) * dim;
+  float vals[4];
+  float s = 0.0F;
+#pragma unroll
+  for (int k = 0; k < 4; ++k) {
+    const int i = lane + 32 * k;
+    vals[k] = 0.0F;
+    if (i < dim) {
+      vals[k] = x[i];
+      s += vals[k] * vals[k];
+    }
+  }
+  for (int off = 16; off > 0; off >>= 1)
+    s += __shfl_xor(s, off);
+  const float inv = rsqrtf(s / static_cast<float>(dim) + eps);
+#pragma unroll
+  for (int k = 0; k < 4; ++k) {
+    const int i = lane + 32 * k;
+    if (i < dim)
+      out[static_cast<std::size_t>(row) * dim + i] = vals[k] * inv;
+  }
+}
+
 __global__ void TauScale(float* x, int per_token, const int* pos0,
                          float floor_v, float alpha) {
   const float tau =
@@ -3672,14 +3746,30 @@ struct Session::Impl : Scratch {
              nkv * hd, n);
     const int* tau_p = swa ? nullptr : d_pos;
     const float tau_floor = static_cast<float>(c.log_scale_floor);
-    Clip<<<n * nh, 128, 0, stream>>>(
-        q, static_cast<const float*>(m->T(m->P(p, "attn_q_clip.weight")).dev),
-        nh, hd, c.qk_clip, tau_p, nh, tau_floor, c.log_scale_alpha);
-    Clip<<<n * nkv, 128, 0, stream>>>(k, nullptr, 1, hd, c.qk_clip);
-    RmsRows(vtmp, nullptr, vtmp, n * nkv, hd, hd, hd);
-    Clip<<<n * nh, 128, 0, stream>>>(
-        r, static_cast<const float*>(m->T(m->P(p, "attn_rel_clip.weight")).dev),
-        nh, nrel, c.relative_clip, tau_p, nh, tau_floor, c.log_scale_alpha);
+    if (big && hd <= 128 && nrel <= 128) {
+      ClipWave<<<(n * nh + 7) / 8, 256, 0, stream>>>(
+          q, static_cast<const float*>(m->T(m->P(p, "attn_q_clip.weight")).dev),
+          nh, hd, c.qk_clip, tau_p, nh, tau_floor, c.log_scale_alpha, n * nh);
+      ClipWave<<<(n * nkv + 7) / 8, 256, 0, stream>>>(
+          k, nullptr, 1, hd, c.qk_clip, nullptr, 1, 1.0F, 0.0F, n * nkv);
+      RmsWave<<<(n * nkv + 7) / 8, 256, 0, stream>>>(vtmp, vtmp, hd, n * nkv,
+                                                     m->config.rms_eps);
+      ClipWave<<<(n * nh + 7) / 8, 256, 0, stream>>>(
+          r,
+          static_cast<const float*>(m->T(m->P(p, "attn_rel_clip.weight")).dev),
+          nh, nrel, c.relative_clip, tau_p, nh, tau_floor, c.log_scale_alpha,
+          n * nh);
+    } else {
+      Clip<<<n * nh, 128, 0, stream>>>(
+          q, static_cast<const float*>(m->T(m->P(p, "attn_q_clip.weight")).dev),
+          nh, hd, c.qk_clip, tau_p, nh, tau_floor, c.log_scale_alpha);
+      Clip<<<n * nkv, 128, 0, stream>>>(k, nullptr, 1, hd, c.qk_clip);
+      RmsRows(vtmp, nullptr, vtmp, n * nkv, hd, hd, hd);
+      Clip<<<n * nh, 128, 0, stream>>>(
+          r,
+          static_cast<const float*>(m->T(m->P(p, "attn_rel_clip.weight")).dev),
+          nh, nrel, c.relative_clip, tau_p, nh, tau_floor, c.log_scale_alpha);
+    }
     StoreKv<<<n, 256, 0, stream>>>(k, vtmp, sl.k, sl.v, nkv * hd, d_pos,
                                    sl.ring, sl.vblocks);
     AttnArgs aa{nh,
