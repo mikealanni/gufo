@@ -1532,7 +1532,8 @@ __global__ void __launch_bounds__(WAVES * 32)
     FlashRel(AttnArgs a, const float* q, const float* r, const float* sink,
              const __half* kc, const __half* vc, const __half* bias, float* out,
              int n, int nsplit, int split_keys, float* pm, float* pl, float* po,
-             const int* blist, const int* bcount, int list_cap) {
+             const int* blist, const int* bcount, int list_cap,
+             const float* gate = nullptr, __half* out_h = nullptr) {
   __shared__ __half Ks[kFlashK][kKStride];
   __shared__ __half Vt[kFlashHd][kVStride];
   // per wave: the bias rows Z (consumed by the score epilogue) and then the P
@@ -1752,6 +1753,16 @@ __global__ void __launch_bounds__(WAVES * 32)
       }
       for (int ni = 0; ni < 8; ++ni)
         po[part * kFlashHd + ni * 16 + (lane & 15)] = o[ni][i];
+      continue;
+    }
+    if (out_h != nullptr) {
+      // the sigmoid gate of the attention output, half rows only
+      for (int ni = 0; ni < 8; ++ni) {
+        const std::size_t at =
+            (static_cast<std::size_t>(t) * a.nh + h) * kFlashHd + ni * 16 +
+            (lane & 15);
+        out_h[at] = __float2half((o[ni][i] / ls) * Sigmoid(gate[at]));
+      }
       continue;
     }
     for (int ni = 0; ni < 8; ++ni) {
@@ -3782,6 +3793,7 @@ struct Session::Impl : Scratch {
                 sl.vblocks,
                 d_pos,
                 1.0F / std::sqrt(static_cast<float>(hd))};
+    bool fused_gate = false;
     const int span =
         swa ? static_cast<int>(c.sliding_window) : static_cast<int>(ctx);
     if (hd == kFlashHd && nrel == kFlashRel) {
@@ -3857,10 +3869,12 @@ struct Session::Impl : Scratch {
             !split ? 1
             : swa  ? (span + 72 + split_keys - 1) / split_keys
                    : static_cast<int>((ctx + split_keys - 1) / split_keys);
+        fused_gate = big && nsplit == 1;
         FlashRel<8><<<dim3((n + kFlashQ - 1) / kFlashQ, nh, nsplit),
                       kFlashThreads, 0, stream>>>(
             aa, q, r, sink, sl.k, sl.v, bias_w, att, n, nsplit, split_keys,
-            split_m, split_l, split_o, nullptr, nullptr, 0);
+            split_m, split_l, split_o, nullptr, nullptr, 0,
+            fused_gate ? gate : nullptr, fused_gate ? atth : nullptr);
         if (nsplit > 1)
           FlashCombine<<<dim3(n, nh), 128, 0, stream>>>(
               split_m, split_l, split_o, att, nh, nsplit);
@@ -3872,8 +3886,9 @@ struct Session::Impl : Scratch {
           att);
     }
     if (big) {
-      SigmoidMulH<<<(n * nh * hd + 255) / 256, 256, 0, stream>>>(
-          att, gate, atth, static_cast<std::size_t>(n) * nh * hd);
+      if (!fused_gate)
+        SigmoidMulH<<<(n * nh * hd + 255) / 256, 256, 0, stream>>>(
+            att, gate, atth, static_cast<std::size_t>(n) * nh * hd);
     } else {
       SigmoidMul<<<(n * nh * hd + 255) / 256, 256, 0, stream>>>(
           att, gate, static_cast<std::size_t>(n) * nh * hd);
