@@ -1686,16 +1686,21 @@ __global__ void __launch_bounds__(WAVES * 32)
     float pmax[8];
     for (int i = 0; i < 8; ++i)
       pmax[i] = kNegInf;
+    // every score of the wave's 16 rows lies inside the causal window and
+    // the bias extent
+    const bool interior = pk == 0 && qp0 >= kb + kFlashK - 1 &&
+                          qp0 + 15 - kb < a.extent &&
+                          (a.window == 0 || qp0 + 15 - kb < a.window);
     for (int ni = 0; ni < 4; ++ni) {
       const int jpos = kb + ni * 16 + (lane & 15);
       for (int i = 0; i < 8; ++i) {
         const int dist = qpos[i] - jpos;
-        const bool valid = dist >= 0 && (a.window == 0 || dist < a.window);
+        const bool valid = interior || (dist >= 0 && (a.window == 0 || dist < a.window));
         float v = kNegInf;
         if (valid) {
           const int lr = 2 * i + (lane >> 4);
           const float b =
-              dist < a.extent
+              (interior || dist < a.extent)
                   ? __half2float(PZ[wave][lr * kZStride + dist -
                                           (qp0 - (kb + kFlashK - 1))])
                   : 0.0F;
