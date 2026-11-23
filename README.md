@@ -57,6 +57,32 @@ Prefill at `-p 8192` with the NPU (GPU only in brackets):
 | GLM-5.3 Flash, AJ-IQ2_XXS (81 GiB) | 690 (613) | see the GLM section |
 | GLM-5.3 Flash, RCO-152E Q3_K_M (69.9 GiB) | **706** (617) | see the GLM section |
 
+### Inkling 2 Mini
+
+Greedy, real text, one request; the weights are the UD-Q4_K_XL GGUF with the DSpark
+drafter. Prefill is the single-request engine check (no cache).
+
+| Prefill, tok/s | GPU only | GPU + NPU |
+| --- | --- | --- |
+| 2K | 1,692 | 1,692 (below the 3,072-row NPU batch) |
+| 4K | 1,768 | **1,837** |
+| 8K | 1,715 | **1,851** |
+| 16K | 1,670 | **1,791** |
+| 32K | 1,536 | **1,689** |
+| 128K | about 1,035 | **1,647** |
+
+| Decode, tok/s | speculation |
+| --- | --- |
+| plain, short context | 33 |
+| code | **74.6** (about 82% of drafts accepted) |
+| JSON | **71.1** (about 82% of drafts accepted) |
+| code at 37K context | 54 to 59 |
+| code at 63K context | 54 to 61 |
+
+Sampled requests (temperature above zero) accept fewer drafts, so they decode more
+slowly than these greedy figures. Loads in about 15 s with the model file cached.
+Details and method: [docs/models/inkling/BENCHMARKS.md](docs/models/inkling/BENCHMARKS.md).
+
 ### Qwen3.6-35B-A3B
 
 | Prefill, tok/s | GPU only | GPU + NPU |
