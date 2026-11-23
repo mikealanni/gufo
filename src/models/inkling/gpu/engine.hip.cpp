@@ -1467,7 +1467,8 @@ __global__ void __launch_bounds__(kWmmaThreads)
     const int c4 = e % (kTileN / 4);
     if (m >= cnt)
       continue;
-    const std::size_t idx = static_cast<std::size_t>(start + m) * h + n0 + c4 * 4;
+    const std::size_t idx =
+        static_cast<std::size_t>(start + m) * h + n0 + c4 * 4;
     float4 cv = *reinterpret_cast<float4*>(cur + idx);
     const float4 mv = *reinterpret_cast<const float4*>(msg + idx);
     const float* tf = &Ts[0][m][c4 * 4];
@@ -3136,6 +3137,7 @@ struct Session::Impl : Scratch {
   int dense_bn{std::getenv("INKLING_DENSE_BN") != nullptr
                    ? std::atoi(std::getenv("INKLING_DENSE_BN"))
                    : 192};
+  float* situ_params{nullptr};
   int* dense_ident{nullptr};
   int* dense_tiles{nullptr};
   std::unordered_map<int, int*> dense_bounds;
@@ -4130,11 +4132,27 @@ struct Session::Impl : Scratch {
           bn_env > 0 ? bn_env : (n >= 2048 ? 192 : (n >= 512 ? 128 : 48));
       int ntiles = 0;
       const int* tmap = TileMap(n, bn, &ntiles);
-      const bool ok1 = qfn::RoutedNvfp4GemmF16(wgu.dev, xmoe, tmap, ntiles, bn,
-                                               rbounds, rrows_token, rrows_slot,
-                                               gu16, 2 * ff, h, s_gu, stream);
-      SituHalfIn<<<items, 256, 0, stream>>>(gu16, act16, ff, c.situ_beta,
-                                            c.situ_linear_beta);
+      if (situ_params == nullptr) {
+        const float host[2] = {c.situ_beta, c.situ_linear_beta};
+        situ_params = static_cast<float*>(AllocBytes(sizeof(host)));
+        HIP_OK(
+            hipMemcpy(situ_params, host, sizeof(host), hipMemcpyHostToDevice));
+      }
+      static const bool fuse_situ =
+          std::getenv("INKLING_SITU_FUSED") == nullptr ||
+          std::getenv("INKLING_SITU_FUSED")[0] != '0';
+      bool ok1 = false;
+      if (fuse_situ && bn != 64) {
+        ok1 = qfn::RoutedNvfp4SituGemmF16(
+            wgu.dev, xmoe, tmap, ntiles, bn, rbounds, rrows_token, rrows_slot,
+            act16, ff, h, s_gu, situ_params, stream);
+      } else {
+        ok1 = qfn::RoutedNvfp4GemmF16(wgu.dev, xmoe, tmap, ntiles, bn, rbounds,
+                                      rrows_token, rrows_slot, gu16, 2 * ff, h,
+                                      s_gu, stream);
+        SituHalfIn<<<items, 256, 0, stream>>>(gu16, act16, ff, c.situ_beta,
+                                              c.situ_linear_beta);
+      }
       const bool ok2 = qfn::RoutedNvfp4GemmF16(wdn.dev, act16, tmap, ntiles, bn,
                                                rbounds, rrows_slot, rrows_slot,
                                                y16, h, ff, s_dn, stream);
