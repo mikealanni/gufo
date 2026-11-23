@@ -1448,19 +1448,35 @@ __global__ void __launch_bounds__(kWmmaThreads)
     }
     __syncthreads();
   }
+  // transpose the activated tile through LDS so cur and msg are read and cur
+  // written as full 256-byte rows
+  __shared__ float Ts[2][kTileM][kTileN + 4];
   for (int mi = 0; mi < 2; ++mi) {
     for (int ni = 0; ni < 2; ++ni) {
       for (int i = 0; i < 8; ++i) {
         const int m = wm * 32 + mi * 16 + 2 * i + (lane >> 4);
-        const int nn = n0 + wn * 32 + ni * 16 + (lane & 15);
-        if (m >= cnt)
-          continue;
-        const std::size_t idx = static_cast<std::size_t>(start + m) * h + nn;
-        const float c = cur[idx];
-        cur[idx] = c - tanhf(af_[mi][ni][i] * 1.0F) * c +
-                   tanhf(ag[mi][ni][i] * 1.0F) * msg[idx];
+        const int nn = wn * 32 + ni * 16 + (lane & 15);
+        Ts[0][m][nn] = tanhf(af_[mi][ni][i] * 1.0F);
+        Ts[1][m][nn] = tanhf(ag[mi][ni][i] * 1.0F);
       }
     }
+  }
+  __syncthreads();
+  for (int e = tid; e < kTileM * (kTileN / 4); e += kWmmaThreads) {
+    const int m = e / (kTileN / 4);
+    const int c4 = e % (kTileN / 4);
+    if (m >= cnt)
+      continue;
+    const std::size_t idx = static_cast<std::size_t>(start + m) * h + n0 + c4 * 4;
+    float4 cv = *reinterpret_cast<float4*>(cur + idx);
+    const float4 mv = *reinterpret_cast<const float4*>(msg + idx);
+    const float* tf = &Ts[0][m][c4 * 4];
+    const float* tg = &Ts[1][m][c4 * 4];
+    cv.x = cv.x - tf[0] * cv.x + tg[0] * mv.x;
+    cv.y = cv.y - tf[1] * cv.y + tg[1] * mv.y;
+    cv.z = cv.z - tf[2] * cv.z + tg[2] * mv.z;
+    cv.w = cv.w - tf[3] * cv.w + tg[3] * mv.w;
+    *reinterpret_cast<float4*>(cur + idx) = cv;
   }
 }
 
