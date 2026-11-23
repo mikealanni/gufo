@@ -1,3 +1,8 @@
+#ifdef PAIRV
+#define PAIRTAG "pair_"
+#else
+#define PAIRTAG ""
+#endif
 #ifndef BMV
 #define BMV 128
 #endif
@@ -69,11 +74,21 @@ static void build(Problem& p, int ne, int m, int k, int tokens, int topk, int bn
 
 template <int BN>
 void launch_base(const Problem& p, hipStream_t s) {
+#ifdef PAIRV
+  const int mm = p.m / 2;
+  dim3 grid((mm + 63) / 64, p.n_tiles);
+  hipLaunchKernelGGL((RoutedF16GEMMKernel<WeightType::kNVFP4, 128, BN, 2, true>), grid, dim3(kThreads), 0, s,
+                     p.d_w, p.d_x, p.d_tiles, p.d_bounds, p.d_rows_in, p.d_rows_out, (const float*)nullptr,
+                     (float*)nullptr, p.d_out, (size_t)mm, (size_t)p.k,
+                     (const void*)((const char*)p.d_w + (size_t)mm * p.row_bytes),
+                     (const std::uint32_t*)nullptr, 1.0f, (const float*)nullptr, (size_t)p.m);
+#else
   dim3 grid((p.m + BMV - 1) / BMV, p.n_tiles);
   hipLaunchKernelGGL((RoutedF16GEMMKernel<WeightType::kNVFP4, BMV, BN, 2>), grid, dim3(kThreads), 0, s,
                      p.d_w, p.d_x, p.d_tiles, p.d_bounds, p.d_rows_in, p.d_rows_out, (const float*)nullptr,
                      (float*)nullptr, p.d_out, (size_t)p.m, (size_t)p.k, (const void*)nullptr,
                      (const std::uint32_t*)nullptr, 1.0f, (const float*)nullptr);
+#endif
 }
 
 int main(int argc, char** argv) {
@@ -95,7 +110,7 @@ int main(int argc, char** argv) {
     std::vector<__half> out((size_t)p.bounds[p.ne] * m);
     CK(hipMemcpy(out.data(), p.d_out, out.size() * 2, hipMemcpyDeviceToHost));
     const char* mode = argc > 3 ? argv[3] : "";
-    std::string fn = std::string("ref_") + std::to_string(k) + "_" + std::to_string(m) + ".bin";
+    std::string fn = std::string(PAIRTAG "ref_") + std::to_string(k) + "_" + std::to_string(m) + ".bin";
     if (std::string(mode) == "save") {
       FILE* f = fopen(fn.c_str(), "wb"); fwrite(out.data(), 2, out.size(), f); fclose(f);
     } else if (std::string(mode) == "cmp") {
