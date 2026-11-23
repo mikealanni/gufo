@@ -532,6 +532,18 @@ bool RoutedQ8RepGemm(const void* w, const __half* x, const std::int32_t* tiles,
                      float* out, std::size_t m, std::size_t k,
                      hipStream_t stream);
 
+/// Gate/up GEMM of Inkling's routed experts fused with the SiTU activation:
+/// out_half[slot][ff] = situ(gate, up); `situ` is a device pair {beta, lb}.
+bool RoutedNvfp4SituGemmF16(const void* w_gate_up, const __half* x,
+                            const std::int32_t* tiles, std::uint32_t n_tiles,
+                            std::uint32_t tile_rows,
+                            const std::int32_t* pad_bounds,
+                            const std::int32_t* rows_in,
+                            const std::int32_t* rows_out, __half* out_half,
+                            std::size_t ff, std::size_t k,
+                            const float* expert_scale, const float* situ,
+                            hipStream_t stream);
+
 /// Experimental 128-row-per-tile variant of RoutedF16Gemm for Q8_0 only,
 /// bypassing the tile_rows<=64 limit RoutedF16Gemm enforces for that type.
 /// Laguna-only for now; promote into RoutedF16Gemm's dispatch if it proves

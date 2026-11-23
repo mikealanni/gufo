@@ -5880,7 +5880,7 @@ __device__ __forceinline__ float Nv4Scale(std::uint32_t x) {
 }
 
 template<WeightType kType, int BM, int BN, int BK, bool kPair = false,
-         bool kClampSwiglu = false>
+         bool kClampSwiglu = false, bool kSitu = false>
 __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
     const void* __restrict__ w, const __half* __restrict__ x,
     const std::int32_t* __restrict__ tiles,
@@ -5891,7 +5891,8 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
     __half* __restrict__ out_half, std::size_t m, std::size_t k,
     const void* __restrict__ w_up,
     const std::uint32_t* __restrict__ iq3s_grid = nullptr,
-    float out_scale = 1.0F, const float* __restrict__ expert_scale = nullptr) {
+    float out_scale = 1.0F, const float* __restrict__ expert_scale = nullptr,
+    std::size_t expert_rows = 0) {
   static_assert(BM == 128 || BM == 256, "eight waves, 16-row tiles");
   static_assert(!kPair || BM == 128);
   static_assert(BN % 16 == 0 && BN / 16 <= 16);
@@ -5963,8 +5964,11 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
   const int num_kb = static_cast<int>(k / 32);
   const int m_i = static_cast<int>(m);
   const std::size_t row_bytes = RoutedF16RowBytes<kType>(k);
-  const auto* w_expert = static_cast<const std::uint8_t*>(w) +
-                         static_cast<std::size_t>(expert) * m * row_bytes;
+  // Rows between two experts' weights; a fused gate/up tensor holds 2 m.
+  const std::size_t expert_stride = expert_rows != 0 ? expert_rows : m;
+  const auto* w_expert =
+      static_cast<const std::uint8_t*>(w) +
+      static_cast<std::size_t>(expert) * expert_stride * row_bytes;
 
   const int tid = static_cast<int>(threadIdx.x);
   const int wave_id = tid >> 5;
@@ -5990,7 +5994,7 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
     if constexpr (kPair) {
       if ((tid >> 1) >= kRows) {
         weights = static_cast<const std::uint8_t*>(w_up) +
-                  static_cast<std::size_t>(expert) * m * row_bytes;
+                  static_cast<std::size_t>(expert) * expert_stride * row_bytes;
       }
     }
     f_ptr[u] = weights +
@@ -6618,6 +6622,18 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
             for (int v = 0; v < 2; ++v) {
               float gate_v = base[idx + v];
               float up_v = base[idx + v + 4 * plane];
+              if constexpr (kSitu) {
+                // Inkling's SiTU activation; swiglu_gate carries {beta, lb}
+                const float es =
+                    expert_scale != nullptr ? expert_scale[expert] : 1.0F;
+                const float g = gate_v * es;
+                const float u = up_v * es;
+                const float beta = swiglu_gate[0];
+                const float lb = swiglu_gate[1];
+                values[v] = __float2half(beta * tanhf(g / beta) * SigmoidF(g) *
+                                         lb * tanhf(u / lb));
+                continue;
+              }
               if constexpr (kSwigluClamp) {
                 gate_v = fminf(gate_v, 10.0F);
                 up_v = fminf(fmaxf(up_v, -10.0F), 10.0F);
@@ -8293,6 +8309,46 @@ bool RoutedQ8RepGemm(const void* w, const __half* x, const std::int32_t* tiles,
       return false;
   }
 #undef INKLING_Q8R_LAUNCH
+}
+
+bool RoutedNvfp4SituGemmF16(const void* w_gate_up, const __half* x,
+                            const std::int32_t* tiles, std::uint32_t n_tiles,
+                            std::uint32_t tile_rows,
+                            const std::int32_t* pad_bounds,
+                            const std::int32_t* rows_in,
+                            const std::int32_t* rows_out, __half* out_half,
+                            std::size_t ff, std::size_t k,
+                            const float* expert_scale, const float* situ,
+                            hipStream_t stream) {
+  if (ff == 0 || k == 0 || k % 64 != 0 || n_tiles == 0 || out_half == nullptr ||
+      situ == nullptr)
+    return false;
+  constexpr int kBM = 128;
+  constexpr int kBK = 2;
+  const std::size_t row_bytes = ((k / 2 + k / 16 + 15) / 16) * 16;
+  const void* w_up =
+      static_cast<const std::uint8_t*>(w_gate_up) + ff * row_bytes;
+  const dim3 grid(static_cast<unsigned int>((ff + 63) / 64), n_tiles);
+#define INKLING_SITU_LAUNCH(BN)                                              \
+  hipLaunchKernelGGL((RoutedF16GEMMKernel<WeightType::kNVFP4, kBM, BN, kBK,  \
+                                          true, false, true>),               \
+                     grid, dim3(kThreads), 0, stream, w_gate_up, x, tiles,   \
+                     pad_bounds, rows_in, rows_out, situ, nullptr, out_half, \
+                     ff, k, w_up, nullptr, 1.0F, expert_scale, 2 * ff)
+  switch (tile_rows) {
+    case 48:
+      INKLING_SITU_LAUNCH(48);
+      return true;
+    case 128:
+      INKLING_SITU_LAUNCH(128);
+      return true;
+    case 192:
+      INKLING_SITU_LAUNCH(192);
+      return true;
+    default:
+      return false;
+  }
+#undef INKLING_SITU_LAUNCH
 }
 
 // Additive experiment: RoutedF16GEMMKernel<kQ8_0, 128, 128, 2> directly,
