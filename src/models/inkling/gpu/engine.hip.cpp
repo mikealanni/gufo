@@ -1,4 +1,5 @@
 #include "src/models/inkling/gpu/engine.hpp"
+#include "src/models/inkling/gpu/iu4_experts.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -1331,6 +1332,37 @@ __global__ void EmuActs(const __half* x, __half* out, int h, const float* s1,
     const float q = s > 0.0F ? fminf(7.0F, fmaxf(-8.0F, rintf(v[t] / s))) : 0.0F;
     out[tok * h + kb * 256 + t] = quant ? __float2half(q * s) : __float2half(v[t]);
     __syncthreads();
+  }
+}
+
+// Compact list of the (expert, token tile) pairs that have rows: the launch
+// grid is bounded by rows / tile + experts instead of experts * tiles. Unused
+// entries point far past any bucket, so those blocks exit at once.
+__global__ void BuildTileList(const int* bounds, int ne, int bn, int* out,
+                              int max_tiles) {
+  __shared__ int start[256];
+  const int t = threadIdx.x;
+  for (int i = t; i < max_tiles; i += blockDim.x)
+    out[i] = 0x7FFF0000;
+  int nt = 0;
+  if (t < ne)
+    nt = (bounds[t + 1] - bounds[t] + bn - 1) / bn;
+  start[t] = nt;
+  __syncthreads();
+  if (t == 0) {
+    int run = 0;
+    for (int e = 0; e < ne; ++e) {
+      const int c = start[e];
+      start[e] = run;
+      run += c;
+    }
+  }
+  __syncthreads();
+  if (t < ne) {
+    const int s0 = start[t];
+    for (int j = 0; j < nt; ++j)
+      if (s0 + j < max_tiles)
+        out[s0 + j] = t | (j << 16);
   }
 }
 
@@ -3051,6 +3083,7 @@ struct Scratch {
   int *rbounds{nullptr}, *rcursors{nullptr}, *rrows_token{nullptr},
       *rrows_slot{nullptr};
   int *sorted{nullptr}, *tiles{nullptr};
+  int *tl_a{nullptr}, *tl_b{nullptr};  ///< compact (expert, token tile) lists
   __half *xh{nullptr}, *act16{nullptr}, *xh0{nullptr}, *xh1{nullptr},
       *xh2{nullptr}, *xhx{nullptr}, *atth{nullptr}, *cath{nullptr};
   signed char* xq{nullptr};
@@ -3290,6 +3323,14 @@ struct Session::Impl : Scratch {
   float* situ_params{nullptr};
   // int4 emulation state (INKLING_IU4_EMU)
   std::vector<void*> emu_w = std::vector<void*>(64, nullptr);
+  // rotated int4 routed gate/up path (INKLING_IU4)
+  std::vector<std::pair<std::uint8_t*, std::uint16_t*>> iu4_w =
+      std::vector<std::pair<std::uint8_t*, std::uint16_t*>>(
+          64, {nullptr, nullptr});
+  float* iu4_signs{nullptr};
+  std::uint8_t* iu4_act{nullptr};
+  float* iu4_act_scales{nullptr};
+  int iu4_padded{0};
   float* emu_signs{nullptr};
   __half* emu_x{nullptr};
   float* emu_gu{nullptr};
@@ -4348,6 +4389,14 @@ struct Session::Impl : Scratch {
           bn_env > 0 ? bn_env : (n >= 2048 ? 192 : (n >= 512 ? 128 : 48));
       int ntiles = 0;
       const int* tmap = TileMap(n, bn, &ntiles);
+      static const bool tile_list = std::getenv("INKLING_TILE_LIST") == nullptr ||
+                                    std::getenv("INKLING_TILE_LIST")[0] != '0';
+      if (tile_list && ne <= 256) {
+        const int max_tiles = (items + bn - 1) / bn + ne;
+        BuildTileList<<<1, 256, 0, stream>>>(rbounds, ne, bn, tl_a, max_tiles);
+        tmap = tl_a;
+        ntiles = max_tiles;
+      }
       if (situ_params == nullptr) {
         const float host[2] = {c.situ_beta, c.situ_linear_beta};
         situ_params = static_cast<float*>(AllocBytes(sizeof(host)));
@@ -4361,7 +4410,104 @@ struct Session::Impl : Scratch {
       static const bool iu4_emu = std::getenv("INKLING_IU4_EMU") != nullptr;
       static const int emu_mode =
           iu4_emu ? std::atoi(std::getenv("INKLING_IU4_EMU")) : 0;
-      if (iu4_emu) {
+      static const bool iu4_on = std::getenv("INKLING_IU4") != nullptr &&
+                                 std::getenv("INKLING_IU4")[0] != '0';
+      if (iu4_on) {
+        namespace iu4 = gufo::models::inkling::iu4;
+        const int rows2 = 2 * ff;
+        if (iu4_signs == nullptr) {
+          float sg[512];
+          iu4::FillSigns(sg);
+          iu4_signs = static_cast<float*>(AllocBytes(sizeof(sg)));
+          HIP_OK(hipMemcpy(iu4_signs, sg, sizeof(sg), hipMemcpyHostToDevice));
+          const int max_rows = kMaxBatch * nu + ne * 16;
+          iu4_padded = (max_rows + 128 + 127) / 128 * 128;
+          iu4_act = static_cast<std::uint8_t*>(AllocBytes(
+              static_cast<std::size_t>(iu4_padded) / 16 * (h / 128) * 1024));
+          iu4_act_scales = static_cast<float*>(AllocBytes(
+              static_cast<std::size_t>(h / 128) * iu4_padded * 4));
+        }
+        if (iu4_w[p].first == nullptr) {
+          iu4_w[p].first = static_cast<std::uint8_t*>(AllocBytes(
+              static_cast<std::size_t>(ne) *
+              iu4::WeightBytesPerExpert(rows2, h)));
+          iu4_w[p].second = static_cast<std::uint16_t*>(AllocBytes(
+              static_cast<std::size_t>(ne) *
+              iu4::ScaleBytesPerExpert(rows2, h)));
+          iu4::RepackExperts(static_cast<const std::uint8_t*>(wgu.dev),
+                             wgu.row_bytes, iu4_w[p].first, iu4_w[p].second,
+                             ne, rows2, h, iu4_signs, stream);
+        }
+        int nt128 = 0;
+        const int* tmap128 = TileMap(n, iu4::kTokenTile, &nt128);
+        if (tile_list && ne <= 256) {
+          nt128 = (items + iu4::kTokenTile - 1) / iu4::kTokenTile + ne;
+          BuildTileList<<<1, 256, 0, stream>>>(rbounds, ne, iu4::kTokenTile,
+                                               tl_b, nt128);
+          tmap128 = tl_b;
+        }
+        iu4::QuantizeRoutedActs(xmoe, rrows_token, rrows_slot, rbounds, ne,
+                                items + ne * 16, h, iu4_act, iu4_act_scales,
+                                iu4_padded, iu4_signs, stream);
+        iu4::GateUpSitu(iu4_w[p].first, iu4_w[p].second, iu4_act,
+                        iu4_act_scales, iu4_padded, tmap128, nt128, rbounds,
+                        rrows_slot, act16, ff, h, s_gu, situ_params, stream);
+        ok1 = true;
+        static bool iu4_checked = false;
+        if (!iu4_checked && std::getenv("INKLING_IU4_CHECK") != nullptr &&
+            p == 10 && n >= 2048) {
+          iu4_checked = true;
+          HIP_OK(hipStreamSynchronize(stream));
+          std::vector<__half> a(static_cast<std::size_t>(items) * ff),
+              b(a.size());
+          HIP_OK(hipMemcpy(a.data(), act16, a.size() * 2,
+                           hipMemcpyDeviceToHost));
+          // reference: the Q8Rep emulation of the same numerics
+          const int rows_total = ne * 2 * ff;
+          const std::size_t dst_rb =
+              (static_cast<std::size_t>(h) + h / 16 + 15) / 16 * 16;
+          if (emu_signs == nullptr) {
+            std::vector<float> sg(512);
+            iu4::FillSigns(sg.data());
+            emu_signs = static_cast<float*>(AllocBytes(512 * 4));
+            HIP_OK(hipMemcpy(emu_signs, sg.data(), 512 * 4,
+                             hipMemcpyHostToDevice));
+            emu_x = static_cast<__half*>(
+                AllocBytes(static_cast<std::size_t>(kMaxBatch) * h * 2));
+            emu_gu = static_cast<float*>(AllocBytes(
+                static_cast<std::size_t>(kMaxBatch) * nu * 2 * ff * 4));
+          }
+          void* ew = AllocBytes(static_cast<std::size_t>(rows_total) * dst_rb);
+          EmuWeights<<<rows_total, 256, 0, stream>>>(
+              static_cast<const std::uint8_t*>(wgu.dev),
+              static_cast<std::uint8_t*>(ew), h, wgu.row_bytes, dst_rb,
+              emu_signs, emu_signs + 256, true);
+          EmuActs<<<n, 256, 0, stream>>>(xmoe, emu_x, h, emu_signs,
+                                         emu_signs + 256, true, true);
+          qfn::RoutedQ8RepGemm(ew, emu_x, tmap, ntiles, bn, rbounds,
+                               rrows_token, rrows_slot, emu_gu, 2 * ff, h,
+                               stream);
+          EmuSitu<<<items, 256, 0, stream>>>(emu_gu, ids, s_gu, act16, ff,
+                                             c.situ_beta, c.situ_linear_beta);
+          HIP_OK(hipStreamSynchronize(stream));
+          HIP_OK(hipMemcpy(b.data(), act16, b.size() * 2,
+                           hipMemcpyDeviceToHost));
+          double num = 0, den = 0, maxd = 0;
+          std::size_t bad = 0;
+          for (std::size_t i = 0; i < a.size(); ++i) {
+            const double x = __half2float(a[i]), y = __half2float(b[i]);
+            num += (x - y) * (x - y);
+            den += y * y;
+            maxd = std::max(maxd, std::fabs(x - y));
+            if (std::fabs(x - y) > 0.05 * std::fabs(y) + 1e-3)
+              ++bad;
+          }
+          std::fprintf(stderr,
+                       "inkling: iu4 check layer 10: rel rms diff %.4f, max "
+                       "|d| %.4f, elements off by >5%%: %zu of %zu\n",
+                       std::sqrt(num / den), maxd, bad, a.size());
+        }
+      } else if (iu4_emu) {
         const int rows_total = ne * 2 * ff;
         const std::size_t dst_rb = (static_cast<std::size_t>(h) + h / 16 + 15) /
                                    16 * 16;
@@ -5541,6 +5687,8 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
     sc.rbounds =
         static_cast<int*>(i.AllocBytes((c.expert_count + 1) * sizeof(int)));
     sc.rcursors = static_cast<int*>(i.AllocBytes(c.expert_count * sizeof(int)));
+    sc.tl_a = static_cast<int*>(i.AllocBytes(1024 * sizeof(int)));
+    sc.tl_b = static_cast<int*>(i.AllocBytes(1024 * sizeof(int)));
     {
       const std::size_t rows =
           gufo::models::qwen38_flash_next::rocm::RoutedCompactRows(
