@@ -3331,6 +3331,12 @@ struct Session::Impl : Scratch {
   std::uint8_t* iu4_act{nullptr};
   float* iu4_act_scales{nullptr};
   int iu4_padded{0};
+  // down projection (INKLING_IU4=2): int4 weights per layer, activations
+  std::vector<std::pair<std::uint8_t*, std::uint16_t*>> iu4_dw =
+      std::vector<std::pair<std::uint8_t*, std::uint16_t*>>(
+          64, {nullptr, nullptr});
+  std::uint8_t* iu4_act2{nullptr};
+  float* iu4_act2_scales{nullptr};
   float* emu_signs{nullptr};
   __half* emu_x{nullptr};
   float* emu_gu{nullptr};
@@ -4410,8 +4416,12 @@ struct Session::Impl : Scratch {
       static const bool iu4_emu = std::getenv("INKLING_IU4_EMU") != nullptr;
       static const int emu_mode =
           iu4_emu ? std::atoi(std::getenv("INKLING_IU4_EMU")) : 0;
-      static const bool iu4_on = std::getenv("INKLING_IU4") != nullptr &&
-                                 std::getenv("INKLING_IU4")[0] != '0';
+      static const int iu4_level =
+          std::getenv("INKLING_IU4") != nullptr
+              ? std::atoi(std::getenv("INKLING_IU4"))
+              : 0;
+      static const bool iu4_on = iu4_level >= 1;
+      bool iu4_down_done = false;
       if (iu4_on) {
         namespace iu4 = gufo::models::inkling::iu4;
         const int rows2 = 2 * ff;
@@ -4436,7 +4446,7 @@ struct Session::Impl : Scratch {
               iu4::ScaleBytesPerExpert(rows2, h)));
           iu4::RepackExperts(static_cast<const std::uint8_t*>(wgu.dev),
                              wgu.row_bytes, iu4_w[p].first, iu4_w[p].second,
-                             ne, rows2, h, iu4_signs, stream);
+                             ne, rows2, h, h, iu4_signs, stream);
         }
         int nt128 = 0;
         const int* tmap128 = TileMap(n, iu4::kTokenTile, &nt128);
@@ -4447,12 +4457,42 @@ struct Session::Impl : Scratch {
           tmap128 = tl_b;
         }
         iu4::QuantizeRoutedActs(xmoe, rrows_token, rrows_slot, rbounds, ne,
-                                items + ne * 16, h, iu4_act, iu4_act_scales,
+                                items + ne * 16, h, h, iu4_act, iu4_act_scales,
                                 iu4_padded, iu4_signs, stream);
         iu4::GateUpSitu(iu4_w[p].first, iu4_w[p].second, iu4_act,
                         iu4_act_scales, iu4_padded, tmap128, nt128, rbounds,
                         rrows_slot, act16, ff, h, s_gu, situ_params, stream);
         ok1 = true;
+        if (iu4_level >= 2) {
+          // down projection on int4 too: K = ff is padded to 1280
+          const int kd = (ff + 255) / 256 * 256;
+          if (iu4_act2 == nullptr) {
+            iu4_act2 = static_cast<std::uint8_t*>(AllocBytes(
+                static_cast<std::size_t>(iu4_padded) / 16 * (kd / 128) * 1024));
+            iu4_act2_scales = static_cast<float*>(AllocBytes(
+                static_cast<std::size_t>(kd / 128) * iu4_padded * 4));
+          }
+          if (iu4_dw[p].first == nullptr) {
+            iu4_dw[p].first = static_cast<std::uint8_t*>(AllocBytes(
+                static_cast<std::size_t>(ne) *
+                iu4::WeightBytesPerExpert(h, kd)));
+            iu4_dw[p].second = static_cast<std::uint16_t*>(AllocBytes(
+                static_cast<std::size_t>(ne) *
+                iu4::ScaleBytesPerExpert(h, kd)));
+            iu4::RepackExperts(static_cast<const std::uint8_t*>(wdn.dev),
+                               wdn.row_bytes, iu4_dw[p].first,
+                               iu4_dw[p].second, ne, h, ff, kd, iu4_signs,
+                               stream);
+          }
+          iu4::QuantizeRoutedActs(act16, rrows_slot, rrows_slot, rbounds, ne,
+                                  items + ne * 16, ff, kd, iu4_act2,
+                                  iu4_act2_scales, iu4_padded, iu4_signs,
+                                  stream);
+          iu4::DownGemm(iu4_dw[p].first, iu4_dw[p].second, iu4_act2,
+                        iu4_act2_scales, iu4_padded, tmap128, nt128, rbounds,
+                        rrows_slot, y16, h, kd, s_dn, stream);
+          iu4_down_done = true;
+        }
         static bool iu4_checked = false;
         if (!iu4_checked && std::getenv("INKLING_IU4_CHECK") != nullptr &&
             p == 10 && n >= 2048) {
@@ -4572,9 +4612,11 @@ struct Session::Impl : Scratch {
         SituHalfIn<<<items, 256, 0, stream>>>(gu16, act16, ff, c.situ_beta,
                                               c.situ_linear_beta);
       }
-      const bool ok2 = qfn::RoutedNvfp4GemmF16(wdn.dev, act16, tmap, ntiles, bn,
-                                               rbounds, rrows_slot, rrows_slot,
-                                               y16, h, ff, s_dn, stream);
+      const bool ok2 =
+          iu4_down_done ||
+          qfn::RoutedNvfp4GemmF16(wdn.dev, act16, tmap, ntiles, bn, rbounds,
+                                  rrows_slot, rrows_slot, y16, h, ff, s_dn,
+                                  stream);
       if (!ok1 || !ok2) {
         std::fprintf(stderr,
                      "inkling: shared routed gemm rejected the launch\n");

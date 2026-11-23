@@ -26,19 +26,31 @@ std::size_t ScaleBytesPerExpert(std::size_t rows, std::size_t k);
 
 /// nvfp4: [experts][rows][src_row_bytes] repacked NVFP4 rows. tiles/scales
 /// receive the int4 form for every expert.
+/// k_src real K values per row, zero padded to k (a multiple of 256).
 void RepackExperts(const std::uint8_t* nvfp4, std::size_t src_row_bytes,
                    std::uint8_t* tiles, std::uint16_t* scales, int experts,
-                   int rows, int k, const float* signs, hipStream_t stream);
+                   int rows, int k_src, int k, const float* signs,
+                   hipStream_t stream);
 
 /// Rotates and quantizes the activation row of every compact routed row
 /// (rows_out < 0 are padding and become zero rows). tiles is tile-major
 /// [row/16][K/128][1024 B]; scales [K/128][padded_rows] floats.
+/// x rows are k_src halves; the quantized row is zero padded to k.
 void QuantizeRoutedActs(const __half* x, const std::int32_t* rows_in,
                         const std::int32_t* rows_out,
                         const std::int32_t* pad_bounds, int experts,
-                        int max_rows, int k, std::uint8_t* tiles,
+                        int max_rows, int k_src, int k, std::uint8_t* tiles,
                         float* scales, int padded_rows, const float* signs,
                         hipStream_t stream);
+
+/// y[slot][rows] = F16(expert_scale * down(act)) for every routed row; rows is
+/// the output width (hidden size), k the padded K of tiles/act_tiles.
+void DownGemm(const std::uint8_t* tiles, const std::uint16_t* scales,
+              const std::uint8_t* act_tiles, const float* act_scales,
+              int padded_rows, const std::int32_t* tile_map,
+              std::uint32_t n_tiles, const std::int32_t* pad_bounds,
+              const std::int32_t* rows_out, __half* y, int rows, int k,
+              const float* expert_scale, hipStream_t stream);
 
 /// act[slot][ff] = situ(gate, up) for every routed row, gate/up from the int4
 /// GEMM with the expert scale applied. rows = 2 * ff rows per expert.

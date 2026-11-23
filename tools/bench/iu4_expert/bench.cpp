@@ -60,8 +60,8 @@ int main(int argc, char** argv) {
   std::vector<float> es(ne, 0.01f); CK(hipMalloc(&d_es, ne * 4)); CK(hipMemcpy(d_es, es.data(), ne * 4, hipMemcpyHostToDevice));
   float situ[2] = {7.0f, 7.0f}; CK(hipMalloc(&d_situ, 8)); CK(hipMemcpy(d_situ, situ, 8, hipMemcpyHostToDevice));
   hipStream_t s; CK(hipStreamCreate(&s));
-  RepackExperts(d_nv, row_bytes, d_tiles, d_sc, ne, rows2, K, d_signs, s);
-  QuantizeRoutedActs(d_x, d_in, d_outr, d_bounds, ne, pos, K, d_act, d_as, padded_rows, d_signs, s);
+  RepackExperts(d_nv, row_bytes, d_tiles, d_sc, ne, rows2, K, K, d_signs, s);
+  QuantizeRoutedActs(d_x, d_in, d_outr, d_bounds, ne, pos, K, K, d_act, d_as, padded_rows, d_signs, s);
   CK(hipStreamSynchronize(s));
   auto run = [&]() { GateUpSitu(d_tiles, d_sc, d_act, d_as, padded_rows, d_tl, max_tiles, d_bounds, d_outr, d_out, ff, K, d_es, d_situ, s); };
   for (int i = 0; i < 3; ++i) run();
@@ -83,6 +83,36 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 20; ++i) run();
     CK(hipEventRecord(b, s)); CK(hipEventSynchronize(b));
     float ms; CK(hipEventElapsedTime(&ms, a, b)); best = std::min(best, ms / 20);
+  }
+  // ---- down projection: K = ff = 1152 padded to 1280, output 2304 rows
+  {
+    const int Kd = 1280, rowsd = 2304;
+    const size_t drb = ((ff / 2 + ff / 16 + 15) / 16) * 16;
+    std::vector<uint8_t> dw((size_t)ne * rowsd * drb);
+    for (auto& b : dw) b = (uint8_t)rng();
+    for (size_t r = 0; r < (size_t)ne * rowsd; ++r) for (int j = 0; j < ff / 16; ++j) dw[r * drb + ff / 2 + j] = 0x30 + (rng() % 16);
+    uint8_t *d_dnv, *d_dt, *d_a2; uint16_t* d_ds; float* d_as2; __half* d_y;
+    CK(hipMalloc(&d_dnv, dw.size())); CK(hipMemcpy(d_dnv, dw.data(), dw.size(), hipMemcpyHostToDevice));
+    CK(hipMalloc(&d_dt, (size_t)ne * WeightBytesPerExpert(rowsd, Kd)));
+    CK(hipMalloc(&d_ds, (size_t)ne * ScaleBytesPerExpert(rowsd, Kd)));
+    CK(hipMalloc(&d_a2, (size_t)padded_rows / 16 * (Kd / 128) * 1024)); CK(hipMemset(d_a2, 0, (size_t)padded_rows / 16 * (Kd / 128) * 1024));
+    CK(hipMalloc(&d_as2, (size_t)(Kd / 128) * padded_rows * 4)); CK(hipMemset(d_as2, 0, (size_t)(Kd / 128) * padded_rows * 4));
+    CK(hipMalloc(&d_y, (size_t)tokens * topk * rowsd * 2));
+    RepackExperts(d_dnv, drb, d_dt, d_ds, ne, rowsd, ff, Kd, d_signs, s);
+    CK(hipStreamSynchronize(s));
+    auto actq = [&]() { QuantizeRoutedActs(d_out, d_outr, d_outr, d_bounds, ne, pos, ff, Kd, d_a2, d_as2, padded_rows, d_signs, s); };
+    auto down = [&]() { DownGemm(d_dt, d_ds, d_a2, d_as2, padded_rows, d_tl, max_tiles, d_bounds, d_outr, d_y, rowsd, Kd, d_es, s); };
+    for (int i = 0; i < 3; ++i) { actq(); down(); }
+    CK(hipStreamSynchronize(s));
+    float bq = 1e9, bd = 1e9;
+    for (int rep = 0; rep < 5; ++rep) {
+      CK(hipEventRecord(a, s)); for (int i = 0; i < 20; ++i) actq(); CK(hipEventRecord(b, s)); CK(hipEventSynchronize(b));
+      float ms; CK(hipEventElapsedTime(&ms, a, b)); bq = std::min(bq, ms / 20);
+      CK(hipEventRecord(a, s)); for (int i = 0; i < 20; ++i) down(); CK(hipEventRecord(b, s)); CK(hipEventSynchronize(b));
+      CK(hipEventElapsedTime(&ms, a, b)); bd = std::min(bd, ms / 20);
+    }
+    double fl = 2.0 * (double)tokens * topk * rowsd * ff;
+    printf("down int4: act producer %.3f ms, GEMM %.3f ms  %.1f TOPS (useful, K=1152)\n", bq, bd, fl / bd / 1e9);
   }
   double flops = 2.0 * (double)tokens * topk * rows2 * K;
   printf("gate/up int4: %.3f ms (min of 5x20)  %.1f TOPS (useful)  padded rows %d\n", best, flops / best / 1e9, pos);

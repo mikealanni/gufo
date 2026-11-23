@@ -91,8 +91,8 @@ __device__ __forceinline__ void QuantHalves(const float* v, int* qc,
 __global__ void __launch_bounds__(256)
     RepackKernel(const std::uint8_t* __restrict__ src,
                  std::size_t src_row_bytes, std::uint8_t* __restrict__ tiles,
-                 std::uint16_t* __restrict__ scales, int rows, int k,
-                 const float* __restrict__ signs) {
+                 std::uint16_t* __restrict__ scales, int rows, int k_src,
+                 int k, const float* __restrict__ signs) {
   __shared__ float v[256];
   __shared__ int qc[256];
   __shared__ float red[8];
@@ -115,11 +115,16 @@ __global__ void __launch_bounds__(256)
     const int p = t & 31;
     const int byte = (p < 8) ? p : (p < 16) ? p - 8 : (p < 24) ? 8 + p - 16
                                                               : 8 + p - 24;
-    const unsigned raw = sr[j * 16 + byte];
-    const unsigned nb = (p < 8 || (p >= 16 && p < 24)) ? (raw & 15U) : (raw >> 4);
-    const float mag = kMags[nb & 7U];
-    const float sc = Ue4m3(sr[k / 2 + j * 2 + (p >> 4)]);
-    v[t] = ((nb & 8U) ? -mag : mag) * sc;
+    float val = 0.0f;
+    if (kb * 256 + t < k_src) {
+      const unsigned raw = sr[j * 16 + byte];
+      const unsigned nb =
+          (p < 8 || (p >= 16 && p < 24)) ? (raw & 15U) : (raw >> 4);
+      const float mag = kMags[nb & 7U];
+      const float sc = Ue4m3(sr[k_src / 2 + j * 2 + (p >> 4)]);
+      val = ((nb & 8U) ? -mag : mag) * sc;
+    }
+    v[t] = val;
     __syncthreads();
     Rot256(v, s1, s2);
     float s;
@@ -175,9 +180,10 @@ __global__ void __launch_bounds__(1024)
     ActKernel(const __half* __restrict__ x,
               const std::int32_t* __restrict__ rows_in,
               const std::int32_t* __restrict__ rows_out,
-              const std::int32_t* __restrict__ pad_bounds, int experts, int k,
-              std::uint8_t* __restrict__ tiles, float* __restrict__ scales,
-              int padded_rows, const float* __restrict__ signs) {
+              const std::int32_t* __restrict__ pad_bounds, int experts,
+              int k_src, int k, std::uint8_t* __restrict__ tiles,
+              float* __restrict__ scales, int padded_rows,
+              const float* __restrict__ signs) {
   const int c = blockIdx.x;
   if (c >= pad_bounds[experts])
     return;
@@ -187,8 +193,10 @@ __global__ void __launch_bounds__(1024)
   float v[8];
   if (live) {
     const std::size_t token = static_cast<std::size_t>(rows_in[c]);
-    const uint4 raw = *reinterpret_cast<const uint4*>(
-        x + token * k + wave * 256 + lane * 8);
+    const bool inside = wave * 256 + lane * 8 < k_src;
+    const uint4 raw = inside ? *reinterpret_cast<const uint4*>(
+                                   x + token * k_src + wave * 256 + lane * 8)
+                             : make_uint4(0, 0, 0, 0);
     const __half2* h2 = reinterpret_cast<const __half2*>(&raw);
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -254,14 +262,13 @@ __global__ void __launch_bounds__(1024)
     scales[static_cast<std::size_t>(e) * padded_rows + c] = scale;
 }
 
-template<bool kDefer>
-__device__ __forceinline__ void GateUpBody(
+template<bool kDefer, bool kPair>
+__device__ __forceinline__ void RoutedBody(
     const std::uint8_t* __restrict__ pw, const std::uint16_t* __restrict__ psc,
     const std::uint8_t* __restrict__ qs, const float* __restrict__ dsT,
-    int Npad, int K, int ff, int f0, int c0, int c_end,
+    int Npad, int K, int M, int ff, int f0, int c0, int c_end,
     const std::int32_t* __restrict__ rows_out, __half* __restrict__ act,
     float es, float beta, float lb, char* lds) {
-  const int M = 2 * ff;
   const int tid = threadIdx.x;
   const int wave = __builtin_amdgcn_readfirstlane(tid >> 5);
   const int lane = tid & 31;
@@ -273,10 +280,11 @@ __device__ __forceinline__ void GateUpBody(
                    static_cast<size_t>((c0 >> 4) + wave) * E * 1024 + lane * 32;
   const uint32_t lds_off = wave * 1024 + hi * 128 + lr * 8;
   const uint32_t aoff = (wth * 4) * 1024 + prow * 8;
-  // b = 0: gate features, b = 1: the matching up features
-  const int fr0 = f0 + wf * 16;
-  const int tb[2] = {fr0 >> 4, (ff + fr0) >> 4};
-  const int mrow[2] = {fr0 + lr, ff + fr0 + lr};
+  // pair: b = 0 gate features, b = 1 the matching up features; otherwise the
+  // wave owns 32 consecutive output rows (two 16-row sub-tiles)
+  const int fr0 = f0 + wf * (kPair ? 16 : 32);
+  const int tb[2] = {fr0 >> 4, kPair ? (ff + fr0) >> 4 : (fr0 >> 4) + 1};
+  const int mrow[2] = {fr0 + lr, kPair ? ff + fr0 + lr : fr0 + 16 + lr};
 
   // 16-token sub-tiles past the bucket's rows hold no work: skip their matrix
   // work and fold (wave-uniform).
@@ -449,6 +457,7 @@ __device__ __forceinline__ void GateUpBody(
   if (kDefer)
     fold(1, Cp, scp, sslp);
 
+  if constexpr (kPair) {
   // Epilogue: gate and up go to LDS as F16 (the K loop's buffers are dead
   // now), then every thread applies SiTU on coalesced rows. Keeping the
   // transcendentals out of the accumulator-live region stops the register
@@ -479,17 +488,47 @@ __device__ __forceinline__ void GateUpBody(
     act[static_cast<std::size_t>(dst) * ff + f0 + f2] = __float2half(
         beta * FastTanh(g / beta) * SigmoidF(g) * lb * FastTanh(u / lb));
   }
+  } else {
+    // Down projection: F16 rows through LDS, stored as coalesced 16-byte runs.
+    __syncthreads();
+    __half* ey = reinterpret_cast<__half*>(lds);
+#pragma unroll
+    for (int a = 0; a < 4; ++a)
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const int tl = wth * 64 + a * 16 + 8 * hi + j;
+#pragma unroll
+        for (int b = 0; b < 2; ++b)
+          ey[tl * 128 + wf * 32 + b * 16 + lr] =
+              __float2half(sum[a][b][j] * es);
+      }
+    __syncthreads();
+    for (int idx = tid; idx < kTokenTile * 16; idx += 256) {
+      const int tl = idx >> 4, f8 = idx & 15;
+      const int c = c0 + tl;
+      if (c >= c_end)
+        continue;
+      const std::int32_t dst = rows_out[c];
+      if (dst < 0)
+        continue;
+      *reinterpret_cast<uint4*>(act + static_cast<std::size_t>(dst) * M + f0 +
+                                f8 * 8) =
+          *reinterpret_cast<const uint4*>(ey + tl * 128 + f8 * 8);
+    }
+  }
 }
 
+template<bool kPair>
 __global__ void __launch_bounds__(256)
-    GateUpKernel(const std::uint8_t* __restrict__ pw,
+    RoutedKernel(const std::uint8_t* __restrict__ pw,
                  const std::uint16_t* __restrict__ psc,
                  const std::uint8_t* __restrict__ qs,
-                 const float* __restrict__ dsT, int Npad, int K, int ff,
+                 const float* __restrict__ dsT, int Npad, int K, int M, int ff,
                  const std::int32_t* __restrict__ tiles,
                  const std::int32_t* __restrict__ pad_bounds,
                  const std::int32_t* __restrict__ rows_out,
-                 __half* __restrict__ act, const float* __restrict__ expert_scale,
+                 __half* __restrict__ out,
+                 const float* __restrict__ expert_scale,
                  const float* __restrict__ situ) {
   __shared__ __attribute__((aligned(16))) char lds[kLdsBytes];
   const std::int32_t tile = tiles[blockIdx.y];
@@ -499,21 +538,22 @@ __global__ void __launch_bounds__(256)
   const int bucket_rows = pad_bounds[expert + 1] - bucket_begin;
   if (bucket_rows - t_local <= 0)
     return;
-  const int M = 2 * ff;
   const int E = K >> 7;
   const std::uint8_t* pw_e =
       pw + static_cast<std::size_t>(expert) * E * M * 64;
   const std::uint16_t* psc_e = psc + static_cast<std::size_t>(expert) * E * M;
-  const int f0 = static_cast<int>(blockIdx.x) * kFeatureTile;
+  const int f0 = static_cast<int>(blockIdx.x) * (kPair ? kFeatureTile : 128);
   const float es = expert_scale != nullptr ? expert_scale[expert] : 1.0f;
   const int c0 = bucket_begin + t_local;
   const int c_end = bucket_begin + bucket_rows;
+  const float beta = kPair ? situ[0] : 1.0f;
+  const float lb = kPair ? situ[1] : 1.0f;
   if ((threadIdx.x >> 7) & 1)
-    GateUpBody<true>(pw_e, psc_e, qs, dsT, Npad, K, ff, f0, c0, c_end, rows_out,
-                     act, es, situ[0], situ[1], lds);
+    RoutedBody<true, kPair>(pw_e, psc_e, qs, dsT, Npad, K, M, ff, f0, c0,
+                            c_end, rows_out, out, es, beta, lb, lds);
   else
-    GateUpBody<false>(pw_e, psc_e, qs, dsT, Npad, K, ff, f0, c0, c_end,
-                      rows_out, act, es, situ[0], situ[1], lds);
+    RoutedBody<false, kPair>(pw_e, psc_e, qs, dsT, Npad, K, M, ff, f0, c0,
+                             c_end, rows_out, out, es, beta, lb, lds);
 }
 
 }  // namespace
@@ -540,20 +580,21 @@ std::size_t ScaleBytesPerExpert(std::size_t rows, std::size_t k) {
 
 void RepackExperts(const std::uint8_t* nvfp4, std::size_t src_row_bytes,
                    std::uint8_t* tiles, std::uint16_t* scales, int experts,
-                   int rows, int k, const float* signs, hipStream_t stream) {
+                   int rows, int k_src, int k, const float* signs,
+                   hipStream_t stream) {
   RepackKernel<<<static_cast<unsigned>(experts) * rows, 256, 0, stream>>>(
-      nvfp4, src_row_bytes, tiles, scales, rows, k, signs);
+      nvfp4, src_row_bytes, tiles, scales, rows, k_src, k, signs);
 }
 
 void QuantizeRoutedActs(const __half* x, const std::int32_t* rows_in,
                         const std::int32_t* rows_out,
                         const std::int32_t* pad_bounds, int experts,
-                        int max_rows, int k, std::uint8_t* tiles,
+                        int max_rows, int k_src, int k, std::uint8_t* tiles,
                         float* scales, int padded_rows, const float* signs,
                         hipStream_t stream) {
-  ActKernel<<<max_rows, (k / 256) * 32, 0, stream>>>(x, rows_in, rows_out, pad_bounds,
-                                          experts, k, tiles, scales,
-                                          padded_rows, signs);
+  ActKernel<<<max_rows, (k / 256) * 32, 0, stream>>>(
+      x, rows_in, rows_out, pad_bounds, experts, k_src, k, tiles, scales,
+      padded_rows, signs);
 }
 
 void GateUpSitu(const std::uint8_t* tiles, const std::uint16_t* scales,
@@ -564,10 +605,21 @@ void GateUpSitu(const std::uint8_t* tiles, const std::uint16_t* scales,
                 const float* expert_scale, const float* situ,
                 hipStream_t stream) {
   const dim3 grid(static_cast<unsigned>(ff / kFeatureTile), n_tiles);
-  GateUpKernel<<<grid, 256, 0, stream>>>(tiles, scales, act_tiles, act_scales,
-                                         padded_rows, k, ff, tile_map,
-                                         pad_bounds, rows_out, act,
-                                         expert_scale, situ);
+  RoutedKernel<true><<<grid, 256, 0, stream>>>(
+      tiles, scales, act_tiles, act_scales, padded_rows, k, 2 * ff, ff,
+      tile_map, pad_bounds, rows_out, act, expert_scale, situ);
+}
+
+void DownGemm(const std::uint8_t* tiles, const std::uint16_t* scales,
+              const std::uint8_t* act_tiles, const float* act_scales,
+              int padded_rows, const std::int32_t* tile_map,
+              std::uint32_t n_tiles, const std::int32_t* pad_bounds,
+              const std::int32_t* rows_out, __half* y, int rows, int k,
+              const float* expert_scale, hipStream_t stream) {
+  const dim3 grid(static_cast<unsigned>(rows / 128), n_tiles);
+  RoutedKernel<false><<<grid, 256, 0, stream>>>(
+      tiles, scales, act_tiles, act_scales, padded_rows, k, rows, 0, tile_map,
+      pad_bounds, rows_out, y, expert_scale, nullptr);
 }
 
 }  // namespace gufo::models::inkling::iu4
