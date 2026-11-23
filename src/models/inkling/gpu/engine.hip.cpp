@@ -4465,7 +4465,26 @@ struct Session::Impl : Scratch {
           std::getenv("INKLING_IU4") != nullptr
               ? std::atoi(std::getenv("INKLING_IU4"))
               : 0;
-      static const bool iu4_on = iu4_level >= 1;
+      // INKLING_IU4_SKIP=<physical layers, comma separated> keeps those layers
+      // on the NVFP4 experts
+      static const std::uint64_t iu4_skip = [] {
+        std::uint64_t mask = 0;
+        if (const char* e = std::getenv("INKLING_IU4_SKIP")) {
+          const std::string str = e;
+          std::size_t pos = 0;
+          while (pos < str.size()) {
+            const std::size_t end = str.find(',', pos);
+            const int v = std::atoi(str.substr(pos, end - pos).c_str());
+            if (v >= 0 && v < 64)
+              mask |= 1ULL << v;
+            if (end == std::string::npos)
+              break;
+            pos = end + 1;
+          }
+        }
+        return mask;
+      }();
+      const bool iu4_on = iu4_level >= 1 && ((iu4_skip >> p) & 1ULL) == 0;
       bool iu4_down_done = false;
       if (iu4_on) {
         namespace iu4 = gufo::models::inkling::iu4;

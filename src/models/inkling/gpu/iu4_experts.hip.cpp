@@ -4,6 +4,7 @@
 // SiTU activation runs on the accumulators in registers.
 #include "src/models/inkling/gpu/iu4_experts.hpp"
 
+#include <cstdlib>
 #include <cstring>
 #include <type_traits>
 
@@ -68,7 +69,8 @@ __device__ __forceinline__ void Rot256(float* v, const float* s1,
 // codes into qc (LDS, as ints); returns this half's scale in `scale_out`.
 __device__ __forceinline__ void QuantHalves(const float* v, int* qc,
                                             float* red, float& scale_out,
-                                            bool round_scale_half) {
+                                            bool round_scale_half,
+                                            bool search_clip) {
   const int t = threadIdx.x;
   float a = fabsf(v[t]);
   for (int o = 16; o > 0; o >>= 1)
@@ -80,6 +82,33 @@ __device__ __forceinline__ void QuantHalves(const float* v, int* qc,
   const float amax = fmaxf(fmaxf(red[g * 4], red[g * 4 + 1]),
                            fmaxf(red[g * 4 + 2], red[g * 4 + 3]));
   float s = amax / 7.0f;
+  if (search_clip) {
+    // Scale minimizing the group's squared rounding error: try a few clipped
+    // scales (each element's squared error summed over the 128-wide half).
+    float best_err = 3.0e38f;
+    float best_s = s;
+    for (int ci = 0; ci < 8; ++ci) {
+      const float sc = s * (1.0f - 0.04f * ci);
+      const float q =
+          sc > 0.0f ? fminf(7.0f, fmaxf(-8.0f, rintf(v[t] / sc))) : 0.0f;
+      float e = v[t] - q * sc;
+      e *= e;
+      for (int o = 16; o > 0; o >>= 1)
+        e += __shfl_xor(e, o);
+      __syncthreads();
+      if ((t & 31) == 0)
+        red[t >> 5] = e;
+      __syncthreads();
+      const float tot =
+          red[g * 4] + red[g * 4 + 1] + red[g * 4 + 2] + red[g * 4 + 3];
+      __syncthreads();
+      if (tot < best_err) {
+        best_err = tot;
+        best_s = sc;
+      }
+    }
+    s = best_s;
+  }
   if (round_scale_half)
     s = __half2float(__float2half(s));
   const float q = s > 0.0f ? fminf(7.0f, fmaxf(-8.0f, rintf(v[t] / s))) : 0.0f;
@@ -92,7 +121,7 @@ __global__ void __launch_bounds__(256)
     RepackKernel(const std::uint8_t* __restrict__ src,
                  std::size_t src_row_bytes, std::uint8_t* __restrict__ tiles,
                  std::uint16_t* __restrict__ scales, int rows, int k_src,
-                 int k, const float* __restrict__ signs) {
+                 int k, const float* __restrict__ signs, bool clip_search) {
   __shared__ float v[256];
   __shared__ int qc[256];
   __shared__ float red[8];
@@ -128,7 +157,7 @@ __global__ void __launch_bounds__(256)
     __syncthreads();
     Rot256(v, s1, s2);
     float s;
-    QuantHalves(v, qc, red, s, true);
+    QuantHalves(v, qc, red, s, true, clip_search);
     const int g = t >> 7;
     const int e = kb * 2 + g;
     if ((t & 127) == 0)
@@ -183,7 +212,7 @@ __global__ void __launch_bounds__(1024)
               const std::int32_t* __restrict__ pad_bounds, int experts,
               int k_src, int k, std::uint8_t* __restrict__ tiles,
               float* __restrict__ scales, int padded_rows,
-              const float* __restrict__ signs) {
+              const float* __restrict__ signs, float clip) {
   const int c = blockIdx.x;
   if (c >= pad_bounds[experts])
     return;
@@ -243,7 +272,7 @@ __global__ void __launch_bounds__(1024)
   for (int i = 0; i < 8; ++i)
     amax = fmaxf(amax, fabsf(v[i]));
   amax = Reduce16Max(amax);
-  const float scale = amax / 7.0f;
+  const float scale = amax * clip / 7.0f;
   const float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
   std::uint32_t word = 0;
 #pragma unroll
@@ -582,8 +611,11 @@ void RepackExperts(const std::uint8_t* nvfp4, std::size_t src_row_bytes,
                    std::uint8_t* tiles, std::uint16_t* scales, int experts,
                    int rows, int k_src, int k, const float* signs,
                    hipStream_t stream) {
+  // MSE-optimal weight scale search, on by default (INKLING_IU4_WCLIP=0 off)
+  static const bool clip = std::getenv("INKLING_IU4_WCLIP") == nullptr ||
+                           std::getenv("INKLING_IU4_WCLIP")[0] != '0';
   RepackKernel<<<static_cast<unsigned>(experts) * rows, 256, 0, stream>>>(
-      nvfp4, src_row_bytes, tiles, scales, rows, k_src, k, signs);
+      nvfp4, src_row_bytes, tiles, scales, rows, k_src, k, signs, clip);
 }
 
 void QuantizeRoutedActs(const __half* x, const std::int32_t* rows_in,
@@ -592,9 +624,13 @@ void QuantizeRoutedActs(const __half* x, const std::int32_t* rows_in,
                         int max_rows, int k_src, int k, std::uint8_t* tiles,
                         float* scales, int padded_rows, const float* signs,
                         hipStream_t stream) {
+  static const float clip =
+      std::getenv("INKLING_IU4_ACLIP") != nullptr
+          ? static_cast<float>(std::atof(std::getenv("INKLING_IU4_ACLIP")))
+          : 0.9f;  // activation scale = 0.9 * absmax / 7 (measured best)
   ActKernel<<<max_rows, (k / 256) * 32, 0, stream>>>(
       x, rows_in, rows_out, pad_bounds, experts, k_src, k, tiles, scales,
-      padded_rows, signs);
+      padded_rows, signs, clip);
 }
 
 void GateUpSitu(const std::uint8_t* tiles, const std::uint16_t* scales,
