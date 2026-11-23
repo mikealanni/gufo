@@ -20,3 +20,7 @@ Later findings (pair mode: add -DPAIRV; kernel_nvfp4_regdirect.inc = production 
 weights-only fetch removal -2.2 ms, activations-only removal -0.3 ms, so the weight stream (not activations) is the exposed cost.
 Prefetching weights 2 stages deep, or splitting the two 16-byte chunks across lane halves with a lane exchange: no gain / slower.
 Timings in this harness are bimodal; compare min of 5 runs, interleaved.
+
+BM=256 retry after the weights left LDS (kernel_nvfp4_regdirect_bm256.inc, two 16-row tiles per wave; bit-identical to BM=128):
+BM=128/BN=192 11.11 ms (198 VGPRs, occupancy 7); BM=256/BN=96 11.86 (213 VGPRs); BM=256/BN=128 12.01 (252 VGPRs, occupancy 5); BM=256/BN=64 13.54.
+Slower in every configuration: the wider block costs more registers than the shared activation reuse saves. Production keeps BM=128.
