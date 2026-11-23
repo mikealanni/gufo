@@ -87,6 +87,16 @@ Prefill at `-p 8192` with the NPU (GPU only in brackets):
 | prose | 12.3 | **24.8** | 24 |
 | JSON | 12.3 | **62.2** | 53 |
 
+With the rotated int4 artifact (int4 x int4 WMMA, FFN split on the NPU), measured
+2026-11-21 on the main binary:
+
+| Prefill, tok/s | Q4_K_XL GGUF + NPU | Rotated int4 + NPU |
+| --- | --- | --- |
+| `-p 8192` | 806 | **1,335** (+66%) |
+
+Plain decode is 14.7 tok/s (12.3 with the GGUF). HumanEval 156/164 against 158/164
+for the GGUF, with equal NLL.
+
 ### Qwen3.8 Flash-Next
 
 | Prefill, tok/s | GPU only | GPU + NPU (two-bank) |
