@@ -53,16 +53,17 @@ question per line, answer `Yes|No <p_yes> <p_no> ...`). The plugin never starts 
 second NPU process. A command is treated as heavy when `p_yes` reaches
 `--judge-cutoff`.
 
-- **Model.** The launcher `~/run-jev-guard.sh` runs the pplx decider
-  (Qwen3.5-4B, Q8_0) on the general NPU engine (`gufo-judge`, built from
-  `tools/npu/gen`). About 370 ms per request, 4.5 GB real RAM (measured as the
-  drop in `MemAvailable`; NPU buffers do not show in RSS).
+- **Model.** The launcher `~/run-jev-guard.sh` runs the d1 decision model
+  (d1-2B, Q8_0, about 2.3 GB of RAM) on the general NPU engine (`gufo-judge`,
+  built from `tools/npu/gen`). `GUFO_JUDGE=pplx` selects the pplx decider
+  (Qwen3.5-4B, Q8_0): about 370 ms per request and 4.5 GB real RAM (measured as
+  the drop in `MemAvailable`; NPU buffers do not show in RSS).
 - **Cutoff.** Probabilities are not comparable between judges. The old 0.85
   cutoff flagged none of the 239 unknown commands in a replay of real sessions.
   pplx uses `0.05` (flags 18% of unknown commands, 3 of 4 labeled heavy ones);
-  the d1 decision model uses about `0.3`. Each false stop costs a gufo reload
+  the launcher uses `0.45` for d1 (`JUDGE_CUTOFF` overrides either). Each false stop costs a gufo reload
   (about 70 s), so tune it from `~/.gufo/jev-log/jev.sqlite3` before relying on it.
-- **Roll back.** `run-jev-guard.sh.bak-pre-pplx` restores the d1 launcher.
+- **Roll back.** `GUFO_JUDGE=pplx` restores the pplx judge; `run-jev-guard.sh.bak-d1default` is the launcher before d1 became the default.
 
 ## Start-up check
 
