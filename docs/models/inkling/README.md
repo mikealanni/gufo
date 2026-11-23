@@ -66,3 +66,10 @@ the same exact-match rule as greedy and therefore accepts fewer drafts.
 
 The CPU reference (`reference.cpp`, `gufo_inkling_ref_check`) is complete but runs
 at about 13 s per token; the GPU engine matches it to about four digits.
+
+## Planned
+
+- Prefill attention on the NPU (attention is 23 to 27% of GPU time at 8K): the full task
+  description for a kernel and its engine hook is
+  [../../plans/inkling-npu-attention-kernel.md](../../plans/inkling-npu-attention-kernel.md).
+

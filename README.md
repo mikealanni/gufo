@@ -17,9 +17,9 @@ speculative decoding on top, for Qwen, Inkling, Flint, GLM-5.3 Flash and Laguna 
 - **Inkling 2 Mini** (26.4B MoE, 3.4B active, looped middle layers) on the GPU with
   DSpark speculation and NPU prefill. Up to 256K context with block-sparse
   attention, tool calls, a reasoning channel, and the same RAM and disk
-  continuation cache as the other models. Prefill about 1,700 to 1,850 tok/s
-  (1,647 at 128K with the NPU); decode 74.6 tok/s on code and 71.1 on JSON, 54 to
-  61 tok/s at 63K context. See [docs/models/inkling](docs/models/inkling/README.md).
+  continuation cache as the other models. Prefill about 2,100 to 2,400 tok/s at 4K to 8K
+  (2,382 at 8K with the NPU; 1,647 at 128K); decode 74.6 tok/s on code and 71.1
+  on JSON, 54 to 61 tok/s at 63K context. See [docs/models/inkling](docs/models/inkling/README.md).
 - **Qwen3.8-27B on int4 WMMA plus NPU.** The dense projections run as int4 x int4
   WMMA on the GPU with the FFN split across the NPU: prefill 1,335 tok/s at 8K
   (806 with the Q4_K_XL GGUF and the NPU), plain decode 14.7 tok/s, HumanEval
@@ -53,12 +53,14 @@ drafter. Prefill is the single-request engine check (no cache).
 
 | Prefill, tok/s | GPU only | GPU + NPU |
 | --- | --- | --- |
-| 2K | 1,692 | 1,692 (below the 3,072-row NPU batch) |
-| 4K | 1,768 | **1,837** |
-| 8K | 1,715 | **1,851** |
-| 16K | 1,670 | **1,791** |
+| 2K | 2,065 | 2,065 (below the 3,072-row NPU batch) |
+| 4K | 2,144 | **2,342** |
+| 8K | 2,075 | **2,382** |
+| 16K | 1,930 | **2,170** |
 | 32K | 1,536 | **1,689** |
 | 128K | about 1,035 | **1,647** |
+
+The 32K and 128K rows were measured before the latest prefill work and have not been repeated.
 
 | Decode, tok/s | speculation |
 | --- | --- |

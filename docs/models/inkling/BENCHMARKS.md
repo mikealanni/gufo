@@ -1,28 +1,25 @@
 # Inkling 2 Mini benchmarks
 
-Measured 2026-11-22 on one Strix Halo (gfx1151) machine, greedy, real text.
+Decode measured 2026-11-22 on one Strix Halo (gfx1151) machine, greedy, real text.
 Prefill is `gufo_inkling_gpu_check` `INKLING_BENCH=<n>` (single request, no
 cache); decode is `gufo serve` over HTTP with `--think off`, 400-token (short) or
 300-token (deep) replies, speculation on unless stated.
 
 ## Prefill
 
+Measured 2026-11-23 (`gufo_inkling_gpu_check`, `INKLING_BENCH=<n>`, warm, three
+repeats, greedy text, fabric clock held).
+
 | Prompt | GPU only | GPU + NPU |
 | --- | --- | --- |
-| 2k | 1,692 | 1,692 (below the 3,072-row NPU batch) |
-| 4k | 1,768 | 1,837 |
-| 8k | 1,715 | 1,851 |
-| 16k | 1,670 | 1,791 |
-| 32k | 1,536 (1,619 sparse) | 1,689 |
-| 128k | about 1,035 | 1,647 |
+| 2k | 2,065 | below the NPU batch |
+| 4k | 2,144 | 2,342 |
+| 8k | 2,075 | 2,382 |
+| 16k | 1,930 | 2,170 |
 
-The 8k to 128k rows predate the expert-layer conversion, which added about 2% at
-2k and 4k.
-
-## Load
-
-About 15 s with the model file in the page cache (weights go through the shared
-`hip::TensorUpload` staging pipeline); 44 s before that change with a cold cache.
+Run-to-run spread is about 1% when nothing else uses the machine; background load
+costs more. The 32k and 128k rows of the earlier table (1,536 to 1,689 and about
+1,035 to 1,647 tok/s) have not been re-measured.
 
 ## Decode
 
