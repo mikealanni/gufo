@@ -1199,6 +1199,115 @@ __global__ void SituHalfIn(const __half* gu, __half* act, int ff, float beta,
   }
 }
 
+// ---- int4 emulation (INKLING_IU4_EMU): rotated symmetric int4 numerics run
+// through the existing f16 routed GEMM -------------------------------------
+__device__ __forceinline__ float EmuUe4m3(unsigned b) {
+  const unsigned e = (b >> 3) & 15U, m = b & 7U;
+  if (b == 0x7F)
+    return 0.0F;
+  return e == 0 ? static_cast<float>(m) * (1.0F / 512.0F)
+                : (1.0F + static_cast<float>(m) * 0.125F) *
+                      exp2f(static_cast<float>(e) - 7.0F);
+}
+
+// y = R v with R = D2 H D1 / 16 over one 256 block held in LDS.
+__device__ __forceinline__ void EmuRot256(float* v, const float* s1,
+                                          const float* s2) {
+  const int t = threadIdx.x;
+  v[t] *= s1[t];
+  for (int len = 1; len < 256; len <<= 1) {
+    __syncthreads();
+    if (t < 128) {
+      const int i = (t / len) * 2 * len + (t % len);
+      const float a = v[i], b = v[i + len];
+      v[i] = a + b;
+      v[i + len] = a - b;
+    }
+  }
+  __syncthreads();
+  v[t] *= s2[t] * (1.0F / 16.0F);
+  __syncthreads();
+}
+
+// NVFP4 gate/up rows -> rotated symmetric int4 (per-128 scale) as Q8Rep rows.
+__global__ void EmuWeights(const std::uint8_t* src, std::uint8_t* dst, int k,
+                           std::size_t src_row_bytes,
+                           std::size_t dst_row_bytes, const float* s1,
+                           const float* s2, bool quant) {
+  __shared__ float v[256];
+  __shared__ float red[2][8];
+  const std::size_t row = blockIdx.x;
+  const std::uint8_t* sr = src + row * src_row_bytes;
+  std::uint8_t* dr = dst + row * dst_row_bytes;
+  const int t = threadIdx.x;
+  constexpr float kMags[8] = {0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F};
+  for (int kb = 0; kb < k / 256; ++kb) {
+    const int j = kb * 8 + t / 32;
+    const int p = t % 32;
+    const int byte = (p < 8) ? p : (p < 16) ? p - 8 : (p < 24) ? 8 + p - 16
+                                                              : 8 + p - 24;
+    const unsigned raw = sr[j * 16 + byte];
+    const unsigned nb = (p < 8 || (p >= 16 && p < 24)) ? (raw & 15U) : (raw >> 4);
+    const float mag = kMags[nb & 7U];
+    const float sc = EmuUe4m3(sr[k / 2 + j * 2 + p / 16]);
+    v[t] = ((nb & 8U) ? -mag : mag) * sc;
+    __syncthreads();
+    EmuRot256(v, s1, s2);
+    float a = fabsf(v[t]);
+    for (int o = 16; o > 0; o >>= 1)
+      a = fmaxf(a, __shfl_xor(a, o));
+    if ((t & 31) == 0)
+      red[t / 128][(t / 32) % 4] = a;
+    __syncthreads();
+    const int g = t / 128;
+    const float amax =
+        fmaxf(fmaxf(red[g][0], red[g][1]), fmaxf(red[g][2], red[g][3]));
+    const float s = __half2float(__float2half(amax / 7.0F));
+    float q = s > 0.0F ? fminf(7.0F, fmaxf(-8.0F, rintf(v[t] / s))) : 0.0F;
+    if (!quant)
+      q = fminf(127.0F, fmaxf(-128.0F, rintf(v[t] * (127.0F / fmaxf(amax, 1e-30F)))));
+    dr[kb * 256 + t] = static_cast<std::uint8_t>(static_cast<std::int8_t>(q));
+    if ((t & 31) == 0) {
+      const __half hs = __float2half(quant ? s : amax / 127.0F);
+      std::memcpy(dr + k + j * 2, &hs, 2);
+    }
+    __syncthreads();
+  }
+}
+
+// Fake-quantize activations: rotate each 256 block, per-32 scale, round to
+// int4, return the rotated dequantized values.
+__global__ void EmuActs(const __half* x, __half* out, int h, const float* s1,
+                        const float* s2, bool quant) {
+  __shared__ float v[256];
+  const std::size_t tok = blockIdx.x;
+  const int t = threadIdx.x;
+  for (int kb = 0; kb < h / 256; ++kb) {
+    v[t] = __half2float(x[tok * h + kb * 256 + t]);
+    __syncthreads();
+    EmuRot256(v, s1, s2);
+    float a = fabsf(v[t]);
+    for (int o = 16; o > 0; o >>= 1)
+      a = fmaxf(a, __shfl_xor(a, o));
+    const float s = __half2float(__float2half(a / 7.0F));
+    const float q = s > 0.0F ? fminf(7.0F, fmaxf(-8.0F, rintf(v[t] / s))) : 0.0F;
+    out[tok * h + kb * 256 + t] = quant ? __float2half(q * s) : __float2half(v[t]);
+    __syncthreads();
+  }
+}
+
+__global__ void EmuSitu(const float* gu, const int* ids, const float* es,
+                        __half* act, int ff, float beta, float lb) {
+  const int item = blockIdx.x;
+  const float sc = es != nullptr ? es[ids[item]] : 1.0F;
+  for (int j = threadIdx.x; j < ff; j += blockDim.x) {
+    const float g = gu[static_cast<std::size_t>(item) * 2 * ff + j] * sc;
+    const float u = gu[static_cast<std::size_t>(item) * 2 * ff + ff + j] * sc;
+    act[static_cast<std::size_t>(item) * ff + j] =
+        __float2half(beta * tanhf(g / beta) * Sigmoid(g) * lb * tanhf(u / lb));
+  }
+}
+
 __global__ void CombineHalf(const __half* y, const float* wts, float* out,
                             int nu, int h) {
   const int h8 = h / 8;
@@ -3138,6 +3247,11 @@ struct Session::Impl : Scratch {
                    ? std::atoi(std::getenv("INKLING_DENSE_BN"))
                    : 192};
   float* situ_params{nullptr};
+  // int4 emulation state (INKLING_IU4_EMU)
+  std::vector<void*> emu_w = std::vector<void*>(64, nullptr);
+  float* emu_signs{nullptr};
+  __half* emu_x{nullptr};
+  float* emu_gu{nullptr};
   int* dense_ident{nullptr};
   int* dense_tiles{nullptr};
   std::unordered_map<int, int*> dense_bounds;
@@ -4188,7 +4302,48 @@ struct Session::Impl : Scratch {
           std::getenv("INKLING_SITU_FUSED") == nullptr ||
           std::getenv("INKLING_SITU_FUSED")[0] != '0';
       bool ok1 = false;
-      if (fuse_situ && bn != 64) {
+      static const bool iu4_emu = std::getenv("INKLING_IU4_EMU") != nullptr;
+      static const int emu_mode =
+          iu4_emu ? std::atoi(std::getenv("INKLING_IU4_EMU")) : 0;
+      if (iu4_emu) {
+        const int rows_total = ne * 2 * ff;
+        const std::size_t dst_rb = (static_cast<std::size_t>(h) + h / 16 + 15) /
+                                   16 * 16;
+        if (emu_signs == nullptr) {
+          std::vector<float> sg(512);
+          unsigned st = 42;
+          for (int i = 0; i < 256; ++i) {
+            st = (st * 1103515245U + 12345U) & 0x7fffffffU;
+            sg[i] = ((st >> 16) & 1U) ? -1.0F : 1.0F;
+          }
+          st = 1042;
+          for (int i = 0; i < 256; ++i) {
+            st = (st * 1103515245U + 12345U) & 0x7fffffffU;
+            sg[256 + i] = ((st >> 16) & 1U) ? -1.0F : 1.0F;
+          }
+          emu_signs = static_cast<float*>(AllocBytes(512 * 4));
+          HIP_OK(hipMemcpy(emu_signs, sg.data(), 512 * 4,
+                           hipMemcpyHostToDevice));
+          emu_x = static_cast<__half*>(
+              AllocBytes(static_cast<std::size_t>(kMaxBatch) * h * 2));
+          emu_gu = static_cast<float*>(AllocBytes(
+              static_cast<std::size_t>(kMaxBatch) * nu * 2 * ff * 4));
+        }
+        if (emu_w[p] == nullptr) {
+          emu_w[p] = AllocBytes(static_cast<std::size_t>(rows_total) * dst_rb);
+          EmuWeights<<<rows_total, 256, 0, stream>>>(
+              static_cast<const std::uint8_t*>(wgu.dev),
+              static_cast<std::uint8_t*>(emu_w[p]), h, wgu.row_bytes, dst_rb,
+              emu_signs, emu_signs + 256, (emu_mode & 1) != 0);
+        }
+        EmuActs<<<n, 256, 0, stream>>>(xmoe, emu_x, h, emu_signs,
+                                       emu_signs + 256, (emu_mode & 2) != 0);
+        ok1 = qfn::RoutedQ8RepGemm(emu_w[p], emu_x, tmap, ntiles, bn, rbounds,
+                                   rrows_token, rrows_slot, emu_gu, 2 * ff, h,
+                                   stream);
+        EmuSitu<<<items, 256, 0, stream>>>(emu_gu, ids, s_gu, act16, ff,
+                                           c.situ_beta, c.situ_linear_beta);
+      } else if (fuse_situ && bn != 64) {
         ok1 = qfn::RoutedNvfp4SituGemmF16(
             wgu.dev, xmoe, tmap, ntiles, bn, rbounds, rrows_token, rrows_slot,
             act16, ff, h, s_gu, situ_params, stream);
