@@ -1278,7 +1278,7 @@ __global__ void EmuWeights(const std::uint8_t* src, std::uint8_t* dst, int k,
 // Fake-quantize activations: rotate each 256 block, per-32 scale, round to
 // int4, return the rotated dequantized values.
 __global__ void EmuActs(const __half* x, __half* out, int h, const float* s1,
-                        const float* s2, bool quant) {
+                        const float* s2, bool quant, bool group128) {
   __shared__ float v[256];
   const std::size_t tok = blockIdx.x;
   const int t = threadIdx.x;
@@ -1289,6 +1289,17 @@ __global__ void EmuActs(const __half* x, __half* out, int h, const float* s1,
     float a = fabsf(v[t]);
     for (int o = 16; o > 0; o >>= 1)
       a = fmaxf(a, __shfl_xor(a, o));
+    if (group128) {
+      // per-128 scale: combine the four 32-lane groups of each half
+      __shared__ float gmax[8];
+      if ((t & 31) == 0)
+        gmax[t / 32] = a;
+      __syncthreads();
+      const int g = t / 128;
+      a = fmaxf(fmaxf(gmax[g * 4], gmax[g * 4 + 1]),
+                fmaxf(gmax[g * 4 + 2], gmax[g * 4 + 3]));
+      __syncthreads();
+    }
     const float s = __half2float(__float2half(a / 7.0F));
     const float q = s > 0.0F ? fminf(7.0F, fmaxf(-8.0F, rintf(v[t] / s))) : 0.0F;
     out[tok * h + kb * 256 + t] = quant ? __float2half(q * s) : __float2half(v[t]);
@@ -4337,7 +4348,8 @@ struct Session::Impl : Scratch {
               emu_signs, emu_signs + 256, (emu_mode & 1) != 0);
         }
         EmuActs<<<n, 256, 0, stream>>>(xmoe, emu_x, h, emu_signs,
-                                       emu_signs + 256, (emu_mode & 2) != 0);
+                                       emu_signs + 256, (emu_mode & 2) != 0,
+                                       (emu_mode & 16) != 0);
         ok1 = qfn::RoutedQ8RepGemm(emu_w[p], emu_x, tmap, ntiles, bn, rbounds,
                                    rrows_token, rrows_slot, emu_gu, 2 * ff, h,
                                    stream);
