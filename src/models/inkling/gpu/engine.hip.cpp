@@ -4127,6 +4127,7 @@ struct Session::Impl : Scratch {
       }
       static const char* const dump_layer = std::getenv("INKLING_DUMP_MOE");
       static bool dumped = false;
+      static bool dumped_out = false;
       if (dump_layer != nullptr && !dumped &&
           p == static_cast<std::uint32_t>(std::atoi(dump_layer)) && n >= 2048) {
         dumped = true;
@@ -4195,6 +4196,21 @@ struct Session::Impl : Scratch {
         ok1 = qfn::RoutedNvfp4GemmF16(wgu.dev, xmoe, tmap, ntiles, bn, rbounds,
                                       rrows_token, rrows_slot, gu16, 2 * ff, h,
                                       s_gu, stream);
+        if (dumped && dump_layer != nullptr && !dumped_out &&
+            p == static_cast<std::uint32_t>(std::atoi(dump_layer))) {
+          dumped_out = true;
+          HIP_OK(hipStreamSynchronize(stream));
+          std::vector<__half> hy(static_cast<std::size_t>(items) * 2 * ff);
+          HIP_OK(hipMemcpy(hy.data(), gu16, hy.size() * 2,
+                           hipMemcpyDeviceToHost));
+          std::vector<float> hs(ne, 1.0F);
+          if (s_gu != nullptr)
+            HIP_OK(hipMemcpy(hs.data(), s_gu, ne * 4, hipMemcpyDeviceToHost));
+          FILE* fo = std::fopen("/tmp/inkling_moe_out.bin", "wb");
+          std::fwrite(hs.data(), 4, hs.size(), fo);
+          std::fwrite(hy.data(), 2, hy.size(), fo);
+          std::fclose(fo);
+        }
         SituHalfIn<<<items, 256, 0, stream>>>(gu16, act16, ff, c.situ_beta,
                                               c.situ_linear_beta);
       }
