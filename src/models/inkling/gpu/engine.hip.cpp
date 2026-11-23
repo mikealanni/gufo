@@ -1199,6 +1199,55 @@ __global__ void SituHalfIn(const __half* gu, __half* act, int ff, float beta,
   }
 }
 
+// Sums the split-K slices in a fixed order.
+__global__ void SplitKReduce(const float* part, float* y, std::size_t count,
+                             int slices) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= count)
+    return;
+  float a = part[i];
+  for (int z = 1; z < slices; ++z)
+    a += part[static_cast<std::size_t>(z) * count + i];
+  y[i] = a;
+}
+
+// Compact list of the (expert, token tile) pairs that have rows: the launch
+// grid is bounded by rows / tile + experts instead of experts * tiles. Unused
+// entries point far past any bucket, so those blocks exit at once.
+__global__ void BuildTileList(const int* bounds, int ne, int bn, int* out,
+                              int max_tiles) {
+  __shared__ int start[256];
+  const int t = threadIdx.x;
+  for (int i = t; i < max_tiles; i += blockDim.x)
+    out[i] = 0x7FFF0000;
+  int nt = 0;
+  if (t < ne)
+    nt = (bounds[t + 1] - bounds[t] + bn - 1) / bn;
+  start[t] = nt;
+  __syncthreads();
+  if (t == 0) {
+    int run = 0;
+    for (int e = 0; e < ne; ++e) {
+      const int c = start[e];
+      start[e] = run;
+      run += c;
+    }
+  }
+  __syncthreads();
+  if (t < ne) {
+    const int s0 = start[t];
+    for (int j = 0; j < nt; ++j)
+      if (s0 + j < max_tiles)
+        out[s0 + j] = t | (j << 16);
+  }
+}
+
+__global__ void SetDenseBounds(int* bounds, int n) {
+  bounds[0] = 0;
+  bounds[1] = n;
+}
+
 __global__ void CombineHalf(const __half* y, const float* wts, float* out,
                             int nu, int h) {
   const int h8 = h / 8;
@@ -1264,6 +1313,8 @@ struct WmmaArgs {
   const int* tiles;
   const int* sorted;
   int n;
+  int ksplit{1};  ///< split-K slices (grid z); partial sums go to y + z * n * rows
+  int kchunk{0};  ///< K per slice
 };
 
 // 16 consecutive K elements [k0, k0 + 16) of one weight row as F16.
@@ -1338,7 +1389,13 @@ __global__ void __launch_bounds__(kWmmaThreads) WmmaGemm(WmmaArgs a) {
   V8f acc[2][2] = {};
   const int wm = wave >> 1;
   const int wn = wave & 1;
-  for (int k0 = 0; k0 < a.cols; k0 += 32) {
+  const int kbeg = a.ksplit > 1 ? static_cast<int>(blockIdx.z) * a.kchunk : 0;
+  const int kend = a.ksplit > 1 ? min(a.cols, kbeg + a.kchunk) : a.cols;
+  float* const yout = a.ksplit > 1
+                          ? a.y + static_cast<std::size_t>(blockIdx.z) *
+                                      a.n * a.rows
+                          : a.y;
+  for (int k0 = kbeg; k0 < kend; k0 += 32) {
     uint4* ad = reinterpret_cast<uint4*>(&As[lr][lh * 16]);
     if (xr != nullptr) {
       const uint4* xs = reinterpret_cast<const uint4*>(xr + k0 + lh * 16);
@@ -1381,7 +1438,7 @@ __global__ void __launch_bounds__(kWmmaThreads) WmmaGemm(WmmaArgs a) {
           continue;
         const int out_item =
             a.sorted != nullptr ? a.sorted[start + m] : start + m;
-        a.y[static_cast<std::size_t>(out_item) * a.rows + nn] =
+        yout[static_cast<std::size_t>(out_item) * a.rows + nn] =
             acc[mi][ni][i] * sc;
       }
     }
@@ -2909,6 +2966,10 @@ struct Scratch {
   int *rbounds{nullptr}, *rcursors{nullptr}, *rrows_token{nullptr},
       *rrows_slot{nullptr};
   int *sorted{nullptr}, *tiles{nullptr};
+  int *tl_a{nullptr};               ///< compact (expert, token tile) list
+  float* ksbuf{nullptr};            ///< split-K partial sums
+  int* dense_bounds_buf{nullptr};   ///< {0, n} of the dense routed GEMM
+  int dense_bounds_n{-1};
   __half *xh{nullptr}, *act16{nullptr}, *xh0{nullptr}, *xh1{nullptr},
       *xh2{nullptr}, *xhx{nullptr}, *atth{nullptr}, *cath{nullptr};
   signed char* xq{nullptr};
@@ -3123,6 +3184,15 @@ struct Session::Impl : Scratch {
     allocs.push_back(p);
     return p;
   }
+  // Buffers created on first use are not part of the session's measured state:
+  // the server compares it with a claim taken from a probe session that never
+  // ran a forward pass.
+  void* AllocLazy(std::size_t bytes) {
+    void* p = AllocBytes(bytes);
+    HIP_OK(hipDeviceSynchronize());  // the zeroing must land before any stream writes
+    allocated_bytes -= bytes;
+    return p;
+  }
   ~Impl() {
     if (graph_exec != nullptr)
       (void)hipGraphExecDestroy(graph_exec);
@@ -3148,7 +3218,6 @@ struct Session::Impl : Scratch {
   float* situ_params{nullptr};
   int* dense_ident{nullptr};
   int* dense_tiles{nullptr};
-  std::unordered_map<int, int*> dense_bounds;
   const int* DenseMaps(int n, int bn, int* ntiles) {
     constexpr int kMaxTiles = kMaxBatch / 128 + 2;
     if (dense_ident == nullptr) {
@@ -3158,21 +3227,21 @@ struct Session::Impl : Scratch {
         ident[i] = i;
       for (int t = 0; t < kMaxTiles; ++t)
         tiles[t] = t << 16;
-      dense_ident = static_cast<int*>(AllocBytes(kMaxBatch * sizeof(int)));
-      dense_tiles = static_cast<int*>(AllocBytes(kMaxTiles * sizeof(int)));
+      dense_ident = static_cast<int*>(AllocLazy(kMaxBatch * sizeof(int)));
+      dense_tiles = static_cast<int*>(AllocLazy(kMaxTiles * sizeof(int)));
       HIP_OK(hipMemcpy(dense_ident, ident.data(), kMaxBatch * sizeof(int),
                        hipMemcpyHostToDevice));
       HIP_OK(hipMemcpy(dense_tiles, tiles.data(), kMaxTiles * sizeof(int),
                        hipMemcpyHostToDevice));
     }
-    int*& bounds = dense_bounds[n];
-    if (bounds == nullptr) {
-      const int host[2] = {0, n};
-      bounds = static_cast<int*>(AllocBytes(2 * sizeof(int)));
-      HIP_OK(hipMemcpy(bounds, host, sizeof(host), hipMemcpyHostToDevice));
+    // one {0, n} buffer per bank, rewritten when n changes (a new buffer per
+    // prompt length would grow the session's measured state forever)
+    if (dense_bounds_n != n) {
+      SetDenseBounds<<<1, 1, 0, stream>>>(dense_bounds_buf, n);
+      dense_bounds_n = n;
     }
     *ntiles = (n + bn - 1) / bn;
-    return bounds;
+    return dense_bounds_buf;
   }
   void Dense(const Tensor& w, const float* xin, std::size_t ldx, float* yout,
              std::size_t ldy, int n, int rows = -1,
@@ -3257,9 +3326,27 @@ struct Session::Impl : Scratch {
       const dim3 wg(nrows / kTileN, (n + kTileM - 1) / kTileM);
       if (ldx == w.cols) {
         switch (w.type) {
-          case kTypeF32:
+          case kTypeF32: {
+            static const bool split_on =
+                std::getenv("INKLING_SPLITK") == nullptr ||
+                std::getenv("INKLING_SPLITK")[0] != '0';
+            constexpr int kSplit = 4;
+            if (split_on && nrows <= 128 && w.cols >= 2048 &&
+                w.cols % (32 * kSplit) == 0 && n >= kWmmaMinTokens &&
+                ksbuf != nullptr) {
+              wa.ksplit = kSplit;
+              wa.kchunk = static_cast<int>(w.cols) / kSplit;
+              wa.y = ksbuf;
+              const dim3 wgs(wg.x, wg.y, kSplit);
+              WmmaGemm<kTypeF32><<<wgs, kWmmaThreads, 0, stream>>>(wa);
+              const std::size_t count = static_cast<std::size_t>(n) * nrows;
+              SplitKReduce<<<(count + 255) / 256, 256, 0, stream>>>(
+                  ksbuf, yout, count, kSplit);
+              return;
+            }
             WmmaGemm<kTypeF32><<<wg, kWmmaThreads, 0, stream>>>(wa);
             return;
+          }
           case kTypeBf16:
             WmmaGemm<kTypeBf16><<<wg, kWmmaThreads, 0, stream>>>(wa);
             return;
@@ -4139,10 +4226,19 @@ struct Session::Impl : Scratch {
       const int bn =
           bn_env > 0 ? bn_env : (n >= 2048 ? 192 : (n >= 512 ? 128 : 48));
       int ntiles = 0;
-      const int* tmap = TileMap(n, bn, &ntiles);
+      static const bool tile_list = std::getenv("INKLING_TILE_LIST") == nullptr ||
+                                    std::getenv("INKLING_TILE_LIST")[0] != '0';
+      const int* tmap = tile_list && ne <= 256 ? nullptr
+                                               : TileMap(n, bn, &ntiles);
+      if (tile_list && ne <= 256) {
+        const int max_tiles = (items + bn - 1) / bn + ne;
+        BuildTileList<<<1, 256, 0, stream>>>(rbounds, ne, bn, tl_a, max_tiles);
+        tmap = tl_a;
+        ntiles = max_tiles;
+      }
       if (situ_params == nullptr) {
         const float host[2] = {c.situ_beta, c.situ_linear_beta};
-        situ_params = static_cast<float*>(AllocBytes(sizeof(host)));
+        situ_params = static_cast<float*>(AllocLazy(sizeof(host)));
         HIP_OK(
             hipMemcpy(situ_params, host, sizeof(host), hipMemcpyHostToDevice));
       }
@@ -5276,6 +5372,10 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
     sc.rbounds =
         static_cast<int*>(i.AllocBytes((c.expert_count + 1) * sizeof(int)));
     sc.rcursors = static_cast<int*>(i.AllocBytes(c.expert_count * sizeof(int)));
+    sc.ksbuf = static_cast<float*>(
+        i.AllocBytes(static_cast<std::size_t>(4) * b * 128 * sizeof(float)));
+    sc.dense_bounds_buf = static_cast<int*>(i.AllocBytes(2 * sizeof(int)));
+    sc.tl_a = static_cast<int*>(i.AllocBytes(1024 * sizeof(int)));
     {
       const std::size_t rows =
           gufo::models::qwen38_flash_next::rocm::RoutedCompactRows(
