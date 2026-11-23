@@ -1734,13 +1734,16 @@ __global__ void __launch_bounds__(WAVES * 32)
     }
     for (int ni = 0; ni < 4; ++ni) {
       for (int i = 0; i < 8; ++i) {
-        const float pv = sc[ni][i] <= kNegInf ? 0.0F : exp2f(sc[ni][i] - m[i]);
+        const float pv = (!interior && sc[ni][i] <= kNegInf)
+                            ? 0.0F
+                            : exp2f(sc[ni][i] - m[i]);
         l[i] += pv;
         PZ[wave][(2 * i + (lane >> 4)) * kPStride + ni * 16 + (lane & 15)] =
             __float2half(pv);
       }
     }
-    __syncthreads();
+    // the P rows are wave-private: LDS accesses of one wave stay in order
+    __builtin_amdgcn_wave_barrier();
     for (int c = 0; c < 4; ++c) {
       V16h pf;
       std::memcpy(&pf, &PZ[wave][(lane & 15) * kPStride + c * 16],
