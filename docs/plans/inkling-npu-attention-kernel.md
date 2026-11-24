@@ -233,3 +233,19 @@ ring unchanged in kind, 0.57 ms per 128-token pass of 4 kv heads (one pass of tw
 for all 8 kv heads, or about 37 ms per 4K-token chunk per window visit. Over 40 window visits plus 8 full visits that
 is still more than the GPU's 270 ms attention share per chunk, so the kernel needs about another 3-5x (bias on the core,
 fewer exps per chunk) before it can win.
+
+### Bias on the core (2026-11-24)
+
+The host no longer computes bias scores. Per core the A fifo now carries the header (plus a per-row sink offset
+at byte 512), six Q blocks, one bf16 basis-row element (48 rows x 16), then one 1 KB bf16 table slice per chunk
+(`slice[z][j] = log2e * Bias[dmax - j][z]`, zero outside [0, extent)). The core forms the 48 x 16 bias tile with
+shuffle_down plus mac (about 3 macs per shuffle) and writes it in accumulator lane order, so the rest of the chunk is
+unchanged. Per-core stream per chunk drops from 3 KB to 1.5 KB.
+
+Window probe, same data: rel 0.00902 (gate 0.01), 0.70 ms per 128-token pass of 4 kv heads (was 0.57 ms with host bias;
+the bias product costs about 0.13 ms). Host CPU cost of bias for a 4K chunk window visit (about 1.6 GMAC) is gone.
+
+Where the time goes (ablations, window, mc=80): removing exp2 entirely saves 0.11 ms; making the A fifo depth 2
+changes nothing; bandwidth is about 7 GB/s. So the remaining about 0.6 ms (7-8 us per 16-key chunk) is neither
+exp, bandwidth nor prefetch. Next to measure: the QK/PV mac chains and per-chunk acquire/release overhead (try 32-key
+chunks to halve it). Note a_q cannot simply be shrunk to 6 blocks: it broke accuracy (rel 0.078) in an experiment.
