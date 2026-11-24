@@ -1296,6 +1296,7 @@ constexpr int kSparseLocal = 16;
 constexpr int kSparseTop = 192;
 constexpr bool kGroupBound = false;
 constexpr int kListCap = kSparseSink + kSparseLocal + kSparseTop + 4;
+constexpr int kSortCap = 256;  // power of two >= kListCap
 constexpr int kBlockKeys = 64;
 constexpr int kMaxSparseBlocks = 4096;
 constexpr std::uint32_t kSparseAutoContext = 65536;
@@ -1868,8 +1869,35 @@ __global__ void SelectBlocks(const float* q, const __half* kmm, const int* pos0,
   for (int b = local_start + threadIdx.x; b <= last_blk; b += blockDim.x)
     push(b);
   __syncthreads();
+  // push() order follows atomicAdd scheduling, and the list order decides the
+  // split each block lands in and so the summation order. Sort the list so
+  // the result does not depend on thread timing (or on the batch it runs in).
+  static_assert(kListCap <= kSortCap, "block list must fit the sort buffer");
+  __shared__ int sorted[kSortCap];
+  const int count = min(taken, kListCap);
+  for (int i = threadIdx.x; i < kSortCap; i += blockDim.x)
+    sorted[i] = i < count ? out[i] : 0x7fffffff;
+  __syncthreads();
+  for (int k = 2; k <= kSortCap; k <<= 1) {
+    for (int j = k >> 1; j > 0; j >>= 1) {
+      for (int i = threadIdx.x; i < kSortCap; i += blockDim.x) {
+        const int l = i ^ j;
+        if (l > i) {
+          const int a = sorted[i];
+          const int b = sorted[l];
+          if (((i & k) == 0) == (a > b)) {
+            sorted[i] = b;
+            sorted[l] = a;
+          }
+        }
+      }
+      __syncthreads();
+    }
+  }
+  for (int i = threadIdx.x; i < count; i += blockDim.x)
+    out[i] = sorted[i];
   if (threadIdx.x == 0)
-    bcount[tile * nh + h] = min(taken, kListCap);
+    bcount[tile * nh + h] = count;
 }
 
 __global__ void FlashCombine(const float* pm, const float* pl, const float* po,

@@ -115,26 +115,6 @@ public:
   [[nodiscard]] bool LoadDrafter(const std::string& path,
                                  std::string* error_msg = nullptr);
   [[nodiscard]] bool HasDrafter() const noexcept;
-  /// Appends one token to each of 1..kMaxDecodeBatch sessions in one forward
-  /// pass: the rows share every weight read, while each row keeps its own
-  /// cache, convolution history, position and drafter features. All sessions
-  /// must belong to this model and share one context size. Afterwards each
-  /// session's Logits() / Argmax() hold its own next-token distribution.
-  static constexpr std::uint32_t kMaxDecodeBatch = 8;
-  [[nodiscard]] bool DecodeBatch(std::span<Session* const> sessions,
-                                 std::span<const std::int32_t> tokens,
-                                 std::string* error_msg = nullptr);
-  /// One forward pass for 1..kMaxDecodeBatch sessions and 1..kMaxVerifyRows
-  /// tokens each (rows[b] for sessions[b], concatenated in `tokens`). Each
-  /// session's rows are appended at consecutive positions after its own
-  /// position. Afterwards Logits(row) / Argmax(row) of each session hold its
-  /// rows (row i after its i-th token) and its position advanced by rows[b].
-  /// Used for batched speculative verification; call KeepRows(keep) per
-  /// session to drop unaccepted rows.
-  [[nodiscard]] bool StepBatch(std::span<Session* const> sessions,
-                               std::span<const std::uint32_t> rows,
-                               std::span<const std::int32_t> tokens,
-                               std::string* error_msg = nullptr);
   [[nodiscard]] const Config& config() const noexcept;
   [[nodiscard]] std::size_t ResidentBytes() const noexcept;
 
