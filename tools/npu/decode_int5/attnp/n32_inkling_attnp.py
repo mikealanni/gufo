@@ -42,6 +42,7 @@ def design(m, k, n, mc):
         lw = f"mm_{m}x{k}x{n}.o"
         attn_begin = external_func("attn_begin_p", inputs=[B_l1_ty], link_with=lw)
         attn_q = external_func("attn_q_p", inputs=[B_l1_ty, np.int32], link_with=lw)
+        attn_r = external_func("attn_r_p", inputs=[B_l1_ty], link_with=lw)
         attn_bias = external_func("attn_bias_p", inputs=[B_l1_ty, np.int32], link_with=lw)
         attn_feed = external_func("attn_feed_p", inputs=[B_chunk_ty], link_with=lw)
         attn_out = external_func("attn_out", inputs=[C_l1_ty, np.int32], link_with=lw)
@@ -101,11 +102,13 @@ def design(m, k, n, mc):
                             e = B_l2l1[row][col].acquire(ObjectFifoPort.Consume, 1)
                             attn_q(e, arith.index_cast(T.i32(), qi))
                             B_l2l1[row][col].release(ObjectFifoPort.Consume, 1)
+                        e = B_l2l1[row][col].acquire(ObjectFifoPort.Consume, 1)
+                        attn_r(e)
+                        B_l2l1[row][col].release(ObjectFifoPort.Consume, 1)
                         for fi in range_(feeds):
-                            for bi in range_(2):
-                                e = B_l2l1[row][col].acquire(ObjectFifoPort.Consume, 1)
-                                attn_bias(e, arith.index_cast(T.i32(), bi))
-                                B_l2l1[row][col].release(ObjectFifoPort.Consume, 1)
+                            e = B_l2l1[row][col].acquire(ObjectFifoPort.Consume, 1)
+                            attn_bias(e, arith.index_cast(T.i32(), fi))
+                            B_l2l1[row][col].release(ObjectFifoPort.Consume, 1)
                             e = BC[row].acquire(ObjectFifoPort.Consume, 1)
                             attn_feed(e)
                             BC[row].release(ObjectFifoPort.Consume, 1)
@@ -114,7 +117,7 @@ def design(m, k, n, mc):
                             attn_out(o, arith.index_cast(T.i32(), oi))
                             C_l1l2[row][col].release(ObjectFifoPort.Produce, 1)
 
-        prefix_units = 1 + Q_ELEMS + 2 * mc
+        prefix_units = 1 + Q_ELEMS + 1 + mc
         PREFIX_COL = prefix_units * ROWS * BQ
         b_total = mc * CHUNK
         c_per_col = OUT_ELEMS * ROWS * CB

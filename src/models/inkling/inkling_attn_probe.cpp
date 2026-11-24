@@ -31,6 +31,13 @@ constexpr int Q_ELEMS = 6, OUT_ELEMS = 26;
 constexpr size_t QUARTER = BQ;
 constexpr size_t CHUNK = 3 * ROWS * QUARTER;
 
+uint16_t Bf16(float v) {
+  uint32_t u;
+  std::memcpy(&u, &v, 4);
+  u += 0x7FFFu + ((u >> 16) & 1u);
+  return static_cast<uint16_t>(u >> 16);
+}
+
 void EncGroup(const float* v, uint8_t* out) {
   unsigned max_exp = 0;
   for (int i = 0; i < 8; ++i) {
@@ -321,7 +328,7 @@ int main(int argc, char** argv) {
   }
 
   // Build A and B buffers per pass (4 kv heads each).
-  const size_t prefix_units = static_cast<size_t>(7) + 2 * mc;
+  const size_t prefix_units = static_cast<size_t>(8) + mc;
   const size_t PREFIX_COL = prefix_units * ROWS * QUARTER;
   const size_t c_bytes = static_cast<size_t>(8) * OUT_ELEMS * 4 * CB;
   size_t b_bytes = static_cast<size_t>(mc) * CHUNK;
@@ -402,6 +409,7 @@ int main(int argc, char** argv) {
         std::memcpy(unit(0), h, sizeof h);
         float* mrow = reinterpret_cast<float*>(unit(0) + 128);
         float* ilrow = reinterpret_cast<float*>(unit(0) + 128 + 192);
+        float* srow = reinterpret_cast<float*>(unit(0) + 128 + 384);
         std::vector<uint8_t> qb(6 * QUARTER, 0);
         for (int rb = 0; rb < 6; ++rb) {
           for (int ks = 0; ks < 16; ++ks) {
@@ -438,30 +446,25 @@ int main(int argc, char** argv) {
           }
           mrow[i] = static_cast<float>(mx * LOG2E);
           ilrow[i] = static_cast<float>(std::exp2(-mx * LOG2E));
+          srow[i] = static_cast<float>(sf(t, head) * LOG2E);
+        }
+        {
+          std::vector<uint16_t> rb16(48 * 16);
+          for (int i = 0; i < 48; ++i)
+            for (int z = 0; z < NREL; ++z)
+              rb16[i * 16 + z] = Bf16(rf(c * 16 + i / HPK, qbase + i % HPK, z));
+          std::memcpy(unit(7), rb16.data(), rb16.size() * 2);
         }
         for (int q = 0; q < mc; ++q) {
-          std::vector<float> bs(6 * 2 * 64, 0.0f);
-          for (int i = 0; i < 48; ++i) {
-            const int head = qbase + i % HPK;
-            const int t = c * 16 + i / HPK;
-            const int abs_t = pos0 + t;
-            for (int k = 0; k < 16; ++k) {
-              const int dist = abs_t - (key0 + q * 16 + k);
-              double b = 0;
+          std::vector<uint16_t> sl(16 * 32, 0);
+          const int d0 = pos0 + c * 16 - (key0 + q * 16);
+          for (int z = 0; z < NREL; ++z)
+            for (int j = 0; j < 31; ++j) {
+              const int dist = d0 + 15 - j;
               if (dist >= 0 && dist < EXTENT)
-                for (int z = 0; z < NREL; ++z)
-                  b += static_cast<double>(Bias[(size_t)dist * NREL + z]) *
-                       rf(t, head, z);
-              const float v =
-                  dist < 0
-                      ? -1000.0f
-                      : static_cast<float>(b * LOG2E - sf(t, head) * LOG2E);
-              const int rb = i / 8, lane = (i % 8) * 8 + (k & 7);
-              bs[(rb * 2 + (k >> 3)) * 64 + lane] = v;
+                sl[z * 32 + j] = Bf16(Bias[(size_t)dist * NREL + z] * LOG2E);
             }
-          }
-          std::memcpy(unit(7 + 2 * q), bs.data(), QUARTER);
-          std::memcpy(unit(7 + 2 * q + 1), bs.data() + QUARTER / 4, QUARTER);
+          std::memcpy(unit(8 + q), sl.data(), sl.size() * 2);
         }
       }
     }

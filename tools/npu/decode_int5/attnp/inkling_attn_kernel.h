@@ -32,7 +32,9 @@ static float *const a_l = (float *)(arena + 1280);     // 6*64 floats
 static float *const a_bias = (float *)(arena + 2816);  // 6*2*64 floats = 3072 B
 static float *const a_o = (float *)(arena + 5888);     // 6*16*64 floats = 24576 B
 static uint8_t *const a_chunk = (uint8_t *)(arena + 30464); // 4608 B
-// total 35072 < 40448
+static bfloat16 *const a_r = (bfloat16 *)(arena + 35072);     // 48 rows x 16 basis
+static bfloat16 *const a_slice = (bfloat16 *)(arena + 36608); // 16 basis x 32 shifts
+// total 37632 < 40448
 
 static int a_pos = 0, a_n = 0, a_chunk_idx = 0;
 static int a_qhi = 0, a_win = 0, a_key0 = 0;
@@ -102,9 +104,10 @@ __attribute__((noinline)) static void AttnBegin(const uint8_t *hdr) {
   a_chunk_idx = 0;
   const float *mrow = (const float *)(hdr + 128);
   const float *ilrow = (const float *)(hdr + 128 + 192);
+  const float *srow = (const float *)(hdr + 128 + 384);
   for (int i = 0; i < 48; i++) {
     const int tok = i / kAttnHeads;
-    a_m[i] = mrow[i];
+    a_m[i] = mrow[i] + srow[i];
     a_il[i] = ilrow[i];
     a_pp[i] = tok < a_n ? a_pos + tok : -1;
     a_hi[i] = a_pp[i];
@@ -124,9 +127,33 @@ __attribute__((noinline)) static void AttnQ(const uint8_t *pB, int idx) {
   CopyBytes(dst, pB, 1536);
 }
 
+__attribute__((noinline)) static void AttnR(const uint8_t *pB) { CopyBytes((uint8_t *)a_r, pB, 1536); }
+
+// Bias scores of one 16-key chunk, from the basis rows (a_r) and the shifted table slice:
+// slice[z][j] = log2e * Bias[dmax - j][z], so token tok sees keys 0..15 at j = 15 - tok + k.
 __attribute__((noinline)) static void AttnBias(const uint8_t *pB, int idx) {
-  uint8_t *dst = (uint8_t *)a_bias + idx * 1536;
-  CopyBytes(dst, pB, 1536);
+  CopyBytes((uint8_t *)a_slice, pB, 1024);
+  for (int tok = 0; tok < kAttnTokens; tok++) {
+    aie::accum<accfloat, 16> acc0 = aie::zeros<accfloat, 16>();
+    aie::accum<accfloat, 16> acc1 = aie::zeros<accfloat, 16>();
+    aie::accum<accfloat, 16> acc2 = aie::zeros<accfloat, 16>();
+    for (int z = 0; z < 16; z++) {
+      const aie::vector<bfloat16, 32> v = aie::load_v<32>(a_slice + z * 32);
+      const aie::vector<bfloat16, 16> sh = aie::shuffle_down(v, 15 - tok).template extract<16>(0);
+      acc0 = aie::mac(acc0, sh, a_r[(tok * 3 + 0) * 16 + z]);
+      acc1 = aie::mac(acc1, sh, a_r[(tok * 3 + 1) * 16 + z]);
+      acc2 = aie::mac(acc2, sh, a_r[(tok * 3 + 2) * 16 + z]);
+    }
+    const aie::vector<float, 16> o[3] = {acc0.template to_vector<float>(),
+                                         acc1.template to_vector<float>(),
+                                         acc2.template to_vector<float>()};
+    for (int h = 0; h < 3; h++) {
+      const int i = tok * 3 + h;
+      float *dst = a_bias + (i / 8) * 128 + (i % 8) * 8;
+      aie::store_v(dst, o[h].template extract<8>(0));
+      aie::store_v(dst + 64, o[h].template extract<8>(1));
+    }
+  }
 }
 
 static const uint8_t *a_kvp = a_chunk;
