@@ -265,3 +265,19 @@ the a_q buffer shrunk, which broke accuracy), memtile staging depth 3, 4 and 6 (
 failed"), 32-key chunks (core memory full: 9 KB K/V x2 does not fit beside the 37 KB arena and 9 KB Q buffer).
 Idea not built: the four cores of one column receive identical bias slices (4x redundant A traffic); a shared
 broadcast stream needs a third shim channel per column and the 4 K/V rows already use the spare ones.
+
+### Real-data run and overlap budget (2026-11-24)
+
+Real dump (layer 1, window, pos 4096, 128 rows, 24 heads, text input, production UD-Q4_K_XL; the dump hook needs
+`gufo_inkling_gpu_check <gguf> 1` with `INKLING_BENCH=4224 INKLING_BENCH_FILE=<text>`; the probe now reads the leading
+rows of a larger ring dump): relative rms 0.0044, max abs 0.13, 0.69 ms per pass.
+The norm-derived static bound flags 31.4% of rows as unsafe (max gap 30 log2, so the 2^-30 underflow is real). The kernel
+therefore needs either an exact per-row max (a GPU QK pass) or online-softmax rescaling before it can run on real data
+without a fallback path.
+
+Budget in the engine's two-bank NPU prefill (estimates, not measured on the NPU): the q/gate/k/v/o projections already use
+the NPU, about 210 GFLOP per 4K bank-layer, roughly 10 ms of the roughly 42 ms the GPU needs per visit. A window visit costs
+the NPU kernel about 45 ms and saves the GPU about 3-5 ms. Full visits cost the NPU about 6x a window visit at 8K depth and
+the GPU about 75 ms. Offloading attention therefore saves 1-2% of prefill at best, before the context switches between the
+projection and attention programs and the roughly 15% expert slowdown under NPU traffic. Not worth engine integration
+until the kernel is several times faster and has a bound that needs no fallback.

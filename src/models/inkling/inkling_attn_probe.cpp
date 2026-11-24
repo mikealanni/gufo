@@ -85,14 +85,14 @@ std::vector<T> LoadBin(const std::string& path, size_t count) {
     std::exit(2);
   }
   const std::streamoff size = f.tellg();
-  if (size != static_cast<std::streamoff>(count * sizeof(T))) {
+  if (size < static_cast<std::streamoff>(count * sizeof(T))) {
     std::printf("%s: expected %zu bytes, got %lld\n", path.c_str(),
                 count * sizeof(T), static_cast<long long>(size));
     std::exit(2);
   }
   f.seekg(0);
   std::vector<T> v(count);
-  f.read(reinterpret_cast<char*>(v.data()), size);
+  f.read(reinterpret_cast<char*>(v.data()), count * sizeof(T));
   return v;
 }
 
