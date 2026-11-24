@@ -182,6 +182,42 @@ A change that wins at 4K and loses at 8K is not done.
 4. **M4, speed:** tune dispatch count (about 0.15 to 0.3 us per instruction-stream op and ~3 ms per
    context switch; one hardware context for GEMM and attention if possible), report the table.
 
-Open questions for the agent to settle and write down: row packing for 3 query heads; where the
-bias product runs (matrix unit vs vector unit); static bound vs online softmax; whether K/V bfp16
-copies can be written by the existing GPU encode kernels or need a new one.
+## 11. Implementation status
+
+M1 is complete. One 16-token query block x 3 q heads is packed as 48 real rows of 64 (six row
+blocks) per kv head. Four kv heads run per pass, so two passes cover all eight. Bias scores are
+computed on the host in the log2 domain and streamed through the A fifo as two 1,536-byte elements
+per 16-token kv chunk. The sink is one constant zero logit: the host supplies both the per-row
+bound `M_row` and `exp2(-M_row)`, and the kernel seeds one lane per row with the sink mass.
+`Exp2Accurate` replaces the XDNA2 elementary `exp2` for logits; the hardware result was off by
+about 4% at `s = -1.2929`. K/V stay in block-float form for the PV matmul.
+
+`gufo_inkling_attn_probe` compares the NPU path with the fp64 CPU reference. On the current
+artifacts (`M=16 K=N=2048`, `mc=8` for a window, `mc=80` for full and ring):
+
+| mode | relative rms | max abs | tokens |
+| --- | --- | --- | --- |
+| window | 0.00888 | 0.02801 | 128 |
+| full | 0.00912 | 0.00496 | 1,280 |
+| ring | 0.00902 | 0.00371 | 1,228 |
+
+All three meet the `1e-2` M1/M2 correctness gate. The probe also checks tau-scaled inputs, keys
+past `E`, and cross-boundary ring windows.
+
+M2 is partial. Real q/r/sink/K/V dumps are still not measured. `LayerAttn` now has a dump hook
+controlled by `INKLING_ATTN_DUMP_DIR`, `INKLING_ATTN_DUMP_LAYER` and `INKLING_ATTN_DUMP_POS`; it
+writes `Q.bin`, `R.bin`, `S.bin`, `Bias.bin`, `K.bin` and `V.bin` in the probe's layout. The probe
+reads them when `INKLING_ATTN_DUMP_DIR` is set. The local full-visit artifact used for probing is
+the loop variant, which the current loader rejects, so the dump hook has not yet been exercised on
+an accepted artifact.
+
+The static bound uses the exact per-row maximum of the full logits in the probe. The separate
+norm-derived bound used for the fallback estimate is too loose on synthetic data: 49.1% of window
+rows, 99.1% of full rows and 98.8% of ring rows are flagged. Real-data fallback rate is still
+required before choosing static-bound fallback over online softmax.
+
+Settled open questions: pack 3 q heads into 48 rows; run the bias product on the host instead of
+the matrix unit; keep the static bound for M1/M2 but keep the fallback decision open until real
+data is measured; K/V encode for the engine path is still pending.
+
+Not done: M2 real-data fallback rate, M3 engine integration, and M4 speed table.

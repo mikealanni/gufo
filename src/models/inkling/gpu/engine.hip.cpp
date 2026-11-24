@@ -1020,6 +1020,26 @@ __global__ void StoreKv(const float* k, const float* v, __half* kc, __half* vc,
   }
 }
 
+float HalfToFloat(uint16_t h) { return __half2float(__ushort_as_half(h)); }
+
+uint16_t FloatToBf16(float f) {
+  uint32_t u;
+  std::memcpy(&u, &f, sizeof u);
+  u += 0x7FFFU + ((u >> 16U) & 1U);
+  return static_cast<uint16_t>(u >> 16U);
+}
+
+template<typename T>
+void WriteDump(const std::string& path, const std::vector<T>& v) {
+  FILE* f = std::fopen(path.c_str(), "wb");
+  if (f == nullptr) {
+    std::fprintf(stderr, "inkling: cannot write %s\n", path.c_str());
+    std::abort();
+  }
+  std::fwrite(v.data(), sizeof(T), v.size(), f);
+  std::fclose(f);
+}
+
 struct AttnArgs {
   int nh, nkv, hd, nrel, extent, window, ring, vblocks;
   const int* pos0;
@@ -3920,6 +3940,88 @@ struct Session::Impl : Scratch {
                             kNpuSlice, kNpuSlice, 0, false, stream);
   }
 
+  void DumpAttn(std::uint32_t p, int n, const float* q, const float* r,
+                const float* sink, const Slot& sl) {
+    static const char* const dir = std::getenv("INKLING_ATTN_DUMP_DIR");
+    static const int layer =
+        std::getenv("INKLING_ATTN_DUMP_LAYER") != nullptr
+            ? std::atoi(std::getenv("INKLING_ATTN_DUMP_LAYER"))
+            : -1;
+    static const int pos = std::getenv("INKLING_ATTN_DUMP_POS") != nullptr
+                               ? std::atoi(std::getenv("INKLING_ATTN_DUMP_POS"))
+                               : -1;
+    static bool dumped = false;
+    constexpr int kDumpRows = 128;
+    if (dir == nullptr || dumped || layer < 0 || pos < 0 ||
+        p != static_cast<std::uint32_t>(layer) ||
+        pos_base != static_cast<std::uint32_t>(pos) || n < kDumpRows)
+      return;
+    dumped = true;
+    HIP_OK(hipStreamSynchronize(stream));
+    const Config& c = m->config;
+    const int nh = c.num_heads, nkv = c.num_kv, hd = c.head_dim;
+    const int nrel = c.relative_length;
+    const int cache_rows =
+        sl.ring > 0 ? sl.ring
+                    : std::min<int>(static_cast<int>(pos_base) + kDumpRows,
+                                    sl.vblocks * 64);
+    const int nb = (cache_rows + 63) / 64;
+    std::vector<float> dump_q(static_cast<std::size_t>(kDumpRows) * nh * hd);
+    std::vector<float> dump_r(static_cast<std::size_t>(kDumpRows) * nh * nrel);
+    std::vector<float> dump_s(static_cast<std::size_t>(kDumpRows) * nh);
+    std::vector<uint16_t> dump_k(static_cast<std::size_t>(cache_rows) * nkv *
+                                 hd);
+    std::vector<uint16_t> dump_vb(static_cast<std::size_t>(nkv) * nb * hd * 64);
+    std::vector<uint16_t> dump_v(static_cast<std::size_t>(cache_rows) * nkv *
+                                 hd);
+    HIP_OK(
+        hipMemcpy(dump_q.data(), q, dump_q.size() * 4, hipMemcpyDeviceToHost));
+    HIP_OK(
+        hipMemcpy(dump_r.data(), r, dump_r.size() * 4, hipMemcpyDeviceToHost));
+    HIP_OK(hipMemcpy(dump_s.data(), sink, dump_s.size() * 4,
+                     hipMemcpyDeviceToHost));
+    HIP_OK(hipMemcpy(dump_k.data(), sl.k, dump_k.size() * 2,
+                     hipMemcpyDeviceToHost));
+    for (int g = 0; g < nkv; ++g)
+      HIP_OK(hipMemcpy(
+          dump_vb.data() + static_cast<std::size_t>(g) * nb * hd * 64,
+          sl.v + static_cast<std::size_t>(g) * sl.vblocks * hd * 64,
+          static_cast<std::size_t>(nb) * hd * 64 * 2, hipMemcpyDeviceToHost));
+    const Tensor& tb = m->T(m->P(p, "attn_rel_bias.weight.h"));
+    const std::size_t bias_count =
+        static_cast<std::size_t>(tb.rows) * tb.row_bytes / 2;
+    std::vector<uint16_t> hb(bias_count);
+    HIP_OK(hipMemcpy(hb.data(), tb.dev, bias_count * 2, hipMemcpyDeviceToHost));
+    std::vector<float> bias(bias_count);
+    for (std::size_t i = 0; i < bias_count; ++i)
+      bias[i] = HalfToFloat(hb[i]);
+    std::vector<uint16_t> vk(dump_k.size()), vv(dump_v.size());
+    for (std::size_t i = 0; i < dump_k.size(); ++i)
+      vk[i] = FloatToBf16(HalfToFloat(dump_k[i]));
+    for (int j = 0; j < cache_rows; ++j) {
+      const int slot = sl.ring > 0 ? j % sl.ring : j;
+      for (int g = 0; g < nkv; ++g) {
+        for (int d = 0; d < hd; ++d) {
+          const std::size_t src =
+              (static_cast<std::size_t>(g) * nb + (slot >> 6)) * hd * 64 +
+              static_cast<std::size_t>(d) * 64 + (slot & 63);
+          vv[(static_cast<std::size_t>(j) * nkv + g) * hd + d] =
+              FloatToBf16(HalfToFloat(dump_vb[src]));
+        }
+      }
+    }
+    const std::string root(dir);
+    WriteDump(root + "/Q.bin", dump_q);
+    WriteDump(root + "/R.bin", dump_r);
+    WriteDump(root + "/S.bin", dump_s);
+    WriteDump(root + "/Bias.bin", bias);
+    WriteDump(root + "/K.bin", vk);
+    WriteDump(root + "/V.bin", vv);
+    std::fprintf(stderr,
+                 "inkling: dumped attn layer %u pos %u rows %d keys %d\n", p,
+                 pos_base, kDumpRows, cache_rows);
+  }
+
   // stage 2: q/k/v/gate/rel/sink projections (GPU or NPU)
   void LayerQkvBegin(LayerCtx& L) {
     const Config& c = m->config;
@@ -4085,6 +4187,7 @@ struct Session::Impl : Scratch {
     }
     StoreKv<<<n, 256, 0, stream>>>(k, vtmp, sl.k, sl.v, nkv * hd, d_pos,
                                    sl.ring, sl.vblocks);
+    DumpAttn(p, n, q, r, sink, sl);
     AttnArgs aa{nh,
                 nkv,
                 hd,
