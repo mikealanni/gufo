@@ -280,7 +280,8 @@ int main(int argc, char** argv) {
                 static_cast<double>(a->SnapshotBytes()) / 1e6);
     const auto generate = [&](gufo::models::inkling::gpu::Session& s) {
       std::vector<std::int32_t> out;
-      for (int i = 0; i < 48; ++i) {
+      // long enough to read past the restored position's first key tiles
+      for (int i = 0; i < 240; ++i) {
         const std::int32_t t = argmax_of(s);
         out.push_back(t);
         (void)s.Append(std::span(&t, 1), &err);
@@ -303,7 +304,30 @@ int main(int argc, char** argv) {
     std::printf("restore into advanced session: %s, tokens %s\n",
                 ok_a ? "ok" : "FAILED",
                 first == third ? "IDENTICAL" : "DIFFERENT");
-    return first == second && first == third && ok_a && ok_b ? 0 : 1;
+    // a session that last held a different, longer conversation, as a
+    // server slot does when a cached prompt comes back later
+    auto c = model->CreateSession(ctx, &err);
+    {
+      const int other_len =
+          std::min<int>(prefix_len * 2, static_cast<int>(ids.size()) - 7000);
+      std::vector<std::int32_t> other;
+      for (int i = 0; i < other_len; ++i)
+        other.push_back(static_cast<std::int32_t>(ids[7000 + i]));
+      for (int off = 0; off < other_len; off += 8192)
+        (void)c->Append(
+            std::span(other).subspan(off, std::min(8192, other_len - off)),
+            &err);
+    }
+    const bool ok_c = c->RestoreSnapshot(*snapshot, &err);
+    const auto fourth = generate(*c);
+    std::printf(
+        "restore into session that held a longer conversation: %s, "
+        "tokens %s\n",
+        ok_c ? "ok" : "FAILED", first == fourth ? "IDENTICAL" : "DIFFERENT");
+    return first == second && first == third && first == fourth && ok_a &&
+                   ok_b && ok_c
+               ? 0
+               : 1;
   }
   if (argc >= 4 && std::string(argv[2]) == "--vtime") {
     // --vtime <text file> <k>: time of a k-row verify and a single step at

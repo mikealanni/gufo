@@ -2828,6 +2828,39 @@ struct Session::Impl : Scratch {
     allocs.push_back(p);
     return static_cast<float*>(p);
   }
+  // After a restore, zero the cache rows past `pos` in the full-attention
+  // slots. Attention reads whole key/value tiles and relies on rows past the
+  // position being zero (as in a fresh session); a session reused from a
+  // longer conversation still holds that conversation's rows there.
+  void ClearPast(std::uint32_t pos) {
+    const Config& c = m->config;
+    const std::size_t kv = static_cast<std::size_t>(c.num_kv) * c.head_dim;
+    for (auto& sl : slots) {
+      if (sl.ring > 0)
+        continue;
+      const std::size_t rows_total = static_cast<std::size_t>(sl.vblocks) * 64;
+      const std::size_t rows = std::min<std::size_t>(pos, rows_total);
+      if (rows < rows_total)
+        HIP_OK(hipMemsetAsync(sl.k + rows * kv, 0, (rows_total - rows) * kv * 2,
+                              stream));
+      const std::size_t nb = (rows + 63) / 64;
+      if (nb < static_cast<std::size_t>(sl.vblocks)) {
+        for (int g = 0; g < c.num_kv; ++g)
+          HIP_OK(hipMemsetAsync(
+              sl.v + (static_cast<std::size_t>(g) * sl.vblocks + nb) * 128 * 64,
+              0, (sl.vblocks - nb) * 128 * 64 * 2, stream));
+      }
+      if (sl.kmm != nullptr) {
+        const std::size_t total = ctx / kBlockKeys + 2;
+        const std::size_t blocks =
+            std::min<std::size_t>(pos / kBlockKeys + 2, total);
+        if (blocks < total)
+          HIP_OK(hipMemsetAsync(sl.kmm + blocks * c.num_kv * 2 * kFlashHd, 0,
+                                (total - blocks) * c.num_kv * 2 * kFlashHd * 2,
+                                stream));
+      }
+    }
+  }
   void* AllocBytes(std::size_t bytes) {
     void* p = nullptr;
     HIP_OK(hipMalloc(&p, bytes));
@@ -4443,6 +4476,7 @@ bool Session::RestoreSnapshot(const SessionSnapshot& snapshot,
   HIP_OK(hipMemcpyAsync(i.d_logits, d.logits.data(),
                         d.logits.size() * sizeof(float), hipMemcpyHostToDevice,
                         i.stream));
+  i.ClearPast(d.position);
   HIP_OK(hipStreamSynchronize(i.stream));
   i.position = d.position;
   i.dwarmed = d.dwarmed;
@@ -4549,6 +4583,7 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
   HIP_OK(hipMemcpyAsync(i.d_logits, payload.data() + sizeof(header),
                         vocab * sizeof(float), hipMemcpyHostToDevice,
                         i.stream));
+  i.ClearPast(header.position);
   HIP_OK(hipStreamSynchronize(i.stream));
   i.position = header.position;
   i.dwarmed = header.dwarmed;
