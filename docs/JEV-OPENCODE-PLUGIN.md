@@ -229,7 +229,8 @@ All must pass before Phase 0 is considered done.
 1. **Classification parity.** A script `tools/jev/opencode-plugin/test/parity.ts`
    loads a JSON list of `{cmd, verdict}` (generated from the opencode database
    with `tools/jev/guard.py`'s `classify`; the repo does not contain the data, a
-   local copy exists at `~/dflash-train/guard_cmds.json`, 42,570 commands) and
+   build it with `tools/jev/opencode-plugin/test/make_guard_cmds.py`, which writes
+   `~/.gufo/jev-data/guard_cmds.json`, about 36,000 distinct commands) and
    compares the TypeScript `classify` result. Target: at least 99.5% identical
    verdicts, and zero cases where Python says `heavy` and TypeScript says
    `light`. List every disagreement in the output.
@@ -324,7 +325,7 @@ because the file-plugin revision is keyed by target string, not content hash).
   `kairic-remote` (provider ids as of the spike; `kairic-direct` was renamed `local-gufo` afterwards).
   Default `JEV_GUFO_PROVIDERS` should be `local-gufo,kairic-remote` until
   the config says otherwise.
-- **Parity data:** `~/dflash-train/guard_cmds.json` exists, 42,570 rows,
+- **Parity data:** `~/.gufo/jev-data/guard_cmds.json` (rebuilt by `make_guard_cmds.py`), about 36,000 rows,
   keys `{cmd, dur, sid, script_heavy, verdict}` — ready for the parity test.
 - **Bash tool args (live):** `tool.execute.before` fires with `tool:
   "shell"` — **not `"bash"`** (fix Section 1's `tool === "bash"` check to

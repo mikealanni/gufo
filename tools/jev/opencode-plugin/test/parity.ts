@@ -8,7 +8,8 @@ import { homedir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { classify } from "../classify.ts";
 
-const dataPath = join(homedir(), "dflash-train", "guard_cmds.json");
+// Built by make_guard_cmds.py from the opencode database; private text, so not in git.
+const dataPath = process.env.JEV_PARITY_DATA ?? join(homedir(), ".gufo", "jev-data", "guard_cmds.json");
 const data = JSON.parse(readFileSync(dataPath, "utf8")) as Array<{ cmd: string; verdict: string }>;
 
 const pyScript = `
@@ -16,7 +17,7 @@ import json, importlib.util
 spec = importlib.util.spec_from_file_location("g", "/home/majed/gufo/tools/jev/guard.py")
 g = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(g)
-d = json.load(open("/home/majed/dflash-train/guard_cmds.json"))
+d = json.load(open(${JSON.stringify(dataPath)}))
 print(json.dumps([g.classify(r["cmd"])[0] for r in d]))
 `;
 writeFileSync("/tmp/jev-parity-fresh.py", pyScript);
