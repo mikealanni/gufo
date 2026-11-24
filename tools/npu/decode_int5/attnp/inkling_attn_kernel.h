@@ -70,10 +70,23 @@ static inline float Exp2Accurate(float x) {
   return p * s.f;
 }
 
-static inline aie::vector<bfloat16, 64> Exp2Wide(const aie::vector<float, 64> &a) {
-  aie::vector<float, 64> r;
-  for (int i = 0; i < 64; ++i) r[i] = Exp2Accurate(a[i]);
-  return aie::accum<accfloat, 64>(r).to_vector<bfloat16>();
+__attribute__((noinline)) static aie::vector<bfloat16, 64> Exp2Wide(const aie::vector<float, 64> &a) {
+  const aie::vector<float, 64> x = aie::max(a, aie::broadcast<float, 64>(-100.0f));
+  const aie::vector<int32, 64> n = aie::to_fixed<int32>(x, 0);
+  const aie::vector<float, 64> f = aie::sub(x, aie::to_float(n, 0));
+  const aie::vector<bfloat16, 64> fb = aie::accum<accfloat, 64>(f).to_vector<bfloat16>();
+  aie::vector<bfloat16, 64> t = aie::broadcast<bfloat16, 64>((bfloat16)0.0013333558146428443f);
+  const float cs[5] = {0.009618129107628477f, 0.05550410866482158f, 0.2402265069591007f,
+                       0.6931471805599453f, 1.0f};
+  for (int i = 0; i < 5; i++) {
+    aie::accum<accfloat, 64> acc(aie::broadcast<float, 64>(cs[i]));
+    acc = aie::mac(acc, t, fb);
+    t = acc.template to_vector<bfloat16>();
+  }
+  const aie::vector<int32, 64> eb = aie::upshift(aie::add(n, aie::broadcast<int32, 64>(127)), 23);
+  const aie::vector<bfloat16, 64> sb =
+      aie::accum<accfloat, 64>(eb.cast_to<float>()).to_vector<bfloat16>();
+  return aie::mul(t, sb).template to_vector<bfloat16>();
 }
 
 // hdr: int32[0]=pos, [1]=n, [2]=qhi, [3]=win, [4]=key0; float[32..79]=M rows;

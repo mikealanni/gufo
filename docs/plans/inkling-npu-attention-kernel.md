@@ -221,3 +221,15 @@ the matrix unit; keep the static bound for M1/M2 but keep the fallback decision 
 data is measured; K/V encode for the engine path is still pending.
 
 Not done: M2 real-data fallback rate, M3 engine integration, and M4 speed table.
+
+### Exp2 speedup (2026-11-24)
+
+The scalar `Exp2Accurate` loop made the kernel about 120 times too slow (68.8 ms per 128-token pass at a
+1,024-key window). `Exp2Wide` is now vectorized: round x to the nearest integer n, evaluate a degree-5
+polynomial of the remainder in [-0.5, 0.5] with bf16 operands and fp32 accumulate, and multiply by 2^n built from
+the float exponent bits. The hardware `exp2<bfloat16>` on the remainder alone gives rel 0.023 and is not usable;
+fp32 vector multiplies crash the core (run state 8). Result on the same probe: window 0.00897 rel, full 0.00909,
+ring unchanged in kind, 0.57 ms per 128-token pass of 4 kv heads (one pass of two), i.e. about 1.15 ms per 128 tokens
+for all 8 kv heads, or about 37 ms per 4K-token chunk per window visit. Over 40 window visits plus 8 full visits that
+is still more than the GPU's 270 ms attention share per chunk, so the kernel needs about another 3-5x (bias on the core,
+fewer exps per chunk) before it can win.
