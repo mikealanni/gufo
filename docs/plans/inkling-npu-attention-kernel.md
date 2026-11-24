@@ -249,3 +249,19 @@ Where the time goes (ablations, window, mc=80): removing exp2 entirely saves 0.1
 changes nothing; bandwidth is about 7 GB/s. So the remaining about 0.6 ms (7-8 us per 16-key chunk) is neither
 exp, bandwidth nor prefetch. Next to measure: the QK/PV mac chains and per-chunk acquire/release overhead (try 32-key
 chunks to halve it). Note a_q cannot simply be shrunk to 6 blocks: it broke accuracy (rel 0.078) in an experiment.
+
+### Kernel speed ablations (2026-11-24, window mc=80, 128-token pass of 4 kv heads)
+
+| variant | ms |
+| --- | --- |
+| committed kernel | 0.70 |
+| `AttnChunk` (scores, exp2, PV) disabled | 0.39 |
+| `AttnChunk` and bias disabled (data movement only) | 0.326 |
+| same, mc=40 | 0.197 |
+
+Data movement alone costs 3.2 us per 16-key chunk plus 0.07 ms fixed, and it adds to the compute (3.9 us scores/exp/PV,
+1.6 us bias) instead of overlapping with it. Tried and rejected: A-fifo depth 2 on the core (no change; also needs
+the a_q buffer shrunk, which broke accuracy), memtile staging depth 3, 4 and 6 (aiecc "Resource allocation pipeline
+failed"), 32-key chunks (core memory full: 9 KB K/V x2 does not fit beside the 37 KB arena and 9 KB Q buffer).
+Idea not built: the four cores of one column receive identical bias slices (4x redundant A traffic); a shared
+broadcast stream needs a third shim channel per column and the 4 K/V rows already use the spare ones.
