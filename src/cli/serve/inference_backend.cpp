@@ -4327,6 +4327,9 @@ public:
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
                 .multi_token_decode = draft_width_ > 0,
+                .batched_multi_token_decode = draft_width_ > 0,
+                .batched_multi_token_decode_max_width =
+                    draft_width_ > 0 ? InklingModel::kMaxDecodeBatch : 0,
                 .prefix_reuse = true,
                 .prefill_grid_tokens = 8192,
             },
@@ -4354,7 +4357,24 @@ public:
   [[nodiscard]] bool ToolsHandledByTemplate() const override { return true; }
 
   [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
-    return {{.kind = TextExecutionPlanKind::kSerial, .physical_width = 1}};
+    std::vector<TextExecutionPlan> plans{
+        {
+            .kind = TextExecutionPlanKind::kSerial,
+            .physical_width = 1,
+        },
+    };
+    // Inkling engine rows for separate conversations share one forward pass:
+    // the weights are read once and each row keeps its own cache, positions
+    // and histories. With a drafter, DecodeBatch verifies every lane's draft
+    // in that same pass.
+    for (std::size_t width = 2; width <= InklingModel::kMaxDecodeBatch;
+         ++width) {
+      plans.push_back({
+          .kind = TextExecutionPlanKind::kBatched,
+          .physical_width = width,
+      });
+    }
+    return plans;
   }
 
   [[nodiscard]] std::shared_ptr<const sampling::ConstraintVocabulary>
@@ -4508,6 +4528,84 @@ public:
     inkling.translator.Feed(tokenizer_->DecodeToken(token));
   }
 
+  /// Plain decode for several conversations in one forward pass. The
+  /// scheduler has already sampled each lane's token; this appends them
+  /// together, so the model reads every weight once for all lanes.
+  void AdvanceBatch(std::span<const TextRunnerAdvance> advances) const override {
+    if (advances.size() < 2 ||
+        advances.size() > InklingModel::kMaxDecodeBatch) {
+      TextModelRunner::AdvanceBatch(advances);
+      return;
+    }
+    struct Lane {
+      const TextRunnerAdvance* advance;
+      InklingTextRunnerState* inkling;
+      std::int32_t input;
+    };
+    std::vector<Lane> lanes;
+    lanes.reserve(advances.size());
+    for (const auto& advance : advances) {
+      try {
+        auto& inkling = RequireInklingState(advance.state.get());
+        const std::int32_t input =
+            InklingEngineTokens({&advance.token, 1}).front();
+        lanes.push_back({&advance, &inkling, input});
+      } catch (...) {
+        if (advance.failure == nullptr)
+          throw;
+        *advance.failure = std::current_exception();
+      }
+    }
+    if (lanes.size() < 2) {
+      AdvanceLanesIndividually(lanes);
+      return;
+    }
+    std::vector<InklingSession*> sessions;
+    std::vector<std::int32_t> inputs;
+    sessions.reserve(lanes.size());
+    inputs.reserve(lanes.size());
+    for (const auto& lane : lanes) {
+      sessions.push_back(&lane.inkling->session());
+      inputs.push_back(lane.input);
+    }
+    std::string error;
+    if (!model_->DecodeBatch(sessions, inputs, &error)) {
+      // Validation runs before any state changes, so falling back lane by
+      // lane here cannot double-append.
+      if (std::getenv("INKLING_BATCH_DEBUG") != nullptr)
+        std::fprintf(stderr, "[inkling-batch] rejected %zu lanes: %s\n",
+                     lanes.size(), error.c_str());
+      AdvanceLanesIndividually(lanes);
+      return;
+    }
+    for (const auto& lane : lanes) {
+      lane.inkling->set_position(lane.inkling->position() + 1);
+      lane.inkling->translator.Feed(
+          tokenizer_->DecodeToken(lane.advance->token));
+    }
+  }
+
+  template <typename LaneRange>
+  void AdvanceLanesIndividually(const LaneRange& lanes) const {
+    for (const auto& lane : lanes) {
+      try {
+        Advance(*lane.inkling, lane.advance->token);
+      } catch (const std::exception& e) {
+        if (std::getenv("INKLING_BATCH_DEBUG") != nullptr)
+          std::fprintf(stderr, "[inkling-batch] lane failed: %s\n", e.what());
+        if (lane.advance->failure == nullptr)
+          throw;
+        *lane.advance->failure = std::current_exception();
+      } catch (...) {
+        if (std::getenv("INKLING_BATCH_DEBUG") != nullptr)
+          std::fprintf(stderr, "[inkling-batch] lane failed: unknown\n");
+        if (lane.advance->failure == nullptr)
+          throw;
+        *lane.advance->failure = std::current_exception();
+      }
+    }
+  }
+
   [[nodiscard]] std::optional<TextDecodeSelection> PreviewFirstToken(
       TextRunnerState& state, sampling::SamplerState& sampler) const override {
     return SelectNext(state, sampler);
@@ -4596,6 +4694,176 @@ public:
     inkling.draft_yield +=
         kYieldSmoothing * (static_cast<double>(kept) - inkling.draft_yield);
     return step;
+  }
+
+  /// Speculative decode for several conversations: each lane drafts on its
+  /// own, then every lane's anchor + draft rows are verified in one forward
+  /// pass. Lane decisions (plain vs drafted, sampling, acceptance) mirror
+  /// DecodeStep exactly, so a batched lane emits what it would alone.
+  [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
+      std::span<const TextRunnerDecode> decodes) const override {
+    if (draft_width_ == 0 || decodes.size() < 2 ||
+        decodes.size() > InklingModel::kMaxDecodeBatch)
+      return TextModelRunner::DecodeBatch(decodes);
+    struct Lane {
+      std::size_t index;
+      InklingTextRunnerState* inkling;
+      sampling::SamplerState* sampler;
+      std::optional<sampling::SamplerState> working;  // drafted lanes only
+      std::optional<TextDecodeSelection> plain;       // plain lanes only
+      std::vector<std::int32_t> block;
+    };
+    std::vector<TextDecodeStep> steps(decodes.size());
+    std::vector<Lane> lanes;
+    lanes.reserve(decodes.size());
+    for (std::size_t i = 0; i < decodes.size(); ++i) {
+      try {
+        auto& inkling = RequireInklingState(decodes[i].state.get());
+        auto& sampler = decodes[i].sampler.get();
+        const std::size_t max_tokens = decodes[i].max_tokens;
+        if (max_tokens == 0)
+          throw std::invalid_argument(
+              "text runner decode step budget must be at least one token");
+        const auto plain_lane = [&]() {
+          auto selection = SelectNext(inkling, sampler);
+          if (selection.stop) {
+            steps[i].stop = true;
+            return;
+          }
+          const std::int32_t input =
+              InklingEngineTokens({&selection.token, 1}).front();
+          lanes.push_back({i, &inkling, &sampler, std::nullopt,
+                           std::move(selection), {input}});
+        };
+        if (max_tokens < 2 || inkling.position() + 2 > max_context_) {
+          plain_lane();
+          continue;
+        }
+        if (inkling.draft_yield < kMinDraftYield &&
+            ++inkling.plain_steps % kProbeInterval != 0) {
+          plain_lane();
+          continue;
+        }
+        std::size_t width = std::min<std::size_t>(
+            {draft_width_, max_tokens - 1,
+             max_context_ - inkling.position() - 1});
+        auto& session = inkling.session();
+        sampling::SamplerState working = sampler;
+        std::int32_t anchor = session.Argmax();
+        if (!working.CanSelectArgmax(static_cast<sampling::TokenId>(anchor)))
+          anchor = static_cast<std::int32_t>(working.Sample(session.Logits()));
+        if (IsStop(anchor)) {
+          steps[i].stop = true;
+          continue;
+        }
+        std::vector<std::int32_t> block(width + 1, anchor);
+        std::vector<float> confidence(width);
+        if (!session.Draft(anchor, {block.data() + 1, width}, confidence,
+                           kDraftConfidence)) {
+          plain_lane();
+          continue;
+        }
+        std::size_t keep = 0;
+        while (keep < width && confidence[keep] >= kDraftConfidence)
+          ++keep;
+        if (keep == 0) {
+          inkling.draft_yield += kYieldSmoothing * (1.0 - inkling.draft_yield);
+          plain_lane();
+          continue;
+        }
+        block.resize(keep + 1);
+        lanes.push_back({i, &inkling, &sampler, std::move(working),
+                         std::nullopt, std::move(block)});
+      } catch (...) {
+        steps[i].failure = std::current_exception();
+      }
+    }
+    if (lanes.empty())
+      return steps;
+
+    std::string error;
+    bool ok = true;
+    if (lanes.size() == 1) {
+      ok = lanes[0].inkling->session().AppendAll(lanes[0].block, &error);
+    } else {
+      std::vector<InklingSession*> sessions;
+      std::vector<std::uint32_t> rows;
+      std::vector<std::int32_t> tokens;
+      for (const auto& lane : lanes) {
+        sessions.push_back(&lane.inkling->session());
+        rows.push_back(static_cast<std::uint32_t>(lane.block.size()));
+        tokens.insert(tokens.end(), lane.block.begin(), lane.block.end());
+      }
+      ok = model_->StepBatch(sessions, rows, tokens, &error);
+    }
+    if (!ok) {
+      if (std::getenv("INKLING_BATCH_DEBUG") != nullptr)
+        std::fprintf(stderr, "[inkling-batch] verify batch of %zu failed: %s\n",
+                     lanes.size(), error.c_str());
+      for (auto& lane : lanes) {
+        lane.inkling->Invalidate();
+        steps[lane.index].failure = std::make_exception_ptr(
+            std::runtime_error("Inkling batched verification failed: " + error));
+      }
+      return steps;
+    }
+
+    for (auto& lane : lanes) {
+      auto& step = steps[lane.index];
+      auto& inkling = *lane.inkling;
+      step.execution_plan = {
+          .kind = lanes.size() > 1 ? TextExecutionPlanKind::kBatched
+                                   : TextExecutionPlanKind::kSerial,
+          .physical_width = lanes.size(),
+      };
+      if (lane.plain) {
+        inkling.set_position(inkling.position() + 1);
+        inkling.translator.Feed(tokenizer_->DecodeToken(lane.block[0]));
+        step.selections.push_back(std::move(*lane.plain));
+        continue;
+      }
+      auto& session = inkling.session();
+      auto& working = *lane.working;
+      const std::size_t width = lane.block.size() - 1;
+      const std::int32_t anchor = lane.block[0];
+      step.selections.push_back(
+          {.stop = false,
+           .token = static_cast<TextRunnerToken>(anchor),
+           .piece = inkling.translator.Feed(tokenizer_->DecodeToken(anchor))});
+      working.Accept(static_cast<sampling::TokenId>(anchor));
+      std::size_t kept = 1;
+      bool stopped = false;
+      for (std::size_t r = 0; r < width; ++r) {
+        const auto row = static_cast<std::uint32_t>(r);
+        std::int32_t sampled = session.Argmax(row);
+        if (!working.CanSelectArgmax(static_cast<sampling::TokenId>(sampled)))
+          sampled = static_cast<std::int32_t>(working.Sample(session.Logits(row)));
+        if (sampled != lane.block[r + 1]) {
+          stopped = IsStop(sampled);
+          break;
+        }
+        if (IsStop(sampled)) {
+          stopped = true;
+          break;
+        }
+        step.selections.push_back(
+            {.stop = false,
+             .token = static_cast<TextRunnerToken>(sampled),
+             .piece = inkling.translator.Feed(tokenizer_->DecodeToken(sampled))});
+        working.Accept(static_cast<sampling::TokenId>(sampled));
+        ++kept;
+      }
+      session.KeepRows(static_cast<std::uint32_t>(kept));
+      inkling.set_position(inkling.position() + kept);
+      lane.sampler->CopyDrawStateFrom(working);
+      step.stop = stopped;
+      step.draft_rounds = 1;
+      step.draft_tokens = width;
+      step.draft_accepted_tokens = kept - 1;
+      inkling.draft_yield +=
+          kYieldSmoothing * (static_cast<double>(kept) - inkling.draft_yield);
+    }
+    return steps;
   }
 
   [[nodiscard]] std::size_t SnapshotPayloadBytes(
