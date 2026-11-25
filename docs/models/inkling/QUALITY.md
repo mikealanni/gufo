@@ -94,3 +94,26 @@ Method: `gufo_inkling_gpu_check <gguf> --windows <text> 48 1024 <out.bin>` write
 last-token logits of 48 windows; `tools/bench/inkling_kl.py base.bin test.bin` reports KL
 and top-1 agreement.
 
+
+### GPTQ feasibility for the int4 experts (2026-11-24)
+
+The fast profile's error is almost all the rounding of the int4 gate/up weights (gate/up alone
+KL 0.016 of the 0.019; activations about 0.001, fp16 blocks 0.002; the error is spread evenly over all
+24 layers, so exempting layers does not help). Check on layer 12, expert 71 (rows 2,304, K 2,304; NVFP4
+weights, Hadamard-rotated, per-128 scales exactly as the repack), plain rounding against GPTQ with the
+expert's own input Hessian in the rotated basis, error measured on held-out tokens:
+
+| calibration tokens | damping | RTN output error | GPTQ output error |
+| --- | --- | --- | --- |
+| 6,300 | 0.01 | 0.0774 | 0.0571 |
+| 7,550 | 0.01 | 0.0777 | 0.0529 |
+| 7,550 | 0.05 | 0.0777 | 0.0522 |
+| 7,550 | 0.20 | 0.0777 | 0.0521 |
+
+Output error falls by about a third, so the squared error (which KL follows) falls by about 55%:
+gate/up KL should go from 0.016 to about 0.007, and the fast profile from 0.019 to about 0.011, with no
+change to the kernel or its speed (the codes and scales are produced offline). Held-out error is still
+well above the train error (0.043), so a larger calibration set helps; rare experts see few tokens and
+would need stronger damping or plain rounding. Cost: a calibration pass over text that captures each
+expert's inputs, one Hessian and Cholesky per expert matrix (6,144 matrices over 24 layers), a blocked
+GPTQ solve on the GPU, and a cached repack artifact. The numpy reference takes about 4 s per matrix.
