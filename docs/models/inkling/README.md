@@ -35,6 +35,16 @@ forces it).
   rows (two token banks, the NPU hides behind the other bank's experts). Needs
   the fabric clock held and a binary named `gufo*`. `INKLING_NPU_PARTS` (bit mask
   1 q, 2 gate, 4 k, 8 v) and `INKLING_NPU_OUT=0` narrow it.
+- **Fast profile (opt-in, lossy).** `INKLING_IU4=1` runs the routed gate/up experts
+  on rotated symmetric int4 matrix cores (integer WMMA); `INKLING_IU4=2` runs the
+  down projection on them too; `INKLING_F16_BLOCKS=1` keeps the prefill block states
+  as FP16. The NVFP4 experts are repacked to int4 at first use of each layer
+  (about 28 ms per layer, one-off), so the int4 copy costs extra memory (about
+  340 MB per layer for gate/up, 190 MB for down; one copy per model, shared by all
+  sessions). It applies to prefill batches of 32 rows
+  or more and is off by default because it changes outputs, see
+  [QUALITY.md](QUALITY.md). `INKLING_IU4_WCLIP=0` and `INKLING_IU4_ACLIP=<x>` tune the
+  scale choice, `INKLING_IU4_SKIP=<layers>` keeps listed physical layers on NVFP4.
 - **Expert layers 20 to 23.** They are Q8_0 in the GGUF and are converted to NVFP4
   at load (`INKLING_EXPERT_NVFP4=0` keeps Q8_0). See [QUALITY.md](QUALITY.md).
 - **Expert pruning** (`INKLING_PRUNE=<share>`, default off) skips routed experts
@@ -69,7 +79,7 @@ at about 13 s per token; the GPU engine matches it to about four digits.
 
 ## Planned
 
-- Prefill attention on the NPU (attention is 23 to 27% of GPU time at 8K): the full task
-  description for a kernel and its engine hook is
+- Prefill attention on the NPU (attention is
+  23 to 27% of GPU time at 8K): the full task description for a kernel and its engine hook is
   [../../plans/inkling-npu-attention-kernel.md](../../plans/inkling-npu-attention-kernel.md).
-
+- Per-32 activation scales for the int4 fast profile (quality), see [QUALITY.md](QUALITY.md).

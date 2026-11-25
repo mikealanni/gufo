@@ -8,14 +8,16 @@ cache); decode is `gufo serve` over HTTP with `--think off`, 400-token (short) o
 ## Prefill
 
 Measured 2026-11-23 (`gufo_inkling_gpu_check`, `INKLING_BENCH=<n>`, warm, three
-repeats, greedy text, fabric clock held).
+repeats, greedy text). The default profile is lossless against the engine before
+these changes. The fast profile is opt-in (`INKLING_IU4=2 INKLING_F16_BLOCKS=1`) and
+changes outputs, see [QUALITY.md](QUALITY.md).
 
-| Prompt | GPU only | GPU + NPU |
-| --- | --- | --- |
-| 2k | 2,065 | below the NPU batch |
-| 4k | 2,144 | 2,342 |
-| 8k | 2,075 | 2,382 |
-| 16k | 1,930 | 2,170 |
+| Prompt | Default GPU only | Default GPU + NPU | Fast GPU only | Fast GPU + NPU |
+| --- | --- | --- | --- | --- |
+| 2k | 2,065 | below the NPU batch | 2,499 | below the NPU batch |
+| 4k | 2,144 | 2,342 | 2,580 | 2,737 |
+| 8k | 2,075 | 2,382 | 2,466 | 2,822 |
+| 16k | 1,930 | 2,170 | 2,254 | 2,516 |
 
 Run-to-run spread is about 1% when nothing else uses the machine; background load
 costs more. The 32k and 128k rows of the earlier table (1,536 to 1,689 and about

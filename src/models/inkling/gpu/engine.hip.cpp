@@ -1,4 +1,5 @@
 #include "src/models/inkling/gpu/engine.hpp"
+#include "src/models/inkling/gpu/iu4_experts.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -9,6 +10,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <fstream>
+#include <map>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -16,6 +20,7 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/core/hip/weight_upload.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "src/models/inkling/gpu/gptq.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/npu_gemm.hpp"
 
 namespace gufo::models::inkling::gpu {
@@ -661,15 +666,42 @@ __global__ void FixHist(const HistEntry* entries, int keep) {
 struct StatePtrs {
   const float* p[kMaxStates];
   int count;
+  bool half_blocks;  ///< the block states are FP16 rows (cur is always F32)
 };
+
+__device__ __forceinline__ float4 StateRow4(const void* row, bool half,
+                                            int i) {
+  if (!half)
+    return reinterpret_cast<const float4*>(row)[i];
+  const uint2 u = reinterpret_cast<const uint2*>(row)[i];
+  const float2 a = __half22float2(__builtin_bit_cast(__half2, u.x));
+  const float2 b = __half22float2(__builtin_bit_cast(__half2, u.y));
+  return make_float4(a.x, a.y, b.x, b.y);
+}
+
+__device__ __forceinline__ float StateAt(const void* row, bool half, int i) {
+  return half ? __half2float(reinterpret_cast<const __half*>(row)[i])
+              : reinterpret_cast<const float*>(row)[i];
+}
+
+__device__ __forceinline__ const void* StateRowPtr(const StatePtrs& blocks,
+                                                   const float* cur, int s,
+                                                   std::size_t t, int h) {
+  if (s == blocks.count)
+    return cur + t * h;
+  return blocks.half_blocks
+             ? static_cast<const void*>(
+                   reinterpret_cast<const __half*>(blocks.p[s]) + t * h)
+             : static_cast<const void*>(blocks.p[s] + t * h);
+}
 
 // Norm and query scores of every state of one token in a single pass over the
 // row (128-bit loads, all states accumulated together, one cross-wave
 // reduction): inv[s] = 1 / rms(state s), score[q][s] = state . query[q] *
 // inv[s] / sqrt(h). The block is 256 threads.
-__device__ void MixScores(const float* const* st, int ns, const float* query,
-                          int nq, int h, float* inv, float (*score)[kMaxStates],
-                          float* sred) {
+__device__ void MixScores(const void* const* st, int ns, bool half_blocks,
+                          const float* query, int nq, int h, float* inv,
+                          float (*score)[kMaxStates], float* sred) {
   constexpr int kAcc = 5 * kMaxStates;
   float acc[kAcc];
 #pragma unroll
@@ -686,7 +718,7 @@ __device__ void MixScores(const float* const* st, int ns, const float* query,
 #pragma unroll
     for (int s = 0; s < kMaxStates; ++s) {
       if (s < ns) {
-        const float4 v = reinterpret_cast<const float4*>(st[s])[i];
+        const float4 v = StateRow4(st[s], half_blocks && s < ns - 1, i);
         acc[s * 5] += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
 #pragma unroll
         for (int q = 0; q < 4; ++q) {
@@ -795,11 +827,10 @@ __global__ void MixBig(StatePtrs blocks, const float* cur, const float* query,
   __shared__ float score[4][kMaxStates];
   const int t = blockIdx.x;
   const int ns = blocks.count + 1;
-  const float* st[kMaxStates];
-  for (int s = 0; s < blocks.count; ++s)
-    st[s] = blocks.p[s] + static_cast<std::size_t>(t) * h;
-  st[blocks.count] = cur + static_cast<std::size_t>(t) * h;
-  MixScores(st, ns, query, nq, h, inv, score, sred);
+  const void* st[kMaxStates];
+  for (int s = 0; s < ns; ++s)
+    st[s] = StateRowPtr(blocks, cur, s, t, h);
+  MixScores(st, ns, blocks.half_blocks, query, nq, h, inv, score, sred);
   for (int q = 0; q < nq; ++q) {
     float mx = -1e30F;
     for (int s = 0; s < ns; ++s)
@@ -813,7 +844,8 @@ __global__ void MixBig(StatePtrs blocks, const float* cur, const float* query,
     for (int i = threadIdx.x; i < h; i += blockDim.x) {
       float a = 0.0F;
       for (int s = 0; s < ns; ++s)
-        a += e[s] / den * st[s][i] * inv[s];
+        a += e[s] / den * StateAt(st[s], blocks.half_blocks && s < ns - 1, i) *
+             inv[s];
       out[(static_cast<std::size_t>(q) * n + t) * h + i] = a;
     }
   }
@@ -836,11 +868,10 @@ __global__ void MixRms(StatePtrs blocks, const float* cur, const float* query,
   __shared__ float rsum[256];
   const int t = blockIdx.x;
   const int ns = blocks.count + 1;
-  const float* st[kMaxStates];
-  for (int s = 0; s < blocks.count; ++s)
-    st[s] = blocks.p[s] + static_cast<std::size_t>(t) * h;
-  st[blocks.count] = cur + static_cast<std::size_t>(t) * h;
-  MixScores(st, ns, query, nq, h, inv, score, sred);
+  const void* st[kMaxStates];
+  for (int s = 0; s < ns; ++s)
+    st[s] = StateRowPtr(blocks, cur, s, t, h);
+  MixScores(st, ns, blocks.half_blocks, query, nq, h, inv, score, sred);
   for (int q = 0; q < nq; ++q) {
     float mx = -1e30F;
     for (int s = 0; s < ns; ++s)
@@ -855,7 +886,8 @@ __global__ void MixRms(StatePtrs blocks, const float* cur, const float* query,
     for (int i = threadIdx.x; i < h; i += blockDim.x) {
       float a = 0.0F;
       for (int s = 0; s < ns; ++s)
-        a += e[s] / den * st[s][i] * inv[s];
+        a += e[s] / den * StateAt(st[s], blocks.half_blocks && s < ns - 1, i) *
+             inv[s];
       mixbuf[q * h + i] = a;
       ss += a * a;
     }
@@ -989,6 +1021,26 @@ __global__ void StoreKv(const float* k, const float* v, __half* kc, __half* vc,
        (r & 63)] =
         __float2half(v[static_cast<std::size_t>(blockIdx.x) * dim + i]);
   }
+}
+
+float HalfToFloat(uint16_t h) { return __half2float(__ushort_as_half(h)); }
+
+uint16_t FloatToBf16(float f) {
+  uint32_t u;
+  std::memcpy(&u, &f, sizeof u);
+  u += 0x7FFFU + ((u >> 16U) & 1U);
+  return static_cast<uint16_t>(u >> 16U);
+}
+
+template<typename T>
+void WriteDump(const std::string& path, const std::vector<T>& v) {
+  FILE* f = std::fopen(path.c_str(), "wb");
+  if (f == nullptr) {
+    std::fprintf(stderr, "inkling: cannot write %s\n", path.c_str());
+    std::abort();
+  }
+  std::fwrite(v.data(), sizeof(T), v.size(), f);
+  std::fclose(f);
 }
 
 struct AttnArgs {
@@ -1163,7 +1215,7 @@ __global__ void Situ(const float* gu, const int* group, const float* scale,
 
 __global__ void CountExperts(const int* ids, int items, unsigned int* counts) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < items)
+  if (i < items && ids[i] >= 0)
     atomicAdd(&counts[ids[i]], 1U);
 }
 
@@ -1199,17 +1251,112 @@ __global__ void SituHalfIn(const __half* gu, __half* act, int ff, float beta,
   }
 }
 
-// Sums the split-K slices in a fixed order.
-__global__ void SplitKReduce(const float* part, float* y, std::size_t count,
-                             int slices) {
-  const std::size_t i =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i >= count)
-    return;
-  float a = part[i];
-  for (int z = 1; z < slices; ++z)
-    a += part[static_cast<std::size_t>(z) * count + i];
-  y[i] = a;
+// ---- int4 emulation (INKLING_IU4_EMU): rotated symmetric int4 numerics run
+// through the existing f16 routed GEMM -------------------------------------
+__device__ __forceinline__ float EmuUe4m3(unsigned b) {
+  const unsigned e = (b >> 3) & 15U, m = b & 7U;
+  if (b == 0x7F)
+    return 0.0F;
+  return e == 0 ? static_cast<float>(m) * (1.0F / 512.0F)
+                : (1.0F + static_cast<float>(m) * 0.125F) *
+                      exp2f(static_cast<float>(e) - 7.0F);
+}
+
+// y = R v with R = D2 H D1 / 16 over one 256 block held in LDS.
+__device__ __forceinline__ void EmuRot256(float* v, const float* s1,
+                                          const float* s2) {
+  const int t = threadIdx.x;
+  v[t] *= s1[t];
+  for (int len = 1; len < 256; len <<= 1) {
+    __syncthreads();
+    if (t < 128) {
+      const int i = (t / len) * 2 * len + (t % len);
+      const float a = v[i], b = v[i + len];
+      v[i] = a + b;
+      v[i + len] = a - b;
+    }
+  }
+  __syncthreads();
+  v[t] *= s2[t] * (1.0F / 16.0F);
+  __syncthreads();
+}
+
+// NVFP4 gate/up rows -> rotated symmetric int4 (per-128 scale) as Q8Rep rows.
+__global__ void EmuWeights(const std::uint8_t* src, std::uint8_t* dst, int k,
+                           std::size_t src_row_bytes,
+                           std::size_t dst_row_bytes, const float* s1,
+                           const float* s2, bool quant) {
+  __shared__ float v[256];
+  __shared__ float red[2][8];
+  const std::size_t row = blockIdx.x;
+  const std::uint8_t* sr = src + row * src_row_bytes;
+  std::uint8_t* dr = dst + row * dst_row_bytes;
+  const int t = threadIdx.x;
+  constexpr float kMags[8] = {0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F};
+  for (int kb = 0; kb < k / 256; ++kb) {
+    const int j = kb * 8 + t / 32;
+    const int p = t % 32;
+    const int byte = (p < 8) ? p : (p < 16) ? p - 8 : (p < 24) ? 8 + p - 16
+                                                              : 8 + p - 24;
+    const unsigned raw = sr[j * 16 + byte];
+    const unsigned nb = (p < 8 || (p >= 16 && p < 24)) ? (raw & 15U) : (raw >> 4);
+    const float mag = kMags[nb & 7U];
+    const float sc = EmuUe4m3(sr[k / 2 + j * 2 + p / 16]);
+    v[t] = ((nb & 8U) ? -mag : mag) * sc;
+    __syncthreads();
+    EmuRot256(v, s1, s2);
+    float a = fabsf(v[t]);
+    for (int o = 16; o > 0; o >>= 1)
+      a = fmaxf(a, __shfl_xor(a, o));
+    if ((t & 31) == 0)
+      red[t / 128][(t / 32) % 4] = a;
+    __syncthreads();
+    const int g = t / 128;
+    const float amax =
+        fmaxf(fmaxf(red[g][0], red[g][1]), fmaxf(red[g][2], red[g][3]));
+    const float s = __half2float(__float2half(amax / 7.0F));
+    float q = s > 0.0F ? fminf(7.0F, fmaxf(-8.0F, rintf(v[t] / s))) : 0.0F;
+    if (!quant)
+      q = fminf(127.0F, fmaxf(-128.0F, rintf(v[t] * (127.0F / fmaxf(amax, 1e-30F)))));
+    dr[kb * 256 + t] = static_cast<std::uint8_t>(static_cast<std::int8_t>(q));
+    if ((t & 31) == 0) {
+      const __half hs = __float2half(quant ? s : amax / 127.0F);
+      std::memcpy(dr + k + j * 2, &hs, 2);
+    }
+    __syncthreads();
+  }
+}
+
+// Fake-quantize activations: rotate each 256 block, per-32 scale, round to
+// int4, return the rotated dequantized values.
+__global__ void EmuActs(const __half* x, __half* out, int h, const float* s1,
+                        const float* s2, bool quant, bool group128) {
+  __shared__ float v[256];
+  const std::size_t tok = blockIdx.x;
+  const int t = threadIdx.x;
+  for (int kb = 0; kb < h / 256; ++kb) {
+    v[t] = __half2float(x[tok * h + kb * 256 + t]);
+    __syncthreads();
+    EmuRot256(v, s1, s2);
+    float a = fabsf(v[t]);
+    for (int o = 16; o > 0; o >>= 1)
+      a = fmaxf(a, __shfl_xor(a, o));
+    if (group128) {
+      // per-128 scale: combine the four 32-lane groups of each half
+      __shared__ float gmax[8];
+      if ((t & 31) == 0)
+        gmax[t / 32] = a;
+      __syncthreads();
+      const int g = t / 128;
+      a = fmaxf(fmaxf(gmax[g * 4], gmax[g * 4 + 1]),
+                fmaxf(gmax[g * 4 + 2], gmax[g * 4 + 3]));
+      __syncthreads();
+    }
+    const float s = __half2float(__float2half(a / 7.0F));
+    const float q = s > 0.0F ? fminf(7.0F, fmaxf(-8.0F, rintf(v[t] / s))) : 0.0F;
+    out[tok * h + kb * 256 + t] = quant ? __float2half(q * s) : __float2half(v[t]);
+    __syncthreads();
+  }
 }
 
 // Compact list of the (expert, token tile) pairs that have rows: the launch
@@ -1243,9 +1390,34 @@ __global__ void BuildTileList(const int* bounds, int ne, int bn, int* out,
   }
 }
 
+// Sums the split-K slices in a fixed order.
+__global__ void SplitKReduce(const float* part, float* y, std::size_t count,
+                             int slices) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= count)
+    return;
+  float a = part[i];
+  for (int z = 1; z < slices; ++z)
+    a += part[static_cast<std::size_t>(z) * count + i];
+  y[i] = a;
+}
+
 __global__ void SetDenseBounds(int* bounds, int n) {
   bounds[0] = 0;
   bounds[1] = n;
+}
+
+__global__ void EmuSitu(const float* gu, const int* ids, const float* es,
+                        __half* act, int ff, float beta, float lb) {
+  const int item = blockIdx.x;
+  const float sc = es != nullptr ? es[ids[item]] : 1.0F;
+  for (int j = threadIdx.x; j < ff; j += blockDim.x) {
+    const float g = gu[static_cast<std::size_t>(item) * 2 * ff + j] * sc;
+    const float u = gu[static_cast<std::size_t>(item) * 2 * ff + ff + j] * sc;
+    act[static_cast<std::size_t>(item) * ff + j] =
+        __float2half(beta * tanhf(g / beta) * Sigmoid(g) * lb * tanhf(u / lb));
+  }
 }
 
 __global__ void CombineHalf(const __half* y, const float* wts, float* out,
@@ -1255,6 +1427,8 @@ __global__ void CombineHalf(const __half* y, const float* wts, float* out,
     float a[8] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
     for (int k = 0; k < nu; ++k) {
       const float w = wts[blockIdx.x * nu + k];
+      if (w == 0.0F)
+        continue;
       const uint4 raw = reinterpret_cast<const uint4*>(
           y + (static_cast<std::size_t>(blockIdx.x) * nu + k) * h)[i];
       const __half2* pr = reinterpret_cast<const __half2*>(&raw);
@@ -2339,6 +2513,24 @@ struct ModelState {
       2048};  // rows of the runtime-M program = rows of one bank
   std::unordered_map<std::string, std::vector<int>>
       npu_w;  // tensor -> 1024-row slices
+  // Rotated int4 copies of the routed experts (INKLING_IU4), built at first use
+  // and shared by every session of the model.
+  std::mutex iu4_mutex;
+  std::vector<std::pair<std::uint8_t*, std::uint16_t*>> iu4_w =
+      std::vector<std::pair<std::uint8_t*, std::uint16_t*>>(
+          64, {nullptr, nullptr});
+  std::vector<std::pair<std::uint8_t*, std::uint16_t*>> iu4_dw =
+      std::vector<std::pair<std::uint8_t*, std::uint16_t*>>(
+          64, {nullptr, nullptr});
+  float* iu4_signs{nullptr};
+  void* ModelAlloc(std::size_t bytes) {
+    void* p = nullptr;
+    HIP_OK(hipMalloc(&p, bytes));
+    HIP_OK(hipMemset(p, 0, bytes));
+    HIP_OK(hipDeviceSynchronize());  // the zeroing must land before any stream writes
+    allocations.push_back(p);
+    return p;
+  }
   ~ModelState() {
     npu.reset();
     for (void* p : allocations)
@@ -2966,10 +3158,10 @@ struct Scratch {
   int *rbounds{nullptr}, *rcursors{nullptr}, *rrows_token{nullptr},
       *rrows_slot{nullptr};
   int *sorted{nullptr}, *tiles{nullptr};
-  int *tl_a{nullptr};               ///< compact (expert, token tile) list
-  float* ksbuf{nullptr};            ///< split-K partial sums
-  int* dense_bounds_buf{nullptr};   ///< {0, n} of the dense routed GEMM
+  int *tl_a{nullptr}, *tl_b{nullptr};  ///< compact (expert, token tile) lists
+  int* dense_bounds_buf{nullptr};      ///< {0, n} of the dense routed GEMM
   int dense_bounds_n{-1};
+  float* ksbuf{nullptr};               ///< split-K partial sums
   __half *xh{nullptr}, *act16{nullptr}, *xh0{nullptr}, *xh1{nullptr},
       *xh2{nullptr}, *xhx{nullptr}, *atth{nullptr}, *cath{nullptr};
   signed char* xq{nullptr};
@@ -3216,6 +3408,22 @@ struct Session::Impl : Scratch {
                    ? std::atoi(std::getenv("INKLING_DENSE_BN"))
                    : 192};
   float* situ_params{nullptr};
+  // int4 emulation state (INKLING_IU4_EMU)
+  std::vector<void*> emu_w = std::vector<void*>(64, nullptr);
+  // rotated int4 routed gate/up path (INKLING_IU4)
+  float* iu4_signs{nullptr};  ///< the model's shared signs
+  std::uint8_t* iu4_act{nullptr};
+  float* iu4_act_scales{nullptr};
+  std::uint8_t* iu4_tok{nullptr};
+  float* iu4_tok_scales{nullptr};
+  int iu4_tok_padded{0};
+  int iu4_padded{0};
+  // down projection (INKLING_IU4=2) activations
+  std::uint8_t* iu4_act2{nullptr};
+  float* iu4_act2_scales{nullptr};
+  float* emu_signs{nullptr};
+  __half* emu_x{nullptr};
+  float* emu_gu{nullptr};
   int* dense_ident{nullptr};
   int* dense_tiles{nullptr};
   const int* DenseMaps(int n, int bn, int* ntiles) {
@@ -3429,6 +3637,7 @@ struct Session::Impl : Scratch {
     sp.count = static_cast<int>(blocks.size());
     for (std::size_t i = 0; i < blocks.size(); ++i)
       sp.p[i] = blocks[i];
+    sp.half_blocks = F16Blocks(n);
     if (n >= kWmmaMinTokens) {
       MixBig<<<n, 256, 0, stream>>>(
           sp, cur_, query, nq, static_cast<int>(m->config.hidden_size), n, out);
@@ -3443,6 +3652,7 @@ struct Session::Impl : Scratch {
     sp.count = static_cast<int>(blocks.size());
     for (std::size_t i = 0; i < blocks.size(); ++i)
       sp.p[i] = blocks[i];
+    sp.half_blocks = F16Blocks(n);
     const int hh = static_cast<int>(m->config.hidden_size);
     MixRms<<<n, 256, nq * hh * sizeof(float), stream>>>(
         sp, cur_, query, nq, hh, n, np, m->config.rms_eps);
@@ -3507,6 +3717,13 @@ struct Session::Impl : Scratch {
             : nullptr);
   }
   float* Pool() { return block_pool[pool_used++]; }
+  // Opt-in fast profile (INKLING_F16_BLOCKS=1): prefill block states live as
+  // FP16 rows, the large reads of MixBig/MixRms (logits KL ~2.7e-3).
+  static bool F16Blocks(int n) {
+    static const bool on = std::getenv("INKLING_F16_BLOCKS") != nullptr &&
+                           std::getenv("INKLING_F16_BLOCKS")[0] != '0';
+    return on && n >= kWmmaMinTokens;
+  }
 
   struct LayerCtx {
     std::uint32_t slot{0}, ip{0}, p{0};
@@ -3731,6 +3948,88 @@ struct Session::Impl : Scratch {
                             kNpuSlice, kNpuSlice, 0, false, stream);
   }
 
+  void DumpAttn(std::uint32_t p, int n, const float* q, const float* r,
+                const float* sink, const Slot& sl) {
+    static const char* const dir = std::getenv("INKLING_ATTN_DUMP_DIR");
+    static const int layer =
+        std::getenv("INKLING_ATTN_DUMP_LAYER") != nullptr
+            ? std::atoi(std::getenv("INKLING_ATTN_DUMP_LAYER"))
+            : -1;
+    static const int pos = std::getenv("INKLING_ATTN_DUMP_POS") != nullptr
+                               ? std::atoi(std::getenv("INKLING_ATTN_DUMP_POS"))
+                               : -1;
+    static bool dumped = false;
+    constexpr int kDumpRows = 128;
+    if (dir == nullptr || dumped || layer < 0 || pos < 0 ||
+        p != static_cast<std::uint32_t>(layer) ||
+        pos_base != static_cast<std::uint32_t>(pos) || n < kDumpRows)
+      return;
+    dumped = true;
+    HIP_OK(hipStreamSynchronize(stream));
+    const Config& c = m->config;
+    const int nh = c.num_heads, nkv = c.num_kv, hd = c.head_dim;
+    const int nrel = c.relative_length;
+    const int cache_rows =
+        sl.ring > 0 ? sl.ring
+                    : std::min<int>(static_cast<int>(pos_base) + kDumpRows,
+                                    sl.vblocks * 64);
+    const int nb = (cache_rows + 63) / 64;
+    std::vector<float> dump_q(static_cast<std::size_t>(kDumpRows) * nh * hd);
+    std::vector<float> dump_r(static_cast<std::size_t>(kDumpRows) * nh * nrel);
+    std::vector<float> dump_s(static_cast<std::size_t>(kDumpRows) * nh);
+    std::vector<uint16_t> dump_k(static_cast<std::size_t>(cache_rows) * nkv *
+                                 hd);
+    std::vector<uint16_t> dump_vb(static_cast<std::size_t>(nkv) * nb * hd * 64);
+    std::vector<uint16_t> dump_v(static_cast<std::size_t>(cache_rows) * nkv *
+                                 hd);
+    HIP_OK(
+        hipMemcpy(dump_q.data(), q, dump_q.size() * 4, hipMemcpyDeviceToHost));
+    HIP_OK(
+        hipMemcpy(dump_r.data(), r, dump_r.size() * 4, hipMemcpyDeviceToHost));
+    HIP_OK(hipMemcpy(dump_s.data(), sink, dump_s.size() * 4,
+                     hipMemcpyDeviceToHost));
+    HIP_OK(hipMemcpy(dump_k.data(), sl.k, dump_k.size() * 2,
+                     hipMemcpyDeviceToHost));
+    for (int g = 0; g < nkv; ++g)
+      HIP_OK(hipMemcpy(
+          dump_vb.data() + static_cast<std::size_t>(g) * nb * hd * 64,
+          sl.v + static_cast<std::size_t>(g) * sl.vblocks * hd * 64,
+          static_cast<std::size_t>(nb) * hd * 64 * 2, hipMemcpyDeviceToHost));
+    const Tensor& tb = m->T(m->P(p, "attn_rel_bias.weight.h"));
+    const std::size_t bias_count =
+        static_cast<std::size_t>(tb.rows) * tb.row_bytes / 2;
+    std::vector<uint16_t> hb(bias_count);
+    HIP_OK(hipMemcpy(hb.data(), tb.dev, bias_count * 2, hipMemcpyDeviceToHost));
+    std::vector<float> bias(bias_count);
+    for (std::size_t i = 0; i < bias_count; ++i)
+      bias[i] = HalfToFloat(hb[i]);
+    std::vector<uint16_t> vk(dump_k.size()), vv(dump_v.size());
+    for (std::size_t i = 0; i < dump_k.size(); ++i)
+      vk[i] = FloatToBf16(HalfToFloat(dump_k[i]));
+    for (int j = 0; j < cache_rows; ++j) {
+      const int slot = sl.ring > 0 ? j % sl.ring : j;
+      for (int g = 0; g < nkv; ++g) {
+        for (int d = 0; d < hd; ++d) {
+          const std::size_t src =
+              (static_cast<std::size_t>(g) * nb + (slot >> 6)) * hd * 64 +
+              static_cast<std::size_t>(d) * 64 + (slot & 63);
+          vv[(static_cast<std::size_t>(j) * nkv + g) * hd + d] =
+              FloatToBf16(HalfToFloat(dump_vb[src]));
+        }
+      }
+    }
+    const std::string root(dir);
+    WriteDump(root + "/Q.bin", dump_q);
+    WriteDump(root + "/R.bin", dump_r);
+    WriteDump(root + "/S.bin", dump_s);
+    WriteDump(root + "/Bias.bin", bias);
+    WriteDump(root + "/K.bin", vk);
+    WriteDump(root + "/V.bin", vv);
+    std::fprintf(stderr,
+                 "inkling: dumped attn layer %u pos %u rows %d keys %d\n", p,
+                 pos_base, kDumpRows, cache_rows);
+  }
+
   // stage 2: q/k/v/gate/rel/sink projections (GPU or NPU)
   void LayerQkvBegin(LayerCtx& L) {
     const Config& c = m->config;
@@ -3896,6 +4195,7 @@ struct Session::Impl : Scratch {
     }
     StoreKv<<<n, 256, 0, stream>>>(k, vtmp, sl.k, sl.v, nkv * hd, d_pos,
                                    sl.ring, sl.vblocks);
+    DumpAttn(p, n, q, r, sink, sl);
     AttnArgs aa{nh,
                 nkv,
                 hd,
@@ -4110,7 +4410,13 @@ struct Session::Impl : Scratch {
              sl.hist_attn, ffn_inp, h, n, push ? nullptr : cur);
     if (push) {
       float* b = Pool();
-      HIP_OK(hipMemcpyAsync(b, cur, nh_ * 4, hipMemcpyDeviceToDevice, stream));
+      if (F16Blocks(n)) {
+        ToHalf<<<(nh_ + 255) / 256, 256, 0, stream>>>(
+            cur, reinterpret_cast<__half*>(b), nh_);
+      } else {
+        HIP_OK(
+            hipMemcpyAsync(b, cur, nh_ * 4, hipMemcpyDeviceToDevice, stream));
+      }
       blocks.push_back(b);
     }
   }
@@ -4178,6 +4484,220 @@ struct Session::Impl : Scratch {
     LayerOut2(L, blocks);
   }
 
+  // Reads the GPTQ artifact of layer p (INKLING_GPTQ_DIR): which 0 = gate/up,
+  // 1 = down. Returns false when there is none.
+  bool LoadGptq(std::uint32_t p, int which, void* tiles, std::size_t tb,
+                void* scales, std::size_t sb) {
+    const char* dir = std::getenv("INKLING_GPTQ_DIR");
+    if (dir == nullptr)
+      return false;
+    static const int parts = std::getenv("INKLING_GPTQ_PARTS") != nullptr
+                                 ? std::atoi(std::getenv("INKLING_GPTQ_PARTS"))
+                                 : 3;
+    if (((parts >> which) & 1) == 0)
+      return false;
+    const Config& c = m->config;
+    const int h = c.hidden_size, ne = c.expert_count, ff = c.expert_ff;
+    const int rows2 = 2 * ff;
+    const int kd = (ff + 255) / 256 * 256;
+    std::ifstream in(std::string(dir) + "/layer_" + std::to_string(p) + ".gptq",
+                     std::ios::binary);
+    if (!in)
+      return false;
+    std::uint64_t hdr[8];
+    in.read(reinterpret_cast<char*>(hdr), sizeof hdr);
+    namespace iu4 = gufo::models::inkling::iu4;
+    if (!in || hdr[0] != 0x31504b4e49515447ULL ||
+        hdr[1] != static_cast<std::uint64_t>(ne) ||
+        hdr[2] != static_cast<std::uint64_t>(rows2) ||
+        hdr[3] != static_cast<std::uint64_t>(h) ||
+        hdr[4] != static_cast<std::uint64_t>(kd)) {
+      std::fprintf(stderr, "inkling: gptq artifact for layer %u does not match the model\n", p);
+      return false;
+    }
+    const std::size_t tb_gu = static_cast<std::size_t>(ne) * iu4::WeightBytesPerExpert(rows2, h);
+    const std::size_t sb_gu = static_cast<std::size_t>(ne) * iu4::ScaleBytesPerExpert(rows2, h);
+    std::size_t off = sizeof hdr;
+    if (which == 1)
+      off += tb_gu + sb_gu;
+    in.seekg(static_cast<std::streamoff>(off));
+    const auto fill = [&](void* dev, std::size_t bytes) {
+      constexpr std::size_t kChunk = std::size_t{64} << 20;
+      std::vector<char> buf(std::min(bytes, kChunk));
+      for (std::size_t o = 0; o < bytes; o += kChunk) {
+        const std::size_t n = std::min(kChunk, bytes - o);
+        in.read(buf.data(), static_cast<std::streamsize>(n));
+        HIP_OK(hipMemcpy(static_cast<char*>(dev) + o, buf.data(), n, hipMemcpyHostToDevice));
+      }
+    };
+    fill(tiles, tb);
+    fill(scales, sb);
+    return static_cast<bool>(in);
+  }
+
+  struct GptqLayer {
+    float* gu{nullptr};
+    float* dn{nullptr};
+    std::vector<std::uint64_t> cnt;
+  };
+  struct GptqState {
+    rocblas_handle blas{nullptr};
+    float* signs{nullptr};
+    float *xr_gu{nullptr}, *xr_dn{nullptr};
+    std::map<std::uint32_t, GptqLayer> layers;
+  } gq;
+  bool GptqWants(std::uint32_t p) const {
+    static const std::uint64_t mask = [] {
+      std::uint64_t v = 0;
+      if (const char* e = std::getenv("INKLING_GPTQ_CAPTURE")) {
+        const std::string str = e;
+        std::size_t pos = 0;
+        while (pos < str.size()) {
+          const std::size_t end = str.find(',', pos);
+          const int x = std::atoi(str.substr(pos, end - pos).c_str());
+          if (x >= 0 && x < 64)
+            v |= 1ULL << x;
+          if (end == std::string::npos)
+            break;
+          pos = end + 1;
+        }
+      }
+      return v;
+    }();
+    return ((mask >> p) & 1ULL) != 0;
+  }
+  void GptqCapture(std::uint32_t p, const __half* xmoe, const __half* act16) {
+    namespace gp = gufo::models::inkling::gptq;
+    const Config& c = m->config;
+    const int h = c.hidden_size, ne = c.expert_count, nu = c.expert_used,
+              ff = c.expert_ff;
+    const int kd = (ff + 255) / 256 * 256;
+    if (gq.blas == nullptr) {
+      rocblas_create_handle(&gq.blas);
+      rocblas_set_stream(gq.blas, stream);
+      float sg[512];
+      gufo::models::inkling::iu4::FillSigns(sg);
+      HIP_OK(hipMalloc(&gq.signs, sizeof(sg)));
+      HIP_OK(hipMemcpy(gq.signs, sg, sizeof(sg), hipMemcpyHostToDevice));
+      const std::size_t rows_max = static_cast<std::size_t>(kMaxBatch) * nu + ne * 16;
+      HIP_OK(hipMalloc(&gq.xr_gu, rows_max * h * 4));
+      HIP_OK(hipMalloc(&gq.xr_dn, rows_max * kd * 4));
+    }
+    rocblas_set_stream(gq.blas, stream);
+    GptqLayer& L = gq.layers[p];
+    if (L.gu == nullptr) {
+      HIP_OK(hipMalloc(&L.gu, static_cast<std::size_t>(ne) * h * h * 4));
+      HIP_OK(hipMemset(L.gu, 0, static_cast<std::size_t>(ne) * h * h * 4));
+      HIP_OK(hipMalloc(&L.dn, static_cast<std::size_t>(ne) * kd * kd * 4));
+      HIP_OK(hipMemset(L.dn, 0, static_cast<std::size_t>(ne) * kd * kd * 4));
+      L.cnt.assign(ne, 0);
+    }
+    HIP_OK(hipStreamSynchronize(stream));
+    std::vector<int> rb(ne + 1);
+    std::vector<unsigned int> rc(ne);
+    HIP_OK(hipMemcpy(rb.data(), rbounds, rb.size() * 4, hipMemcpyDeviceToHost));
+    HIP_OK(hipMemcpy(rc.data(), rcounts, rc.size() * 4, hipMemcpyDeviceToHost));
+    const int total = rb[ne];
+    gp::RotateRows(xmoe, rrows_token, rrows_slot, total, h, h, gq.xr_gu,
+                   gq.signs, stream);
+    gp::RotateRows(act16, rrows_slot, rrows_slot, total, ff, kd, gq.xr_dn,
+                   gq.signs, stream);
+    for (int e = 0; e < ne; ++e) {
+      const int rows = rb[e + 1] - rb[e];
+      if (rows <= 0)
+        continue;
+      gp::AccumulateHessian(gq.blas, gq.xr_gu + static_cast<std::size_t>(rb[e]) * h,
+                            rows, h, L.gu + static_cast<std::size_t>(e) * h * h);
+      gp::AccumulateHessian(gq.blas, gq.xr_dn + static_cast<std::size_t>(rb[e]) * kd,
+                            rows, kd, L.dn + static_cast<std::size_t>(e) * kd * kd);
+      L.cnt[e] += rc[e];
+    }
+    HIP_OK(hipStreamSynchronize(stream));
+  }
+  bool GptqFinish(const std::string& dir, std::string* error) {
+    namespace gp = gufo::models::inkling::gptq;
+    namespace iu4 = gufo::models::inkling::iu4;
+    const Config& c = m->config;
+    const int h = c.hidden_size, ne = c.expert_count, ff = c.expert_ff;
+    const int rows2 = 2 * ff;
+    const int kd = (ff + 255) / 256 * 256;
+    if (gq.blas == nullptr) {
+      if (error != nullptr)
+        *error = "nothing captured (set INKLING_GPTQ_CAPTURE and run a prefill)";
+      return false;
+    }
+    rocblas_set_stream(gq.blas, stream);
+    gp::Scratch sgu, sdn;
+    float *wgu_rot{nullptr}, *wdn_rot{nullptr};
+    if (!gp::AllocScratch(sgu, rows2, h) || !gp::AllocScratch(sdn, h, kd)) {
+      if (error != nullptr)
+        *error = "gptq scratch allocation failed";
+      return false;
+    }
+    HIP_OK(hipMalloc(&wgu_rot, static_cast<std::size_t>(rows2) * h * 4));
+    HIP_OK(hipMalloc(&wdn_rot, static_cast<std::size_t>(h) * kd * 4));
+    const std::size_t tb_gu = iu4::WeightBytesPerExpert(rows2, h);
+    const std::size_t sb_gu = iu4::ScaleBytesPerExpert(rows2, h);
+    const std::size_t tb_dn = iu4::WeightBytesPerExpert(h, kd);
+    const std::size_t sb_dn = iu4::ScaleBytesPerExpert(h, kd);
+    std::uint8_t *t_gu, *t_dn;
+    std::uint16_t *s_gu, *s_dn;
+    HIP_OK(hipMalloc(&t_gu, tb_gu * ne));
+    HIP_OK(hipMalloc(&s_gu, sb_gu * ne));
+    HIP_OK(hipMalloc(&t_dn, tb_dn * ne));
+    HIP_OK(hipMalloc(&s_dn, sb_dn * ne));
+    for (auto& [p, L] : gq.layers) {
+      const Tensor& wgu = m->T(m->P(p, "ffn_gate_up_exps.weight"));
+      const Tensor& wdn = m->T(m->P(p, "ffn_down_exps.weight"));
+      int rtn_gu = 0, rtn_dn = 0;
+      for (int e = 0; e < ne; ++e) {
+        const float damp_gu = L.cnt[e] < static_cast<std::uint64_t>(h) ? 0.2F : 0.05F;
+        const float damp_dn = L.cnt[e] < static_cast<std::uint64_t>(kd) ? 0.2F : 0.05F;
+        gp::RotateWeights(static_cast<const std::uint8_t*>(wgu.dev) +
+                              static_cast<std::size_t>(e) * rows2 * wgu.row_bytes,
+                          wgu.row_bytes, wgu_rot, rows2, h, h, gq.signs, stream);
+        if (L.cnt[e] < 64 ||
+            !gp::Quantize(gq.blas, sgu, wgu_rot,
+                          L.gu + static_cast<std::size_t>(e) * h * h, h, damp_gu,
+                          stream)) {
+          gp::QuantizeRtn(sgu, wgu_rot, stream);
+          ++rtn_gu;
+        }
+        gp::Pack(sgu, t_gu + e * tb_gu, s_gu + e * (sb_gu / 2), stream);
+        gp::RotateWeights(static_cast<const std::uint8_t*>(wdn.dev) +
+                              static_cast<std::size_t>(e) * h * wdn.row_bytes,
+                          wdn.row_bytes, wdn_rot, h, ff, kd, gq.signs, stream);
+        if (L.cnt[e] < 64 ||
+            !gp::Quantize(gq.blas, sdn, wdn_rot,
+                          L.dn + static_cast<std::size_t>(e) * kd * kd, ff,
+                          damp_dn, stream)) {
+          gp::QuantizeRtn(sdn, wdn_rot, stream);
+          ++rtn_dn;
+        }
+        gp::Pack(sdn, t_dn + e * tb_dn, s_dn + e * (sb_dn / 2), stream);
+        HIP_OK(hipStreamSynchronize(stream));
+      }
+      std::ofstream out(dir + "/layer_" + std::to_string(p) + ".gptq",
+                        std::ios::binary);
+      const std::uint64_t hdr[8] = {0x31504b4e49515447ULL, static_cast<std::uint64_t>(ne),
+                                    static_cast<std::uint64_t>(rows2), static_cast<std::uint64_t>(h),
+                                    static_cast<std::uint64_t>(kd), 0, 0, 0};
+      out.write(reinterpret_cast<const char*>(hdr), sizeof hdr);
+      const auto dump = [&](const void* dev, std::size_t bytes) {
+        std::vector<char> host(bytes);
+        HIP_OK(hipMemcpy(host.data(), dev, bytes, hipMemcpyDeviceToHost));
+        out.write(host.data(), static_cast<std::streamsize>(bytes));
+      };
+      dump(t_gu, tb_gu * ne);
+      dump(s_gu, sb_gu * ne);
+      dump(t_dn, tb_dn * ne);
+      dump(s_dn, sb_dn * ne);
+      std::fprintf(stderr, "inkling: gptq layer %u written (rtn fallback gate/up %d, down %d)\n",
+                   p, rtn_gu, rtn_dn);
+    }
+    return true;
+  }
+
   void Moe(std::uint32_t p, int n, const __half* xhx_in = nullptr) {
     const Config& c = m->config;
     const int h = c.hidden_size, ne = c.expert_count, nu = c.expert_used,
@@ -4188,11 +4708,20 @@ struct Session::Impl : Scratch {
         std::getenv("INKLING_PRUNE") != nullptr
             ? static_cast<float>(std::atof(std::getenv("INKLING_PRUNE")))
             : 0.0F;
+    static const float prune_prefill_cfg =
+        std::getenv("INKLING_PRUNE_PREFILL") != nullptr
+            ? static_cast<float>(std::atof(std::getenv("INKLING_PRUNE_PREFILL")))
+            : 0.0F;
+    const bool compact_path =
+        n >= kWmmaMinTokens &&
+        m->T(m->P(p, "ffn_gate_up_exps.weight")).type == kTypeNvfp4 &&
+        std::getenv("INKLING_OWN_EXPERTS") == nullptr;
+    const float prune_prefill = compact_path ? prune_prefill_cfg : 0.0F;
     Route<<<n, 256, 0, stream>>>(
         router,
         static_cast<const float*>(m->T(m->P(p, "exp_probs_b.bias")).dev), ne,
         nu, c.expert_weights_scale, ids, wts,
-        n < kWmmaMinTokens ? prune_tau : 0.0F);
+        n < kWmmaMinTokens ? prune_tau : prune_prefill);
     ids_flat = ids;
     const float* s_gu = m->Has(m->P(p, "ffn_gate_up_exps.scale"))
                             ? static_cast<const float*>(
@@ -4220,6 +4749,52 @@ struct Session::Impl : Scratch {
                  stream>>>(x, xh, static_cast<std::size_t>(n) * h);
         xmoe = xh;
       }
+      static const char* const dump_layer = std::getenv("INKLING_DUMP_MOE");
+      static bool dumped = false;
+      static bool dumped_out = false;
+      if (dump_layer != nullptr && !dumped &&
+          p == static_cast<std::uint32_t>(std::atoi(dump_layer)) && n >= 2048) {
+        dumped = true;
+        HIP_OK(hipStreamSynchronize(stream));
+        std::vector<int> hid(static_cast<std::size_t>(items));
+        HIP_OK(hipMemcpy(hid.data(), ids, hid.size() * 4,
+                         hipMemcpyDeviceToHost));
+        std::vector<int> cnt(ne, 0);
+        for (int v : hid)
+          if (v >= 0)
+            ++cnt[v];
+        std::vector<int> order(ne);
+        for (int i = 0; i < ne; ++i)
+          order[i] = i;
+        std::sort(order.begin(), order.end(),
+                  [&](int a, int b) { return cnt[a] > cnt[b]; });
+        const int pick = 4;
+        std::vector<__half> hx(static_cast<std::size_t>(n) * h);
+        HIP_OK(hipMemcpy(hx.data(), xmoe, hx.size() * 2,
+                         hipMemcpyDeviceToHost));
+        FILE* fo = std::fopen("/tmp/inkling_moe_dump.bin", "wb");
+        const std::int32_t hdr[6] = {n, h, nu, ne, ff, pick};
+        std::fwrite(hdr, 4, 6, fo);
+        std::fwrite(hid.data(), 4, hid.size(), fo);
+        std::fwrite(hx.data(), 2, hx.size(), fo);
+        const std::size_t gu_bytes =
+            static_cast<std::size_t>(2 * ff) * wgu.row_bytes;
+        const std::size_t dn_bytes =
+            static_cast<std::size_t>(h) * wdn.row_bytes;
+        std::vector<std::uint8_t> buf(std::max(gu_bytes, dn_bytes));
+        for (int i = 0; i < pick; ++i) {
+          const std::int32_t e = order[i];
+          std::fwrite(&e, 4, 1, fo);
+          HIP_OK(hipMemcpy(buf.data(),
+                           static_cast<const std::uint8_t*>(wgu.dev) +
+                               static_cast<std::size_t>(e) * gu_bytes,
+                           gu_bytes, hipMemcpyDeviceToHost));
+          std::fwrite(buf.data(), 1, gu_bytes, fo);
+        }
+        std::fclose(fo);
+        std::fprintf(stderr, "inkling: dumped moe layer %u (row_bytes %zu)\n",
+                     p, static_cast<std::size_t>(wgu.row_bytes));
+      }
       static const int bn_env = std::getenv("INKLING_BN") != nullptr
                                     ? std::atoi(std::getenv("INKLING_BN"))
                                     : 0;
@@ -4246,7 +4821,234 @@ struct Session::Impl : Scratch {
           std::getenv("INKLING_SITU_FUSED") == nullptr ||
           std::getenv("INKLING_SITU_FUSED")[0] != '0';
       bool ok1 = false;
-      if (fuse_situ && bn != 64) {
+      static const bool iu4_emu = std::getenv("INKLING_IU4_EMU") != nullptr;
+      static const int emu_mode =
+          iu4_emu ? std::atoi(std::getenv("INKLING_IU4_EMU")) : 0;
+      static const int iu4_level =
+          std::getenv("INKLING_IU4") != nullptr
+              ? std::atoi(std::getenv("INKLING_IU4"))
+              : 0;
+      // INKLING_IU4_SKIP=<physical layers, comma separated> keeps those layers
+      // on the NVFP4 experts
+      static const std::uint64_t iu4_skip = [] {
+        std::uint64_t mask = 0;
+        if (const char* e = std::getenv("INKLING_IU4_SKIP")) {
+          const std::string str = e;
+          std::size_t pos = 0;
+          while (pos < str.size()) {
+            const std::size_t end = str.find(',', pos);
+            const int v = std::atoi(str.substr(pos, end - pos).c_str());
+            if (v >= 0 && v < 64)
+              mask |= 1ULL << v;
+            if (end == std::string::npos)
+              break;
+            pos = end + 1;
+          }
+        }
+        return mask;
+      }();
+      const bool iu4_on = iu4_level >= 1 && ((iu4_skip >> p) & 1ULL) == 0;
+      bool iu4_down_done = false;
+      if (iu4_on) {
+        namespace iu4 = gufo::models::inkling::iu4;
+        const int rows2 = 2 * ff;
+        const int kd = (ff + 255) / 256 * 256;
+        {
+          // the repacked weights are shared by every session of the model
+          std::lock_guard<std::mutex> lock(m->iu4_mutex);
+          if (m->iu4_signs == nullptr) {
+            float sg[512];
+            iu4::FillSigns(sg);
+            m->iu4_signs = static_cast<float*>(m->ModelAlloc(sizeof(sg)));
+            HIP_OK(hipMemcpy(m->iu4_signs, sg, sizeof(sg),
+                             hipMemcpyHostToDevice));
+          }
+          if (m->iu4_w[p].first == nullptr) {
+            auto* tiles = static_cast<std::uint8_t*>(m->ModelAlloc(
+                static_cast<std::size_t>(ne) *
+                iu4::WeightBytesPerExpert(rows2, h)));
+            auto* scales = static_cast<std::uint16_t*>(m->ModelAlloc(
+                static_cast<std::size_t>(ne) *
+                iu4::ScaleBytesPerExpert(rows2, h)));
+            const std::size_t tb = static_cast<std::size_t>(ne) *
+                                   iu4::WeightBytesPerExpert(rows2, h);
+            const std::size_t sb = static_cast<std::size_t>(ne) *
+                                   iu4::ScaleBytesPerExpert(rows2, h);
+            if (!LoadGptq(p, 0, tiles, tb, scales, sb))
+              iu4::RepackExperts(static_cast<const std::uint8_t*>(wgu.dev),
+                                 wgu.row_bytes, tiles, scales, ne, rows2, h, h,
+                                 m->iu4_signs, stream);
+            HIP_OK(hipStreamSynchronize(stream));
+            m->iu4_w[p] = {tiles, scales};
+          }
+          if (iu4_level >= 2 && m->iu4_dw[p].first == nullptr) {
+            auto* tiles = static_cast<std::uint8_t*>(m->ModelAlloc(
+                static_cast<std::size_t>(ne) *
+                iu4::WeightBytesPerExpert(h, kd)));
+            auto* scales = static_cast<std::uint16_t*>(m->ModelAlloc(
+                static_cast<std::size_t>(ne) *
+                iu4::ScaleBytesPerExpert(h, kd)));
+            const std::size_t tb = static_cast<std::size_t>(ne) *
+                                   iu4::WeightBytesPerExpert(h, kd);
+            const std::size_t sb = static_cast<std::size_t>(ne) *
+                                   iu4::ScaleBytesPerExpert(h, kd);
+            if (!LoadGptq(p, 1, tiles, tb, scales, sb))
+              iu4::RepackExperts(static_cast<const std::uint8_t*>(wdn.dev),
+                                 wdn.row_bytes, tiles, scales, ne, h, ff, kd,
+                                 m->iu4_signs, stream);
+            HIP_OK(hipStreamSynchronize(stream));
+            m->iu4_dw[p] = {tiles, scales};
+          }
+        }
+        iu4_signs = m->iu4_signs;
+        if (iu4_act == nullptr) {
+          const int max_rows = kMaxBatch * nu + ne * 16;
+          iu4_padded = (max_rows + 128 + 127) / 128 * 128;
+          iu4_act = static_cast<std::uint8_t*>(AllocLazy(
+              static_cast<std::size_t>(iu4_padded) / 16 * (h / 128) * 1024));
+          iu4_act_scales = static_cast<float*>(AllocLazy(
+              static_cast<std::size_t>(h / 128) * iu4_padded * 4));
+          iu4_tok_padded = (kMaxBatch + 127) / 128 * 128;
+          iu4_tok = static_cast<std::uint8_t*>(AllocLazy(
+              static_cast<std::size_t>(iu4_tok_padded) / 16 * (h / 128) * 1024));
+          iu4_tok_scales = static_cast<float*>(AllocLazy(
+              static_cast<std::size_t>(h / 128) * iu4_tok_padded * 4));
+          iu4_act2 = static_cast<std::uint8_t*>(AllocLazy(
+              static_cast<std::size_t>(iu4_padded) / 16 * (kd / 128) * 1024));
+          iu4_act2_scales = static_cast<float*>(AllocLazy(
+              static_cast<std::size_t>(kd / 128) * iu4_padded * 4));
+        }
+        int nt128 = 0;
+        const int* tmap128 = tile_list && ne <= 256
+                                 ? nullptr
+                                 : TileMap(n, iu4::kTokenTile, &nt128);
+        if (tile_list && ne <= 256) {
+          nt128 = (items + iu4::kTokenTile - 1) / iu4::kTokenTile + ne;
+          BuildTileList<<<1, 256, 0, stream>>>(rbounds, ne, iu4::kTokenTile,
+                                               tl_b, nt128);
+          tmap128 = tl_b;
+        }
+        static const bool tok_once = std::getenv("INKLING_IU4_TOKONCE") == nullptr ||
+                                     std::getenv("INKLING_IU4_TOKONCE")[0] != '0';
+        if (tok_once)
+          iu4::QuantizeRoutedActsOnce(
+              xmoe, n, h, h, iu4_tok, iu4_tok_scales, iu4_tok_padded,
+              rrows_token, rrows_slot, rbounds, ne, items + ne * 16, iu4_act,
+              iu4_act_scales, iu4_padded, iu4_signs, stream);
+        else
+          iu4::QuantizeRoutedActs(xmoe, rrows_token, rrows_slot, rbounds, ne,
+                                  items + ne * 16, h, h, iu4_act,
+                                  iu4_act_scales, iu4_padded, iu4_signs,
+                                  stream);
+        iu4::GateUpSitu(m->iu4_w[p].first, m->iu4_w[p].second, iu4_act,
+                        iu4_act_scales, iu4_padded, tmap128, nt128, rbounds,
+                        rrows_slot, act16, ff, h, s_gu, situ_params, stream);
+        ok1 = true;
+        if (iu4_level >= 2) {
+          // down projection on int4 too: K = ff is padded to 1280
+          iu4::QuantizeRoutedActs(act16, rrows_slot, rrows_slot, rbounds, ne,
+                                  items + ne * 16, ff, kd, iu4_act2,
+                                  iu4_act2_scales, iu4_padded, iu4_signs,
+                                  stream);
+          iu4::DownGemm(m->iu4_dw[p].first, m->iu4_dw[p].second, iu4_act2,
+                        iu4_act2_scales, iu4_padded, tmap128, nt128, rbounds,
+                        rrows_slot, y16, h, kd, s_dn, stream);
+          iu4_down_done = true;
+        }
+        static bool iu4_checked = false;
+        if (!iu4_checked && std::getenv("INKLING_IU4_CHECK") != nullptr &&
+            p == 10 && n >= 2048) {
+          iu4_checked = true;
+          HIP_OK(hipStreamSynchronize(stream));
+          std::vector<__half> a(static_cast<std::size_t>(items) * ff),
+              b(a.size());
+          HIP_OK(hipMemcpy(a.data(), act16, a.size() * 2,
+                           hipMemcpyDeviceToHost));
+          // reference: the Q8Rep emulation of the same numerics
+          const int rows_total = ne * 2 * ff;
+          const std::size_t dst_rb =
+              (static_cast<std::size_t>(h) + h / 16 + 15) / 16 * 16;
+          if (emu_signs == nullptr) {
+            std::vector<float> sg(512);
+            iu4::FillSigns(sg.data());
+            emu_signs = static_cast<float*>(AllocBytes(512 * 4));
+            HIP_OK(hipMemcpy(emu_signs, sg.data(), 512 * 4,
+                             hipMemcpyHostToDevice));
+            emu_x = static_cast<__half*>(
+                AllocBytes(static_cast<std::size_t>(kMaxBatch) * h * 2));
+            emu_gu = static_cast<float*>(AllocBytes(
+                static_cast<std::size_t>(kMaxBatch) * nu * 2 * ff * 4));
+          }
+          void* ew = AllocBytes(static_cast<std::size_t>(rows_total) * dst_rb);
+          EmuWeights<<<rows_total, 256, 0, stream>>>(
+              static_cast<const std::uint8_t*>(wgu.dev),
+              static_cast<std::uint8_t*>(ew), h, wgu.row_bytes, dst_rb,
+              emu_signs, emu_signs + 256, true);
+          EmuActs<<<n, 256, 0, stream>>>(xmoe, emu_x, h, emu_signs,
+                                         emu_signs + 256, true, true);
+          qfn::RoutedQ8RepGemm(ew, emu_x, tmap, ntiles, bn, rbounds,
+                               rrows_token, rrows_slot, emu_gu, 2 * ff, h,
+                               stream);
+          EmuSitu<<<items, 256, 0, stream>>>(emu_gu, ids, s_gu, act16, ff,
+                                             c.situ_beta, c.situ_linear_beta);
+          HIP_OK(hipStreamSynchronize(stream));
+          HIP_OK(hipMemcpy(b.data(), act16, b.size() * 2,
+                           hipMemcpyDeviceToHost));
+          double num = 0, den = 0, maxd = 0;
+          std::size_t bad = 0;
+          for (std::size_t i = 0; i < a.size(); ++i) {
+            const double x = __half2float(a[i]), y = __half2float(b[i]);
+            num += (x - y) * (x - y);
+            den += y * y;
+            maxd = std::max(maxd, std::fabs(x - y));
+            if (std::fabs(x - y) > 0.05 * std::fabs(y) + 1e-3)
+              ++bad;
+          }
+          std::fprintf(stderr,
+                       "inkling: iu4 check layer 10: rel rms diff %.4f, max "
+                       "|d| %.4f, elements off by >5%%: %zu of %zu\n",
+                       std::sqrt(num / den), maxd, bad, a.size());
+        }
+      } else if (iu4_emu) {
+        const int rows_total = ne * 2 * ff;
+        const std::size_t dst_rb = (static_cast<std::size_t>(h) + h / 16 + 15) /
+                                   16 * 16;
+        if (emu_signs == nullptr) {
+          std::vector<float> sg(512);
+          unsigned st = 42;
+          for (int i = 0; i < 256; ++i) {
+            st = (st * 1103515245U + 12345U) & 0x7fffffffU;
+            sg[i] = ((st >> 16) & 1U) ? -1.0F : 1.0F;
+          }
+          st = 1042;
+          for (int i = 0; i < 256; ++i) {
+            st = (st * 1103515245U + 12345U) & 0x7fffffffU;
+            sg[256 + i] = ((st >> 16) & 1U) ? -1.0F : 1.0F;
+          }
+          emu_signs = static_cast<float*>(AllocBytes(512 * 4));
+          HIP_OK(hipMemcpy(emu_signs, sg.data(), 512 * 4,
+                           hipMemcpyHostToDevice));
+          emu_x = static_cast<__half*>(
+              AllocBytes(static_cast<std::size_t>(kMaxBatch) * h * 2));
+          emu_gu = static_cast<float*>(AllocBytes(
+              static_cast<std::size_t>(kMaxBatch) * nu * 2 * ff * 4));
+        }
+        if (emu_w[p] == nullptr) {
+          emu_w[p] = AllocBytes(static_cast<std::size_t>(rows_total) * dst_rb);
+          EmuWeights<<<rows_total, 256, 0, stream>>>(
+              static_cast<const std::uint8_t*>(wgu.dev),
+              static_cast<std::uint8_t*>(emu_w[p]), h, wgu.row_bytes, dst_rb,
+              emu_signs, emu_signs + 256, (emu_mode & 1) != 0);
+        }
+        EmuActs<<<n, 256, 0, stream>>>(xmoe, emu_x, h, emu_signs,
+                                       emu_signs + 256, (emu_mode & 2) != 0,
+                                       (emu_mode & 16) != 0);
+        ok1 = qfn::RoutedQ8RepGemm(emu_w[p], emu_x, tmap, ntiles, bn, rbounds,
+                                   rrows_token, rrows_slot, emu_gu, 2 * ff, h,
+                                   stream);
+        EmuSitu<<<items, 256, 0, stream>>>(emu_gu, ids, s_gu, act16, ff,
+                                           c.situ_beta, c.situ_linear_beta);
+      } else if (fuse_situ && bn != 64) {
         ok1 = qfn::RoutedNvfp4SituGemmF16(
             wgu.dev, xmoe, tmap, ntiles, bn, rbounds, rrows_token, rrows_slot,
             act16, ff, h, s_gu, situ_params, stream);
@@ -4254,12 +5056,31 @@ struct Session::Impl : Scratch {
         ok1 = qfn::RoutedNvfp4GemmF16(wgu.dev, xmoe, tmap, ntiles, bn, rbounds,
                                       rrows_token, rrows_slot, gu16, 2 * ff, h,
                                       s_gu, stream);
+        if (dumped && dump_layer != nullptr && !dumped_out &&
+            p == static_cast<std::uint32_t>(std::atoi(dump_layer))) {
+          dumped_out = true;
+          HIP_OK(hipStreamSynchronize(stream));
+          std::vector<__half> hy(static_cast<std::size_t>(items) * 2 * ff);
+          HIP_OK(hipMemcpy(hy.data(), gu16, hy.size() * 2,
+                           hipMemcpyDeviceToHost));
+          std::vector<float> hs(ne, 1.0F);
+          if (s_gu != nullptr)
+            HIP_OK(hipMemcpy(hs.data(), s_gu, ne * 4, hipMemcpyDeviceToHost));
+          FILE* fo = std::fopen("/tmp/inkling_moe_out.bin", "wb");
+          std::fwrite(hs.data(), 4, hs.size(), fo);
+          std::fwrite(hy.data(), 2, hy.size(), fo);
+          std::fclose(fo);
+        }
         SituHalfIn<<<items, 256, 0, stream>>>(gu16, act16, ff, c.situ_beta,
                                               c.situ_linear_beta);
       }
-      const bool ok2 = qfn::RoutedNvfp4GemmF16(wdn.dev, act16, tmap, ntiles, bn,
-                                               rbounds, rrows_slot, rrows_slot,
-                                               y16, h, ff, s_dn, stream);
+      const bool ok2 =
+          iu4_down_done ||
+          qfn::RoutedNvfp4GemmF16(wdn.dev, act16, tmap, ntiles, bn, rbounds,
+                                  rrows_slot, rrows_slot, y16, h, ff, s_dn,
+                                  stream);
+      if (GptqWants(p))
+        GptqCapture(p, xmoe, act16);
       if (!ok1 || !ok2) {
         std::fprintf(stderr,
                      "inkling: shared routed gemm rejected the launch\n");
@@ -4352,6 +5173,15 @@ struct Session::Impl : Scratch {
       }
     }
     const auto fwd_t1 = std::chrono::steady_clock::now();
+    static const bool alloc_log = std::getenv("INKLING_ALLOC_LOG") != nullptr;
+    if (alloc_log) {
+      static std::size_t last = 0;
+      if (allocated_bytes != last) {
+        std::fprintf(stderr, "inkling: session allocated_bytes %zu (n=%d)\n",
+                     allocated_bytes, n);
+        last = allocated_bytes;
+      }
+    }
     const int rows = all_rows ? n : 1;
     ArgMaxRow<<<rows, 256, 0, stream>>>(
         d_logits, static_cast<int>(c.vocab_unpadded), d_argmax, d_argmax);
@@ -5141,6 +5971,10 @@ std::uint32_t Session::Position() const noexcept {
   return impl_->position;
 }
 
+bool Session::GptqFinish(const std::string& dir, std::string* error) {
+  return impl_->GptqFinish(dir, error);
+}
+
 void Session::Reset() noexcept {
   impl_->position = 0;
   impl_->dwarmed = 0;
@@ -5376,6 +6210,7 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
         i.AllocBytes(static_cast<std::size_t>(4) * b * 128 * sizeof(float)));
     sc.dense_bounds_buf = static_cast<int*>(i.AllocBytes(2 * sizeof(int)));
     sc.tl_a = static_cast<int*>(i.AllocBytes(1024 * sizeof(int)));
+    sc.tl_b = static_cast<int*>(i.AllocBytes(1024 * sizeof(int)));
     {
       const std::size_t rows =
           gufo::models::qwen38_flash_next::rocm::RoutedCompactRows(

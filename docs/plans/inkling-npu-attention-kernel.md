@@ -13,7 +13,7 @@ only the q/gate/k/v/out projections run on it) and has 60%+ spare capacity. Movi
 NPU removes up to ~400 ms of GPU time per chunk.
 
 Expected effect if attention is fully hidden behind GPU work: roughly +15 to 20% prefill speed at
-4K to 16K (default engine 8K with NPU is 2,382 tok/s; the opt-in int4 experts on branch `perf/inkling-pp3k` reach 2,822; both short of 3,000).
+4K to 16K (default engine 8K with NPU is 2,382 tok/s; with int4 experts 2,822; both short of 3,000).
 Attention must stay exact up to the same tolerance as the current NPU projections (see section 8).
 
 Nothing in this task is lossy by design except the block-float rounding the NPU kernels already use.
@@ -182,6 +182,102 @@ A change that wins at 4K and loses at 8K is not done.
 4. **M4, speed:** tune dispatch count (about 0.15 to 0.3 us per instruction-stream op and ~3 ms per
    context switch; one hardware context for GEMM and attention if possible), report the table.
 
-Open questions for the agent to settle and write down: row packing for 3 query heads; where the
-bias product runs (matrix unit vs vector unit); static bound vs online softmax; whether K/V bfp16
-copies can be written by the existing GPU encode kernels or need a new one.
+## 11. Implementation status
+
+M1 is complete. One 16-token query block x 3 q heads is packed as 48 real rows of 64 (six row
+blocks) per kv head. Four kv heads run per pass, so two passes cover all eight. Bias scores are
+computed on the host in the log2 domain and streamed through the A fifo as two 1,536-byte elements
+per 16-token kv chunk. The sink is one constant zero logit: the host supplies both the per-row
+bound `M_row` and `exp2(-M_row)`, and the kernel seeds one lane per row with the sink mass.
+`Exp2Accurate` replaces the XDNA2 elementary `exp2` for logits; the hardware result was off by
+about 4% at `s = -1.2929`. K/V stay in block-float form for the PV matmul.
+
+`gufo_inkling_attn_probe` compares the NPU path with the fp64 CPU reference. On the current
+artifacts (`M=16 K=N=2048`, `mc=8` for a window, `mc=80` for full and ring):
+
+| mode | relative rms | max abs | tokens |
+| --- | --- | --- | --- |
+| window | 0.00888 | 0.02801 | 128 |
+| full | 0.00912 | 0.00496 | 1,280 |
+| ring | 0.00902 | 0.00371 | 1,228 |
+
+All three meet the `1e-2` M1/M2 correctness gate. The probe also checks tau-scaled inputs, keys
+past `E`, and cross-boundary ring windows.
+
+M2 is partial. Real q/r/sink/K/V dumps are still not measured. `LayerAttn` now has a dump hook
+controlled by `INKLING_ATTN_DUMP_DIR`, `INKLING_ATTN_DUMP_LAYER` and `INKLING_ATTN_DUMP_POS`; it
+writes `Q.bin`, `R.bin`, `S.bin`, `Bias.bin`, `K.bin` and `V.bin` in the probe's layout. The probe
+reads them when `INKLING_ATTN_DUMP_DIR` is set. The local full-visit artifact used for probing is
+the loop variant, which the current loader rejects, so the dump hook has not yet been exercised on
+an accepted artifact.
+
+The static bound uses the exact per-row maximum of the full logits in the probe. The separate
+norm-derived bound used for the fallback estimate is too loose on synthetic data: 49.1% of window
+rows, 99.1% of full rows and 98.8% of ring rows are flagged. Real-data fallback rate is still
+required before choosing static-bound fallback over online softmax.
+
+Settled open questions: pack 3 q heads into 48 rows; run the bias product on the host instead of
+the matrix unit; keep the static bound for M1/M2 but keep the fallback decision open until real
+data is measured; K/V encode for the engine path is still pending.
+
+Not done: M2 real-data fallback rate, M3 engine integration, and M4 speed table.
+
+### Exp2 speedup (2026-11-24)
+
+The scalar `Exp2Accurate` loop made the kernel about 120 times too slow (68.8 ms per 128-token pass at a
+1,024-key window). `Exp2Wide` is now vectorized: round x to the nearest integer n, evaluate a degree-5
+polynomial of the remainder in [-0.5, 0.5] with bf16 operands and fp32 accumulate, and multiply by 2^n built from
+the float exponent bits. The hardware `exp2<bfloat16>` on the remainder alone gives rel 0.023 and is not usable;
+fp32 vector multiplies crash the core (run state 8). Result on the same probe: window 0.00897 rel, full 0.00909,
+ring unchanged in kind, 0.57 ms per 128-token pass of 4 kv heads (one pass of two), i.e. about 1.15 ms per 128 tokens
+for all 8 kv heads, or about 37 ms per 4K-token chunk per window visit. Over 40 window visits plus 8 full visits that
+is still more than the GPU's 270 ms attention share per chunk, so the kernel needs about another 3-5x (bias on the core,
+fewer exps per chunk) before it can win.
+
+### Bias on the core (2026-11-24)
+
+The host no longer computes bias scores. Per core the A fifo now carries the header (plus a per-row sink offset
+at byte 512), six Q blocks, one bf16 basis-row element (48 rows x 16), then one 1 KB bf16 table slice per chunk
+(`slice[z][j] = log2e * Bias[dmax - j][z]`, zero outside [0, extent)). The core forms the 48 x 16 bias tile with
+shuffle_down plus mac (about 3 macs per shuffle) and writes it in accumulator lane order, so the rest of the chunk is
+unchanged. Per-core stream per chunk drops from 3 KB to 1.5 KB.
+
+Window probe, same data: rel 0.00902 (gate 0.01), 0.70 ms per 128-token pass of 4 kv heads (was 0.57 ms with host bias;
+the bias product costs about 0.13 ms). Host CPU cost of bias for a 4K chunk window visit (about 1.6 GMAC) is gone.
+
+Where the time goes (ablations, window, mc=80): removing exp2 entirely saves 0.11 ms; making the A fifo depth 2
+changes nothing; bandwidth is about 7 GB/s. So the remaining about 0.6 ms (7-8 us per 16-key chunk) is neither
+exp, bandwidth nor prefetch. Next to measure: the QK/PV mac chains and per-chunk acquire/release overhead (try 32-key
+chunks to halve it). Note a_q cannot simply be shrunk to 6 blocks: it broke accuracy (rel 0.078) in an experiment.
+
+### Kernel speed ablations (2026-11-24, window mc=80, 128-token pass of 4 kv heads)
+
+| variant | ms |
+| --- | --- |
+| committed kernel | 0.70 |
+| `AttnChunk` (scores, exp2, PV) disabled | 0.39 |
+| `AttnChunk` and bias disabled (data movement only) | 0.326 |
+| same, mc=40 | 0.197 |
+
+Data movement alone costs 3.2 us per 16-key chunk plus 0.07 ms fixed, and it adds to the compute (3.9 us scores/exp/PV,
+1.6 us bias) instead of overlapping with it. Tried and rejected: A-fifo depth 2 on the core (no change; also needs
+the a_q buffer shrunk, which broke accuracy), memtile staging depth 3, 4 and 6 (aiecc "Resource allocation pipeline
+failed"), 32-key chunks (core memory full: 9 KB K/V x2 does not fit beside the 37 KB arena and 9 KB Q buffer).
+Idea not built: the four cores of one column receive identical bias slices (4x redundant A traffic); a shared
+broadcast stream needs a third shim channel per column and the 4 K/V rows already use the spare ones.
+
+### Real-data run and overlap budget (2026-11-24)
+
+Real dump (layer 1, window, pos 4096, 128 rows, 24 heads, text input, production UD-Q4_K_XL; the dump hook needs
+`gufo_inkling_gpu_check <gguf> 1` with `INKLING_BENCH=4224 INKLING_BENCH_FILE=<text>`; the probe now reads the leading
+rows of a larger ring dump): relative rms 0.0044, max abs 0.13, 0.69 ms per pass.
+The norm-derived static bound flags 31.4% of rows as unsafe (max gap 30 log2, so the 2^-30 underflow is real). The kernel
+therefore needs either an exact per-row max (a GPU QK pass) or online-softmax rescaling before it can run on real data
+without a fallback path.
+
+Budget in the engine's two-bank NPU prefill (estimates, not measured on the NPU): the q/gate/k/v/o projections already use
+the NPU, about 210 GFLOP per 4K bank-layer, roughly 10 ms of the roughly 42 ms the GPU needs per visit. A window visit costs
+the NPU kernel about 45 ms and saves the GPU about 3-5 ms. Full visits cost the NPU about 6x a window visit at 8K depth and
+the GPU about 75 ms. Offloading attention therefore saves 1-2% of prefill at best, before the context switches between the
+projection and attention programs and the roughly 15% expert slowdown under NPU traffic. Not worth engine integration
+until the kernel is several times faster and has a bound that needs no fallback.

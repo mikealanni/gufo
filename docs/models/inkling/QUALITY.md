@@ -29,5 +29,91 @@ top-1 against the unpruned engine; verify is a six-row step):
 Rescaling the kept weights made KL worse at every threshold. Pruning is off by
 default because it changes outputs.
 
+### Prefill pruning (opt-in)
+
+`INKLING_PRUNE_PREFILL=<share>` applies the same threshold to prefill batches on the
+shared routed path. KL against the lossless engine, 48 windows of 1,024 tokens
+(`inkling_kl.py`); the fast profile alone is the first row:
+
+| Setting | KL | Top-1 | 8K prefill, fast + NPU (tok/s) |
+| --- | --- | --- | --- |
+| fast profile (`INKLING_IU4=2 INKLING_F16_BLOCKS=1`) | 0.0191 | 43/48 | about 2,650 to 2,845 |
+| + prune 0.04 | 0.0208 | 42/48 | no gain |
+| + prune 0.06 | 0.0260 | 41/48 | +2% |
+| + prune 0.08 | 0.0355 | 41/48 | +4% |
+| + prune 0.10 | 0.0709 | 42/48 | +10% (about 2,930 to 2,970 in the same noisy runs) |
+
+The speed column was measured while a monitor used a CPU core, which lowered every
+baseline by about 5%; compare rows within the same run only.
+
 Known near-tie behaviour: greedy output with speculation can differ from plain
 decode at positions where the top two logits are within about 0.2.
+
+## Fast profile (int4 experts, opt-in)
+
+The expert weights are NVFP4 in the GGUF, so the int4 form is a second 4-bit
+quantization (rotated, symmetric, one scale per 128 values; activations are
+rotated and quantized per 128 as well). Measured as mean KL and top-1 of the last
+token of 48 windows of 1,024 tokens against the default engine (default against
+itself: KL 0, 48 of 48); the six-window versions of these runs were too noisy to
+rank settings.
+
+| Setting | Mean KL | Max KL | Top-1 |
+| --- | --- | --- | --- |
+| `INKLING_IU4=1` (gate/up) | 0.016 | 0.080 | 42/48 |
+| `INKLING_IU4=2` (gate/up and down) | 0.022 | 0.100 | 44/48 |
+| `INKLING_IU4=2`, weight scale by absmax / 7, activation scale 1.0 | 0.033 | 0.209 | 39/48 |
+| plus `INKLING_F16_BLOCKS=1` | 0.019 | 0.059 | 43/48 |
+
+The defaults of `INKLING_IU4` are the MSE-optimal weight scale (`INKLING_IU4_WCLIP`)
+and an activation scale of 0.9 times absmax / 7 (`INKLING_IU4_ACLIP`; 0.85 and 0.9
+are equal within noise, 0.8 is worse). Keeping any single layer on NVFP4
+(`INKLING_IU4_SKIP`) changes the KL by less than the run-to-run spread, so the error
+is spread over all layers. Next steps for quality: per-32 activation scales (the
+gate/up output error roughly halves in an emulation but the accumulator fold runs
+four times as often) and an int4 artifact made from higher-precision weights, which
+the model release does not provide.
+
+Other changes this round: split-K for the F32 GEMMs and the compact tile list keep
+the default engine at KL 0.0016 (floating-point reassociation) and 0 (bit-identical)
+respectively.
+
+HumanEval (164 tasks, greedy, thinking off, 1,024 new tokens, `gufo serve` on GPU
+only with speculation; int4 applies to the prefill of each prompt and decode stays
+NVFP4): default engine 147/164 (89.6%); fast profile (`INKLING_IU4=2
+INKLING_F16_BLOCKS=1`) 149/164 (90.9%). Only 56 of the 164 completions are
+identical, so the numerics differ clearly, but four tasks flip (one lost, three
+gained), which is within the spread of a 164-task score.
+
+With thinking on (default reasoning, 6,000 new tokens, about 1,340 generated tokens
+per task, 63 minutes for the set) the fast profile scores 152/164 (92.7%). The
+default engine was not run with thinking on, so this is a check that long
+reasoning decodes after an int4 prefill stay coherent, not a comparison.
+
+Method: `gufo_inkling_gpu_check <gguf> --windows <text> 48 1024 <out.bin>` writes the
+last-token logits of 48 windows; `tools/bench/inkling_kl.py base.bin test.bin` reports KL
+and top-1 agreement.
+
+
+### GPTQ feasibility for the int4 experts (2026-11-24)
+
+The fast profile's error is almost all the rounding of the int4 gate/up weights (gate/up alone
+KL 0.016 of the 0.019; activations about 0.001, fp16 blocks 0.002; the error is spread evenly over all
+24 layers, so exempting layers does not help). Check on layer 12, expert 71 (rows 2,304, K 2,304; NVFP4
+weights, Hadamard-rotated, per-128 scales exactly as the repack), plain rounding against GPTQ with the
+expert's own input Hessian in the rotated basis, error measured on held-out tokens:
+
+| calibration tokens | damping | RTN output error | GPTQ output error |
+| --- | --- | --- | --- |
+| 6,300 | 0.01 | 0.0774 | 0.0571 |
+| 7,550 | 0.01 | 0.0777 | 0.0529 |
+| 7,550 | 0.05 | 0.0777 | 0.0522 |
+| 7,550 | 0.20 | 0.0777 | 0.0521 |
+
+Output error falls by about a third, so the squared error (which KL follows) falls by about 55%:
+gate/up KL should go from 0.016 to about 0.007, and the fast profile from 0.019 to about 0.011, with no
+change to the kernel or its speed (the codes and scales are produced offline). Held-out error is still
+well above the train error (0.043), so a larger calibration set helps; rare experts see few tokens and
+would need stronger damping or plain rounding. Cost: a calibration pass over text that captures each
+expert's inputs, one Hessian and Cholesky per expert matrix (6,144 matrices over 24 layers), a blocked
+GPTQ solve on the GPU, and a cached repack artifact. The numpy reference takes about 4 s per matrix.
