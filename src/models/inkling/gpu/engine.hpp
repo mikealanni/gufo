@@ -94,6 +94,9 @@ public:
   [[nodiscard]] std::uint32_t Position() const noexcept;
   void Reset() noexcept;
   [[nodiscard]] std::size_t AllocatedBytes() const noexcept;
+  /// Solves GPTQ for every layer captured under INKLING_GPTQ_CAPTURE and writes
+  /// one artifact per layer into `dir` (see INKLING_GPTQ_DIR).
+  [[nodiscard]] bool GptqFinish(const std::string& dir, std::string* error);
 
 private:
   friend class Model;

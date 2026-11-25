@@ -135,6 +135,39 @@ int main(int argc, char** argv) {
     }
     return 0;
   }
+  if (argc >= 7 && std::string(argv[2]) == "--gptq") {
+    // --gptq <text file> <count> <len> <out dir>: calibration prefill of count
+    // windows (INKLING_GPTQ_CAPTURE lists the layers), then the GPTQ solve
+    std::string err;
+    auto reader = gufo::core::GgufReader::OpenFile(argv[1], &err);
+    auto tok = gufo::tokenization::QwenTokenizer::CreateFromGguf(*reader, &err);
+    std::ifstream in(argv[3]);
+    std::stringstream ss;
+    ss << in.rdbuf();
+    const auto ids = tok->Encode(ss.str(), {});
+    const int count = std::atoi(argv[4]);
+    const int len = std::atoi(argv[5]);
+    auto model = gufo::models::inkling::gpu::Model::Load(argv[1], &err);
+    auto session =
+        model->CreateSession(static_cast<std::uint32_t>(len) + 16, &err);
+    for (int w = 0; w < count; ++w) {
+      session->Reset();
+      std::vector<std::int32_t> win;
+      for (int i = 0; i < len; ++i)
+        win.push_back(static_cast<std::int32_t>(
+            ids[(static_cast<std::size_t>(w) * len + i) % ids.size()]));
+      if (!session->Append(win, &err)) {
+        std::fprintf(stderr, "prefill failed: %s\n", err.c_str());
+        return 1;
+      }
+      std::fprintf(stderr, "gptq calibration window %d of %d\n", w + 1, count);
+    }
+    if (!session->GptqFinish(argv[6], &err)) {
+      std::fprintf(stderr, "gptq failed: %s\n", err.c_str());
+      return 1;
+    }
+    return 0;
+  }
   if (argc >= 5 && std::string(argv[2]) == "--draft") {
     // --draft <text file> <drafter gguf> [width]: greedy speculative loop,
     // acceptance stats

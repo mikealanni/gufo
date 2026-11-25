@@ -11,6 +11,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <fstream>
+#include <map>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -18,6 +20,7 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/core/hip/weight_upload.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "src/models/inkling/gpu/gptq.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/npu_gemm.hpp"
 
 namespace gufo::models::inkling::gpu {
@@ -4481,6 +4484,220 @@ struct Session::Impl : Scratch {
     LayerOut2(L, blocks);
   }
 
+  // Reads the GPTQ artifact of layer p (INKLING_GPTQ_DIR): which 0 = gate/up,
+  // 1 = down. Returns false when there is none.
+  bool LoadGptq(std::uint32_t p, int which, void* tiles, std::size_t tb,
+                void* scales, std::size_t sb) {
+    const char* dir = std::getenv("INKLING_GPTQ_DIR");
+    if (dir == nullptr)
+      return false;
+    static const int parts = std::getenv("INKLING_GPTQ_PARTS") != nullptr
+                                 ? std::atoi(std::getenv("INKLING_GPTQ_PARTS"))
+                                 : 3;
+    if (((parts >> which) & 1) == 0)
+      return false;
+    const Config& c = m->config;
+    const int h = c.hidden_size, ne = c.expert_count, ff = c.expert_ff;
+    const int rows2 = 2 * ff;
+    const int kd = (ff + 255) / 256 * 256;
+    std::ifstream in(std::string(dir) + "/layer_" + std::to_string(p) + ".gptq",
+                     std::ios::binary);
+    if (!in)
+      return false;
+    std::uint64_t hdr[8];
+    in.read(reinterpret_cast<char*>(hdr), sizeof hdr);
+    namespace iu4 = gufo::models::inkling::iu4;
+    if (!in || hdr[0] != 0x31504b4e49515447ULL ||
+        hdr[1] != static_cast<std::uint64_t>(ne) ||
+        hdr[2] != static_cast<std::uint64_t>(rows2) ||
+        hdr[3] != static_cast<std::uint64_t>(h) ||
+        hdr[4] != static_cast<std::uint64_t>(kd)) {
+      std::fprintf(stderr, "inkling: gptq artifact for layer %u does not match the model\n", p);
+      return false;
+    }
+    const std::size_t tb_gu = static_cast<std::size_t>(ne) * iu4::WeightBytesPerExpert(rows2, h);
+    const std::size_t sb_gu = static_cast<std::size_t>(ne) * iu4::ScaleBytesPerExpert(rows2, h);
+    std::size_t off = sizeof hdr;
+    if (which == 1)
+      off += tb_gu + sb_gu;
+    in.seekg(static_cast<std::streamoff>(off));
+    const auto fill = [&](void* dev, std::size_t bytes) {
+      constexpr std::size_t kChunk = std::size_t{64} << 20;
+      std::vector<char> buf(std::min(bytes, kChunk));
+      for (std::size_t o = 0; o < bytes; o += kChunk) {
+        const std::size_t n = std::min(kChunk, bytes - o);
+        in.read(buf.data(), static_cast<std::streamsize>(n));
+        HIP_OK(hipMemcpy(static_cast<char*>(dev) + o, buf.data(), n, hipMemcpyHostToDevice));
+      }
+    };
+    fill(tiles, tb);
+    fill(scales, sb);
+    return static_cast<bool>(in);
+  }
+
+  struct GptqLayer {
+    float* gu{nullptr};
+    float* dn{nullptr};
+    std::vector<std::uint64_t> cnt;
+  };
+  struct GptqState {
+    rocblas_handle blas{nullptr};
+    float* signs{nullptr};
+    float *xr_gu{nullptr}, *xr_dn{nullptr};
+    std::map<std::uint32_t, GptqLayer> layers;
+  } gq;
+  bool GptqWants(std::uint32_t p) const {
+    static const std::uint64_t mask = [] {
+      std::uint64_t v = 0;
+      if (const char* e = std::getenv("INKLING_GPTQ_CAPTURE")) {
+        const std::string str = e;
+        std::size_t pos = 0;
+        while (pos < str.size()) {
+          const std::size_t end = str.find(',', pos);
+          const int x = std::atoi(str.substr(pos, end - pos).c_str());
+          if (x >= 0 && x < 64)
+            v |= 1ULL << x;
+          if (end == std::string::npos)
+            break;
+          pos = end + 1;
+        }
+      }
+      return v;
+    }();
+    return ((mask >> p) & 1ULL) != 0;
+  }
+  void GptqCapture(std::uint32_t p, const __half* xmoe, const __half* act16) {
+    namespace gp = gufo::models::inkling::gptq;
+    const Config& c = m->config;
+    const int h = c.hidden_size, ne = c.expert_count, nu = c.expert_used,
+              ff = c.expert_ff;
+    const int kd = (ff + 255) / 256 * 256;
+    if (gq.blas == nullptr) {
+      rocblas_create_handle(&gq.blas);
+      rocblas_set_stream(gq.blas, stream);
+      float sg[512];
+      gufo::models::inkling::iu4::FillSigns(sg);
+      HIP_OK(hipMalloc(&gq.signs, sizeof(sg)));
+      HIP_OK(hipMemcpy(gq.signs, sg, sizeof(sg), hipMemcpyHostToDevice));
+      const std::size_t rows_max = static_cast<std::size_t>(kMaxBatch) * nu + ne * 16;
+      HIP_OK(hipMalloc(&gq.xr_gu, rows_max * h * 4));
+      HIP_OK(hipMalloc(&gq.xr_dn, rows_max * kd * 4));
+    }
+    rocblas_set_stream(gq.blas, stream);
+    GptqLayer& L = gq.layers[p];
+    if (L.gu == nullptr) {
+      HIP_OK(hipMalloc(&L.gu, static_cast<std::size_t>(ne) * h * h * 4));
+      HIP_OK(hipMemset(L.gu, 0, static_cast<std::size_t>(ne) * h * h * 4));
+      HIP_OK(hipMalloc(&L.dn, static_cast<std::size_t>(ne) * kd * kd * 4));
+      HIP_OK(hipMemset(L.dn, 0, static_cast<std::size_t>(ne) * kd * kd * 4));
+      L.cnt.assign(ne, 0);
+    }
+    HIP_OK(hipStreamSynchronize(stream));
+    std::vector<int> rb(ne + 1);
+    std::vector<unsigned int> rc(ne);
+    HIP_OK(hipMemcpy(rb.data(), rbounds, rb.size() * 4, hipMemcpyDeviceToHost));
+    HIP_OK(hipMemcpy(rc.data(), rcounts, rc.size() * 4, hipMemcpyDeviceToHost));
+    const int total = rb[ne];
+    gp::RotateRows(xmoe, rrows_token, rrows_slot, total, h, h, gq.xr_gu,
+                   gq.signs, stream);
+    gp::RotateRows(act16, rrows_slot, rrows_slot, total, ff, kd, gq.xr_dn,
+                   gq.signs, stream);
+    for (int e = 0; e < ne; ++e) {
+      const int rows = rb[e + 1] - rb[e];
+      if (rows <= 0)
+        continue;
+      gp::AccumulateHessian(gq.blas, gq.xr_gu + static_cast<std::size_t>(rb[e]) * h,
+                            rows, h, L.gu + static_cast<std::size_t>(e) * h * h);
+      gp::AccumulateHessian(gq.blas, gq.xr_dn + static_cast<std::size_t>(rb[e]) * kd,
+                            rows, kd, L.dn + static_cast<std::size_t>(e) * kd * kd);
+      L.cnt[e] += rc[e];
+    }
+    HIP_OK(hipStreamSynchronize(stream));
+  }
+  bool GptqFinish(const std::string& dir, std::string* error) {
+    namespace gp = gufo::models::inkling::gptq;
+    namespace iu4 = gufo::models::inkling::iu4;
+    const Config& c = m->config;
+    const int h = c.hidden_size, ne = c.expert_count, ff = c.expert_ff;
+    const int rows2 = 2 * ff;
+    const int kd = (ff + 255) / 256 * 256;
+    if (gq.blas == nullptr) {
+      if (error != nullptr)
+        *error = "nothing captured (set INKLING_GPTQ_CAPTURE and run a prefill)";
+      return false;
+    }
+    rocblas_set_stream(gq.blas, stream);
+    gp::Scratch sgu, sdn;
+    float *wgu_rot{nullptr}, *wdn_rot{nullptr};
+    if (!gp::AllocScratch(sgu, rows2, h) || !gp::AllocScratch(sdn, h, kd)) {
+      if (error != nullptr)
+        *error = "gptq scratch allocation failed";
+      return false;
+    }
+    HIP_OK(hipMalloc(&wgu_rot, static_cast<std::size_t>(rows2) * h * 4));
+    HIP_OK(hipMalloc(&wdn_rot, static_cast<std::size_t>(h) * kd * 4));
+    const std::size_t tb_gu = iu4::WeightBytesPerExpert(rows2, h);
+    const std::size_t sb_gu = iu4::ScaleBytesPerExpert(rows2, h);
+    const std::size_t tb_dn = iu4::WeightBytesPerExpert(h, kd);
+    const std::size_t sb_dn = iu4::ScaleBytesPerExpert(h, kd);
+    std::uint8_t *t_gu, *t_dn;
+    std::uint16_t *s_gu, *s_dn;
+    HIP_OK(hipMalloc(&t_gu, tb_gu * ne));
+    HIP_OK(hipMalloc(&s_gu, sb_gu * ne));
+    HIP_OK(hipMalloc(&t_dn, tb_dn * ne));
+    HIP_OK(hipMalloc(&s_dn, sb_dn * ne));
+    for (auto& [p, L] : gq.layers) {
+      const Tensor& wgu = m->T(m->P(p, "ffn_gate_up_exps.weight"));
+      const Tensor& wdn = m->T(m->P(p, "ffn_down_exps.weight"));
+      int rtn_gu = 0, rtn_dn = 0;
+      for (int e = 0; e < ne; ++e) {
+        const float damp_gu = L.cnt[e] < static_cast<std::uint64_t>(h) ? 0.2F : 0.05F;
+        const float damp_dn = L.cnt[e] < static_cast<std::uint64_t>(kd) ? 0.2F : 0.05F;
+        gp::RotateWeights(static_cast<const std::uint8_t*>(wgu.dev) +
+                              static_cast<std::size_t>(e) * rows2 * wgu.row_bytes,
+                          wgu.row_bytes, wgu_rot, rows2, h, h, gq.signs, stream);
+        if (L.cnt[e] < 64 ||
+            !gp::Quantize(gq.blas, sgu, wgu_rot,
+                          L.gu + static_cast<std::size_t>(e) * h * h, h, damp_gu,
+                          stream)) {
+          gp::QuantizeRtn(sgu, wgu_rot, stream);
+          ++rtn_gu;
+        }
+        gp::Pack(sgu, t_gu + e * tb_gu, s_gu + e * (sb_gu / 2), stream);
+        gp::RotateWeights(static_cast<const std::uint8_t*>(wdn.dev) +
+                              static_cast<std::size_t>(e) * h * wdn.row_bytes,
+                          wdn.row_bytes, wdn_rot, h, ff, kd, gq.signs, stream);
+        if (L.cnt[e] < 64 ||
+            !gp::Quantize(gq.blas, sdn, wdn_rot,
+                          L.dn + static_cast<std::size_t>(e) * kd * kd, ff,
+                          damp_dn, stream)) {
+          gp::QuantizeRtn(sdn, wdn_rot, stream);
+          ++rtn_dn;
+        }
+        gp::Pack(sdn, t_dn + e * tb_dn, s_dn + e * (sb_dn / 2), stream);
+        HIP_OK(hipStreamSynchronize(stream));
+      }
+      std::ofstream out(dir + "/layer_" + std::to_string(p) + ".gptq",
+                        std::ios::binary);
+      const std::uint64_t hdr[8] = {0x31504b4e49515447ULL, static_cast<std::uint64_t>(ne),
+                                    static_cast<std::uint64_t>(rows2), static_cast<std::uint64_t>(h),
+                                    static_cast<std::uint64_t>(kd), 0, 0, 0};
+      out.write(reinterpret_cast<const char*>(hdr), sizeof hdr);
+      const auto dump = [&](const void* dev, std::size_t bytes) {
+        std::vector<char> host(bytes);
+        HIP_OK(hipMemcpy(host.data(), dev, bytes, hipMemcpyDeviceToHost));
+        out.write(host.data(), static_cast<std::streamsize>(bytes));
+      };
+      dump(t_gu, tb_gu * ne);
+      dump(s_gu, sb_gu * ne);
+      dump(t_dn, tb_dn * ne);
+      dump(s_dn, sb_dn * ne);
+      std::fprintf(stderr, "inkling: gptq layer %u written (rtn fallback gate/up %d, down %d)\n",
+                   p, rtn_gu, rtn_dn);
+    }
+    return true;
+  }
+
   void Moe(std::uint32_t p, int n, const __half* xhx_in = nullptr) {
     const Config& c = m->config;
     const int h = c.hidden_size, ne = c.expert_count, nu = c.expert_used,
@@ -4653,9 +4870,14 @@ struct Session::Impl : Scratch {
             auto* scales = static_cast<std::uint16_t*>(m->ModelAlloc(
                 static_cast<std::size_t>(ne) *
                 iu4::ScaleBytesPerExpert(rows2, h)));
-            iu4::RepackExperts(static_cast<const std::uint8_t*>(wgu.dev),
-                               wgu.row_bytes, tiles, scales, ne, rows2, h, h,
-                               m->iu4_signs, stream);
+            const std::size_t tb = static_cast<std::size_t>(ne) *
+                                   iu4::WeightBytesPerExpert(rows2, h);
+            const std::size_t sb = static_cast<std::size_t>(ne) *
+                                   iu4::ScaleBytesPerExpert(rows2, h);
+            if (!LoadGptq(p, 0, tiles, tb, scales, sb))
+              iu4::RepackExperts(static_cast<const std::uint8_t*>(wgu.dev),
+                                 wgu.row_bytes, tiles, scales, ne, rows2, h, h,
+                                 m->iu4_signs, stream);
             HIP_OK(hipStreamSynchronize(stream));
             m->iu4_w[p] = {tiles, scales};
           }
@@ -4666,9 +4888,14 @@ struct Session::Impl : Scratch {
             auto* scales = static_cast<std::uint16_t*>(m->ModelAlloc(
                 static_cast<std::size_t>(ne) *
                 iu4::ScaleBytesPerExpert(h, kd)));
-            iu4::RepackExperts(static_cast<const std::uint8_t*>(wdn.dev),
-                               wdn.row_bytes, tiles, scales, ne, h, ff, kd,
-                               m->iu4_signs, stream);
+            const std::size_t tb = static_cast<std::size_t>(ne) *
+                                   iu4::WeightBytesPerExpert(h, kd);
+            const std::size_t sb = static_cast<std::size_t>(ne) *
+                                   iu4::ScaleBytesPerExpert(h, kd);
+            if (!LoadGptq(p, 1, tiles, tb, scales, sb))
+              iu4::RepackExperts(static_cast<const std::uint8_t*>(wdn.dev),
+                                 wdn.row_bytes, tiles, scales, ne, h, ff, kd,
+                                 m->iu4_signs, stream);
             HIP_OK(hipStreamSynchronize(stream));
             m->iu4_dw[p] = {tiles, scales};
           }
@@ -4852,6 +5079,8 @@ struct Session::Impl : Scratch {
           qfn::RoutedNvfp4GemmF16(wdn.dev, act16, tmap, ntiles, bn, rbounds,
                                   rrows_slot, rrows_slot, y16, h, ff, s_dn,
                                   stream);
+      if (GptqWants(p))
+        GptqCapture(p, xmoe, act16);
       if (!ok1 || !ok2) {
         std::fprintf(stderr,
                      "inkling: shared routed gemm rejected the launch\n");
@@ -5740,6 +5969,10 @@ void Session::Rewind(std::uint32_t position) noexcept {
 }
 std::uint32_t Session::Position() const noexcept {
   return impl_->position;
+}
+
+bool Session::GptqFinish(const std::string& dir, std::string* error) {
+  return impl_->GptqFinish(dir, error);
 }
 
 void Session::Reset() noexcept {
