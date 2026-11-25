@@ -43,6 +43,18 @@ void QuantizeRoutedActs(const __half* x, const std::int32_t* rows_in,
                         float* scales, int padded_rows, const float* signs,
                         hipStream_t stream);
 
+/// Same result as QuantizeRoutedActs for rows that repeat tokens: every token
+/// is rotated and quantized once into tok_tiles/tok_scales (n rows), then copied
+/// into the per-slot tiles.
+void QuantizeRoutedActsOnce(const __half* x, int n, int k_src, int k,
+                            std::uint8_t* tok_tiles, float* tok_scales,
+                            int tok_padded, const std::int32_t* rows_in,
+                            const std::int32_t* rows_out,
+                            const std::int32_t* pad_bounds, int experts,
+                            int max_rows, std::uint8_t* tiles, float* scales,
+                            int padded_rows, const float* signs,
+                            hipStream_t stream);
+
 /// y[slot][rows] = F16(expert_scale * down(act)) for every routed row; rows is
 /// the output width (hidden size), k the padded K of tiles/act_tiles.
 void DownGemm(const std::uint8_t* tiles, const std::uint16_t* scales,

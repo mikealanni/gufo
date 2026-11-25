@@ -3409,6 +3409,9 @@ struct Session::Impl : Scratch {
   float* iu4_signs{nullptr};  ///< the model's shared signs
   std::uint8_t* iu4_act{nullptr};
   float* iu4_act_scales{nullptr};
+  std::uint8_t* iu4_tok{nullptr};
+  float* iu4_tok_scales{nullptr};
+  int iu4_tok_padded{0};
   int iu4_padded{0};
   // down projection (INKLING_IU4=2) activations
   std::uint8_t* iu4_act2{nullptr};
@@ -4667,6 +4670,11 @@ struct Session::Impl : Scratch {
               static_cast<std::size_t>(iu4_padded) / 16 * (h / 128) * 1024));
           iu4_act_scales = static_cast<float*>(AllocLazy(
               static_cast<std::size_t>(h / 128) * iu4_padded * 4));
+          iu4_tok_padded = (kMaxBatch + 127) / 128 * 128;
+          iu4_tok = static_cast<std::uint8_t*>(AllocLazy(
+              static_cast<std::size_t>(iu4_tok_padded) / 16 * (h / 128) * 1024));
+          iu4_tok_scales = static_cast<float*>(AllocLazy(
+              static_cast<std::size_t>(h / 128) * iu4_tok_padded * 4));
           iu4_act2 = static_cast<std::uint8_t*>(AllocLazy(
               static_cast<std::size_t>(iu4_padded) / 16 * (kd / 128) * 1024));
           iu4_act2_scales = static_cast<float*>(AllocLazy(
@@ -4682,9 +4690,18 @@ struct Session::Impl : Scratch {
                                                tl_b, nt128);
           tmap128 = tl_b;
         }
-        iu4::QuantizeRoutedActs(xmoe, rrows_token, rrows_slot, rbounds, ne,
-                                items + ne * 16, h, h, iu4_act, iu4_act_scales,
-                                iu4_padded, iu4_signs, stream);
+        static const bool tok_once = std::getenv("INKLING_IU4_TOKONCE") == nullptr ||
+                                     std::getenv("INKLING_IU4_TOKONCE")[0] != '0';
+        if (tok_once)
+          iu4::QuantizeRoutedActsOnce(
+              xmoe, n, h, h, iu4_tok, iu4_tok_scales, iu4_tok_padded,
+              rrows_token, rrows_slot, rbounds, ne, items + ne * 16, iu4_act,
+              iu4_act_scales, iu4_padded, iu4_signs, stream);
+        else
+          iu4::QuantizeRoutedActs(xmoe, rrows_token, rrows_slot, rbounds, ne,
+                                  items + ne * 16, h, h, iu4_act,
+                                  iu4_act_scales, iu4_padded, iu4_signs,
+                                  stream);
         iu4::GateUpSitu(m->iu4_w[p].first, m->iu4_w[p].second, iu4_act,
                         iu4_act_scales, iu4_padded, tmap128, nt128, rbounds,
                         rrows_slot, act16, ff, h, s_gu, situ_params, stream);

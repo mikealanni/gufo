@@ -214,14 +214,15 @@ __global__ void __launch_bounds__(1024)
               float* __restrict__ scales, int padded_rows,
               const float* __restrict__ signs, float clip) {
   const int c = blockIdx.x;
-  if (c >= pad_bounds[experts])
+  if (pad_bounds != nullptr && c >= pad_bounds[experts])
     return;
   const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int groups = k >> 7;
-  const bool live = rows_out[c] >= 0;
+  const bool live = rows_out == nullptr || rows_out[c] >= 0;
   float v[8];
   if (live) {
-    const std::size_t token = static_cast<std::size_t>(rows_in[c]);
+    const std::size_t token =
+        rows_in != nullptr ? static_cast<std::size_t>(rows_in[c]) : c;
     const bool inside = wave * 256 + lane * 8 < k_src;
     const uint4 raw = inside ? *reinterpret_cast<const uint4*>(
                                    x + token * k_src + wave * 256 + lane * 8)
@@ -631,6 +632,62 @@ void QuantizeRoutedActs(const __half* x, const std::int32_t* rows_in,
   ActKernel<<<max_rows, (k / 256) * 32, 0, stream>>>(
       x, rows_in, rows_out, pad_bounds, experts, k_src, k, tiles, scales,
       padded_rows, signs, clip);
+}
+
+// Copies the already quantized token rows into the per-slot tile layout: 32-byte
+// segments per (row, 128-block), one scale per (row, block).
+__global__ void __launch_bounds__(256)
+    GatherActs(const std::uint8_t* __restrict__ tok_tiles,
+               const float* __restrict__ tok_scales, int tok_padded,
+               const std::int32_t* __restrict__ rows_in,
+               const std::int32_t* __restrict__ rows_out,
+               const std::int32_t* __restrict__ pad_bounds, int experts,
+               int groups, std::uint8_t* __restrict__ tiles,
+               float* __restrict__ scales, int padded_rows) {
+  const int c = blockIdx.x * 4 + (threadIdx.x >> 6);
+  const int lane = threadIdx.x & 63;
+  if (c >= pad_bounds[experts])
+    return;
+  const bool live = rows_out[c] >= 0;
+  const int t = live ? rows_in[c] : 0;
+  for (int u = lane; u < groups * 4; u += 64) {
+    const int e = u >> 2, sg = (u >> 1) & 1, hf = u & 1;
+    const std::size_t dst =
+        (static_cast<std::size_t>(c >> 4) * groups + e) * 1024 +
+        (sg * 16 + (c & 15)) * 32 + hf * 16;
+    uint4 v = make_uint4(0, 0, 0, 0);
+    if (live) {
+      const std::size_t src =
+          (static_cast<std::size_t>(t >> 4) * groups + e) * 1024 +
+          (sg * 16 + (t & 15)) * 32 + hf * 16;
+      v = *reinterpret_cast<const uint4*>(tok_tiles + src);
+    }
+    *reinterpret_cast<uint4*>(tiles + dst) = v;
+  }
+  if (lane < groups)
+    scales[static_cast<std::size_t>(lane) * padded_rows + c] =
+        live ? tok_scales[static_cast<std::size_t>(lane) * tok_padded + t]
+             : 0.0f;
+}
+
+void QuantizeRoutedActsOnce(const __half* x, int n, int k_src, int k,
+                            std::uint8_t* tok_tiles, float* tok_scales,
+                            int tok_padded, const std::int32_t* rows_in,
+                            const std::int32_t* rows_out,
+                            const std::int32_t* pad_bounds, int experts,
+                            int max_rows, std::uint8_t* tiles, float* scales,
+                            int padded_rows, const float* signs,
+                            hipStream_t stream) {
+  static const float clip =
+      std::getenv("INKLING_IU4_ACLIP") != nullptr
+          ? static_cast<float>(std::atof(std::getenv("INKLING_IU4_ACLIP")))
+          : 0.9f;
+  ActKernel<<<n, (k / 256) * 32, 0, stream>>>(
+      x, nullptr, nullptr, nullptr, experts, k_src, k, tok_tiles, tok_scales,
+      tok_padded, signs, clip);
+  GatherActs<<<(max_rows + 3) / 4, 256, 0, stream>>>(
+      tok_tiles, tok_scales, tok_padded, rows_in, rows_out, pad_bounds,
+      experts, k >> 7, tiles, scales, padded_rows);
 }
 
 void GateUpSitu(const std::uint8_t* tiles, const std::uint16_t* scales,
