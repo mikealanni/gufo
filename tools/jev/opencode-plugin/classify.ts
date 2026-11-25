@@ -20,11 +20,17 @@ export const HEAVY: RegExp[] = [
   /^(?:\S*\/)?python3?\s+(?!-c\b)\S+.*\b(torch|hip|rocm)\b/,
   /run-gufo\.sh/,
   /(?:^|\s)(?:\.\/)?build\/[\w.-]+\/(?:\S*\/)?tests\/\S*(?:_test|_tests|_bench|_probe)\b/,
+  /\bgufo-(?:npu|sbtest[\w-]*)\b/,
+  /npu-lock\.sh/,
+  /\bhipcc\b/,
+  /tools\/bench\/build\.sh/,
 ];
 export const LIGHT_SCRIPTS = new Set(["chroma-helper.py"]);
 // Compiling uses CPU and RAM only, and swap covers the memory, so a build never
 // stops gufo. Running the built tests still does (ctest and the test binaries).
 export const BUILD_ONLY = /^(?:\S*\/)?(?:cmake\s+--build|ninja|make|nix\s+build|nix\s+develop\s+-c\s+(?:cmake\s+--build|ninja|make))\b/;
+const PY_EDIT = /^python3?\s+-\s*<</;
+const PY_RUNS = /subprocess|os\.system|Popen|torch|pyxrt|ctypes/;
 
 export const LIGHT_WORDS = new Set([
   "git", "ls", "cat", "rg", "grep", "sed", "head", "tail", "echo", "pwd", "cd",
@@ -32,7 +38,8 @@ export const LIGHT_WORDS = new Set([
   "uniq", "awk", "stat", "file", "which", "date", "printf", "true", "less", "more",
   "tee", "xxd", "sha256sum", "md5sum", "sha1sum", "strings", "nm", "objdump", "readelf", "ldd", "nl", "cut", "basename", "dirname", "readlink", "realpath", "du",
   "df", "ps", "pgrep", "sleep", "wait", "kill", "tar", "unzip", "gh", "jj",
-  "read", "export", "test", "[", "[[", "local", "return", "exit", "break", "continue",
+  "env", "printenv", "id", "whoami", "hostname", "uname", "nproc", "free", "uptime", "lsof", "ss",
+  "journalctl", "dmesg", "source", ".", "read", "export", "test", "[", "[[", "local", "return", "exit", "break", "continue",
 ]);
 
 export const SECRET_KEYS = [
@@ -179,6 +186,7 @@ export function classify(command: string): { verdict: "heavy" | "light" | "unkno
     if (LIGHT_WORDS.has(firstWord(seg))) continue;
     if (executedScripts(seg).some((x) => LIGHT_SCRIPTS.has(basename(x)))) continue;
     if (BUILD_ONLY.test(seg)) continue;
+    if (PY_EDIT.test(seg) && !PY_RUNS.test(seg)) continue;
     if (detached && seg && !/\s(--help|-h|--version)(\s|$)/.test(seg)) {
       return { verdict: "heavy", segment: seg };
     }

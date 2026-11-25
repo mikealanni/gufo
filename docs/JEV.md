@@ -53,17 +53,25 @@ question per line, answer `Yes|No <p_yes> <p_no> ...`). The plugin never starts 
 second NPU process. A command is treated as heavy when `p_yes` reaches
 `--judge-cutoff`.
 
-- **Model.** The launcher `~/run-jev-guard.sh` runs the d1 decision model
-  (d1-2B, Q8_0, about 2.3 GB of RAM) on the general NPU engine (`gufo-judge`,
-  built from `tools/npu/gen`). `GUFO_JUDGE=pplx` selects the pplx decider
-  (Qwen3.5-4B, Q8_0): about 370 ms per request and 4.5 GB real RAM (measured as
-  the drop in `MemAvailable`; NPU buffers do not show in RSS).
-- **Cutoff.** Probabilities are not comparable between judges. The old 0.85
-  cutoff flagged none of the 239 unknown commands in a replay of real sessions.
-  pplx uses `0.05` (flags 18% of unknown commands, 3 of 4 labeled heavy ones);
-  the launcher uses `0.45` for d1 (`JUDGE_CUTOFF` overrides either). Each false stop costs a gufo reload
-  (about 70 s), so tune it from `~/.gufo/jev-log/jev.sqlite3` before relying on it.
-- **Roll back.** `GUFO_JUDGE=pplx` restores the pplx judge; `run-jev-guard.sh.bak-d1default` is the launcher before d1 became the default.
+- **Model.** `~/run-gufo.sh` picks the judge from the loaded model: pplx for
+  `27b`, `35b`, `flint` and `inkling`; d1 for `flash-next`, `glm`, `glm-coder`
+  and `laguna`. An explicit `GUFO_JUDGE` overrides that. Both run on the general
+  NPU engine (`gufo-judge`, built from `tools/npu/gen`). d1 (d1-2B, Q8_0) uses
+  about 2.3 GB of RAM; pplx (Qwen3.5-4B, Q8_0) about 370 ms per request and 4.5 GB
+  real RAM (measured as the drop in `MemAvailable`; NPU buffers do not show in
+  RSS).
+- **Question.** Each judge gets its own framing from `guard.py`: pplx asks
+  whether the command *actively occupies* the GPU or most RAM, explicitly
+  excluding downloads, copies and reads; d1 asks whether the command uses the
+  GPU *right now* and says that downloading a model file does not. The generic
+  "needs the whole GPU or most of the RAM" wording scored `lemonade pull
+  Qwen3.8-Flash-Next-Gufo 2>&1` as heavy on both judges.
+- **Cutoff.** Probabilities are not comparable between judges. The launcher
+  uses `0.05` for pplx and `0.30` for d1; `JUDGE_CUTOFF` overrides either.
+  With the framing above, the lemonade command scores 0.029 on pplx and 0.126
+  on d1 (both light), while 34/38 and 11/13 labeled heavy commands still stop
+  gufo respectively. Each false stop costs a gufo reload (about 70 s), so tune
+  from `~/.gufo/jev-log/jev.sqlite3` before relying on it.
 
 ## Start-up check
 

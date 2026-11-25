@@ -109,8 +109,15 @@ HOP = {"connection", "keep-alive", "transfer-encoding", "te", "upgrade",
        "proxy-authenticate", "proxy-authorization", "trailers", "content-length",
        "host", "content-encoding"}
 SHELL_TOOLS = {"bash", "shell", "run_command", "execute_command"}
-JUDGE_PROMPT = ("Does this shell command need the whole GPU or most of the RAM "
-                "of the machine? Command: ")
+PPLX_PROMPT = ("Will this shell command actively occupy the GPU or more than "
+               "half the machine RAM while it runs? File downloads, copies "
+               "and reads do not count. Command: ")
+D1_PROMPT = ("Does this command actively use the GPU right now? Downloading "
+             "a model file does not use the GPU. Command: ")
+
+
+def judge_prompt(model):
+    return D1_PROMPT if "d1" in os.path.basename(model or "").lower() else PPLX_PROMPT
 
 
 def log(msg):
@@ -762,7 +769,8 @@ def foreign_rss_over_gb(skip_pgid, skip_pids, limit_gb):
 
 
 class Judge:
-    def __init__(self, binary, model, npu_dir):
+    def __init__(self, binary, model, npu_dir, prompt):
+        self.prompt = prompt
         self.args = [binary, "judge", "--model", model, "--stdio"]
         libs = "/opt/xilinx/xrt/lib:/home/majed/npu-work/boostshim:/opt/rocm/lib:/opt/rocm/core-7.14/lib"
         self.env = dict(os.environ, GUFO_NPU_DIR=npu_dir, LD_LIBRARY_PATH=libs)
@@ -1026,7 +1034,7 @@ class Guard:
             if verdict == "unknown" and self.judge is not None:
                 try:
                     ctx = f"\nScript contents:\n{excerpt}" if excerpt else ""
-                    p = await self.judge.yes_probability(JUDGE_PROMPT + seg + ctx)
+                    p = await self.judge.yes_probability(self.judge.prompt + seg + ctx)
                 except (asyncio.TimeoutError, RuntimeError, OSError):
                     p = None
             by_judge = verdict == "unknown" and p is not None and p >= self.a.judge_cutoff
@@ -1481,7 +1489,8 @@ class Guard:
         self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))
         if self.a.judge_model:
             try:
-                self.judge = Judge(self.a.gufo_bin, self.a.judge_model, self.a.npu_dir)
+                self.judge = Judge(self.a.gufo_bin, self.a.judge_model, self.a.npu_dir,
+                                   judge_prompt(self.a.judge_model))
                 await self.judge.start()
                 log("judge sidecar ready")
             except Exception as exc:
