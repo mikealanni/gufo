@@ -50,6 +50,8 @@ of depth with the NPU on (34.4 without it).
 
 - The NPU releases its activation buffers at the first decode token. Keeping them costs a 2 to 4 s
   stall in the first decode seconds (tok/s over 128 tokens: 25.7 kept, 34.0 released).
-- Plain decode at depth varies between runs on this machine; the cause is open.
+- Plain decode at 16k to 64k tokens measures 30 to 34.5 tok/s over 300 tokens (empty context 37). The
+  gap is a one-time 0.4 to 0.8 s hiccup when the NPU buffers are released at the first decode token;
+  a 128-token window shows it as 29 to 35 tok/s.
 - Output differs from the GPU-only path at near-ties (block-float NPU arithmetic, F16 hi/lo router);
   no KL measurement has been made.

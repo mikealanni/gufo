@@ -60,7 +60,8 @@ path at near-ties. No KL measurement has been made yet.
 
 ## Known limits
 
-- Plain decode at 16k tokens and deeper varies between runs (22 to 35 tok/s); the cause is open.
+- The first decode seconds after a long prefill include a one-time 0.4 to 0.8 s hiccup (NPU buffer
+  release); plain decode at 16k to 64k tokens measures 30 to 34.5 tok/s over 300 tokens.
 - Real-text prefill is 1,600 to 1,700 tok/s at 10k to 24k tokens; the 1,800+ figures are `gufo bench`
   with its repeating token pattern, which touches few experts.
 - `gufo serve` has no speculative decoding for Ling.
