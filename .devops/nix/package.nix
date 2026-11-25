@@ -42,7 +42,11 @@ let
       || relativePath == "tests/models"
       || relativePath == "tests/models/deepseek_v4_flash"
       || relativePath == "tests/models/deepseek_v4_flash/fixtures"
-      || relativePath == "tests/models/deepseek_v4_flash/fixtures/antirez-ds4.json";
+      || relativePath == "tests/models/deepseek_v4_flash/fixtures/antirez-ds4.json"
+      || relativePath == "tests/models/d1"
+      || lib.hasPrefix "tests/models/d1/" relativePath
+      || relativePath == "tests/models/lfm3"
+      || lib.hasPrefix "tests/models/lfm3/" relativePath;
   };
 in
 stdenv.mkDerivation {
