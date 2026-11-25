@@ -35,6 +35,16 @@ documentation text (3.7 and 4.1 accepted tokens per step), 38.1 and 30.3 on raw 
 (2.6 and 1.8 accepted); a step costs about 93 ms at that depth (12 ms draft, 81 ms verify)
 against about 67 ms at 4K, so the rate follows the acceptance.
 
+### Fast profile without pruning (default)
+
+Measured 2026-11-25, GPU + NPU, banks of 4,096, warm 8K prefill, alternating runs: INT4 experts with
+GPTQ and fp16 block states, no pruning, 2,851 and 2,853 tok/s (exact engine about 2,390; pruning 0.10,
+3,010 and 3,030). Light pruning does not pay: 0.02, 0.04, 0.06 and 0.08 give 2,857, 2,862, 2,875 and
+2,933 tok/s. `INKLING_PRUNE_PREFILL=0` gives logits identical to leaving it unset. GPU-only 4K profile
+without pruning, window 1,368 ms: int4 gate/up 308 ms (54 TOPS), exact dense projections 304, attention 296,
+int4 down 164, loop control 98, RMS 95, mixes 124, ConvT 60. Tried and not kept: fusing the NPU q decode with
+the q clip (no change at 8K) and prefetching the next K/V tile in the attention kernel (attention 22% slower).
+
 ## Decode
 
 | Workload | tok/s |

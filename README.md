@@ -17,8 +17,9 @@ speculative decoding on top, for Qwen, Inkling, Flint, GLM-5.3 Flash and Laguna 
 - **Inkling 2 Mini** (26.4B MoE, 3.4B active, looped middle layers) on the GPU with
   DSpark speculation and NPU prefill. Up to 256K context with block-sparse
   attention, tool calls, a reasoning channel, and the same RAM and disk
-  continuation cache as the other models. Prefill about 2,100 to 2,400 tok/s at 4K to 8K
-  (2,382 at 8K with the NPU; 1,647 at 128K); decode 74.6 tok/s on code and 71.1
+  continuation cache as the other models. Prefill about 2,850 tok/s at 8K with the NPU
+  (int4 experts rounded with GPTQ; 2,390 with the exact engine; about 3,000 with the opt-in
+  expert pruning); decode 74.6 tok/s on code and 71.1
   on JSON, 54 to 61 tok/s at 63K context. See [docs/models/inkling](docs/models/inkling/README.md).
 - **Qwen3.8-27B on int4 WMMA plus NPU.** The dense projections run as int4 x int4
   WMMA on the GPU with the FFN split across the NPU: prefill 1,335 tok/s at 8K
@@ -55,12 +56,14 @@ drafter. Prefill is the single-request engine check (no cache).
 | --- | --- | --- |
 | 2K | 2,065 | 2,065 (below the 3,072-row NPU batch) |
 | 4K | 2,144 | **2,342** |
-| 8K | 2,075 | **2,382** |
+| 8K | 2,075 | **2,382** (2,851 fast profile, 3,020 with pruning) |
 | 16K | 1,930 | **2,170** |
 | 32K | 1,536 | **1,689** |
 | 128K | about 1,035 | **1,647** |
 
-The 32K and 128K rows were measured before the latest prefill work and have not been repeated.
+These rows are the exact engine. The fast profile (`run-gufo.sh` default: int4 experts with GPTQ, KL 0.014 against
+the exact engine) prefills 8K at 2,851 tok/s; `GUFO_INKLING_PRUNE=0.10` adds expert pruning for about 3,020 tok/s
+at KL 0.035. The 32K row was measured before the latest prefill work and has not been repeated.
 
 | Decode, tok/s | speculation |
 | --- | --- |
