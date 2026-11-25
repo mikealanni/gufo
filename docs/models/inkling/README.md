@@ -45,12 +45,13 @@ forces it).
   or more and is off by default because it changes outputs, see
   [QUALITY.md](QUALITY.md). `INKLING_IU4_WCLIP=0` and `INKLING_IU4_ACLIP=<x>` tune the
   scale choice, `INKLING_IU4_SKIP=<layers>` keeps listed physical layers on NVFP4.
-- **3K prefill profile (opt-in, lossy).** The fast profile plus GPTQ-rounded int4 gate/up
-  weights and prefill expert pruning reaches about 3,000 tok/s at 8K prompts with the NPU
-  (2,292 tok/s at 128K, against 1,935 for the lossless engine). Set
-  `INKLING_IU4=2 INKLING_F16_BLOCKS=1 INKLING_PRUNE_PREFILL=0.10
-  INKLING_GPTQ_DIR=<dir> INKLING_GPTQ_PARTS=1`; `run-gufo.sh` does this by default for
-  Inkling (`GUFO_INKLING_FAST=0` serves the lossless engine). The GPTQ artifacts are built
+- **Fast prefill profile (lossy, KL 0.014).** The int4 fast profile plus GPTQ-rounded int4
+  gate/up weights reaches about 2,850 tok/s at 8K prompts with the NPU (about 2,390 for the
+  lossless engine). Adding prefill expert pruning (`INKLING_PRUNE_PREFILL=0.10`) reaches
+  about 3,000 tok/s at 8K and 2,292 tok/s at 128K, at KL 0.035. Set
+  `INKLING_IU4=2 INKLING_F16_BLOCKS=1 INKLING_GPTQ_DIR=<dir> INKLING_GPTQ_PARTS=1`;
+  `run-gufo.sh` does this by default for Inkling (`GUFO_INKLING_FAST=0` serves the lossless
+  engine, `GUFO_INKLING_PRUNE=0.10` adds the pruning). The GPTQ artifacts are built
   once per model file: `INKLING_GPTQ_CAPTURE=<layers> gufo_inkling_gpu_check <gguf> --gptq
   <text> <windows> 4096 <dir>` runs a lossless calibration prefill over the text, accumulates
   each expert's input Hessian for the listed layers (six layers at a time fit in memory
