@@ -54,6 +54,12 @@ struct block_q8_K {
   std::int16_t bsums[16];
 };
 
+// Q4_0: fp16 scale + 32 4-bit values packed two per byte, centered at 8.
+struct block_q4_0 {
+  std::uint16_t d;
+  std::uint8_t qs[16];
+};
+
 // Q8_0: fp16 scale + 32 int8 quantized values (QK=32).
 struct block_q8_0 {
   std::uint16_t d;
@@ -92,6 +98,7 @@ struct block_iq3_s {
 
 static_assert(sizeof(block_q4_K) == 144, "block_q4_K must be 144 bytes");
 static_assert(sizeof(block_q5_K) == 176, "block_q5_K must be 176 bytes");
+static_assert(sizeof(block_q4_0) == 18, "block_q4_0 must be 18 bytes");
 static_assert(sizeof(block_q6_K) == 210, "block_q6_K must be 210 bytes");
 static_assert(sizeof(block_q3_K) == 110, "block_q3_K must be 110 bytes");
 static_assert(sizeof(block_q8_K) == 292, "block_q8_K must be 292 bytes");
@@ -149,6 +156,9 @@ inline constexpr std::int8_t kValuesIq4Nl[16] = {
 
 // Standard 16-bit float helper
 float Fp16ToFloat(std::uint16_t h) noexcept;
+
+// Dequantize row of Q4_0 to float
+void DequantizeQ4_0(const void* src, float* dst, std::size_t k);
 
 // Dequantize row of Q4_K to float
 void DequantizeQ4_K(const void* src, float* dst, std::size_t k);

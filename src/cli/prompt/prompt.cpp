@@ -28,6 +28,8 @@
 #include "src/models/glm53_flash/reference.hpp"
 #include "src/models/laguna/chat_template.hpp"
 #include "src/models/laguna/reference.hpp"
+#include "src/models/ling32/chat_template.hpp"
+#include "src/models/ling32/reference.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/generator.hpp"
 #include "src/models/qwen/tokenizer.hpp"
@@ -40,6 +42,7 @@
 #include "src/models/flint/gpu/engine.hpp"
 #include "src/models/glm53_flash/engine.hpp"
 #include "src/models/laguna/gpu/engine.hpp"
+#include "src/models/ling32/gpu/engine.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
@@ -271,6 +274,17 @@ int RunLagunaPromptCPU(const PromptOptions& opt, const core::GgufReader& reader,
                        std::chrono::steady_clock::time_point load_start);
 #ifdef ENGINE_ENABLE_HIP
 int RunLagunaPromptGPU(const PromptOptions& opt, const core::GgufReader& reader,
+                       std::chrono::steady_clock::time_point load_start);
+#endif
+
+bool IsLing32(const core::GgufReader& reader) {
+  return reader.GetMetadataString("general.architecture") == "bailingmoe3";
+}
+
+int RunLing32PromptCPU(const PromptOptions& opt, const core::GgufReader& reader,
+                       std::chrono::steady_clock::time_point load_start);
+#ifdef ENGINE_ENABLE_HIP
+int RunLing32PromptGPU(const PromptOptions& opt, const core::GgufReader& reader,
                        std::chrono::steady_clock::time_point load_start);
 #endif
 
@@ -595,6 +609,79 @@ int RunLagunaPromptCPU(const PromptOptions& opt, const core::GgufReader& reader,
   return 0;
 }
 
+int RunLing32PromptCPU(const PromptOptions& opt, const core::GgufReader& reader,
+                       std::chrono::steady_clock::time_point load_start) {
+  std::string err;
+  auto tokenizer = tokenization::QwenTokenizer::CreateFromGguf(reader, &err);
+  if (!tokenizer) {
+    std::cerr << "Ling-3.2 tokenizer failed: " << err << '\n';
+    return 1;
+  }
+  auto model = models::ling32::ReferenceModel::Open(opt.model_path, &err);
+  if (!model) {
+    std::cerr << "Ling-3.2 load failed: " << err << '\n';
+    PrintModelLoadTime(load_start, false);
+    return 1;
+  }
+  PrintModelLoadTime(load_start, true);
+
+  const auto reasoning = PromptReasoningOptions(opt);
+  models::ling32::ChatTemplateOptions chat_options;
+  chat_options.enable_thinking = reasoning.enabled.value_or(false);
+  std::vector<models::ling32::ChatMessage> messages;
+  if (!opt.system_prompt.empty())
+    messages.push_back({"system", opt.system_prompt, ""});
+  messages.push_back({"user", opt.prompt_text, ""});
+  const std::string rendered =
+      opt.use_chat_template
+          ? models::ling32::RenderPrompt(messages, chat_options)
+          : opt.prompt_text;
+  tokenization::TokenizerOptions encode_options;
+  encode_options.parse_special_tokens = true;
+  const auto prompt = tokenizer->Encode(rendered, encode_options);
+  if (prompt.empty()) {
+    std::cerr << "Ling-3.2 prompt produced no tokens\n";
+    return 1;
+  }
+
+  const auto stop_tokens = FlintStopTokens(reader);
+  const auto is_stop = [&](tokenization::TokenId token) {
+    return std::find(stop_tokens.begin(), stop_tokens.end(), token) !=
+           stop_tokens.end();
+  };
+
+  auto session = model->CreateSession();
+  sampling::SamplerState sampler(opt.sampling, prompt);
+  const auto start = std::chrono::steady_clock::now();
+  const std::vector<float>* logits = nullptr;
+  for (const auto token : prompt)
+    logits = &model->Evaluate(*session, static_cast<std::int32_t>(token));
+  const auto prefill_end = std::chrono::steady_clock::now();
+
+  std::size_t generated = 0;
+  for (; generated < opt.max_tokens; ++generated) {
+    const auto token = sampler.Sample(*logits);
+    if (is_stop(token))
+      break;
+    sampler.Accept(token);
+    std::cout << tokenizer->DecodeToken(token) << std::flush;
+    if (generated + 1 < opt.max_tokens)
+      logits = &model->Evaluate(*session, static_cast<std::int32_t>(token));
+  }
+  std::cout << '\n';
+  if (opt.verbose) {
+    const auto seconds = [](auto a, auto b) {
+      return std::chrono::duration<double>(b - a).count();
+    };
+    const auto end = std::chrono::steady_clock::now();
+    std::cerr << "[Ling-3.2 CPU reference] prompt=" << prompt.size()
+              << " tok in " << seconds(start, prefill_end)
+              << " s, generated=" << generated << " tok in "
+              << seconds(prefill_end, end) << " s\n";
+  }
+  return 0;
+}
+
 #ifdef ENGINE_ENABLE_HIP
 
 int RunLagunaPromptGPU(const PromptOptions& opt, const core::GgufReader& reader,
@@ -823,6 +910,175 @@ int RunLagunaPromptGPU(const PromptOptions& opt, const core::GgufReader& reader,
   return 0;
 }
 
+int RunLing32PromptGPU(const PromptOptions& opt, const core::GgufReader& reader,
+                       std::chrono::steady_clock::time_point load_start) {
+  std::string err;
+  auto tokenizer = tokenization::QwenTokenizer::CreateFromGguf(reader, &err);
+  if (!tokenizer) {
+    std::cerr << "Ling-3.2 tokenizer failed: " << err << '\n';
+    return 1;
+  }
+  const bool mtp = opt.speculative_backend == "mtp";
+  if (!opt.speculative_backend.empty() && !mtp) {
+    std::cerr << "Ling-3.2 supports only --speculative mtp\n";
+    return 2;
+  }
+  if (mtp && opt.sampling.temperature > 0.0F) {
+    std::cerr << "Ling-3.2 MTP verification is greedy: use --temperature 0\n";
+    return 2;
+  }
+  auto model = models::ling32::gpu::Model::Load(opt.model_path, &err);
+  if (!model) {
+    std::cerr << "Ling-3.2 GPU load failed: " << err << '\n';
+    PrintModelLoadTime(load_start, false);
+    return 1;
+  }
+  PrintModelLoadTime(load_start, true);
+
+  const auto reasoning = PromptReasoningOptions(opt);
+  models::ling32::ChatTemplateOptions chat_options;
+  chat_options.enable_thinking = reasoning.enabled.value_or(false);
+  std::vector<models::ling32::ChatMessage> messages;
+  if (!opt.system_prompt.empty())
+    messages.push_back({"system", opt.system_prompt, ""});
+  messages.push_back({"user", opt.prompt_text, ""});
+  const std::string rendered =
+      opt.use_chat_template
+          ? models::ling32::RenderPrompt(messages, chat_options)
+          : opt.prompt_text;
+  tokenization::TokenizerOptions encode_options;
+  encode_options.parse_special_tokens = true;
+  const auto prompt = tokenizer->Encode(rendered, encode_options);
+  if (prompt.empty()) {
+    std::cerr << "Ling-3.2 prompt produced no tokens\n";
+    return 1;
+  }
+
+  constexpr std::size_t kDraftSlack = 16;
+  const auto session = model->CreateSession(
+      static_cast<std::uint32_t>(prompt.size() + opt.max_tokens + 1 +
+                                 kDraftSlack),
+      &err);
+  if (!session) {
+    std::cerr << "Ling-3.2 GPU session creation failed: " << err << '\n';
+    return 1;
+  }
+  const auto stop_tokens = FlintStopTokens(reader);
+  const auto is_stop = [&](tokenization::TokenId token) {
+    return std::find(stop_tokens.begin(), stop_tokens.end(), token) !=
+           stop_tokens.end();
+  };
+  sampling::SamplerState sampler(opt.sampling, prompt);
+  std::vector<std::int32_t> input(prompt.begin(), prompt.end());
+  if (mtp)
+    session->EnableMtp();
+  const auto start = std::chrono::steady_clock::now();
+  if (!session->Append(input, &err)) {
+    std::cerr << "Ling-3.2 GPU prefill failed: " << err << '\n';
+    return 1;
+  }
+  const auto prefill_end = std::chrono::steady_clock::now();
+
+  std::size_t generated = 0;
+  std::size_t rounds = 0;
+  std::size_t accepted = 0;
+  constexpr std::uint32_t kDefaultLingDrafts = 2;
+  constexpr std::uint32_t kMaxLingDrafts = 7;
+  const char* drafts_env = std::getenv("LING_MTP_DRAFTS");
+  const std::uint32_t draft_count = std::min<std::uint32_t>(
+      std::max<std::uint32_t>(
+          drafts_env != nullptr
+              ? static_cast<std::uint32_t>(std::atoi(drafts_env))
+              : kDefaultLingDrafts,
+          1),
+      kMaxLingDrafts);
+  auto token = sampler.Sample(session->Logits());
+  bool done = false;
+  const auto emit = [&](tokenization::TokenId t) {
+    if (is_stop(t) || generated >= opt.max_tokens) {
+      done = true;
+      return;
+    }
+    sampler.Accept(t);
+    std::cout << tokenizer->DecodeToken(t) << std::flush;
+    ++generated;
+  };
+  while (!done && generated < opt.max_tokens) {
+    if (!mtp) {
+      emit(token);
+      if (done || generated >= opt.max_tokens)
+        break;
+      const auto input_token = static_cast<std::int32_t>(token);
+      if (!session->Append(std::span(&input_token, 1), &err)) {
+        std::cerr << "\nLing-3.2 GPU decode failed: " << err << '\n';
+        return 1;
+      }
+      token = sampler.Sample(session->Logits());
+      continue;
+    }
+    std::vector<std::int32_t> toks{static_cast<std::int32_t>(token)};
+    session->BeginDraft();
+    std::int32_t seed = toks[0];
+    for (std::uint32_t j = 0; j < draft_count; ++j) {
+      if (!session->MtpAppend(seed, &err)) {
+        std::cerr << "\nLing-3.2 MTP draft failed: " << err << '\n';
+        return 1;
+      }
+      const auto& ml = session->MtpLogits();
+      seed = static_cast<std::int32_t>(std::max_element(ml.begin(), ml.end()) -
+                                       ml.begin());
+      toks.push_back(seed);
+    }
+    std::vector<float> rows;
+    if (!session->Verify(toks, &rows, &err)) {
+      std::cerr << "\nLing-3.2 verify failed: " << err << '\n';
+      return 1;
+    }
+    const std::size_t vocab = session->Logits().size();
+    std::uint32_t keep = 0;
+    while (keep < draft_count) {
+      const auto* row = rows.data() + keep * vocab;
+      const auto best =
+          static_cast<std::int32_t>(std::max_element(row, row + vocab) - row);
+      if (best != toks[keep + 1])
+        break;
+      ++keep;
+    }
+    for (std::uint32_t j = 0; j <= keep && !done; ++j)
+      emit(static_cast<tokenization::TokenId>(toks[j]));
+    ++rounds;
+    accepted += keep;
+    if (done)
+      break;
+    if (!session->Commit(keep, &err)) {
+      std::cerr << "\nLing-3.2 commit failed: " << err << '\n';
+      return 1;
+    }
+    token = sampler.Sample(session->Logits());
+  }
+  if (mtp && opt.verbose) {
+    std::cerr << "\n[Ling-3.2 MTP] rounds=" << rounds
+              << " accepted_drafts=" << accepted << " tokens/round="
+              << (rounds == 0 ? 0.0 : static_cast<double>(generated) / rounds)
+              << '\n';
+  }
+  std::cout << '\n';
+  if (opt.verbose) {
+    const auto seconds = [](auto a, auto b) {
+      return std::chrono::duration<double>(b - a).count();
+    };
+    const auto end = std::chrono::steady_clock::now();
+    const double prefill = seconds(start, prefill_end);
+    std::cerr << "[Ling-3.2 GPU] prompt=" << prompt.size() << " tok in "
+              << prefill << " s (" << prompt.size() / prefill
+              << " tok/s), generated=" << generated << " tok in "
+              << seconds(prefill_end, end) << " s ("
+              << generated / std::max(seconds(prefill_end, end), 1e-9)
+              << " tok/s)\n";
+  }
+  return 0;
+}
+
 #endif  // ENGINE_ENABLE_HIP
 
 #ifdef ENGINE_ENABLE_HIP
@@ -1020,6 +1276,8 @@ void ResolvePromptSampling(const core::GgufReader& reader, PromptOptions* opt) {
     preset = sampling::TextModelPreset::kDeepSeekV4Flash;
   } else if (artifact_architecture == "flint") {
     preset = sampling::TextModelPreset::kFlint;
+  } else if (artifact_architecture == "bailingmoe3") {
+    preset = sampling::TextModelPreset::kLing32;
   } else if (artifact_architecture == "qwen4exp") {
     preset = sampling::TextModelPreset::kQwen38;
   } else if (const auto config = reader.ExtractModelConfig()) {
@@ -1955,6 +2213,17 @@ int RunPrompt(std::span<const char* const> args) {
       return 2;
     }
     return RunFlintPrompt(opt, *reader, model_load_start);
+  }
+  if (IsLing32(*reader)) {
+    if (!opt.image_paths.empty() || !opt.vision_model_path.empty()) {
+      std::cerr << "Ling-3.2 does not support image input\n";
+      return 2;
+    }
+#ifdef ENGINE_ENABLE_HIP
+    if (!opt.force_cpu)
+      return RunLing32PromptGPU(opt, *reader, model_load_start);
+#endif
+    return RunLing32PromptCPU(opt, *reader, model_load_start);
   }
   if (IsGlm53Flash(*reader)) {
 #if defined(ENGINE_ENABLE_HIP)

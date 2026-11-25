@@ -189,6 +189,8 @@ struct NpuGemm::Impl {
     xrt::bo shared_bo;   // userptr import of `host` (normal mode)
     xrt::bo private_bo;  // NPU-only pages (isolate mode)
     void* private_host{nullptr};
+    bool weight_private{false};  // weights: encoded in pinned memory, then
+                                 // moved to NPU-only pages
   };
   std::vector<Buffer> buffers;
   const bool isolate{std::getenv("GUFO_NPU_ISOLATE") != nullptr};
@@ -267,7 +269,7 @@ struct NpuGemm::Impl {
 
   xrt::bo& NpuBo(int id) {
     Buffer& b = buffers[id];
-    return isolate ? b.private_bo : b.shared_bo;
+    return (isolate || b.weight_private) ? b.private_bo : b.shared_bo;
   }
 
   static double Since(std::chrono::steady_clock::time_point t) {
@@ -279,7 +281,7 @@ struct NpuGemm::Impl {
   void CopyToNpu(int id) {
     const auto t0 = std::chrono::steady_clock::now();
     Buffer& b = buffers[id];
-    if (isolate) {
+    if (isolate || b.weight_private) {
       copy_pool.Copy(b.private_host, b.host, b.bytes);
     }
     NpuBo(id).sync(XCL_BO_SYNC_BO_TO_DEVICE);
@@ -611,6 +613,50 @@ int NpuGemm::NewBuffer(std::size_t bytes, std::string* error) {
   return static_cast<int>(i.buffers.size()) - 1;
 }
 
+void NpuGemm::ReleaseBuffer(int id) {
+  const std::lock_guard lock(impl_->mutex);
+  Impl::Buffer& b = impl_->buffers[id];
+  b.shared_bo = xrt::bo();
+  b.private_bo = xrt::bo();
+  b.private_host = nullptr;
+  if (b.host != nullptr) {
+    (void)hipHostFree(b.host);
+    b.host = nullptr;
+    b.device = nullptr;
+  }
+}
+
+int NpuGemm::NewWeightBuffer(std::size_t bytes, std::string* error) {
+  Impl& i = *impl_;
+  void* host = nullptr;
+  if (hipHostMalloc(&host, bytes, hipHostMallocMapped) != hipSuccess) {
+    if (error != nullptr) {
+      *error = "hipHostMalloc failed for an NPU weight buffer";
+    }
+    return -1;
+  }
+  try {
+    Impl::Buffer buffer;
+    buffer.host = host;
+    buffer.bytes = bytes;
+    buffer.weight_private = true;
+    if (hipHostGetDevicePointer(&buffer.device, host, 0) != hipSuccess) {
+      throw std::runtime_error("hipHostGetDevicePointer failed");
+    }
+    buffer.private_bo =
+        xrt::bo(i.device, bytes, XRT_BO_FLAGS_HOST_ONLY, i.group_a);
+    buffer.private_host = buffer.private_bo.map<void*>();
+    i.buffers.push_back(std::move(buffer));
+  } catch (const std::exception& e) {
+    (void)hipHostFree(host);
+    if (error != nullptr) {
+      *error = std::string("NPU weight buffer setup failed: ") + e.what();
+    }
+    return -1;
+  }
+  return static_cast<int>(i.buffers.size()) - 1;
+}
+
 bool NpuGemm::Healthy() const noexcept {
   return !impl_->failed;
 }
@@ -630,6 +676,12 @@ void* NpuGemm::Device(int id) const {
 void NpuGemm::FinalizeWeights(int id) {
   const std::lock_guard lock(impl_->mutex);
   impl_->CopyToNpu(id);
+  Impl::Buffer& b = impl_->buffers[id];
+  if (b.weight_private && b.host != nullptr) {
+    (void)hipHostFree(b.host);
+    b.host = nullptr;
+    b.device = nullptr;
+  }
 }
 
 int NpuGemm::AddProgram(const std::string& insts, std::string* error) {

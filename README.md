@@ -2,7 +2,7 @@
 
 Fast local inference for AMD Strix Halo (Ryzen AI MAX+ 395, Radeon 8060S
 `gfx1151`), with prefill shared between the GPU and the Ryzen AI NPU and
-speculative decoding on top, for Qwen, Inkling, Flint, GLM-5.3 Flash and Laguna models. Fork of [gufo-org/gufo](https://github.com/gufo-org/gufo) (MIT).
+speculative decoding on top, for Qwen, Inkling, Flint, GLM-5.3 Flash, Laguna and Ling models. Fork of [gufo-org/gufo](https://github.com/gufo-org/gufo) (MIT).
 
 ## What's new
 
@@ -39,6 +39,7 @@ speculative decoding on top, for Qwen, Inkling, Flint, GLM-5.3 Flash and Laguna 
 | Flint | UD-Q4_K_XL | shared expert and QKV, two-bank pipeline | prompt lookup (no draft model) |
 | GLM-5.3 Flash | AJ-IQ2_XXS / RCO-152E Q3_K_M | KDA q/k/v and shared expert, two-bank lock-step | DFlash2 with prompt-lookup drafts |
 | Laguna S 2.1 | UD-Q4_K_M | shared expert, two-bank pipeline | DFlash v1 (block-diffusion) |
+| Ling 3.2 Air | Q4_K_M | KDA q/k/v and shared expert, two-bank pipeline | MTP (embedded layer, `gufo prompt` only) |
 
 ## Speed
 
@@ -256,6 +257,33 @@ correct at every depth tested. Fast HumanEval check (20/20, pass@1 = 1.0)
 with sparse attention on. Details, every bug found turning sparse
 attention on, and the full numbers are in
 [docs/models/laguna](docs/models/laguna/README.md).
+
+### Ling 3.2 Air
+
+A 100B-class hybrid mixture-of-experts model (35 delta-rule linear-attention layers and 7 latent
+attention layers, 512 experts with 8 routed plus a shared expert) in the 75 GB Q4_K_M quantization,
+with block-sparse attention for long context.
+
+| Prefill, tok/s | GPU only | GPU + NPU |
+| --- | --- | --- |
+| `-p 2048` | 1,828 | 1,821 (below the 4,096-row NPU bank) (-0.4%) |
+| `-p 4096` | 1,815 | 1,842 (+1.5%) |
+| `-p 8192` | 1,701 | 1,854 (+9.0%) |
+| `-p 16384` | 1,624 | 1,566 (-3.5%) |
+
+Real-text prefill is lower than `gufo bench` (its repeating pattern touches few experts): 1,600 to
+1,710 tok/s on 10k to 24k token prompts.
+
+| Decode, tok/s | plain | MTP, 2 drafts |
+| --- | --- | --- |
+| code, 4k context | 36.3 | **40.0** |
+| JSON, 4k context | 35.8 | **42.5** |
+| prose, 4k context | 36.0 | 35.6 |
+
+`gufo bench -n 128` plain decode: 37.0 tok/s. MTP (`gufo prompt --speculative mtp --mtp-model
+embedded`) drafts 2 tokens per round; 3 and 4 drafts measured slower. Decode at 16k to 128k
+tokens, the draft-count sweep and the method are in
+[docs/models/ling-3.2](docs/models/ling-3.2/BENCHMARKS.md).
 
 ## Quality
 

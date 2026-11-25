@@ -419,6 +419,10 @@ std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromGguf(
       tokenizer->pre_tokenizer_ = PreTokenizer::kLaguna;
     } else if (*pre == "inkling2") {
       tokenizer->pre_tokenizer_ = PreTokenizer::kInkling2;
+    } else if (*pre == "bailingmoe" || *pre == "bailingmoe2" ||
+               *pre == "llada-moe") {
+      tokenizer->pre_tokenizer_ = PreTokenizer::kQwen35;
+      tokenizer->digit_group_ = 1;
     } else if (*pre == "minicpm5") {
       // MiniCPM5's tokenizer.json regex (llama.cpp's
       // LLAMA_VOCAB_PRE_TYPE_MINICPM5) is byte-for-byte the same

@@ -65,7 +65,14 @@ void* NpuGemm::Host(int /*id*/) const {
 void* NpuGemm::Device(int /*id*/) const {
   return nullptr;
 }
+int NpuGemm::NewWeightBuffer(std::size_t /*bytes*/, std::string* error) {
+  if (error != nullptr)
+    *error = "NPU support is not built";
+  return -1;
+}
+
 void NpuGemm::FinalizeWeights(int /*id*/) {}
+void NpuGemm::ReleaseBuffer(int /*id*/) {}
 
 bool NpuGemm::Submit(hipStream_t /*stream*/, int /*a_id*/, const int* /*b_ids*/,
                      const int* /*c_ids*/, int /*count*/, int /*program*/) {
