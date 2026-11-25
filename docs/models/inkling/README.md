@@ -45,6 +45,19 @@ forces it).
   or more and is off by default because it changes outputs, see
   [QUALITY.md](QUALITY.md). `INKLING_IU4_WCLIP=0` and `INKLING_IU4_ACLIP=<x>` tune the
   scale choice, `INKLING_IU4_SKIP=<layers>` keeps listed physical layers on NVFP4.
+- **3K prefill profile (opt-in, lossy).** The fast profile plus GPTQ-rounded int4 gate/up
+  weights and prefill expert pruning reaches about 3,000 tok/s at 8K prompts with the NPU
+  (2,292 tok/s at 128K, against 1,935 for the lossless engine). Set
+  `INKLING_IU4=2 INKLING_F16_BLOCKS=1 INKLING_PRUNE_PREFILL=0.10
+  INKLING_GPTQ_DIR=<dir> INKLING_GPTQ_PARTS=1`; `run-gufo.sh` does this by default for
+  Inkling (`GUFO_INKLING_FAST=0` serves the lossless engine). The GPTQ artifacts are built
+  once per model file: `INKLING_GPTQ_CAPTURE=<layers> gufo_inkling_gpu_check <gguf> --gptq
+  <text> <windows> 4096 <dir>` runs a lossless calibration prefill over the text, accumulates
+  each expert's input Hessian for the listed layers (six layers at a time fit in memory
+  next to the model) and writes `layer_<n>.gptq`; the whole model takes about 25 minutes
+  and 13 GB. Without the artifacts the int4 experts fall back to plain rounding. Decode
+  and speculative verification always use the exact kernels. Measurements are in
+  [QUALITY.md](QUALITY.md) and [BENCHMARKS.md](BENCHMARKS.md).
 - **Expert layers 20 to 23.** They are Q8_0 in the GGUF and are converted to NVFP4
   at load (`INKLING_EXPERT_NVFP4=0` keeps Q8_0). See [QUALITY.md](QUALITY.md).
 - **Expert pruning** (`INKLING_PRUNE=<share>`, default off) skips routed experts

@@ -23,6 +23,18 @@ Run-to-run spread is about 1% when nothing else uses the machine; background loa
 costs more. The 32k and 128k rows of the earlier table (1,536 to 1,689 and about
 1,035 to 1,647 tok/s) have not been re-measured.
 
+### 3K profile and 128K
+
+Measured 2026-11-24 with `gufo_inkling_gpu_check` (one cold run per row, GPU + NPU, banks of 4,096):
+the 3K profile (see [README.md](README.md)) prefills an 8K prompt at 3,018, 3,034 and 3,038 tok/s
+against 2,545 to 2,807 for the fast profile on the same machine (a monitor was using a core; the
+spread shows the noise). At 127,680 tokens of real text prefill is 1,935 tok/s for the default engine
+and 2,292 for the 3K profile; plain decode at that depth is 28.5 tok/s in both. Speculative decode
+at 127,680 tokens with the drafter, 400 generated tokens: 49.0 and 53.8 tok/s on code and
+documentation text (3.7 and 4.1 accepted tokens per step), 38.1 and 30.3 on raw source dumps
+(2.6 and 1.8 accepted); a step costs about 93 ms at that depth (12 ms draft, 81 ms verify)
+against about 67 ms at 4K, so the rate follows the acceptance.
+
 ## Decode
 
 | Workload | tok/s |

@@ -117,3 +117,33 @@ well above the train error (0.043), so a larger calibration set helps; rare expe
 would need stronger damping or plain rounding. Cost: a calibration pass over text that captures each
 expert's inputs, one Hessian and Cholesky per expert matrix (6,144 matrices over 24 layers), a blocked
 GPTQ solve on the GPU, and a cached repack artifact. The numpy reference takes about 4 s per matrix.
+
+### GPTQ artifacts and the 3K profile (2026-11-24)
+
+Calibration: 48 windows of 4,096 tokens of source and documentation (about 196,000 tokens),
+lossless prefill, Hessians in the rotated basis, damping 0.05 (0.2 for experts with fewer
+tokens than inputs), plain rounding for experts with under 64 calibration tokens. Evaluation:
+1,000 windows of 512 tokens from files never used in calibration, KL against the lossless
+engine on the last token, mean with standard error:
+
+| Setting | KL | Top-1 |
+| --- | --- | --- |
+| gate/up int4 only, plain rounding | 0.0134 +- 0.0013 | 97.3% |
+| gate/up int4 only, GPTQ | 0.0115 +- 0.0013 | 97.6% |
+| fast profile, plain rounding | 0.0166 +- 0.0026 | 96.7% |
+| fast profile, GPTQ gate/up and down | 0.0147 +- 0.0022 | 96.7% |
+| fast profile, GPTQ gate/up only (`INKLING_GPTQ_PARTS=1`) | 0.0143 +- 0.0014 | 96.6% |
+| fast profile + prune 0.10 | 0.0375 +- 0.0031 | 95.0% |
+| fast profile + GPTQ gate/up + prune 0.095 | 0.0319 +- 0.0028 | 95.3% |
+| fast profile + GPTQ gate/up + prune 0.10 (3K profile) | 0.0351 +- 0.0040 | 95.7% |
+| gate/up int4 + exact down, GPTQ, prune 0.10 | 0.0329 +- 0.0036 | 94.7% |
+| gate/up int4 + exact down, GPTQ, prune 0.12 | 0.0658 +- 0.0046 | 93.2% |
+
+GPTQ lowers the error by about 11 to 14%; it does nothing for the down projection, whose error
+is the large SiTU activations. Pruning is the main cost and has a cliff between 0.10 and 0.12.
+Pruning only one group of six layers at a time adds 0.0058, 0.0075, 0.0067 and 0.0044 to the
+no-pruning 0.0143, so no layers are cheap to prune.
+
+HumanEval (164 tasks, greedy, thinking off, 1,024 new tokens, `gufo serve` with the drafter),
+3K profile: 146/164 (89.0%), against 147/164 for the default engine and 149/164 for the fast
+profile. Four tasks the default engine passes fail and three it fails pass.
