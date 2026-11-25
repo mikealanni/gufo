@@ -14,7 +14,8 @@ enum class TextModelPreset {
   kDeepSeekV4Flash,
   kFlint,
   kGlm53Flash,
-  kInkling
+  kInkling,
+  kLing32
 };
 
 // Presence is independent of value: an explicit zero must override a preset.
@@ -42,6 +43,8 @@ inline TextModelPreset TextPreset(const core::ModelConfig& config) {
     return TextModelPreset::kFlint;
   if (config.architecture == "inkling2")
     return TextModelPreset::kInkling;
+  if (config.architecture == "bailingmoe3")
+    return TextModelPreset::kLing32;
   if (config.architecture == "glm5next" || config.architecture == "glm5-next")
     return TextModelPreset::kGlm53Flash;
   if (config.architecture == "qwen4exp" ||
@@ -62,7 +65,8 @@ inline SamplingConfig ResolveTextSampling(TextModelPreset model,
   result.constraint = configured.constraint;
   result.temperature = 1.0F;
   result.top_p = 0.95F;
-  if (model == TextModelPreset::kQwen38 || model == TextModelPreset::kFlint) {
+  if (model == TextModelPreset::kQwen38 || model == TextModelPreset::kFlint ||
+      model == TextModelPreset::kLing32) {
     result.top_k = 20;
   }
   if (model == TextModelPreset::kInkling) {

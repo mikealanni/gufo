@@ -47,6 +47,12 @@ public:
   /// Allocates a pinned buffer of `bytes` visible to the GPU; returns its id,
   /// or -1. Host(id) is the CPU view and Device(id) the GPU pointer.
   int NewBuffer(std::size_t bytes, std::string* error);
+  /// A weight buffer: written by the GPU through Device(id) until
+  /// FinalizeWeights copies it to NPU-only pages and frees the pinned host
+  /// memory, so the NPU driver does not keep userptr mappings of it.
+  int NewWeightBuffer(std::size_t bytes, std::string* error);
+  /// Drops a buffer's NPU mapping and pinned memory. No run may be pending.
+  void ReleaseBuffer(int id);
   void* Host(int id) const;
   void* Device(int id) const;
 

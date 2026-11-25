@@ -6,6 +6,7 @@
 #   27b         Qwen3.8-27B, DFlash2 and/or MTP
 #   35b         Qwen3.6-35B-A3B, embedded MTP head and/or DFlash2
 #   glm         GLM-5.3-Flash AJ-IQ2_XXS, DFlash2 draft, two-bank NPU prefill
+#   ling32      Ling 3.2 Air Q4_K_M, no draft model, GPU-only hybrid KDA/MLA engine
 #
 # Required: GUFO_MODEL = the GGUF (for flash-next the first shard, ...-00001-of-00003.gguf)
 # Optional: GUFO_MTP (flash-next: shared Q8_0 sidecar; 27b: MTP GGUF; 35b: "embedded" by default),
@@ -27,7 +28,8 @@ case "$KIND" in
   27b) SERVED_NAME="Qwen3.8 27B"; DEFAULT_CONTEXT=262144 ;;
   35b) SERVED_NAME="Qwen3.6 35B-A3B"; DEFAULT_CONTEXT=262144 ;;
   glm) SERVED_NAME="GLM-5.3 Flash"; DEFAULT_CONTEXT=131072 ;;
-  *) echo "GUFO_KIND must be flash-next, 27b, 35b or glm (got: $KIND)" >&2; exit 1 ;;
+  ling32) SERVED_NAME="Ling 3.2 Air"; DEFAULT_CONTEXT=262144 ;;
+  *) echo "GUFO_KIND must be flash-next, 27b, 35b, glm or ling32 (got: $KIND)" >&2; exit 1 ;;
 esac
 GUFO_BIN=${GUFO_BIN:-}
 if [ -z "$GUFO_BIN" ]; then
@@ -95,6 +97,8 @@ if [ "$KIND" = glm ]; then
   else
     echo "WARNING: no DFlash2 draft (set GUFO_DFLASH): running without the drafter." >&2
   fi
+elif [ "$KIND" = ling32 ]; then
+  :
 elif [ "$KIND" = flash-next ]; then
   if [ "${GUFO_FN_SPEC:-dflash2}" = dflash2 ] && [ -n "$DFLASH" ] && [ -f "$DFLASH" ]; then
     SPEC=(--speculative dflash2 --dflash-model "$DFLASH")
