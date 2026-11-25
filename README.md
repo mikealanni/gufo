@@ -51,14 +51,11 @@ text, with greedy chat requests to `gufo serve`. NPU numbers need the setup in
 Greedy, real text, one request; the weights are the UD-Q4_K_XL GGUF with the DSpark
 drafter. Prefill is the single-request engine check (no cache).
 
-| Prefill, tok/s | GPU only | GPU + NPU | Fast profile | Fast + pruning |
-| --- | --- | --- | --- | --- |
-| 2K | 2,065 | 2,065 | | |
-| 4K | 2,144 | 2,342 | | |
-| 8K | 2,075 | 2,382 | **2,851** | **3,020** |
-| 16K | 1,930 | 2,170 | | |
-| 32K | 1,536 | 1,689 | | |
-| 128K | about 1,035 | 1,935 | | 2,292 |
+| Prefill, tok/s | GPU + NPU |
+| --- | --- |
+| 8K | **2,851** |
+| 8K, `GUFO_INKLING_PRUNE=0.10` | **3,020** |
+| 128K, `GUFO_INKLING_PRUNE=0.10` | **2,292** |
 
 | Decode, tok/s | speculation |
 | --- | --- |
