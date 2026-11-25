@@ -29,6 +29,23 @@ top-1 against the unpruned engine; verify is a six-row step):
 Rescaling the kept weights made KL worse at every threshold. Pruning is off by
 default because it changes outputs.
 
+### Prefill pruning (opt-in)
+
+`INKLING_PRUNE_PREFILL=<share>` applies the same threshold to prefill batches on the
+shared routed path. KL against the lossless engine, 48 windows of 1,024 tokens
+(`inkling_kl.py`); the fast profile alone is the first row:
+
+| Setting | KL | Top-1 | 8K prefill, fast + NPU (tok/s) |
+| --- | --- | --- | --- |
+| fast profile (`INKLING_IU4=2 INKLING_F16_BLOCKS=1`) | 0.0191 | 43/48 | about 2,650 to 2,845 |
+| + prune 0.04 | 0.0208 | 42/48 | no gain |
+| + prune 0.06 | 0.0260 | 41/48 | +2% |
+| + prune 0.08 | 0.0355 | 41/48 | +4% |
+| + prune 0.10 | 0.0709 | 42/48 | +10% (about 2,930 to 2,970 in the same noisy runs) |
+
+The speed column was measured while a monitor used a CPU core, which lowered every
+baseline by about 5%; compare rows within the same run only.
+
 Known near-tie behaviour: greedy output with speculation can differ from plain
 decode at positions where the top two logits are within about 0.2.
 

@@ -1212,7 +1212,7 @@ __global__ void Situ(const float* gu, const int* group, const float* scale,
 
 __global__ void CountExperts(const int* ids, int items, unsigned int* counts) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < items)
+  if (i < items && ids[i] >= 0)
     atomicAdd(&counts[ids[i]], 1U);
 }
 
@@ -1424,6 +1424,8 @@ __global__ void CombineHalf(const __half* y, const float* wts, float* out,
     float a[8] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
     for (int k = 0; k < nu; ++k) {
       const float w = wts[blockIdx.x * nu + k];
+      if (w == 0.0F)
+        continue;
       const uint4 raw = reinterpret_cast<const uint4*>(
           y + (static_cast<std::size_t>(blockIdx.x) * nu + k) * h)[i];
       const __half2* pr = reinterpret_cast<const __half2*>(&raw);
@@ -4489,11 +4491,20 @@ struct Session::Impl : Scratch {
         std::getenv("INKLING_PRUNE") != nullptr
             ? static_cast<float>(std::atof(std::getenv("INKLING_PRUNE")))
             : 0.0F;
+    static const float prune_prefill_cfg =
+        std::getenv("INKLING_PRUNE_PREFILL") != nullptr
+            ? static_cast<float>(std::atof(std::getenv("INKLING_PRUNE_PREFILL")))
+            : 0.0F;
+    const bool compact_path =
+        n >= kWmmaMinTokens &&
+        m->T(m->P(p, "ffn_gate_up_exps.weight")).type == kTypeNvfp4 &&
+        std::getenv("INKLING_OWN_EXPERTS") == nullptr;
+    const float prune_prefill = compact_path ? prune_prefill_cfg : 0.0F;
     Route<<<n, 256, 0, stream>>>(
         router,
         static_cast<const float*>(m->T(m->P(p, "exp_probs_b.bias")).dev), ne,
         nu, c.expert_weights_scale, ids, wts,
-        n < kWmmaMinTokens ? prune_tau : 0.0F);
+        n < kWmmaMinTokens ? prune_tau : prune_prefill);
     ids_flat = ids;
     const float* s_gu = m->Has(m->P(p, "ffn_gate_up_exps.scale"))
                             ? static_cast<const float*>(
