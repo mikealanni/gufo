@@ -54,8 +54,6 @@ drafter. Prefill is the single-request engine check (no cache).
 | Prefill, tok/s | GPU + NPU |
 | --- | --- |
 | 8K | **2,851** |
-| 8K, `GUFO_INKLING_PRUNE=0.10` | **3,020** |
-| 128K, `GUFO_INKLING_PRUNE=0.10` | **2,292** |
 
 | Decode, tok/s | speculation |
 | --- | --- |
