@@ -55,3 +55,17 @@ of depth with the NPU on (34.4 without it).
   a 128-token window shows it as 29 to 35 tok/s.
 - Output differs from the GPU-only path at near-ties (block-float NPU arithmetic, F16 hi/lo router);
   no KL measurement has been made.
+
+## Notes moved from the README speed section
+
+A 100B-class hybrid mixture-of-experts model (35 delta-rule linear-attention layers and 7 latent
+attention layers, 512 experts with 8 routed plus a shared expert) in the 75 GB Q4_K_M quantization,
+with block-sparse attention for long context.
+
+Real-text prefill is lower than `gufo bench` (its repeating pattern touches few experts): 1,600 to
+1,710 tok/s on 10k to 24k token prompts.
+
+`gufo bench -n 128` plain decode: 37.0 tok/s. MTP (`gufo prompt --speculative mtp --mtp-model
+embedded`) drafts 2 tokens per round; 3 and 4 drafts measured slower. Decode at 16k to 128k
+tokens, the draft-count sweep and the method are in
+[docs/models/ling-3.2](docs/models/ling-3.2/BENCHMARKS.md).

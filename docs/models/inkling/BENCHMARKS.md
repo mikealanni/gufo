@@ -62,3 +62,12 @@ Speculation gain depends on the text: prose accepts far fewer drafts than code o
 JSON. Run-to-run spread at depth is about 2 tok/s because acceptance varies.
 
 TODO: sampled (temperature above zero) decode, concurrent requests, 128k decode.
+
+## Notes moved from the README speed section
+
+Greedy, real text, one request; the weights are the UD-Q4_K_XL GGUF with the DSpark
+drafter. Prefill is the single-request engine check (no cache).
+
+Sampled requests (temperature above zero) accept fewer drafts, so they decode more
+slowly than these greedy figures. Loads in about 15 s with the model file cached.
+Details and method: [docs/models/inkling/BENCHMARKS.md](docs/models/inkling/BENCHMARKS.md).

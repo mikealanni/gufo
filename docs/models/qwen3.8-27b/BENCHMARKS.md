@@ -234,3 +234,11 @@ without the NPU.
 | code | 12.3 | 47.6 | 43.3 |
 | prose | 12.3 | 24.8 | 23.8 |
 | JSON | 12.3 | 62.2 | 53.0 |
+
+## Notes moved from the README speed section
+
+With the rotated int4 artifact (int4 x int4 WMMA, FFN split on the NPU), measured
+2026-11-21 on the main binary:
+
+Plain decode is 14.7 tok/s (12.3 with the GGUF). HumanEval 156/164 against 158/164
+for the GGUF, with equal NLL.

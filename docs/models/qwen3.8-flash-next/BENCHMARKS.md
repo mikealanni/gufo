@@ -141,3 +141,37 @@ p=16384 1953–1969, p=32768 1934. In the server, prompts that are not multiples
 Prefill speed depends on the text: a
 concatenation of code and markdown prefilled 20–30% slower than code alone at the
 same length because expert routing differs.
+
+## Notes moved from the README speed section
+
+A `-c` above the native 262,144 extends the model to a **1,048,576-token context**
+with YaRN automatically. That full-prompt row above is a real 1,048,044-token
+request served end to end in 641.7 s, decoding at 33.7 tok/s with DFlash2
+(46% draft acceptance). At cached depths, `gufo bench -d` decode reaches
+106.8 tok/s at 524,288 (`-n 512`) and 72.9 at 983,040 (`-n 1024`).
+
+The DFlash2 column was re-measured with the confidence cut described under
+speculative decoding (greedy, the project's probe prompts: 4 code, 6 prose and the
+JSON request). The plain and MTP columns come from an earlier prompt set, so read
+differences under about 5% as noise. DFlash2 also skips the MTP head's prompt
+priming, which is why its prefill is about 3% faster. Math prompts decode at
+about 95 tok/s and copy-heavy prompts at about 127 tok/s.
+
+Grammar-constrained turns (tool calls) decode at 90 to 93 tok/s, up from 59 to 61
+before their draft verification stayed on the GPU.
+
+Prompt passes of 1,024 to 4,095 tokens (short prompts and the tail of a long one)
+also run on the NPU, through the runtime-M program: prefill is +1% to +5% from
+about 3,000 tokens upward and unchanged below, and the text matches the previous
+build on 27 of 28 regression prompts (the other is a paraphrase at a near tie).
+
+`gufo bench -n 96`: 35.9 tok/s plain, 54.2 tok/s with MTP (on the benchmark's
+own repetitive context, where drafts are accepted easily).
+
+In the two-bank NPU mode the prefill residual stays in F16, worth about 1.5%
+(+0.5% perplexity); `GUFO_F16_RESIDUAL=0` keeps it in F32 (about 2,085 tok/s at
+`-p 16384`). GPU-only prefill stays exact. The first NPU run after the machine
+has been idle can be much slower, so discard it when benchmarking.
+
+Prefill depends on the text as well as the length: code, markdown and prose
+route to experts differently, so the same length can vary by 20% or more.

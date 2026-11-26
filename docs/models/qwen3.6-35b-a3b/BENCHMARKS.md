@@ -25,3 +25,7 @@ running. Prefill is `gufo bench -m MODEL -p N -n 128 -r 3`; GPU + NPU sets
 
 MTP drafts three tokens. `gufo bench` on its repetitive synthetic context
 reports 69 to 80 tok/s for MTP, a poor guide to real text.
+
+## Notes moved from the README speed section
+
+`gufo bench -n 128` plain decode: 60.6 tok/s.

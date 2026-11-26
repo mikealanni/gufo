@@ -48,9 +48,6 @@ text, with greedy chat requests to `gufo serve`. NPU numbers need the setup in
 
 ### Inkling 2 Mini
 
-Greedy, real text, one request; the weights are the UD-Q4_K_XL GGUF with the DSpark
-drafter. Prefill is the single-request engine check (no cache).
-
 | Prefill, tok/s | GPU only | GPU + NPU |
 | --- | --- | --- |
 | `-p 2048` | 2,499 | **2,499** |
@@ -62,12 +59,10 @@ drafter. Prefill is the single-request engine check (no cache).
 | --- | --- | --- |
 | code | 33 | **74.6** |
 | JSON | 33 | **71.1** |
-| code at 37K context | not measured | **54 to 59** |
-| code at 63K context | not measured | **54 to 61** |
+| code at 37K context | | **54 to 59** |
+| code at 63K context | | **54 to 61** |
 
-Sampled requests (temperature above zero) accept fewer drafts, so they decode more
-slowly than these greedy figures. Loads in about 15 s with the model file cached.
-Details and method: [docs/models/inkling/BENCHMARKS.md](docs/models/inkling/BENCHMARKS.md).
+Details: [docs/models/inkling](docs/models/inkling/)
 
 ### Qwen3.6-35B-A3B
 
@@ -83,7 +78,7 @@ Details and method: [docs/models/inkling/BENCHMARKS.md](docs/models/inkling/BENC
 | prose | 61 | **72** | 59 | 68 |
 | JSON | 61 | 122 | **159** | 156 |
 
-`gufo bench -n 128` plain decode: 60.6 tok/s.
+Details: [docs/models/qwen3.6-35b-a3b](docs/models/qwen3.6-35b-a3b/)
 
 ### Qwen3.8-27B
 
@@ -93,21 +88,17 @@ Details and method: [docs/models/inkling/BENCHMARKS.md](docs/models/inkling/BENC
 | `-p 4096` | 636 | **795** (+25.0%) |
 | `-p 8192` | 629 | **806** (+28.2%) |
 
+| Prefill, tok/s (rotated int4) | Q4_K_XL GGUF + NPU | Rotated int4 + NPU |
+| --- | --- | --- |
+| `-p 8192` | 806 | **1,335** (+66%) |
+
 | Decode, tok/s | plain | DFlash2 | auto |
 | --- | --- | --- | --- |
 | code | 12.3 | **47.6** | 43 |
 | prose | 12.3 | **24.8** | 24 |
 | JSON | 12.3 | **62.2** | 53 |
 
-With the rotated int4 artifact (int4 x int4 WMMA, FFN split on the NPU), measured
-2026-11-21 on the main binary:
-
-| Prefill, tok/s | Q4_K_XL GGUF + NPU | Rotated int4 + NPU |
-| --- | --- | --- |
-| `-p 8192` | 806 | **1,335** (+66%) |
-
-Plain decode is 14.7 tok/s (12.3 with the GGUF). HumanEval 156/164 against 158/164
-for the GGUF, with equal NLL.
+Details: [docs/models/qwen3.8-27b](docs/models/qwen3.8-27b/)
 
 ### Qwen3.8 Flash-Next
 
@@ -120,43 +111,13 @@ for the GGUF, with equal NLL.
 | `-p 131072` | not measured | **1,990** |
 | full 1,048,044-token prompt | not measured | **1,633** |
 
-A `-c` above the native 262,144 extends the model to a **1,048,576-token context**
-with YaRN automatically. That full-prompt row above is a real 1,048,044-token
-request served end to end in 641.7 s, decoding at 33.7 tok/s with DFlash2
-(46% draft acceptance). At cached depths, `gufo bench -d` decode reaches
-106.8 tok/s at 524,288 (`-n 512`) and 72.9 at 983,040 (`-n 1024`).
-
 | Decode, tok/s | plain | MTP | DFlash2 |
 | --- | --- | --- | --- |
 | code | 36.6 | 76.5 | **109.6** |
 | prose | 36.5 | 47.2 | **51.8** |
 | JSON | 36.7 | 99.8 | **118.7** |
 
-The DFlash2 column was re-measured with the confidence cut described under
-speculative decoding (greedy, the project's probe prompts: 4 code, 6 prose and the
-JSON request). The plain and MTP columns come from an earlier prompt set, so read
-differences under about 5% as noise. DFlash2 also skips the MTP head's prompt
-priming, which is why its prefill is about 3% faster. Math prompts decode at
-about 95 tok/s and copy-heavy prompts at about 127 tok/s.
-
-Grammar-constrained turns (tool calls) decode at 90 to 93 tok/s, up from 59 to 61
-before their draft verification stayed on the GPU.
-
-Prompt passes of 1,024 to 4,095 tokens (short prompts and the tail of a long one)
-also run on the NPU, through the runtime-M program: prefill is +1% to +5% from
-about 3,000 tokens upward and unchanged below, and the text matches the previous
-build on 27 of 28 regression prompts (the other is a paraphrase at a near tie).
-
-`gufo bench -n 96`: 35.9 tok/s plain, 54.2 tok/s with MTP (on the benchmark's
-own repetitive context, where drafts are accepted easily).
-
-In the two-bank NPU mode the prefill residual stays in F16, worth about 1.5%
-(+0.5% perplexity); `GUFO_F16_RESIDUAL=0` keeps it in F32 (about 2,085 tok/s at
-`-p 16384`). GPU-only prefill stays exact. The first NPU run after the machine
-has been idle can be much slower, so discard it when benchmarking.
-
-Prefill depends on the text as well as the length: code, markdown and prose
-route to experts differently, so the same length can vary by 20% or more.
+Details: [docs/models/qwen3.8-flash-next](docs/models/qwen3.8-flash-next/)
 
 ### Flint
 
@@ -172,23 +133,13 @@ route to experts differently, so the same length can vary by 20% or more.
 | prose | 72.6 | 72.3 |
 | JSON | 72.6 | **73.3** |
 
-`gufo bench -n 128` plain decode: 73.6 tok/s; `gufo serve`: 72.8 tok/s. Flint has
-no MTP head and no drafter yet, so only prompt lookup (lossless) applies, and it
-helps when the output copies earlier text. Long context: 131k-token prefill takes
-89 s dense and 48 s (2,716 tok/s) with `FLINT_SPARSE_ATTN=1`, which is
-approximate beyond about 19k tokens. Details, numerics and the prefill history
-are in [docs/models/flint](docs/models/flint/README.md).
+Details: [docs/models/flint](docs/models/flint/)
 
 ### GLM-5.3 Flash
 
-A 321B-parameter mixture-of-experts model (about 14B active per token; 45 layers,
-34 KDA and 11 DSA, 288 experts with 8 routed) in the 81 GiB AJ-IQ2_XXS quantization,
-and its coder variant RCO-152E (152 experts with 8 routed, 69.9 GiB Q3_K_M, served
-by native Q3_K WMMA expert GEMMs).
-
 | Prefill, tok/s (RCO-152E) | GPU only | GPU + NPU (two-bank) |
 | --- | --- | --- |
-| `-p 2048` | 632 | 636 (GPU path) |
+| `-p 2048` | 632 | 636 |
 | `-p 4096` | 623 | **714** (+14.6%) |
 | `-p 8192` | 617 | **706** (+14.4%) |
 | `-p 16384` | 610 | **699** (+14.6%) |
@@ -201,31 +152,15 @@ by native Q3_K WMMA expert GEMMs).
 | `-p 4096` | 616 | **689** (+11.9%) |
 | `-p 8192` | 613 | **690** (+12.6%) |
 
-Every prompt of 4096 tokens or more runs a two-bank pair of 2048-token banks
-through the runtime-M/K program, at any context depth; smaller prompts and
-decode stay on the GPU at full speed. `GUFO_GLM53_NPU_M=4096` selects wide
-banks (same speed at 8192, no gain elsewhere). Moving the shared-expert down
-projection to the NPU as well (`GUFO_NPU_WHOLE=1`, implemented) measures zero
-net gain: the NPU queue is already balanced at 28 slices per bank.
-
 | Decode, tok/s | plain | DFlash2 |
 | --- | --- | --- |
 | code | 18.9 | **29.7** |
 | prose | 18.9 | **22.5** |
 | JSON | 18.9 | **26.0** |
 
-Greedy chat requests to `gufo serve`, 256 tokens. `gufo bench -n 128` plain decode:
-18.8 tok/s. Prose is the expository prompt; a creative-writing prompt gains nothing
-(18.7). Decode reads about 9 GB of weights per token, mostly the Q6_K attention and
-shared-expert projections, so plain decode is bandwidth-bound; drafting helps when
-the next tokens are predictable. Serving uses a 131,072-token context and one
-session at a time. Start it with `GUFO_KIND=glm scripts/run-gufo.sh`.
+Details: [docs/models/glm53-flash](docs/models/glm53-flash/)
 
 ### Laguna S 2.1
-
-A 118B-ish mixture-of-experts model (48 layers, 256 experts with 10 routed
-plus a shared expert, sliding-window attention on 3 of every 4 layers) in
-the 68 GiB UD-Q4_K_M quantization.
 
 | Prefill, tok/s | GPU only | GPU + NPU |
 | --- | --- | --- |
@@ -235,38 +170,20 @@ the 68 GiB UD-Q4_K_M quantization.
 
 | Decode, tok/s | plain | DFlash v1 |
 | --- | --- | --- |
-| code | 25.9 | **44.5** (79% accepted) |
-| prose | 25.9 | 27.9 (35% accepted) |
-| JSON | 25.9 | **45.4** (81% accepted) |
+| code | 25.9 | **44.5** |
+| prose | 25.9 | 27.9 |
+| JSON | 25.9 | **45.4** |
 
-`gufo bench -n 128` plain decode: 25.9 tok/s. DFlash v1's gain is sharply
-content-dependent - a short/trivial prompt can land below plain decode
-(25% accepted, 24.0 tok/s on a filler prompt); measure on real target
-text, not a filler prompt. Measured via `gufo prompt`
-(`--speculative dflash2 --dflash-model ...`); `gufo serve` doesn't support
-`--speculative` for Laguna yet. Block-sparse attention
-(`LAGUNA_SPARSE_ATTN=1`) gives a depth-growing prefill win -
-+6.6%/+16.5%/+37.9% at 41k/61k/100k tokens, needle-in-haystack-verified
-correct at every depth tested. Fast HumanEval check (20/20, pass@1 = 1.0)
-with sparse attention on. Details, every bug found turning sparse
-attention on, and the full numbers are in
-[docs/models/laguna](docs/models/laguna/README.md).
+Details: [docs/models/laguna](docs/models/laguna/)
 
 ### Ling 3.2 Air
 
-A 100B-class hybrid mixture-of-experts model (35 delta-rule linear-attention layers and 7 latent
-attention layers, 512 experts with 8 routed plus a shared expert) in the 75 GB Q4_K_M quantization,
-with block-sparse attention for long context.
-
 | Prefill, tok/s | GPU only | GPU + NPU |
 | --- | --- | --- |
-| `-p 2048` | 1,828 | 1,821 (below the 4,096-row NPU bank) (-0.4%) |
+| `-p 2048` | 1,828 | 1,821 (-0.4%) |
 | `-p 4096` | 1,815 | 1,842 (+1.5%) |
 | `-p 8192` | 1,701 | 1,854 (+9.0%) |
 | `-p 16384` | 1,624 | 1,566 (-3.5%) |
-
-Real-text prefill is lower than `gufo bench` (its repeating pattern touches few experts): 1,600 to
-1,710 tok/s on 10k to 24k token prompts.
 
 | Decode, tok/s | plain | MTP, 2 drafts |
 | --- | --- | --- |
@@ -274,10 +191,7 @@ Real-text prefill is lower than `gufo bench` (its repeating pattern touches few 
 | JSON, 4k context | 35.8 | **42.5** |
 | prose, 4k context | 36.0 | 35.6 |
 
-`gufo bench -n 128` plain decode: 37.0 tok/s. MTP (`gufo prompt --speculative mtp --mtp-model
-embedded`) drafts 2 tokens per round; 3 and 4 drafts measured slower. Decode at 16k to 128k
-tokens, the draft-count sweep and the method are in
-[docs/models/ling-3.2](docs/models/ling-3.2/BENCHMARKS.md).
+Details: [docs/models/ling-3.2](docs/models/ling-3.2/)
 
 ## Quality
 
