@@ -32,7 +32,6 @@ std::string StripNewlines(const std::string& text, bool leading,
   return text.substr(begin, end - begin);
 }
 
-
 void AppendJsonString(std::string* output, std::string_view value) {
   output->push_back('"');
   for (const unsigned char character : value) {
@@ -62,7 +61,8 @@ void AppendJsonString(std::string* output, std::string_view value) {
 
 void AppendToolsPrompt(std::string* output, const std::vector<ChatTool>& tools,
                        bool require_tool_call) {
-  output->append("# Tools\n\nYou have access to the following functions:\n\n<tools>");
+  output->append(
+      "# Tools\n\nYou have access to the following functions:\n\n<tools>");
   for (const ChatTool& tool : tools) {
     output->push_back('\n');
     if (!tool.definition_json.empty()) {
