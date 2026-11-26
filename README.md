@@ -51,20 +51,19 @@ text, with greedy chat requests to `gufo serve`. NPU numbers need the setup in
 Greedy, real text, one request; the weights are the UD-Q4_K_XL GGUF with the DSpark
 drafter. Prefill is the single-request engine check (no cache).
 
-| Prefill, tok/s | GPU + NPU |
-| --- | --- |
-| 2K | **2,499** |
-| 4K | **2,737** |
-| 8K | **2,851** |
-| 16K | **2,516** |
+| Prefill, tok/s | GPU only | GPU + NPU |
+| --- | --- | --- |
+| `-p 2048` | 2,499 | **2,499** |
+| `-p 4096` | 2,580 | **2,737** (+6.1%) |
+| `-p 8192` | 2,466 | **2,822** (+14.4%) |
+| `-p 16384` | 2,254 | **2,516** (+11.6%) |
 
-| Decode, tok/s | speculation |
-| --- | --- |
-| plain, short context | 33 |
-| code | **74.6** (about 82% of drafts accepted) |
-| JSON | **71.1** (about 82% of drafts accepted) |
-| code at 37K context | 54 to 59 |
-| code at 63K context | 54 to 61 |
+| Decode, tok/s | plain | DSpark |
+| --- | --- | --- |
+| code | 33 | **74.6** |
+| JSON | 33 | **71.1** |
+| code at 37K context | not measured | **54 to 59** |
+| code at 63K context | not measured | **54 to 61** |
 
 Sampled requests (temperature above zero) accept fewer drafts, so they decode more
 slowly than these greedy figures. Loads in about 15 s with the model file cached.
