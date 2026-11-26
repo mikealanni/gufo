@@ -5891,6 +5891,21 @@ struct Session::Impl : Scratch {
       HIP_OK(hipMemcpyAsync(conf_out, dconf, steps * 4, hipMemcpyDeviceToHost,
                             stream));
     HIP_OK(hipStreamSynchronize(stream));
+    if (conf_out != nullptr) {
+      // A verified row costs about as much as half an accepted token is worth:
+      // keep a slot while the chance that the whole prefix is accepted holds
+      // above the threshold (reported as 1 for kept slots, 0 after the first
+      // slot that fails).
+      static const float theta =
+          std::getenv("INKLING_D2_THETA") != nullptr
+              ? static_cast<float>(std::atof(std::getenv("INKLING_D2_THETA")))
+              : 0.5F;
+      float cum = 1.0F;
+      for (int i = 0; i < steps; ++i) {
+        cum *= conf_out[i];
+        conf_out[i] = cum >= theta ? 1.0F : 0.0F;
+      }
+    }
     return true;
   }
   void Tap(int v, int n, const float* src = nullptr) {
