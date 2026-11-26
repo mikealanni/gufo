@@ -306,6 +306,12 @@ public:
   }
   /// Zero when the vocabulary cannot be enumerated.
   [[nodiscard]] virtual std::uint32_t VocabularySize() const { return 0; }
+  /// Reasoning-token cap implied by an effort level when the request gives no
+  /// budget. Null means no cap (the default for every model).
+  [[nodiscard]] virtual std::optional<std::size_t> DefaultReasoningBudget(
+      ReasoningEffort) const {
+    return std::nullopt;
+  }
   /// A budget for a prompt that opens reasoning, or null when the tags are not
   /// single tokens in this vocabulary.
   [[nodiscard]] std::shared_ptr<const sampling::ReasoningBudget>

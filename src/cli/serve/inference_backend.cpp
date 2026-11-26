@@ -4156,10 +4156,6 @@ public:
 
   [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
       const ChatRequest& request) const override {
-    if (!request.tools.empty() &&
-        request.tool_choice == ChatRequest::ToolChoice::kRequired) {
-      throw std::invalid_argument("Ling-3.2 does not support tools yet");
-    }
     std::vector<models::ling32::ChatMessage> messages;
     messages.reserve(request.messages.size());
     for (const auto& message : request.messages) {
@@ -4167,16 +4163,66 @@ public:
         throw std::invalid_argument("Ling-3.2 does not support image input");
       messages.push_back({std::string(tokenization::ToString(message.role)),
                           message.content + message.framing_suffix,
-                          message.thought});
+                          message.thought,
+                          {}});
       if (message.role == tokenization::ChatRole::kDeveloper)
         messages.back().role = "system";
+      for (const auto& call : message.tool_calls) {
+        models::ling32::ChatToolCall converted;
+        converted.name = call.name;
+        for (const auto& argument : call.arguments)
+          converted.arguments.emplace_back(argument.name, argument.value);
+        messages.back().tool_calls.push_back(std::move(converted));
+      }
     }
     models::ling32::ChatTemplateOptions chat_options;
     chat_options.enable_thinking = ThinkingEnabled(request);
+    if (request.tool_choice != ChatRequest::ToolChoice::kNone) {
+      for (const auto& tool : request.tools)
+        chat_options.tools.push_back({tool.name, tool.description,
+                                      tool.parameters_json,
+                                      tool.definition_json});
+    }
+    chat_options.require_tool_call =
+        !chat_options.tools.empty() &&
+        request.tool_choice == ChatRequest::ToolChoice::kRequired;
     tokenization::TokenizerOptions options;
     options.parse_special_tokens = true;
     return tokenizer_->Encode(
         models::ling32::RenderPrompt(messages, chat_options), options);
+  }
+
+  /// The server parses and constrains the Qwen XML call dialect.
+  [[nodiscard]] sampling::JsonConstraint::ToolFormat ToolFormat()
+      const override {
+    return sampling::JsonConstraint::ToolFormat::kQwen;
+  }
+
+  [[nodiscard]] std::uint32_t VocabularySize() const override {
+    return static_cast<std::uint32_t>(tokenizer_->GetVocabSize());
+  }
+
+  /// Reasoning ends at `</think>` and also at a tool call.
+  [[nodiscard]] ReasoningTags ReasoningBudgetTags() const override {
+    return {"<think>", "</think>", {"</think>", "<tool_call>"}};
+  }
+
+  /// Ling's template has only a thinking switch, so effort scales the budget.
+  [[nodiscard]] std::optional<std::size_t> DefaultReasoningBudget(
+      ReasoningEffort effort) const override {
+    switch (effort) {
+      case ReasoningEffort::kLow:
+        return 1024;
+      case ReasoningEffort::kMedium:
+        return 4096;
+      case ReasoningEffort::kHigh:
+        return 16384;
+      case ReasoningEffort::kMinimal:
+      case ReasoningEffort::kXHigh:
+      case ReasoningEffort::kMax:
+        return std::nullopt;
+    }
+    return std::nullopt;
   }
 
   [[nodiscard]] TextGenerationBackend::InitialOutputState InitialOutputState(
@@ -7353,11 +7399,15 @@ InferenceBackend::Result InferenceBackend::chat(
   }
   const auto initial =
       state->scheduler->runner().InitialOutputState(effective_request);
-  if (request.reasoning.budget_tokens &&
+  std::optional<std::size_t> reasoning_budget = request.reasoning.budget_tokens;
+  if (!reasoning_budget && request.reasoning.effort)
+    reasoning_budget = state->scheduler->runner().DefaultReasoningBudget(
+        *request.reasoning.effort);
+  if (reasoning_budget &&
       initial == TextGenerationBackend::InitialOutputState::kReasoning)
     effective_sampling.reasoning_budget =
-        state->scheduler->runner().BuildReasoningBudget(
-            *request.reasoning.budget_tokens, prompt->tokens);
+        state->scheduler->runner().BuildReasoningBudget(*reasoning_budget,
+                                                        prompt->tokens);
 
   return impl_->GenerateScheduled(
       state, std::move(prompt->tokens), request_start, max_tokens,
@@ -7439,11 +7489,15 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
 
   const auto initial =
       state->scheduler->runner().InitialOutputState(effective_request);
-  if (request.reasoning.budget_tokens &&
+  std::optional<std::size_t> reasoning_budget = request.reasoning.budget_tokens;
+  if (!reasoning_budget && request.reasoning.effort)
+    reasoning_budget = state->scheduler->runner().DefaultReasoningBudget(
+        *request.reasoning.effort);
+  if (reasoning_budget &&
       initial == TextGenerationBackend::InitialOutputState::kReasoning)
     effective_sampling.reasoning_budget =
-        state->scheduler->runner().BuildReasoningBudget(
-            *request.reasoning.budget_tokens, prompt->tokens);
+        state->scheduler->runner().BuildReasoningBudget(*reasoning_budget,
+                                                        prompt->tokens);
 
   const std::string client_id =
       request.client_id.empty() ? "anonymous" : request.client_id;

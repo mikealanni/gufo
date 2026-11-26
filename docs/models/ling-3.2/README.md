@@ -54,6 +54,19 @@ The NPU path uses block-float arithmetic; the final logits shift by 0.1 to 0.9 a
 path and the top token is unchanged on the prompts tested. Greedy outputs diverge from the GPU-only
 path at near-ties. No KL measurement has been made yet.
 
+## Chat template, tools and reasoning effort
+
+The prompt follows the model's own template: one SYSTEM turn that carries the first system message and
+`detailed thinking on` or `off`, history turns with `<think>` blocks, `<role>OBSERVATION</role>` tool
+responses, and a generation prompt ending in `\n<think>` (thinking on, the default) or `\n<think></think>`.
+Thinking is on unless the request turns it off; the `minimal` effort turns it off.
+
+Tools are listed in the system turn and written in the history in the Qwen XML call dialect
+(`<tool_call>`, `<function=NAME>`, `<parameter=KEY>`), because that is the dialect the server parses
+and constrains during decoding; the model's own `<arg_key>` dialect is not used. The template has no
+effort levels, so the server maps effort to a reasoning budget when the request gives none: `low` 1,024
+tokens, `medium` 4,096, `high` 16,384, `xhigh` and `max` uncapped.
+
 ## Debug switches
 
 `LING_VALIDATE=1` (finite/range checks), `LING_GUARD=1` (buffer canaries), `LING_PF_TIMING=1`,
