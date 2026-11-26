@@ -168,6 +168,43 @@ int main(int argc, char** argv) {
     }
     return 0;
   }
+  if (argc >= 6 && std::string(argv[2]) == "--append") {
+    // --append <text file> <depth> <n> [repeats]: prefill `depth` tokens, then
+    // time appends of n tokens at that depth (an agent turn's new tokens)
+    std::string err;
+    auto reader = gufo::core::GgufReader::OpenFile(argv[1], &err);
+    auto tok = gufo::tokenization::QwenTokenizer::CreateFromGguf(*reader, &err);
+    std::ifstream in(argv[3]);
+    std::stringstream ss;
+    ss << in.rdbuf();
+    const auto ids = tok->Encode(ss.str(), {});
+    const int depth = std::atoi(argv[4]);
+    const int n = std::atoi(argv[5]);
+    const int repeats = argc > 6 ? std::atoi(argv[6]) : 3;
+    if (static_cast<std::size_t>(depth + n * repeats) > ids.size()) {
+      std::fprintf(stderr, "text too short\n");
+      return 1;
+    }
+    auto model = gufo::models::inkling::gpu::Model::Load(argv[1], &err);
+    auto session = model->CreateSession(depth + n * repeats + 64, &err);
+    std::vector<std::int32_t> prefix;
+    for (int i = 0; i < depth; ++i)
+      prefix.push_back(static_cast<std::int32_t>(ids[i]));
+    (void)session->Append(prefix, &err);
+    for (int r = 0; r < repeats; ++r) {
+      std::vector<std::int32_t> chunk;
+      for (int i = 0; i < n; ++i)
+        chunk.push_back(static_cast<std::int32_t>(ids[depth + r * n + i]));
+      const auto t0 = std::chrono::steady_clock::now();
+      (void)session->Append(chunk, &err);
+      const double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+      std::printf("append %d at depth %d: %.1f ms (%.0f tok/s)\n", n,
+                  depth + r * n, ms, n / ms * 1000.0);
+    }
+    return 0;
+  }
   if (argc >= 5 && std::string(argv[2]) == "--draft") {
     // --draft <text file> <drafter gguf> [width]: greedy speculative loop,
     // acceptance stats
