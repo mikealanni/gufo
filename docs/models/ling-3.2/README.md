@@ -1,6 +1,8 @@
 # Ling 3.2 Air
 
-Hybrid linear-attention mixture-of-experts text model (`bailingmoe3`) on gfx1151: 42 trunk
+Ling-3.2-air (inclusionAI/Ling-3.2-air) is a hybrid-linear mixture-of-experts vision-language model
+with 124 billion total parameters and 5.5 billion activated per token. gufo runs its text side
+(`bailingmoe3`; image input is rejected) on gfx1151: 42 trunk
 layers (35 Kimi-delta-rule KDA layers and 7 multi-latent-attention layers), 2 dense lead layers,
 512 routed experts with 8 used per token (sigmoid router, 8 groups of which 4 are searched) plus a
 shared expert, and one multi-token-prediction layer. The tested weights are the bartowski

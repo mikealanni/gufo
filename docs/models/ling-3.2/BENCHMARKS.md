@@ -58,9 +58,7 @@ of depth with the NPU on (34.4 without it).
 
 ## Notes moved from the README speed section
 
-A 100B-class hybrid mixture-of-experts model (35 delta-rule linear-attention layers and 7 latent
-attention layers, 512 experts with 8 routed plus a shared expert) in the 75 GB Q4_K_M quantization,
-with block-sparse attention for long context.
+Ling-3.2-air (inclusionAI/Ling-3.2-air) is a hybrid-linear mixture-of-experts vision-language model with 124 billion total parameters and 5.5 billion activated per token (35 delta-rule linear-attention layers and 7 latent attention layers, 512 experts with 8 routed plus a shared expert). gufo runs the text side only, in the 75 GB Q4_K_M quantization, with block-sparse attention for long context; image input is rejected.
 
 Real-text prefill is lower than `gufo bench` (its repeating pattern touches few experts): 1,600 to
 1,710 tok/s on 10k to 24k token prompts.
