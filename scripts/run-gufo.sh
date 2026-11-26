@@ -6,7 +6,7 @@
 #   27b         Qwen3.8-27B, DFlash2 and/or MTP
 #   35b         Qwen3.6-35B-A3B, embedded MTP head and/or DFlash2
 #   glm         GLM-5.3-Flash AJ-IQ2_XXS, DFlash2 draft, two-bank NPU prefill
-#   ling32      Ling 3.2 Air Q4_K_M, no draft model, GPU-only hybrid KDA/MLA engine
+#   ling32      Ling 3.2 Air Q4_K_M, hybrid KDA/MLA engine, MTP (GUFO_SPEC=off disables), NPU prefill
 #
 # Required: GUFO_MODEL = the GGUF (for flash-next the first shard, ...-00001-of-00003.gguf)
 # Optional: GUFO_MTP (flash-next: shared Q8_0 sidecar; 27b: MTP GGUF; 35b: "embedded" by default),
@@ -98,7 +98,9 @@ if [ "$KIND" = glm ]; then
     echo "WARNING: no DFlash2 draft (set GUFO_DFLASH): running without the drafter." >&2
   fi
 elif [ "$KIND" = ling32 ]; then
-  :
+  # Ling's own MTP layer drafts 2 tokens per round for plain greedy requests
+  # (LING_MTP_DRAFTS changes the count; sampled requests decode normally).
+  [ "${GUFO_SPEC:-}" != off ] && SPEC=(--speculative mtp --mtp-model embedded)
 elif [ "$KIND" = flash-next ]; then
   if [ "${GUFO_FN_SPEC:-dflash2}" = dflash2 ] && [ -n "$DFLASH" ] && [ -f "$DFLASH" ]; then
     SPEC=(--speculative dflash2 --dflash-model "$DFLASH")
