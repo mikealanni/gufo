@@ -4040,15 +4040,22 @@ std::vector<std::int32_t> Ling32EngineTokens(
 class Ling32TextRunnerState final : public TextRunnerState {
 public:
   Ling32TextRunnerState(const std::shared_ptr<Ling32Model>& model,
-                        std::uint32_t max_context) {
+                        std::uint32_t max_context, bool mtp) {
     std::string error;
     session_ = model->CreateSession(max_context, &error);
     if (session_ == nullptr) {
       throw std::runtime_error("Failed to create Ling-3.2 session: " + error);
     }
+    mtp_ = mtp;
+    if (mtp)
+      session_->EnableMtp();
   }
 
-  void Invalidate() noexcept override { session_->Reset(); }
+  void Invalidate() noexcept override {
+    session_->Reset();
+    if (mtp_)
+      session_->EnableMtp();
+  }
 
   [[nodiscard]] Ling32Session& session() const noexcept { return *session_; }
   [[nodiscard]] std::size_t position() const noexcept {
@@ -4057,6 +4064,7 @@ public:
 
 private:
   std::unique_ptr<Ling32Session> session_;
+  bool mtp_{false};
 };
 
 Ling32TextRunnerState& RequireLing32State(TextRunnerState& state) {
@@ -4080,11 +4088,14 @@ public:
   Ling32TextRunner(std::shared_ptr<Ling32Model> model,
                    std::unique_ptr<tokenization::QwenTokenizer> tokenizer,
                    std::vector<std::int32_t> stop_tokens,
-                   std::uint32_t max_context)
+                   std::uint32_t max_context, bool mtp = false,
+                   std::uint32_t mtp_drafts = 2)
       : model_(std::move(model)),
         tokenizer_(std::move(tokenizer)),
         stop_tokens_(std::move(stop_tokens)),
-        max_context_(max_context) {}
+        max_context_(max_context),
+        mtp_(mtp),
+        mtp_drafts_(std::clamp<std::uint32_t>(mtp_drafts, 1, 7)) {}
 
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
     return {
@@ -4098,6 +4109,7 @@ public:
                 .fork = false,
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
+                .multi_token_decode = mtp_,
                 .prefix_reuse = true,
                 .prefill_grid_tokens = kPrefillChunk,
             },
@@ -4168,7 +4180,7 @@ public:
   }
 
   [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
-    return std::make_unique<Ling32TextRunnerState>(model_, max_context_);
+    return std::make_unique<Ling32TextRunnerState>(model_, max_context_, mtp_);
   }
 
   void PreparePrefixReuse(
@@ -4230,6 +4242,71 @@ public:
     return SelectNext(state, sampler);
   }
 
+  /// One MTP round: the frontier token, the model's own draft tokens, one
+  /// verification pass over all of them, and the accepted prefix. Only plain
+  /// greedy requests (no sampling, penalties or grammar) are speculated, so
+  /// every emitted token is the argmax a plain decode would have chosen.
+  [[nodiscard]] TextDecodeStep DecodeStep(
+      TextRunnerState& state, std::size_t max_tokens,
+      sampling::SamplerState& sampler) const override {
+    auto& ling = RequireLing32State(state);
+    if (!mtp_ || max_tokens < 2 ||
+        !sampler.config().can_use_unmodified_argmax() ||
+        ling.position() + mtp_drafts_ + 2 > max_context_) {
+      return TextModelRunner::DecodeStep(state, max_tokens, sampler);
+    }
+    auto first = SelectNext(state, sampler);
+    if (first.stop)
+      return {.selections = {}, .stop = true};
+    auto& session = ling.session();
+    std::string error;
+    std::vector<std::int32_t> tokens{static_cast<std::int32_t>(first.token)};
+    session.BeginDraft();
+    std::int32_t seed = tokens.front();
+    for (std::uint32_t draft = 0; draft < mtp_drafts_; ++draft) {
+      if (!session.MtpAppend(seed, &error)) {
+        ling.Invalidate();
+        throw std::runtime_error("Ling-3.2 MTP draft failed: " + error);
+      }
+      const auto& draft_logits = session.MtpLogits();
+      seed = static_cast<std::int32_t>(
+          std::max_element(draft_logits.begin(), draft_logits.end()) -
+          draft_logits.begin());
+      tokens.push_back(seed);
+    }
+    std::vector<float> rows;
+    if (!session.Verify(tokens, &rows, &error)) {
+      ling.Invalidate();
+      throw std::runtime_error("Ling-3.2 verify failed: " + error);
+    }
+    const std::size_t vocab = session.Logits().size();
+    std::uint32_t keep = 0;
+    while (keep < mtp_drafts_ && keep + 1 < max_tokens) {
+      const float* row = rows.data() + static_cast<std::size_t>(keep) * vocab;
+      const auto best =
+          static_cast<std::int32_t>(std::max_element(row, row + vocab) - row);
+      if (best != tokens[keep + 1] || IsStop(best))
+        break;
+      ++keep;
+    }
+    if (!session.Commit(keep, &error)) {
+      ling.Invalidate();
+      throw std::runtime_error("Ling-3.2 commit failed: " + error);
+    }
+    TextDecodeStep step;
+    step.selections.push_back(std::move(first));
+    for (std::uint32_t index = 1; index <= keep; ++index) {
+      step.selections.push_back(
+          {.stop = false,
+           .token = static_cast<TextRunnerToken>(tokens[index]),
+           .piece = std::string(tokenizer_->DecodeToken(tokens[index]))});
+    }
+    step.draft_rounds = 1;
+    step.draft_tokens = mtp_drafts_;
+    step.draft_accepted_tokens = keep;
+    return step;
+  }
+
   [[nodiscard]] std::size_t CheckpointPosition(
       const TextRunnerState& state) const override {
     return RequireLing32State(state).position();
@@ -4245,6 +4322,8 @@ private:
   std::unique_ptr<tokenization::QwenTokenizer> tokenizer_;
   std::vector<std::int32_t> stop_tokens_;
   std::uint32_t max_context_;
+  bool mtp_;
+  std::uint32_t mtp_drafts_;
 };
 
 constexpr std::string_view kInklingStateAbi = "inkling-rocm-session-v1";
@@ -6037,10 +6116,13 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                 scheduler_policy);
   }
   if (reader->GetMetadataString("general.architecture") == "bailingmoe3") {
-    if (speculative_config.backend != TextSpeculativeBackend::kDisabled) {
-      SetError(error, "Ling-3.2 does not support speculation over serve yet");
+    if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
+        speculative_config.backend != TextSpeculativeBackend::kMtp) {
+      SetError(error, "Ling-3.2 speculation over serve supports mtp only");
       return false;
     }
+    const bool ling_mtp =
+        speculative_config.backend == TextSpeculativeBackend::kMtp;
     std::string tokenizer_error;
     auto tokenizer =
         tokenization::QwenTokenizer::CreateFromGguf(*reader, &tokenizer_error);
@@ -6074,7 +6156,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     }
     return load(std::move(model), std::move(tokenizer), std::move(stop_tokens),
                 error, max_context, session_count, prefill_policy,
-                scheduler_policy);
+                scheduler_policy, ling_mtp);
   }
   if (reader->GetMetadataString("general.architecture") == "inkling2") {
     if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
@@ -6775,7 +6857,8 @@ bool InferenceBackend::load(
     std::unique_ptr<tokenization::QwenTokenizer> tokenizer,
     std::vector<std::int32_t> stop_tokens, std::string* error,
     std::uint32_t max_context, std::size_t session_count,
-    TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy) {
+    TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
+    bool mtp) {
   if (model == nullptr || tokenizer == nullptr) {
     SetError(error, "Ling-3.2 model and tokenizer must not be null");
     return false;
@@ -6795,9 +6878,12 @@ bool InferenceBackend::load(
     auto new_state = std::make_shared<Impl::State>();
     new_state->sampling_defaults.model = sampling::TextModelPreset::kLing32;
     new_state->sampling_defaults.supplied = {};
+    std::uint32_t mtp_drafts = 2;
+    if (const char* env = std::getenv("LING_MTP_DRAFTS"))
+      mtp_drafts = static_cast<std::uint32_t>(std::atoi(env));
     auto runner = std::make_shared<Ling32TextRunner>(
         std::move(model), std::move(tokenizer), std::move(stop_tokens),
-        max_context);
+        max_context, mtp, mtp_drafts);
     new_state->model_id = runner->Descriptor().model_id;
     new_state->max_context = max_context;
     auto runner_pool = std::make_shared<TextRunnerPool>(

@@ -23,7 +23,7 @@ depth the NPU is ahead (`-p 8192 -d 60000`: 1,693 against 1,553 GPU only).
 ## Decode, real text, depth
 
 `gufo prompt` with a context built from this repository's own prose, C++ and JSON files, 300
-generated tokens, `--think off`, NPU on. `gufo serve` has no MTP for Ling, so these are CLI runs.
+generated tokens, `--think off`, NPU on. These are CLI runs; the serve table below uses the same prompts.
 
 | Context | Workload | Prompt tokens | Plain | MTP 2 drafts | MTP 3 | MTP 4 |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -45,6 +45,20 @@ prose and code at 4k to 16k it is within 3 tok/s of plain decode or below it.
 
 `gufo bench -n 128` plain decode: 37.0 tok/s (empty context, GPU only), 34.0 tok/s at 60k tokens
 of depth with the NPU on (34.4 without it).
+
+## Decode through `gufo serve`
+
+Streaming chat requests (`temperature` 0, 300 tokens, 4k-token prompts), NPU on, one request per
+cell. The server logs the draft rounds and accepted drafts of each request.
+
+| Decode, tok/s | plain | MTP, 2 drafts | rounds | accepted drafts | tokens per round |
+| --- | --- | --- | --- | --- | --- |
+| code | 32.7 | 34.3 | 132 | 167 | 2.27 |
+| JSON | 35.9 | 40.5 | 121 | 179 | 2.48 |
+| prose | 36.1 | 34.4 | 147 | 153 | 2.04 |
+
+Serve decode is 2 to 3 tok/s below the CLI figures above; the MTP and plain outputs agree for the
+first 120 to 160 characters and then diverge at a near-tie, both staying coherent.
 
 ## Notes
 

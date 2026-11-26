@@ -14,12 +14,12 @@ layers, Q4_0 MTP layer).
 ```sh
 gufo prompt -m Ling-3.2-air-Q4_K_M-00001-of-00003.gguf -f prompt.txt -n 300 -t 0 --think off -v
 gufo prompt ... --speculative mtp --mtp-model embedded     # MTP, 2 drafts
-GUFO_MODEL=ling32 ~/run-gufo.sh                             # serve (plain decode)
+GUFO_MODEL=ling32 ~/run-gufo.sh                             # serve, MTP on (GUFO_SPEC=off for plain)
 ```
 
 `GUFO_NPU_DIR=<repo>/tools/npu` turns the NPU prefill on (needs the fabric clock held, a binary
-named `gufo*`, and the XRT libraries on `LD_LIBRARY_PATH`). `gufo serve` has no MTP for Ling yet;
-`gufo prompt` is the MTP path.
+named `gufo*`, and the XRT libraries on `LD_LIBRARY_PATH`). `gufo serve` drafts with MTP for plain greedy
+requests (`--speculative mtp --mtp-model embedded`; sampled, penalised or grammar-constrained requests decode normally).
 
 ## What runs where
 
@@ -66,4 +66,4 @@ path at near-ties. No KL measurement has been made yet.
   release); plain decode at 16k to 64k tokens measures 30 to 34.5 tok/s over 300 tokens.
 - Real-text prefill is 1,600 to 1,700 tok/s at 10k to 24k tokens; the 1,800+ figures are `gufo bench`
   with its repeating token pattern, which touches few experts.
-- `gufo serve` has no speculative decoding for Ling.
+- Serve MTP has no continuation snapshots yet (the Ling engine has none), so a repeated prefix is prefilled again.

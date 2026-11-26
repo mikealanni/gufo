@@ -163,12 +163,13 @@ public:
             TextSchedulerPolicy scheduler_policy = {});
   /// Installs a previously loaded Ling-3.2 model with request-owned sessions.
   /// No snapshot/fork support yet (the engine has none).
+  /// `mtp` drafts with the model's own MTP layer for plain greedy requests.
   bool load(std::shared_ptr<models::ling32::gpu::Model> model,
             std::unique_ptr<tokenization::QwenTokenizer> tokenizer,
             std::vector<std::int32_t> stop_tokens, std::string* error,
             std::uint32_t max_context = 0, std::size_t session_count = 1,
             TextPrefillPolicy prefill_policy = {},
-            TextSchedulerPolicy scheduler_policy = {});
+            TextSchedulerPolicy scheduler_policy = {}, bool mtp = false);
 
   /// Installs a previously loaded GLM-5.3-Flash model with request-owned
   /// sessions, the artifact's tokenizer, and host-memory continuation

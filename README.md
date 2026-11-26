@@ -38,7 +38,7 @@ speculative decoding on top, for Qwen, Inkling, Flint, GLM-5.3 Flash, Laguna and
 | Flint | UD-Q4_K_XL | shared expert and QKV, two-bank pipeline | prompt lookup (no draft model) |
 | GLM-5.3 Flash | AJ-IQ2_XXS / RCO-152E Q3_K_M | KDA q/k/v and shared expert, two-bank lock-step | DFlash2 with prompt-lookup drafts |
 | Laguna S 2.1 | UD-Q4_K_M | shared expert, two-bank pipeline | DFlash v1 (block-diffusion) |
-| Ling 3.2 Air | Q4_K_M | KDA q/k/v and shared expert, two-bank pipeline | MTP (embedded layer, `gufo prompt` only) |
+| Ling 3.2 Air | Q4_K_M | KDA q/k/v and shared expert, two-bank pipeline | MTP (embedded layer) |
 
 ## Speed
 
@@ -190,6 +190,12 @@ Details: [docs/models/laguna](docs/models/laguna/)
 | code, 4k context | 36.3 | **40.0** |
 | JSON, 4k context | 35.8 | **42.5** |
 | prose, 4k context | 36.0 | 35.6 |
+
+| Decode via `gufo serve`, tok/s | plain | MTP, 2 drafts |
+| --- | --- | --- |
+| code, 4k context | 32.7 | 34.3 |
+| JSON, 4k context | 35.9 | **40.5** |
+| prose, 4k context | 36.1 | 34.4 |
 
 Details: [docs/models/ling-3.2](docs/models/ling-3.2/)
 
