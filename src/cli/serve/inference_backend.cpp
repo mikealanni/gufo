@@ -4083,7 +4083,7 @@ const Ling32TextRunnerState& RequireLing32State(const TextRunnerState& state) {
 
 class Ling32TextRunner final : public HipTextModelRunner {
 public:
-  static constexpr std::size_t kPrefillChunk = 4096;
+  static constexpr std::size_t kPrefillChunk = 16384;
 
   Ling32TextRunner(std::shared_ptr<Ling32Model> model,
                    std::unique_ptr<tokenization::QwenTokenizer> tokenizer,
