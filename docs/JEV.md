@@ -67,7 +67,7 @@ second NPU process. A command is treated as heavy when `p_yes` reaches
   "needs the whole GPU or most of the RAM" wording scored `lemonade pull
   Qwen3.8-Flash-Next-Gufo 2>&1` as heavy on both judges.
 - **Cutoff.** Probabilities are not comparable between judges. The launcher
-  uses `0.05` for pplx and `0.30` for d1; `JUDGE_CUTOFF` overrides either.
+  uses `0.2` for pplx and `0.30` for d1; `JUDGE_CUTOFF` overrides either.
   With the framing above, the lemonade command scores 0.029 on pplx and 0.126
   on d1 (both light), while 34/38 and 11/13 labeled heavy commands still stop
   gufo respectively. Each false stop costs a gufo reload (about 70 s), so tune
