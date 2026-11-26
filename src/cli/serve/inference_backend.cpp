@@ -4179,6 +4179,13 @@ public:
         models::ling32::RenderPrompt(messages, chat_options), options);
   }
 
+  [[nodiscard]] TextGenerationBackend::InitialOutputState InitialOutputState(
+      const ChatRequest& request) const override {
+    return request.reasoning.enabled.value_or(false)
+               ? TextGenerationBackend::InitialOutputState::kReasoning
+               : TextGenerationBackend::InitialOutputState::kContent;
+  }
+
   [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
     return std::make_unique<Ling32TextRunnerState>(model_, max_context_, mtp_);
   }
