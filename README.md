@@ -18,7 +18,7 @@ speculative decoding on top, for Qwen, Inkling, Flint, GLM-5.3 Flash, Laguna and
   DFlash2 speculation (default) and NPU prefill. Up to 256K context with block-sparse
   attention, tool calls, a reasoning channel, and the same RAM and disk
   continuation cache as the other models. Prefill 2,851 tok/s at 8K with the NPU; decode 60.6 tok/s on code and 58.3
-  on JSON at temperature 1, 51.7 tok/s at 25K context. See [docs/models/inkling](docs/models/inkling/README.md).
+  on JSON at temperature 1. See [docs/models/inkling](docs/models/inkling/README.md).
 - **Qwen3.8-27B on int4 WMMA plus NPU.** The dense projections run as int4 x int4
   WMMA on the GPU with the FFN split across the NPU: prefill 1,335 tok/s at 8K
   (806 with the Q4_K_XL GGUF and the NPU), plain decode 14.7 tok/s, HumanEval
@@ -60,7 +60,6 @@ text, with greedy chat requests to `gufo serve`. NPU numbers need the setup in
 | code | 33 | **60.6** |
 | JSON | 33 | **58.3** |
 | prose | 33 | **36.4** |
-| code at 25K context | | **51.7** |
 
 Details: [docs/models/inkling](docs/models/inkling/)
 
