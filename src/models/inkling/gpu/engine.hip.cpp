@@ -2502,6 +2502,9 @@ struct ModelState {
   std::vector<void*> allocations;
   std::size_t resident_bytes{0};
   bool has_draft{false};
+  bool d2{false};  // the loaded drafter is a DFlash2 block drafter
+  int d2_layers{5}, d2_window{2048}, d2_mask{200056};
+  float d2_theta{10000.0F}, d2_softcap{30.0F};
   float draft_fuse[4][4]{};     // softmax of every row of dspark_fuse
   std::vector<int> draft_rank;  // token ids by descending markov_w1 row norm
   // optional NPU offload of the q / gate / k / v projections (INKLING_NPU=1)
@@ -2814,7 +2817,8 @@ __global__ void DraftFuseNorm(const __half* feat, int pos0, const float* w4,
 // per (row, head): rms over 128 (optional weight) then NEOX rope at position
 // pos_base + row
 __global__ void DraftNormRope(float* x, const float* w, int heads, int pos_base,
-                              float eps, bool rope) {
+                              float eps, bool rope,
+                              float theta = kDraftRopeTheta) {
   __shared__ float red[128];
   float* p =
       x + (static_cast<std::size_t>(blockIdx.x) * heads + blockIdx.y) * 128;
@@ -2831,9 +2835,12 @@ __global__ void DraftNormRope(float* x, const float* w, int heads, int pos_base,
   sh[d] = v;
   __syncthreads();
   const int i = d & 63;
-  const float freq =
-      expf(-static_cast<float>(i) * (logf(kDraftRopeTheta) / 64.0F));
-  const float ang = static_cast<float>(pos_base + blockIdx.x) * freq;
+  // angle in double with range reduction: small rope bases give large angles
+  // at deep positions, where single-precision sin and cos lose their accuracy
+  const double freq = exp(-static_cast<double>(i) * (log(static_cast<double>(theta)) / 64.0));
+  const double ang_d = fmod(static_cast<double>(pos_base + blockIdx.x) * freq,
+                            6.283185307179586);
+  const float ang = static_cast<float>(ang_d);
   const float c = cosf(ang);
   const float sn = sinf(ang);
   p[d] = d < 64 ? sh[i] * c - sh[i + 64] * sn : sh[i + 64] * c + sh[i] * sn;
@@ -3071,6 +3078,292 @@ __global__ void DraftBf16Gemv(const unsigned short* w, const float* x, float* y,
         acc + (a1 != nullptr ? a1[r] : 0.0F) + (a2 != nullptr ? a2[r] : 0.0F);
 }
 
+__global__ void HalfToFloat(const __half* in, float* out, std::size_t count) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < count)
+    out[i] = __half2float(in[i]);
+}
+
+// ---------------------------------------------------------------- DFlash2
+// drafter kernels (block of 8 rows, 32 heads, two-tap dynamic convolutions and
+// a low-rank candidate path selector)
+constexpr int kD2Taps = 2;
+
+// grouped dynamic causal convolution over the rows of the block:
+// out[t][c] = sum over taps of (base[which][tap][c] + dyn[t][which][tap][c /
+// group]) * in[t - tap][c]; dyn is the kernel projection of the block rows,
+// laid out [which][tap][group]
+__global__ void D2Conv(const float* in, const float* proj, const float* base,
+                       float* out, int h, int groups, int gsz, int which) {
+  const int t = blockIdx.x;
+  for (int c = threadIdx.x; c < h; c += blockDim.x) {
+    float acc = 0.0F;
+    for (int tap = 0; tap < kD2Taps; ++tap) {
+      if (t - tap < 0)
+        break;
+      const float x = in[static_cast<std::size_t>(t - tap) * h + c];
+      const float d =
+          proj[static_cast<std::size_t>(t) * (2 * kD2Taps * groups) +
+               (which * kD2Taps + tap) * groups + c / gsz];
+      acc += (base[(which * kD2Taps + tap) * h + c] + d) * x;
+    }
+    out[static_cast<std::size_t>(t) * h + c] = acc;
+  }
+}
+
+// block attention for one head and one key split with the sliding window of
+// the DFlash2 layers: context rows [lo, P) from the ring, then the 8 block keys
+// (all visible). A context key j is hidden from slot s when
+// P + s - (lo + j) >= window.
+__global__ void D2AttnPartial(const float* q, const float* kb, const float* vb,
+                              const __half* kc, const __half* vc, int P, int lo,
+                              int cap, int nsplit, int nh, int gq, int window,
+                              float* pm, float* pl, float* po) {
+  __shared__ float sm[4][kDraftSlots], sl[4][kDraftSlots];
+  __shared__ float so[4][kDraftSlots][128];
+  const int h = blockIdx.x;
+  const int split = blockIdx.y;
+  const int g = h / gq;
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int slot = lane & 7;
+  const int chunk = lane >> 3;
+  const int nctx = P - lo;
+  const int total = nctx + kDraftSlots;
+  const int per = (total + nsplit - 1) / nsplit;
+  const int st = split * per;
+  const int en = min(total, st + per);
+  constexpr float scale = 0.08838834764831843F;
+  float q32[32];
+  float o32[32];
+  {
+    const float* qp =
+        q + (static_cast<std::size_t>(slot) * nh + h) * 128 + chunk * 32;
+    for (int t = 0; t < 32; ++t) {
+      q32[t] = qp[t] * scale;
+      o32[t] = 0.0F;
+    }
+  }
+  float m = -3.0e38F;
+  float l = 0.0F;
+  for (int j = st + warp; j < en; j += 4) {
+    float k32[32], v32[32];
+    if (j < nctx) {
+      const std::size_t base = static_cast<std::size_t>((lo + j) % cap) * 1024 +
+                               g * 128 + chunk * 32;
+      const uint4* kp = reinterpret_cast<const uint4*>(kc + base);
+      const uint4* vp = reinterpret_cast<const uint4*>(vc + base);
+      for (int u = 0; u < 4; ++u) {
+        const uint4 kw = kp[u];
+        const uint4 vw = vp[u];
+        const __half2* kh = reinterpret_cast<const __half2*>(&kw);
+        const __half2* vh = reinterpret_cast<const __half2*>(&vw);
+        for (int e = 0; e < 4; ++e) {
+          const float2 kf = __half22float2(kh[e]);
+          const float2 vf = __half22float2(vh[e]);
+          k32[u * 8 + e * 2] = kf.x;
+          k32[u * 8 + e * 2 + 1] = kf.y;
+          v32[u * 8 + e * 2] = vf.x;
+          v32[u * 8 + e * 2 + 1] = vf.y;
+        }
+      }
+    } else {
+      const std::size_t base =
+          (static_cast<std::size_t>(j - nctx) * 8 + g) * 128 + chunk * 32;
+      for (int t = 0; t < 32; ++t) {
+        k32[t] = kb[base + t];
+        v32[t] = vb[base + t];
+      }
+    }
+    float dot = 0.0F;
+    for (int t = 0; t < 32; ++t)
+      dot += q32[t] * k32[t];
+    dot += __shfl_xor(dot, 8);
+    dot += __shfl_xor(dot, 16);
+    if (j < nctx && window > 0 && P + slot - (lo + j) >= window)
+      dot = -3.0e38F;
+    const float mn = fmaxf(m, dot);
+    const float al = expf(m - mn);
+    const float pr = expf(dot - mn);
+    l = l * al + pr;
+    for (int t = 0; t < 32; ++t)
+      o32[t] = o32[t] * al + pr * v32[t];
+    m = mn;
+  }
+  if (chunk == 0) {
+    sm[warp][slot] = m;
+    sl[warp][slot] = l;
+  }
+  for (int t = 0; t < 32; ++t)
+    so[warp][slot][chunk * 32 + t] = o32[t];
+  __syncthreads();
+  for (int idx = threadIdx.x; idx < kDraftSlots * 128; idx += blockDim.x) {
+    const int s = idx >> 7;
+    const int d = idx & 127;
+    float mx = -3.0e38F;
+    for (int w = 0; w < 4; ++w)
+      mx = fmaxf(mx, sm[w][s]);
+    float den = 0.0F, acc = 0.0F;
+    for (int w = 0; w < 4; ++w) {
+      const float sc = sm[w][s] > -1.0e38F ? expf(sm[w][s] - mx) : 0.0F;
+      den += sc * sl[w][s];
+      acc += sc * so[w][s][d];
+    }
+    const std::size_t part =
+        (static_cast<std::size_t>(s) * nh + h) * nsplit + split;
+    po[part * 128 + d] = acc;
+    if (d == 0) {
+      pm[part] = mx;
+      pl[part] = den;
+    }
+  }
+}
+
+__global__ void D2AttnCombine(const float* pm, const float* pl, const float* po,
+                              float* out, int nsplit, int nh) {
+  const std::size_t base =
+      (static_cast<std::size_t>(blockIdx.x) * nh + blockIdx.y) * nsplit;
+  float mx = -3.0e38F;
+  for (int s = 0; s < nsplit; ++s)
+    mx = fmaxf(mx, pm[base + s]);
+  float den = 0.0F, acc = 0.0F;
+  for (int s = 0; s < nsplit; ++s) {
+    const float sc = pm[base + s] > -1.0e38F ? expf(pm[base + s] - mx) : 0.0F;
+    den += sc * pl[base + s];
+    acc += sc * po[(base + s) * 128 + threadIdx.x];
+  }
+  out[(static_cast<std::size_t>(blockIdx.x) * nh + blockIdx.y) * 128 +
+      threadIdx.x] = acc / den;
+}
+
+// the 16 largest logits of each row (unordered), one block per row
+__global__ void __launch_bounds__(256)
+    D2TopK(const float* logits, int n, std::size_t ld, int* ids, float* vals) {
+  constexpr int kK = 16;
+  __shared__ float sv[256 * kK];
+  __shared__ int si[256 * kK];
+  __shared__ float rv[256];
+  __shared__ int ri[256];
+  const float* x = logits + static_cast<std::size_t>(blockIdx.x) * ld;
+  float lv[kK];
+  int li[kK];
+  for (int j = 0; j < kK; ++j) {
+    lv[j] = -3.0e38F;
+    li[j] = 0;
+  }
+  float mn = -3.0e38F;
+  int mi = 0;
+  for (int i = threadIdx.x; i < n; i += 256) {
+    const float v = x[i];
+    if (v > mn) {
+      lv[mi] = v;
+      li[mi] = i;
+      mn = lv[0];
+      mi = 0;
+      for (int j = 1; j < kK; ++j) {
+        if (lv[j] < mn) {
+          mn = lv[j];
+          mi = j;
+        }
+      }
+    }
+  }
+  for (int j = 0; j < kK; ++j) {
+    sv[threadIdx.x * kK + j] = lv[j];
+    si[threadIdx.x * kK + j] = li[j];
+  }
+  __syncthreads();
+  for (int round = 0; round < kK; ++round) {
+    float best = -3.4e38F;
+    int bj = 0;
+    for (int j = 0; j < kK; ++j) {
+      const float v = sv[threadIdx.x * kK + j];
+      if (v > best) {
+        best = v;
+        bj = j;
+      }
+    }
+    rv[threadIdx.x] = best;
+    ri[threadIdx.x] = threadIdx.x;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) {
+      if (threadIdx.x < s && rv[threadIdx.x + s] > rv[threadIdx.x]) {
+        rv[threadIdx.x] = rv[threadIdx.x + s];
+        ri[threadIdx.x] = ri[threadIdx.x + s];
+      }
+      __syncthreads();
+    }
+    const int win = ri[0];
+    if (threadIdx.x == win) {
+      ids[blockIdx.x * kK + round] = si[win * kK + bj];
+      vals[blockIdx.x * kK + round] = rv[0];
+      sv[win * kK + bj] = -3.4e38F;
+    }
+    __syncthreads();
+  }
+}
+
+// greedy path over the 16 candidates of each of the 7 draft positions:
+// score = unary + (predecessor[prev] * hp) . successor[cand], softcapped
+__global__ void __launch_bounds__(256)
+    D2Select(const int* cand, const float* unary, const float* hp,
+             const unsigned short* pred, const unsigned short* succ,
+             const int* anchor, int rank, int steps, float softcap, int* out,
+             float* conf) {
+  __shared__ float pv[256];
+  __shared__ float score[16];
+  __shared__ int prev_s;
+  if (threadIdx.x == 0)
+    prev_s = *anchor;
+  __syncthreads();
+  const int grp = threadIdx.x >> 4;
+  const int lane = threadIdx.x & 15;
+  for (int s = 0; s < steps; ++s) {
+    const int prev = prev_s;
+    for (int r = threadIdx.x; r < rank; r += 256)
+      pv[r] = __uint_as_float(
+                  static_cast<unsigned>(
+                      pred[static_cast<std::size_t>(prev) * rank + r])
+                  << 16) *
+              hp[s * rank + r];
+    __syncthreads();
+    const int c = cand[s * 16 + grp];
+    float dot = 0.0F;
+    for (int r = lane; r < rank; r += 16)
+      dot += __uint_as_float(
+                 static_cast<unsigned>(
+                     succ[static_cast<std::size_t>(c) * rank + r])
+                 << 16) *
+             pv[r];
+    for (int off = 8; off > 0; off >>= 1)
+      dot += __shfl_xor(dot, off, 16);
+    if (lane == 0) {
+      float v = unary[s * 16 + grp] + dot;
+      if (softcap > 0.0F)
+        v = softcap * tanhf(v / softcap);
+      score[grp] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      int bi = 0;
+      for (int k = 1; k < 16; ++k)
+        if (score[k] > score[bi])
+          bi = k;
+      float tot = 0.0F;
+      for (int k = 0; k < 16; ++k)
+        tot += expf(score[k] - score[bi]);
+      const int pick = bi;
+      const float c = 1.0F / tot;
+      const int tok = cand[s * 16 + pick];
+      out[s] = tok;
+      conf[s] = c;
+      prev_s = tok;
+    }
+    __syncthreads();
+  }
+}
+
 __global__ void GatherRows(const unsigned char* src, std::size_t row_bytes,
                            const int* ids, unsigned char* dst) {
   const uint4* in = reinterpret_cast<const uint4*>(
@@ -3207,6 +3500,15 @@ struct Session::Impl : Scratch {
       *dgate{}, *dup{}, *dact{}, *dpm{}, *dpl{}, *dpo{}, *dcarry{}, *dstate{},
       *dlatent{}, *djin{}, *djout{}, *deff{}, *dlog{}, *dtmp{}, *dw{};
   int *dprev{}, *dtok{}, *dout{};
+  // DFlash2 drafter state
+  static constexpr int kD2Cap = 4096;
+  static constexpr int kD2Layers = 5;
+  __half* d2k[kD2Layers]{};
+  __half* d2v[kD2Layers]{};
+  float *d2cat{}, *d2th{}, *d2ctx{}, *d2ck{}, *d2cv{}, *d2emb{}, *d2q{},
+      *d2att{}, *d2proj{}, *d2conv{}, *d2log{}, *d2hp{}, *d2uv{}, *d2gate{},
+      *d2up{}, *d2act{}, *d2pm{}, *d2pl{}, *d2po{};
+  int *d2tok{}, *d2ids{};
   static constexpr int kDraftWarmChunk = 256;
   static constexpr int kDraftSplit = 64;
   static constexpr int kDraftShortlistMax = 65536;
@@ -3278,7 +3580,7 @@ struct Session::Impl : Scratch {
     }
     if (feat != nullptr)
       out.push_back({feat, static_cast<std::size_t>(pos) * kTapCount * h * 2});
-    if (drafter && dready) {
+    if (drafter && dready && !m->d2) {
       for (int l = 0; l < 3; ++l) {
         const std::size_t rows =
             l == 1 ? std::min<std::size_t>(dwarm, dcap[l]) : dcap[l];
@@ -5208,6 +5510,10 @@ struct Session::Impl : Scratch {
   void DraftEnsure() {
     if (dready)
       return;
+    if (m->d2) {
+      DraftEnsure2();
+      return;
+    }
     const int h = static_cast<int>(m->config.hidden_size);
     constexpr int kSlots = 8;
     const auto f = [&](std::size_t n) {
@@ -5302,6 +5608,8 @@ struct Session::Impl : Scratch {
   }
   bool Draft(std::int32_t anchor, std::int32_t* out, int count,
              float* conf_out = nullptr, float stop_conf = 0.0F) {
+    if (m->d2)
+      return Draft2(anchor, out, count, conf_out);
     const int h = static_cast<int>(m->config.hidden_size);
     const float eps = m->config.rms_eps;
     const int P = static_cast<int>(position);
@@ -5381,6 +5689,167 @@ struct Session::Impl : Scratch {
           dlog, kDraftShortlist, dprev, dout + (s - 1), dmap, dconf + (s - 1),
           stop_conf > 0.0F ? dstop : nullptr, stop_conf);
     }
+    HIP_OK(hipMemcpyAsync(out, dout, steps * 4, hipMemcpyDeviceToHost, stream));
+    if (conf_out != nullptr)
+      HIP_OK(hipMemcpyAsync(conf_out, dconf, steps * 4, hipMemcpyDeviceToHost,
+                            stream));
+    HIP_OK(hipStreamSynchronize(stream));
+    return true;
+  }
+  // ---- DFlash2 drafter
+  void DraftEnsure2() {
+    if (dready)
+      return;
+    const int h = static_cast<int>(m->config.hidden_size);
+    const std::size_t vocab = m->config.vocab_unpadded;
+    const auto f = [&](std::size_t n) {
+      return static_cast<float*>(AllocBytes(n * 4));
+    };
+    for (int l = 0; l < kD2Layers; ++l) {
+      d2k[l] = static_cast<__half*>(
+          AllocBytes(static_cast<std::size_t>(kD2Cap) * 1024 * 2));
+      d2v[l] = static_cast<__half*>(
+          AllocBytes(static_cast<std::size_t>(kD2Cap) * 1024 * 2));
+    }
+    constexpr std::size_t kChunk = kDraftWarmChunk;
+    d2cat = f(kChunk * 4 * h);
+    d2th = f(kChunk * h);
+    d2ctx = f(kChunk * h);
+    d2ck = f(kChunk * 1024);
+    d2cv = f(kChunk * 1024);
+    d2emb = f(2 * h);
+    dx = f(8 * h);
+    dh = f(8 * h);
+    dtmp = f(8 * h);
+    d2q = f(8 * 4096);
+    dkb = f(8 * 1024);
+    dvb = f(8 * 1024);
+    d2att = f(8 * 4096);
+    d2proj = f(8 * 576);
+    d2conv = f(8 * h);
+    d2gate = f(8 * 6912);
+    d2up = f(8 * 6912);
+    d2act = f(8 * 6912);
+    const std::size_t parts = static_cast<std::size_t>(8) * 32 * kDraftSplit;
+    d2pm = f(parts);
+    d2pl = f(parts);
+    d2po = f(parts * 128);
+    d2log = f(7 * vocab);
+    d2hp = f(7 * 256);
+    d2uv = f(7 * 16);
+    dconf = f(8);
+    d2tok = static_cast<int*>(AllocBytes(2 * 4));
+    d2ids = static_cast<int*>(AllocBytes(7 * 16 * 4));
+    dout = static_cast<int*>(AllocBytes(8 * 4));
+    dready = true;
+  }
+  void DraftWarm2(int P) {
+    const int h = static_cast<int>(m->config.hidden_size);
+    const float eps = 1.0e-6F;
+    const float theta = m->d2_theta;
+    const int start = std::max<int>(static_cast<int>(dwarmed),
+                                    std::max(0, P - m->d2_window - 8));
+    for (int p0 = start; p0 < P; p0 += kDraftWarmChunk) {
+      const int n = std::min(kDraftWarmChunk, P - p0);
+      const std::size_t count = static_cast<std::size_t>(n) * 4 * h;
+      HalfToFloat<<<(count + 255) / 256, 256, 0, stream>>>(
+          feat + static_cast<std::size_t>(p0) * 4 * h, d2cat, count);
+      Dense(m->T("d.fc.weight"), d2cat, 4 * h, d2th, h, n);
+      RmsRows(d2th, DW("enc.output_norm.weight"), d2ctx, n, h, h, h);
+      for (int l = 0; l < kD2Layers; ++l) {
+        const std::string b = "blk." + std::to_string(l) + ".";
+        Dense(m->T("d." + b + "attn_k.weight"), d2ctx, h, d2ck, 1024, n);
+        Dense(m->T("d." + b + "attn_v.weight"), d2ctx, h, d2cv, 1024, n);
+        DraftNormRope<<<dim3(n, 8), 128, 0, stream>>>(
+            d2ck, DW(b + "attn_k_norm.weight"), 8, p0, eps, true, theta);
+        DraftStoreCtx<<<n, 256, 0, stream>>>(d2ck, d2cv, d2k[l], d2v[l], p0,
+                                             kD2Cap);
+      }
+    }
+    dwarmed = static_cast<std::uint32_t>(P);
+  }
+  void D2Conv_(const float* in, const float* proj, const std::string& base,
+               float* out, int which) {
+    D2Conv<<<8, 256, 0, stream>>>(in, proj, DW(base), out,
+                                  static_cast<int>(m->config.hidden_size), 144,
+                                  16, which);
+  }
+  bool Draft2(std::int32_t anchor, std::int32_t* out, int count,
+              float* conf_out) {
+    const int h = static_cast<int>(m->config.hidden_size);
+    const float eps = 1.0e-6F;
+    const float theta = m->d2_theta;
+    const int P = static_cast<int>(position);
+    const int vocab = static_cast<int>(m->config.vocab_unpadded);
+    if (feat == nullptr || !m->has_draft || P == 0)
+      return false;
+    DraftEnsure();
+    if (dwarmed > static_cast<std::uint32_t>(P))
+      dwarmed = static_cast<std::uint32_t>(P);
+    DraftWarm2(P);
+    const int toks[2] = {anchor, m->d2_mask};
+    HIP_OK(hipMemcpyAsync(d2tok, toks, 8, hipMemcpyHostToDevice, stream));
+    const Tensor& emb = m->T("token_embd.weight");
+    EmbedQ8<<<2, 256, 0, stream>>>(static_cast<const unsigned char*>(emb.dev),
+                                   emb.row_bytes, d2tok, d2emb, h);
+    static const bool emb_norm = std::getenv("INKLING_D2_EMBNORM") == nullptr ||
+                                 std::getenv("INKLING_D2_EMBNORM")[0] != '0';
+    if (emb_norm)
+      RmsRows(d2emb, static_cast<const float*>(m->T("token_embd_norm.weight").dev),
+              d2emb, 2, h, h, h);
+    DraftSlotsInit<<<8, 256, 0, stream>>>(d2emb + h, d2emb, dx, h);
+    DraftAddNorm<<<8, 256, 0, stream>>>(dx, nullptr, DW("blk.0.attn_norm.weight"),
+                                        dh, h, eps);
+    const int lo = std::max(0, P - m->d2_window + 1);
+    const int total = P - lo + 8;
+    const int nsplit = std::min(kDraftSplit, std::max(1, (total + 255) / 256));
+    for (int l = 0; l < kD2Layers; ++l) {
+      const std::string b = "blk." + std::to_string(l) + ".";
+      const std::string d = "d." + b;
+      Dense(m->T(d + "attn_conv_proj.weight"), dh, h, d2proj, 576, 8);
+      D2Conv_(dh, d2proj, b + "attn_conv_base", d2conv, 0);
+      Dense(m->T(d + "attn_q.weight"), d2conv, h, d2q, 4096, 8);
+      Dense(m->T(d + "attn_k.weight"), d2conv, h, dkb, 1024, 8);
+      Dense(m->T(d + "attn_v.weight"), d2conv, h, dvb, 1024, 8);
+      DraftNormRope<<<dim3(8, 32), 128, 0, stream>>>(
+          d2q, DW(b + "attn_q_norm.weight"), 32, P, eps, true, theta);
+      DraftNormRope<<<dim3(8, 8), 128, 0, stream>>>(
+          dkb, DW(b + "attn_k_norm.weight"), 8, P, eps, true, theta);
+      D2AttnPartial<<<dim3(32, nsplit), 128, 0, stream>>>(
+          d2q, dkb, dvb, d2k[l], d2v[l], P, lo, kD2Cap, nsplit, 32, 4,
+          m->d2_window, d2pm, d2pl, d2po);
+      D2AttnCombine<<<dim3(8, 32), 128, 0, stream>>>(d2pm, d2pl, d2po, d2att,
+                                                     nsplit, 32);
+      Dense(m->T(d + "attn_output.weight"), d2att, 4096, dtmp, h, 8);
+      D2Conv_(dtmp, d2proj, b + "attn_conv_base", d2conv, 1);
+      DraftAddNorm<<<8, 256, 0, stream>>>(dx, d2conv, DW(b + "ffn_norm.weight"),
+                                          dh, h, eps);
+      Dense(m->T(d + "ffn_conv_proj.weight"), dh, h, d2proj, 576, 8);
+      D2Conv_(dh, d2proj, b + "ffn_conv_base", d2conv, 0);
+      Dense(m->T(d + "ffn_gate.weight"), d2conv, h, d2gate, 6912, 8);
+      Dense(m->T(d + "ffn_up.weight"), d2conv, h, d2up, 6912, 8);
+      DraftSwiglu<<<(8 * 6912 + 255) / 256, 256, 0, stream>>>(d2gate, d2up,
+                                                              d2act, 8 * 6912);
+      Dense(m->T(d + "ffn_down.weight"), d2act, 6912, dtmp, h, 8);
+      D2Conv_(dtmp, d2proj, b + "ffn_conv_base", d2conv, 1);
+      const float* next = l + 1 < kD2Layers
+                              ? DW("blk." + std::to_string(l + 1) +
+                                   ".attn_norm.weight")
+                              : DW("output_norm.weight");
+      DraftAddNorm<<<8, 256, 0, stream>>>(dx, d2conv, next, dh, h, eps);
+    }
+    const float* rows = dh + h;  // draft positions 1..7
+    Dense(m->T("output.weight"), rows, h, d2log, vocab, 7, vocab);
+    D2TopK<<<7, 256, 0, stream>>>(d2log, vocab, vocab, d2ids, d2uv);
+    Dense(m->T("d.selector_hidden.weight"), rows, h, d2hp, 256, 7);
+    D2Select<<<1, 256, 0, stream>>>(
+        d2ids, d2uv, d2hp,
+        static_cast<const unsigned short*>(
+            m->T("d.selector_predecessor.weight").dev),
+        static_cast<const unsigned short*>(
+            m->T("d.selector_successor.weight").dev),
+        d2tok, 256, 7, m->d2_softcap, dout, dconf);
+    const int steps = std::min(count, 7);
     HIP_OK(hipMemcpyAsync(out, dout, steps * 4, hipMemcpyDeviceToHost, stream));
     if (conf_out != nullptr)
       HIP_OK(hipMemcpyAsync(conf_out, dconf, steps * 4, hipMemcpyDeviceToHost,
@@ -5777,7 +6246,7 @@ bool Session::RestoreSnapshot(const SessionSnapshot& snapshot,
                         i.stream));
   HIP_OK(hipStreamSynchronize(i.stream));
   i.position = d.position;
-  i.dwarmed = d.dwarmed;
+  i.dwarmed = i.m->d2 ? 0 : d.dwarmed;
   i.argmax_host[0] = d.argmax;
   i.logits_rows = 1;
   i.logits_last = 0;
@@ -5883,7 +6352,7 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
                         i.stream));
   HIP_OK(hipStreamSynchronize(i.stream));
   i.position = header.position;
-  i.dwarmed = header.dwarmed;
+  i.dwarmed = i.m->d2 ? 0 : header.dwarmed;
   i.argmax_host[0] = header.argmax;
   i.logits_rows = 1;
   i.logits_last = 0;
@@ -6095,6 +6564,17 @@ bool Model::LoadDrafter(const std::string& path, std::string* error) {
           st.draft_rank.push_back(norms[i].second);
     }
     st.tensors.emplace(name, t);
+  }
+  if (reader->FindTensor("selector_hidden.weight") != nullptr) {
+    st.d2 = true;
+    if (const auto w = reader->GetMetadataUint32("dflash.attention.sliding_window"))
+      st.d2_window = static_cast<int>(*w);
+    if (const auto w = reader->GetMetadataUint32("dflash.mask_token_id"))
+      st.d2_mask = static_cast<int>(*w);
+    if (const auto w = reader->GetMetadataFloat32("dflash.rope.freq_base"))
+      st.d2_theta = *w;
+    if (const auto w = reader->GetMetadataFloat32("dflash.final_logit_softcapping"))
+      st.d2_softcap = *w;
   }
   st.has_draft = true;
   return true;

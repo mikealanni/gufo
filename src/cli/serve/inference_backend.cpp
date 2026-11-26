@@ -6220,8 +6220,11 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   }
   if (reader->GetMetadataString("general.architecture") == "inkling2") {
     if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
-        speculative_config.backend != TextSpeculativeBackend::kDSpark) {
-      SetError(error, "Inkling speculation over serve supports dspark only");
+        speculative_config.backend != TextSpeculativeBackend::kDSpark &&
+        speculative_config.backend != TextSpeculativeBackend::kDFlash) {
+      SetError(error,
+               "Inkling speculation over serve supports dspark and dflash2 "
+               "only");
       return false;
     }
     std::string tokenizer_error;
@@ -6256,7 +6259,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
       return false;
     }
     std::size_t draft_width = 0;
-    if (speculative_config.backend == TextSpeculativeBackend::kDSpark &&
+    if ((speculative_config.backend == TextSpeculativeBackend::kDSpark ||
+         speculative_config.backend == TextSpeculativeBackend::kDFlash) &&
         !speculative_config.draft_model_path.empty()) {
       std::string draft_error;
       if (!model->LoadDrafter(speculative_config.draft_model_path,
