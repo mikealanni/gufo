@@ -97,3 +97,32 @@ at about 13 s per token; the GPU engine matches it to about four digits.
   23 to 27% of GPU time at 8K): the full task description for a kernel and its engine hook is
   [../../plans/inkling-npu-attention-kernel.md](../../plans/inkling-npu-attention-kernel.md).
 - Per-32 activation scales for the int4 fast profile (quality), see [QUALITY.md](QUALITY.md).
+
+## DFlash2 drafter
+
+`incoai/Inkling-2-Mini-DFlash2` (a 5-layer block drafter with two-tap dynamic convolutions and a
+16-candidate path selector, 8-token blocks, 2,048-token sliding window) is supported next to DSpark. Convert the
+safetensors once, then serve it with `--speculative dflash2 --dflash-model <gguf> --draft-tokens 7 --min-draft-tokens 1`
+(`run-gufo.sh`: `GUFO_INKLING_DFLASH=<gguf>`):
+
+```sh
+python3 tools/inkling/dflash2-export-gguf.py --weights model.safetensors --config config.json --out Inkling-2-Mini-DFlash2.gguf
+```
+
+It taps the same four target features as DSpark (visits 5, 23, 41 and the final norm) and embeds the anchor and mask
+tokens through the target's embedding and its norm. Greedy output equals plain decoding. Measured over HTTP
+(400-500 tokens, short context):
+
+| Decode, tok/s | DSpark | DFlash2 |
+| --- | --- | --- |
+| code, greedy | 73.0 | 76.5 to 79.4 |
+| JSON, greedy | 68.4 | 71.5 to 74.6 |
+| prose, greedy | 42.8 | 43.7 |
+| code, temperature 1 | 62.8 | 60.7 |
+| JSON, temperature 1 | 57.5 | 57.2 |
+
+DFlash2 accepts more tokens per step (4.1 against 3.4 on chat code), but verifying a block costs about 6.5 ms per
+extra row (each row streams about eight more experts), so the step is bound by expert weight bandwidth and the gain is
+small. Sampled requests use the same sample-and-compare verification as DSpark. Exact speculative sampling with the
+drafter's own candidate distribution was tried and decoded slower (54.6 against 60.7 on code). The 2,048-token window
+loses to DSpark's full-context layer on text that repeats from far back.

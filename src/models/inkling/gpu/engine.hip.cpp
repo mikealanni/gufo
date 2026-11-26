@@ -1,5 +1,4 @@
 #include "src/models/inkling/gpu/engine.hpp"
-#include "src/models/inkling/gpu/iu4_experts.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -10,17 +9,18 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <mutex>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
 #include "src/core/hip/weight_upload.hpp"
-#include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/inkling/gpu/gptq.hpp"
+#include "src/models/inkling/gpu/iu4_experts.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/npu_gemm.hpp"
 
 namespace gufo::models::inkling::gpu {
@@ -669,8 +669,7 @@ struct StatePtrs {
   bool half_blocks;  ///< the block states are FP16 rows (cur is always F32)
 };
 
-__device__ __forceinline__ float4 StateRow4(const void* row, bool half,
-                                            int i) {
+__device__ __forceinline__ float4 StateRow4(const void* row, bool half, int i) {
   if (!half)
     return reinterpret_cast<const float4*>(row)[i];
   const uint2 u = reinterpret_cast<const uint2*>(row)[i];
@@ -1023,7 +1022,9 @@ __global__ void StoreKv(const float* k, const float* v, __half* kc, __half* vc,
   }
 }
 
-float HalfToFloat(uint16_t h) { return __half2float(__ushort_as_half(h)); }
+float HalfToFloat(uint16_t h) {
+  return __half2float(__ushort_as_half(h));
+}
 
 uint16_t FloatToBf16(float f) {
   uint32_t u;
@@ -1283,9 +1284,8 @@ __device__ __forceinline__ void EmuRot256(float* v, const float* s1,
 
 // NVFP4 gate/up rows -> rotated symmetric int4 (per-128 scale) as Q8Rep rows.
 __global__ void EmuWeights(const std::uint8_t* src, std::uint8_t* dst, int k,
-                           std::size_t src_row_bytes,
-                           std::size_t dst_row_bytes, const float* s1,
-                           const float* s2, bool quant) {
+                           std::size_t src_row_bytes, std::size_t dst_row_bytes,
+                           const float* s1, const float* s2, bool quant) {
   __shared__ float v[256];
   __shared__ float red[2][8];
   const std::size_t row = blockIdx.x;
@@ -1296,10 +1296,13 @@ __global__ void EmuWeights(const std::uint8_t* src, std::uint8_t* dst, int k,
   for (int kb = 0; kb < k / 256; ++kb) {
     const int j = kb * 8 + t / 32;
     const int p = t % 32;
-    const int byte = (p < 8) ? p : (p < 16) ? p - 8 : (p < 24) ? 8 + p - 16
-                                                              : 8 + p - 24;
+    const int byte = (p < 8)    ? p
+                     : (p < 16) ? p - 8
+                     : (p < 24) ? 8 + p - 16
+                                : 8 + p - 24;
     const unsigned raw = sr[j * 16 + byte];
-    const unsigned nb = (p < 8 || (p >= 16 && p < 24)) ? (raw & 15U) : (raw >> 4);
+    const unsigned nb =
+        (p < 8 || (p >= 16 && p < 24)) ? (raw & 15U) : (raw >> 4);
     const float mag = kMags[nb & 7U];
     const float sc = EmuUe4m3(sr[k / 2 + j * 2 + p / 16]);
     v[t] = ((nb & 8U) ? -mag : mag) * sc;
@@ -1317,7 +1320,8 @@ __global__ void EmuWeights(const std::uint8_t* src, std::uint8_t* dst, int k,
     const float s = __half2float(__float2half(amax / 7.0F));
     float q = s > 0.0F ? fminf(7.0F, fmaxf(-8.0F, rintf(v[t] / s))) : 0.0F;
     if (!quant)
-      q = fminf(127.0F, fmaxf(-128.0F, rintf(v[t] * (127.0F / fmaxf(amax, 1e-30F)))));
+      q = fminf(127.0F,
+                fmaxf(-128.0F, rintf(v[t] * (127.0F / fmaxf(amax, 1e-30F)))));
     dr[kb * 256 + t] = static_cast<std::uint8_t>(static_cast<std::int8_t>(q));
     if ((t & 31) == 0) {
       const __half hs = __float2half(quant ? s : amax / 127.0F);
@@ -1353,8 +1357,10 @@ __global__ void EmuActs(const __half* x, __half* out, int h, const float* s1,
       __syncthreads();
     }
     const float s = __half2float(__float2half(a / 7.0F));
-    const float q = s > 0.0F ? fminf(7.0F, fmaxf(-8.0F, rintf(v[t] / s))) : 0.0F;
-    out[tok * h + kb * 256 + t] = quant ? __float2half(q * s) : __float2half(v[t]);
+    const float q =
+        s > 0.0F ? fminf(7.0F, fmaxf(-8.0F, rintf(v[t] / s))) : 0.0F;
+    out[tok * h + kb * 256 + t] =
+        quant ? __float2half(q * s) : __float2half(v[t]);
     __syncthreads();
   }
 }
@@ -1440,7 +1446,8 @@ __global__ void CombineHalf(const __half* y, const float* wts, float* out,
       }
     }
     float4* o = reinterpret_cast<float4*>(
-        out + static_cast<std::size_t>(blockIdx.x) * h) + 2 * i;
+                    out + static_cast<std::size_t>(blockIdx.x) * h) +
+                2 * i;
     o[0] = make_float4(a[0], a[1], a[2], a[3]);
     o[1] = make_float4(a[4], a[5], a[6], a[7]);
   }
@@ -1487,7 +1494,8 @@ struct WmmaArgs {
   const int* tiles;
   const int* sorted;
   int n;
-  int ksplit{1};  ///< split-K slices (grid z); partial sums go to y + z * n * rows
+  int ksplit{
+      1};  ///< split-K slices (grid z); partial sums go to y + z * n * rows
   int kchunk{0};  ///< K per slice
 };
 
@@ -1565,10 +1573,9 @@ __global__ void __launch_bounds__(kWmmaThreads) WmmaGemm(WmmaArgs a) {
   const int wn = wave & 1;
   const int kbeg = a.ksplit > 1 ? static_cast<int>(blockIdx.z) * a.kchunk : 0;
   const int kend = a.ksplit > 1 ? min(a.cols, kbeg + a.kchunk) : a.cols;
-  float* const yout = a.ksplit > 1
-                          ? a.y + static_cast<std::size_t>(blockIdx.z) *
-                                      a.n * a.rows
-                          : a.y;
+  float* const yout =
+      a.ksplit > 1 ? a.y + static_cast<std::size_t>(blockIdx.z) * a.n * a.rows
+                   : a.y;
   for (int k0 = kbeg; k0 < kend; k0 += 32) {
     uint4* ad = reinterpret_cast<uint4*>(&As[lr][lh * 16]);
     if (xr != nullptr) {
@@ -1943,7 +1950,8 @@ __global__ void __launch_bounds__(WAVES * 32)
       const int jpos = kb + ni * 16 + (lane & 15);
       for (int i = 0; i < 8; ++i) {
         const int dist = qpos[i] - jpos;
-        const bool valid = interior || (dist >= 0 && (a.window == 0 || dist < a.window));
+        const bool valid =
+            interior || (dist >= 0 && (a.window == 0 || dist < a.window));
         float v = kNegInf;
         if (valid) {
           const int lr = 2 * i + (lane >> 4);
@@ -1971,8 +1979,8 @@ __global__ void __launch_bounds__(WAVES * 32)
     for (int ni = 0; ni < 4; ++ni) {
       for (int i = 0; i < 8; ++i) {
         const float pv = (!interior && sc[ni][i] <= kNegInf)
-                            ? 0.0F
-                            : exp2f(sc[ni][i] - m[i]);
+                             ? 0.0F
+                             : exp2f(sc[ni][i] - m[i]);
         l[i] += pv;
         PZ[wave][(2 * i + (lane >> 4)) * kPStride + ni * 16 + (lane & 15)] =
             __float2half(pv);
@@ -2520,17 +2528,18 @@ struct ModelState {
   // and shared by every session of the model.
   std::mutex iu4_mutex;
   std::vector<std::pair<std::uint8_t*, std::uint16_t*>> iu4_w =
-      std::vector<std::pair<std::uint8_t*, std::uint16_t*>>(
-          64, {nullptr, nullptr});
+      std::vector<std::pair<std::uint8_t*, std::uint16_t*>>(64,
+                                                            {nullptr, nullptr});
   std::vector<std::pair<std::uint8_t*, std::uint16_t*>> iu4_dw =
-      std::vector<std::pair<std::uint8_t*, std::uint16_t*>>(
-          64, {nullptr, nullptr});
+      std::vector<std::pair<std::uint8_t*, std::uint16_t*>>(64,
+                                                            {nullptr, nullptr});
   float* iu4_signs{nullptr};
   void* ModelAlloc(std::size_t bytes) {
     void* p = nullptr;
     HIP_OK(hipMalloc(&p, bytes));
     HIP_OK(hipMemset(p, 0, bytes));
-    HIP_OK(hipDeviceSynchronize());  // the zeroing must land before any stream writes
+    HIP_OK(hipDeviceSynchronize());  // the zeroing must land before any stream
+                                     // writes
     allocations.push_back(p);
     return p;
   }
@@ -2837,7 +2846,8 @@ __global__ void DraftNormRope(float* x, const float* w, int heads, int pos_base,
   const int i = d & 63;
   // angle in double with range reduction: small rope bases give large angles
   // at deep positions, where single-precision sin and cos lose their accuracy
-  const double freq = exp(-static_cast<double>(i) * (log(static_cast<double>(theta)) / 64.0));
+  const double freq =
+      exp(-static_cast<double>(i) * (log(static_cast<double>(theta)) / 64.0));
   const double ang_d = fmod(static_cast<double>(pos_base + blockIdx.x) * freq,
                             6.283185307179586);
   const float ang = static_cast<float>(ang_d);
@@ -3322,19 +3332,18 @@ __global__ void __launch_bounds__(256)
   for (int s = 0; s < steps; ++s) {
     const int prev = prev_s;
     for (int r = threadIdx.x; r < rank; r += 256)
-      pv[r] = __uint_as_float(
-                  static_cast<unsigned>(
-                      pred[static_cast<std::size_t>(prev) * rank + r])
-                  << 16) *
-              hp[s * rank + r];
+      pv[r] =
+          __uint_as_float(static_cast<unsigned>(
+                              pred[static_cast<std::size_t>(prev) * rank + r])
+                          << 16) *
+          hp[s * rank + r];
     __syncthreads();
     const int c = cand[s * 16 + grp];
     float dot = 0.0F;
     for (int r = lane; r < rank; r += 16)
-      dot += __uint_as_float(
-                 static_cast<unsigned>(
-                     succ[static_cast<std::size_t>(c) * rank + r])
-                 << 16) *
+      dot += __uint_as_float(static_cast<unsigned>(
+                                 succ[static_cast<std::size_t>(c) * rank + r])
+                             << 16) *
              pv[r];
     for (int off = 8; off > 0; off >>= 1)
       dot += __shfl_xor(dot, off, 16);
@@ -3454,7 +3463,7 @@ struct Scratch {
   int *tl_a{nullptr}, *tl_b{nullptr};  ///< compact (expert, token tile) lists
   int* dense_bounds_buf{nullptr};      ///< {0, n} of the dense routed GEMM
   int dense_bounds_n{-1};
-  float* ksbuf{nullptr};               ///< split-K partial sums
+  float* ksbuf{nullptr};  ///< split-K partial sums
   __half *xh{nullptr}, *act16{nullptr}, *xh0{nullptr}, *xh1{nullptr},
       *xh2{nullptr}, *xhx{nullptr}, *atth{nullptr}, *cath{nullptr};
   signed char* xq{nullptr};
@@ -3683,7 +3692,8 @@ struct Session::Impl : Scratch {
   // ran a forward pass.
   void* AllocLazy(std::size_t bytes) {
     void* p = AllocBytes(bytes);
-    HIP_OK(hipDeviceSynchronize());  // the zeroing must land before any stream writes
+    HIP_OK(hipDeviceSynchronize());  // the zeroing must land before any stream
+                                     // writes
     allocated_bytes -= bytes;
     return p;
   }
@@ -4814,11 +4824,15 @@ struct Session::Impl : Scratch {
         hdr[2] != static_cast<std::uint64_t>(rows2) ||
         hdr[3] != static_cast<std::uint64_t>(h) ||
         hdr[4] != static_cast<std::uint64_t>(kd)) {
-      std::fprintf(stderr, "inkling: gptq artifact for layer %u does not match the model\n", p);
+      std::fprintf(
+          stderr,
+          "inkling: gptq artifact for layer %u does not match the model\n", p);
       return false;
     }
-    const std::size_t tb_gu = static_cast<std::size_t>(ne) * iu4::WeightBytesPerExpert(rows2, h);
-    const std::size_t sb_gu = static_cast<std::size_t>(ne) * iu4::ScaleBytesPerExpert(rows2, h);
+    const std::size_t tb_gu =
+        static_cast<std::size_t>(ne) * iu4::WeightBytesPerExpert(rows2, h);
+    const std::size_t sb_gu =
+        static_cast<std::size_t>(ne) * iu4::ScaleBytesPerExpert(rows2, h);
     std::size_t off = sizeof hdr;
     if (which == 1)
       off += tb_gu + sb_gu;
@@ -4829,7 +4843,8 @@ struct Session::Impl : Scratch {
       for (std::size_t o = 0; o < bytes; o += kChunk) {
         const std::size_t n = std::min(kChunk, bytes - o);
         in.read(buf.data(), static_cast<std::streamsize>(n));
-        HIP_OK(hipMemcpy(static_cast<char*>(dev) + o, buf.data(), n, hipMemcpyHostToDevice));
+        HIP_OK(hipMemcpy(static_cast<char*>(dev) + o, buf.data(), n,
+                         hipMemcpyHostToDevice));
       }
     };
     fill(tiles, tb);
@@ -4881,7 +4896,8 @@ struct Session::Impl : Scratch {
       gufo::models::inkling::iu4::FillSigns(sg);
       HIP_OK(hipMalloc(&gq.signs, sizeof(sg)));
       HIP_OK(hipMemcpy(gq.signs, sg, sizeof(sg), hipMemcpyHostToDevice));
-      const std::size_t rows_max = static_cast<std::size_t>(kMaxBatch) * nu + ne * 16;
+      const std::size_t rows_max =
+          static_cast<std::size_t>(kMaxBatch) * nu + ne * 16;
       HIP_OK(hipMalloc(&gq.xr_gu, rows_max * h * 4));
       HIP_OK(hipMalloc(&gq.xr_dn, rows_max * kd * 4));
     }
@@ -4908,10 +4924,12 @@ struct Session::Impl : Scratch {
       const int rows = rb[e + 1] - rb[e];
       if (rows <= 0)
         continue;
-      gp::AccumulateHessian(gq.blas, gq.xr_gu + static_cast<std::size_t>(rb[e]) * h,
-                            rows, h, L.gu + static_cast<std::size_t>(e) * h * h);
-      gp::AccumulateHessian(gq.blas, gq.xr_dn + static_cast<std::size_t>(rb[e]) * kd,
-                            rows, kd, L.dn + static_cast<std::size_t>(e) * kd * kd);
+      gp::AccumulateHessian(
+          gq.blas, gq.xr_gu + static_cast<std::size_t>(rb[e]) * h, rows, h,
+          L.gu + static_cast<std::size_t>(e) * h * h);
+      gp::AccumulateHessian(
+          gq.blas, gq.xr_dn + static_cast<std::size_t>(rb[e]) * kd, rows, kd,
+          L.dn + static_cast<std::size_t>(e) * kd * kd);
       L.cnt[e] += rc[e];
     }
     HIP_OK(hipStreamSynchronize(stream));
@@ -4925,7 +4943,8 @@ struct Session::Impl : Scratch {
     const int kd = (ff + 255) / 256 * 256;
     if (gq.blas == nullptr) {
       if (error != nullptr)
-        *error = "nothing captured (set INKLING_GPTQ_CAPTURE and run a prefill)";
+        *error =
+            "nothing captured (set INKLING_GPTQ_CAPTURE and run a prefill)";
       return false;
     }
     rocblas_set_stream(gq.blas, stream);
@@ -4953,15 +4972,18 @@ struct Session::Impl : Scratch {
       const Tensor& wdn = m->T(m->P(p, "ffn_down_exps.weight"));
       int rtn_gu = 0, rtn_dn = 0;
       for (int e = 0; e < ne; ++e) {
-        const float damp_gu = L.cnt[e] < static_cast<std::uint64_t>(h) ? 0.2F : 0.05F;
-        const float damp_dn = L.cnt[e] < static_cast<std::uint64_t>(kd) ? 0.2F : 0.05F;
-        gp::RotateWeights(static_cast<const std::uint8_t*>(wgu.dev) +
-                              static_cast<std::size_t>(e) * rows2 * wgu.row_bytes,
-                          wgu.row_bytes, wgu_rot, rows2, h, h, gq.signs, stream);
+        const float damp_gu =
+            L.cnt[e] < static_cast<std::uint64_t>(h) ? 0.2F : 0.05F;
+        const float damp_dn =
+            L.cnt[e] < static_cast<std::uint64_t>(kd) ? 0.2F : 0.05F;
+        gp::RotateWeights(
+            static_cast<const std::uint8_t*>(wgu.dev) +
+                static_cast<std::size_t>(e) * rows2 * wgu.row_bytes,
+            wgu.row_bytes, wgu_rot, rows2, h, h, gq.signs, stream);
         if (L.cnt[e] < 64 ||
             !gp::Quantize(gq.blas, sgu, wgu_rot,
-                          L.gu + static_cast<std::size_t>(e) * h * h, h, damp_gu,
-                          stream)) {
+                          L.gu + static_cast<std::size_t>(e) * h * h, h,
+                          damp_gu, stream)) {
           gp::QuantizeRtn(sgu, wgu_rot, stream);
           ++rtn_gu;
         }
@@ -4981,9 +5003,14 @@ struct Session::Impl : Scratch {
       }
       std::ofstream out(dir + "/layer_" + std::to_string(p) + ".gptq",
                         std::ios::binary);
-      const std::uint64_t hdr[8] = {0x31504b4e49515447ULL, static_cast<std::uint64_t>(ne),
-                                    static_cast<std::uint64_t>(rows2), static_cast<std::uint64_t>(h),
-                                    static_cast<std::uint64_t>(kd), 0, 0, 0};
+      const std::uint64_t hdr[8] = {0x31504b4e49515447ULL,
+                                    static_cast<std::uint64_t>(ne),
+                                    static_cast<std::uint64_t>(rows2),
+                                    static_cast<std::uint64_t>(h),
+                                    static_cast<std::uint64_t>(kd),
+                                    0,
+                                    0,
+                                    0};
       out.write(reinterpret_cast<const char*>(hdr), sizeof hdr);
       const auto dump = [&](const void* dev, std::size_t bytes) {
         std::vector<char> host(bytes);
@@ -4994,8 +5021,10 @@ struct Session::Impl : Scratch {
       dump(s_gu, sb_gu * ne);
       dump(t_dn, tb_dn * ne);
       dump(s_dn, sb_dn * ne);
-      std::fprintf(stderr, "inkling: gptq layer %u written (rtn fallback gate/up %d, down %d)\n",
-                   p, rtn_gu, rtn_dn);
+      std::fprintf(
+          stderr,
+          "inkling: gptq layer %u written (rtn fallback gate/up %d, down %d)\n",
+          p, rtn_gu, rtn_dn);
     }
     return true;
   }
@@ -5012,7 +5041,8 @@ struct Session::Impl : Scratch {
             : 0.0F;
     static const float prune_prefill_cfg =
         std::getenv("INKLING_PRUNE_PREFILL") != nullptr
-            ? static_cast<float>(std::atof(std::getenv("INKLING_PRUNE_PREFILL")))
+            ? static_cast<float>(
+                  std::atof(std::getenv("INKLING_PRUNE_PREFILL")))
             : 0.0F;
     const bool compact_path =
         n >= kWmmaMinTokens &&
@@ -5059,8 +5089,8 @@ struct Session::Impl : Scratch {
         dumped = true;
         HIP_OK(hipStreamSynchronize(stream));
         std::vector<int> hid(static_cast<std::size_t>(items));
-        HIP_OK(hipMemcpy(hid.data(), ids, hid.size() * 4,
-                         hipMemcpyDeviceToHost));
+        HIP_OK(
+            hipMemcpy(hid.data(), ids, hid.size() * 4, hipMemcpyDeviceToHost));
         std::vector<int> cnt(ne, 0);
         for (int v : hid)
           if (v >= 0)
@@ -5072,8 +5102,8 @@ struct Session::Impl : Scratch {
                   [&](int a, int b) { return cnt[a] > cnt[b]; });
         const int pick = 4;
         std::vector<__half> hx(static_cast<std::size_t>(n) * h);
-        HIP_OK(hipMemcpy(hx.data(), xmoe, hx.size() * 2,
-                         hipMemcpyDeviceToHost));
+        HIP_OK(
+            hipMemcpy(hx.data(), xmoe, hx.size() * 2, hipMemcpyDeviceToHost));
         FILE* fo = std::fopen("/tmp/inkling_moe_dump.bin", "wb");
         const std::int32_t hdr[6] = {n, h, nu, ne, ff, pick};
         std::fwrite(hdr, 4, 6, fo);
@@ -5103,10 +5133,11 @@ struct Session::Impl : Scratch {
       const int bn =
           bn_env > 0 ? bn_env : (n >= 2048 ? 192 : (n >= 512 ? 128 : 48));
       int ntiles = 0;
-      static const bool tile_list = std::getenv("INKLING_TILE_LIST") == nullptr ||
-                                    std::getenv("INKLING_TILE_LIST")[0] != '0';
-      const int* tmap = tile_list && ne <= 256 ? nullptr
-                                               : TileMap(n, bn, &ntiles);
+      static const bool tile_list =
+          std::getenv("INKLING_TILE_LIST") == nullptr ||
+          std::getenv("INKLING_TILE_LIST")[0] != '0';
+      const int* tmap =
+          tile_list && ne <= 256 ? nullptr : TileMap(n, bn, &ntiles);
       if (tile_list && ne <= 256) {
         const int max_tiles = (items + bn - 1) / bn + ne;
         BuildTileList<<<1, 256, 0, stream>>>(rbounds, ne, bn, tl_a, max_tiles);
@@ -5126,10 +5157,9 @@ struct Session::Impl : Scratch {
       static const bool iu4_emu = std::getenv("INKLING_IU4_EMU") != nullptr;
       static const int emu_mode =
           iu4_emu ? std::atoi(std::getenv("INKLING_IU4_EMU")) : 0;
-      static const int iu4_level =
-          std::getenv("INKLING_IU4") != nullptr
-              ? std::atoi(std::getenv("INKLING_IU4"))
-              : 0;
+      static const int iu4_level = std::getenv("INKLING_IU4") != nullptr
+                                       ? std::atoi(std::getenv("INKLING_IU4"))
+                                       : 0;
       // INKLING_IU4_SKIP=<physical layers, comma separated> keeps those layers
       // on the NVFP4 experts
       static const std::uint64_t iu4_skip = [] {
@@ -5162,16 +5192,16 @@ struct Session::Impl : Scratch {
             float sg[512];
             iu4::FillSigns(sg);
             m->iu4_signs = static_cast<float*>(m->ModelAlloc(sizeof(sg)));
-            HIP_OK(hipMemcpy(m->iu4_signs, sg, sizeof(sg),
-                             hipMemcpyHostToDevice));
+            HIP_OK(
+                hipMemcpy(m->iu4_signs, sg, sizeof(sg), hipMemcpyHostToDevice));
           }
           if (m->iu4_w[p].first == nullptr) {
-            auto* tiles = static_cast<std::uint8_t*>(m->ModelAlloc(
-                static_cast<std::size_t>(ne) *
-                iu4::WeightBytesPerExpert(rows2, h)));
-            auto* scales = static_cast<std::uint16_t*>(m->ModelAlloc(
-                static_cast<std::size_t>(ne) *
-                iu4::ScaleBytesPerExpert(rows2, h)));
+            auto* tiles = static_cast<std::uint8_t*>(
+                m->ModelAlloc(static_cast<std::size_t>(ne) *
+                              iu4::WeightBytesPerExpert(rows2, h)));
+            auto* scales = static_cast<std::uint16_t*>(
+                m->ModelAlloc(static_cast<std::size_t>(ne) *
+                              iu4::ScaleBytesPerExpert(rows2, h)));
             const std::size_t tb = static_cast<std::size_t>(ne) *
                                    iu4::WeightBytesPerExpert(rows2, h);
             const std::size_t sb = static_cast<std::size_t>(ne) *
@@ -5184,16 +5214,16 @@ struct Session::Impl : Scratch {
             m->iu4_w[p] = {tiles, scales};
           }
           if (iu4_level >= 2 && m->iu4_dw[p].first == nullptr) {
-            auto* tiles = static_cast<std::uint8_t*>(m->ModelAlloc(
-                static_cast<std::size_t>(ne) *
-                iu4::WeightBytesPerExpert(h, kd)));
-            auto* scales = static_cast<std::uint16_t*>(m->ModelAlloc(
-                static_cast<std::size_t>(ne) *
-                iu4::ScaleBytesPerExpert(h, kd)));
-            const std::size_t tb = static_cast<std::size_t>(ne) *
-                                   iu4::WeightBytesPerExpert(h, kd);
-            const std::size_t sb = static_cast<std::size_t>(ne) *
-                                   iu4::ScaleBytesPerExpert(h, kd);
+            auto* tiles = static_cast<std::uint8_t*>(
+                m->ModelAlloc(static_cast<std::size_t>(ne) *
+                              iu4::WeightBytesPerExpert(h, kd)));
+            auto* scales = static_cast<std::uint16_t*>(
+                m->ModelAlloc(static_cast<std::size_t>(ne) *
+                              iu4::ScaleBytesPerExpert(h, kd)));
+            const std::size_t tb =
+                static_cast<std::size_t>(ne) * iu4::WeightBytesPerExpert(h, kd);
+            const std::size_t sb =
+                static_cast<std::size_t>(ne) * iu4::ScaleBytesPerExpert(h, kd);
             if (!LoadGptq(p, 1, tiles, tb, scales, sb))
               iu4::RepackExperts(static_cast<const std::uint8_t*>(wdn.dev),
                                  wdn.row_bytes, tiles, scales, ne, h, ff, kd,
@@ -5208,17 +5238,18 @@ struct Session::Impl : Scratch {
           iu4_padded = (max_rows + 128 + 127) / 128 * 128;
           iu4_act = static_cast<std::uint8_t*>(AllocLazy(
               static_cast<std::size_t>(iu4_padded) / 16 * (h / 128) * 1024));
-          iu4_act_scales = static_cast<float*>(AllocLazy(
-              static_cast<std::size_t>(h / 128) * iu4_padded * 4));
+          iu4_act_scales = static_cast<float*>(
+              AllocLazy(static_cast<std::size_t>(h / 128) * iu4_padded * 4));
           iu4_tok_padded = (kMaxBatch + 127) / 128 * 128;
-          iu4_tok = static_cast<std::uint8_t*>(AllocLazy(
-              static_cast<std::size_t>(iu4_tok_padded) / 16 * (h / 128) * 1024));
+          iu4_tok = static_cast<std::uint8_t*>(
+              AllocLazy(static_cast<std::size_t>(iu4_tok_padded) / 16 *
+                        (h / 128) * 1024));
           iu4_tok_scales = static_cast<float*>(AllocLazy(
               static_cast<std::size_t>(h / 128) * iu4_tok_padded * 4));
           iu4_act2 = static_cast<std::uint8_t*>(AllocLazy(
               static_cast<std::size_t>(iu4_padded) / 16 * (kd / 128) * 1024));
-          iu4_act2_scales = static_cast<float*>(AllocLazy(
-              static_cast<std::size_t>(kd / 128) * iu4_padded * 4));
+          iu4_act2_scales = static_cast<float*>(
+              AllocLazy(static_cast<std::size_t>(kd / 128) * iu4_padded * 4));
         }
         int nt128 = 0;
         const int* tmap128 = tile_list && ne <= 256
@@ -5230,28 +5261,27 @@ struct Session::Impl : Scratch {
                                                tl_b, nt128);
           tmap128 = tl_b;
         }
-        static const bool tok_once = std::getenv("INKLING_IU4_TOKONCE") == nullptr ||
-                                     std::getenv("INKLING_IU4_TOKONCE")[0] != '0';
+        static const bool tok_once =
+            std::getenv("INKLING_IU4_TOKONCE") == nullptr ||
+            std::getenv("INKLING_IU4_TOKONCE")[0] != '0';
         if (tok_once)
           iu4::QuantizeRoutedActsOnce(
               xmoe, n, h, h, iu4_tok, iu4_tok_scales, iu4_tok_padded,
               rrows_token, rrows_slot, rbounds, ne, items + ne * 16, iu4_act,
               iu4_act_scales, iu4_padded, iu4_signs, stream);
         else
-          iu4::QuantizeRoutedActs(xmoe, rrows_token, rrows_slot, rbounds, ne,
-                                  items + ne * 16, h, h, iu4_act,
-                                  iu4_act_scales, iu4_padded, iu4_signs,
-                                  stream);
+          iu4::QuantizeRoutedActs(
+              xmoe, rrows_token, rrows_slot, rbounds, ne, items + ne * 16, h, h,
+              iu4_act, iu4_act_scales, iu4_padded, iu4_signs, stream);
         iu4::GateUpSitu(m->iu4_w[p].first, m->iu4_w[p].second, iu4_act,
                         iu4_act_scales, iu4_padded, tmap128, nt128, rbounds,
                         rrows_slot, act16, ff, h, s_gu, situ_params, stream);
         ok1 = true;
         if (iu4_level >= 2) {
           // down projection on int4 too: K = ff is padded to 1280
-          iu4::QuantizeRoutedActs(act16, rrows_slot, rrows_slot, rbounds, ne,
-                                  items + ne * 16, ff, kd, iu4_act2,
-                                  iu4_act2_scales, iu4_padded, iu4_signs,
-                                  stream);
+          iu4::QuantizeRoutedActs(
+              act16, rrows_slot, rrows_slot, rbounds, ne, items + ne * 16, ff,
+              kd, iu4_act2, iu4_act2_scales, iu4_padded, iu4_signs, stream);
           iu4::DownGemm(m->iu4_dw[p].first, m->iu4_dw[p].second, iu4_act2,
                         iu4_act2_scales, iu4_padded, tmap128, nt128, rbounds,
                         rrows_slot, y16, h, kd, s_dn, stream);
@@ -5264,8 +5294,8 @@ struct Session::Impl : Scratch {
           HIP_OK(hipStreamSynchronize(stream));
           std::vector<__half> a(static_cast<std::size_t>(items) * ff),
               b(a.size());
-          HIP_OK(hipMemcpy(a.data(), act16, a.size() * 2,
-                           hipMemcpyDeviceToHost));
+          HIP_OK(
+              hipMemcpy(a.data(), act16, a.size() * 2, hipMemcpyDeviceToHost));
           // reference: the Q8Rep emulation of the same numerics
           const int rows_total = ne * 2 * ff;
           const std::size_t dst_rb =
@@ -5294,8 +5324,8 @@ struct Session::Impl : Scratch {
           EmuSitu<<<items, 256, 0, stream>>>(emu_gu, ids, s_gu, act16, ff,
                                              c.situ_beta, c.situ_linear_beta);
           HIP_OK(hipStreamSynchronize(stream));
-          HIP_OK(hipMemcpy(b.data(), act16, b.size() * 2,
-                           hipMemcpyDeviceToHost));
+          HIP_OK(
+              hipMemcpy(b.data(), act16, b.size() * 2, hipMemcpyDeviceToHost));
           double num = 0, den = 0, maxd = 0;
           std::size_t bad = 0;
           for (std::size_t i = 0; i < a.size(); ++i) {
@@ -5313,8 +5343,8 @@ struct Session::Impl : Scratch {
         }
       } else if (iu4_emu) {
         const int rows_total = ne * 2 * ff;
-        const std::size_t dst_rb = (static_cast<std::size_t>(h) + h / 16 + 15) /
-                                   16 * 16;
+        const std::size_t dst_rb =
+            (static_cast<std::size_t>(h) + h / 16 + 15) / 16 * 16;
         if (emu_signs == nullptr) {
           std::vector<float> sg(512);
           unsigned st = 42;
@@ -5328,8 +5358,8 @@ struct Session::Impl : Scratch {
             sg[256 + i] = ((st >> 16) & 1U) ? -1.0F : 1.0F;
           }
           emu_signs = static_cast<float*>(AllocBytes(512 * 4));
-          HIP_OK(hipMemcpy(emu_signs, sg.data(), 512 * 4,
-                           hipMemcpyHostToDevice));
+          HIP_OK(
+              hipMemcpy(emu_signs, sg.data(), 512 * 4, hipMemcpyHostToDevice));
           emu_x = static_cast<__half*>(
               AllocBytes(static_cast<std::size_t>(kMaxBatch) * h * 2));
           emu_gu = static_cast<float*>(AllocBytes(
@@ -5363,8 +5393,8 @@ struct Session::Impl : Scratch {
           dumped_out = true;
           HIP_OK(hipStreamSynchronize(stream));
           std::vector<__half> hy(static_cast<std::size_t>(items) * 2 * ff);
-          HIP_OK(hipMemcpy(hy.data(), gu16, hy.size() * 2,
-                           hipMemcpyDeviceToHost));
+          HIP_OK(
+              hipMemcpy(hy.data(), gu16, hy.size() * 2, hipMemcpyDeviceToHost));
           std::vector<float> hs(ne, 1.0F);
           if (s_gu != nullptr)
             HIP_OK(hipMemcpy(hs.data(), s_gu, ne * 4, hipMemcpyDeviceToHost));
@@ -5376,11 +5406,10 @@ struct Session::Impl : Scratch {
         SituHalfIn<<<items, 256, 0, stream>>>(gu16, act16, ff, c.situ_beta,
                                               c.situ_linear_beta);
       }
-      const bool ok2 =
-          iu4_down_done ||
-          qfn::RoutedNvfp4GemmF16(wdn.dev, act16, tmap, ntiles, bn, rbounds,
-                                  rrows_slot, rrows_slot, y16, h, ff, s_dn,
-                                  stream);
+      const bool ok2 = iu4_down_done ||
+                       qfn::RoutedNvfp4GemmF16(wdn.dev, act16, tmap, ntiles, bn,
+                                               rbounds, rrows_slot, rrows_slot,
+                                               y16, h, ff, s_dn, stream);
       if (GptqWants(p))
         GptqCapture(p, xmoe, act16);
       if (!ok1 || !ok2) {
@@ -5795,11 +5824,12 @@ struct Session::Impl : Scratch {
     static const bool emb_norm = std::getenv("INKLING_D2_EMBNORM") == nullptr ||
                                  std::getenv("INKLING_D2_EMBNORM")[0] != '0';
     if (emb_norm)
-      RmsRows(d2emb, static_cast<const float*>(m->T("token_embd_norm.weight").dev),
+      RmsRows(d2emb,
+              static_cast<const float*>(m->T("token_embd_norm.weight").dev),
               d2emb, 2, h, h, h);
     DraftSlotsInit<<<8, 256, 0, stream>>>(d2emb + h, d2emb, dx, h);
-    DraftAddNorm<<<8, 256, 0, stream>>>(dx, nullptr, DW("blk.0.attn_norm.weight"),
-                                        dh, h, eps);
+    DraftAddNorm<<<8, 256, 0, stream>>>(
+        dx, nullptr, DW("blk.0.attn_norm.weight"), dh, h, eps);
     const int lo = std::max(0, P - m->d2_window + 1);
     const int total = P - lo + 8;
     const int nsplit = std::min(kDraftSplit, std::max(1, (total + 255) / 256));
@@ -5832,10 +5862,10 @@ struct Session::Impl : Scratch {
                                                               d2act, 8 * 6912);
       Dense(m->T(d + "ffn_down.weight"), d2act, 6912, dtmp, h, 8);
       D2Conv_(dtmp, d2proj, b + "ffn_conv_base", d2conv, 1);
-      const float* next = l + 1 < kD2Layers
-                              ? DW("blk." + std::to_string(l + 1) +
-                                   ".attn_norm.weight")
-                              : DW("output_norm.weight");
+      const float* next =
+          l + 1 < kD2Layers
+              ? DW("blk." + std::to_string(l + 1) + ".attn_norm.weight")
+              : DW("output_norm.weight");
       DraftAddNorm<<<8, 256, 0, stream>>>(dx, d2conv, next, dh, h, eps);
     }
     const float* rows = dh + h;  // draft positions 1..7
@@ -6567,13 +6597,15 @@ bool Model::LoadDrafter(const std::string& path, std::string* error) {
   }
   if (reader->FindTensor("selector_hidden.weight") != nullptr) {
     st.d2 = true;
-    if (const auto w = reader->GetMetadataUint32("dflash.attention.sliding_window"))
+    if (const auto w =
+            reader->GetMetadataUint32("dflash.attention.sliding_window"))
       st.d2_window = static_cast<int>(*w);
     if (const auto w = reader->GetMetadataUint32("dflash.mask_token_id"))
       st.d2_mask = static_cast<int>(*w);
     if (const auto w = reader->GetMetadataFloat32("dflash.rope.freq_base"))
       st.d2_theta = *w;
-    if (const auto w = reader->GetMetadataFloat32("dflash.final_logit_softcapping"))
+    if (const auto w =
+            reader->GetMetadataFloat32("dflash.final_logit_softcapping"))
       st.d2_softcap = *w;
   }
   st.has_draft = true;
