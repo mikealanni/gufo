@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -122,6 +123,9 @@ private:
   void InitializeByteTokens(bool eager_decoded_tokens = true);
   std::vector<TokenId> BpeMergeChunk(std::string_view chunk) const;
   std::vector<TokenId> BpeEncodeText(std::string_view text) const;
+  /// BpeEncodeText with a memo of long text segments: a chat history repeats
+  /// the same message bodies on every turn, and they are encoded once.
+  std::vector<TokenId> BpeEncodeSegment(std::string_view text) const;
   /// GLM-4/GLM-5 split regex plus whole-piece vocabulary lookup
   /// (`tokenizer.ggml.ignore_merges`) before BPE.
   std::vector<TokenId> Glm4EncodeText(std::string_view text) const;
@@ -139,6 +143,21 @@ private:
   /// Special tokens in one contiguous list, scanned per Encode call.
   std::vector<std::pair<std::string, TokenId>> special_token_list_;
   std::unordered_map<TokenId, bool> is_special_token_;
+
+  struct SegmentCache {
+    struct Hash {
+      using is_transparent = void;
+      std::size_t operator()(std::string_view v) const noexcept {
+        return std::hash<std::string_view>{}(v);
+      }
+    };
+    std::mutex mutex;
+    std::unordered_map<std::string, std::vector<TokenId>, Hash, std::equal_to<>>
+        entries;
+    std::size_t bytes{0};
+  };
+  std::shared_ptr<SegmentCache> segment_cache_ =
+      std::make_shared<SegmentCache>();
 
   std::array<TokenId, 256> byte_tokens_{};
   TokenId bos_token_id_{kInvalidTokenId};

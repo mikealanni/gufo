@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <queue>
 #include <span>
@@ -847,6 +848,30 @@ std::vector<TokenId> QwenTokenizer::BpeEncodeText(std::string_view text) const {
   return tokens;
 }
 
+std::vector<TokenId> QwenTokenizer::BpeEncodeSegment(
+    std::string_view text) const {
+  constexpr std::size_t kMinSegmentBytes = 256;
+  constexpr std::size_t kCacheBudgetBytes = std::size_t{256} << 20;
+  if (text.size() < kMinSegmentBytes)
+    return BpeEncodeText(text);
+  {
+    const std::lock_guard<std::mutex> lock(segment_cache_->mutex);
+    const auto found = segment_cache_->entries.find(text);
+    if (found != segment_cache_->entries.end())
+      return found->second;
+  }
+  auto encoded = BpeEncodeText(text);
+  const std::size_t cost = text.size() + encoded.size() * sizeof(TokenId) + 64;
+  const std::lock_guard<std::mutex> lock(segment_cache_->mutex);
+  if (segment_cache_->bytes + cost > kCacheBudgetBytes) {
+    segment_cache_->entries.clear();
+    segment_cache_->bytes = 0;
+  }
+  if (segment_cache_->entries.emplace(std::string(text), encoded).second)
+    segment_cache_->bytes += cost;
+  return encoded;
+}
+
 std::vector<TokenId> QwenTokenizer::Encode(
     std::string_view text, const TokenizerOptions& options) const {
   std::vector<TokenId> tokens;
@@ -865,7 +890,7 @@ std::vector<TokenId> QwenTokenizer::Encode(
   }
 
   if (!options.parse_special_tokens || special_token_to_id_.empty()) {
-    const auto chunk_tokens = BpeEncodeText(text);
+    const auto chunk_tokens = BpeEncodeSegment(text);
     tokens.insert(tokens.end(), chunk_tokens.begin(), chunk_tokens.end());
   } else {
     // Scan text for special token delimiters. Searching every special from
@@ -908,14 +933,14 @@ std::vector<TokenId> QwenTokenizer::Encode(
       if (next_special_pos == std::string_view::npos) {
         // No more special tokens; encode remainder
         const auto chunk = text.substr(pos);
-        const auto chunk_tokens = BpeEncodeText(chunk);
+        const auto chunk_tokens = BpeEncodeSegment(chunk);
         tokens.insert(tokens.end(), chunk_tokens.begin(), chunk_tokens.end());
         break;
       }
 
       if (next_special_pos > pos) {
         const auto chunk = text.substr(pos, next_special_pos - pos);
-        const auto chunk_tokens = BpeEncodeText(chunk);
+        const auto chunk_tokens = BpeEncodeSegment(chunk);
         tokens.insert(tokens.end(), chunk_tokens.begin(), chunk_tokens.end());
       }
 
