@@ -15,10 +15,10 @@ speculative decoding on top, for Qwen, Inkling, Flint, GLM-5.3 Flash, Laguna and
   keeps thinking off for every request. See [docs/JEV.md](docs/JEV.md) and the
   [setup guide](docs/JEV-SETUP.md).
 - **Inkling 2 Mini** (26.4B MoE, 3.4B active, looped middle layers) on the GPU with
-  DSpark speculation and NPU prefill. Up to 256K context with block-sparse
+  DFlash2 speculation (default) and NPU prefill. Up to 256K context with block-sparse
   attention, tool calls, a reasoning channel, and the same RAM and disk
-  continuation cache as the other models. Prefill 2,851 tok/s at 8K with the NPU; decode 74.6 tok/s on code and 71.1
-  on JSON, 54 to 61 tok/s at 63K context. See [docs/models/inkling](docs/models/inkling/README.md).
+  continuation cache as the other models. Prefill 2,851 tok/s at 8K with the NPU; decode 60.6 tok/s on code and 58.3
+  on JSON at temperature 1, 51.7 tok/s at 25K context. See [docs/models/inkling](docs/models/inkling/README.md).
 - **Qwen3.8-27B on int4 WMMA plus NPU.** The dense projections run as int4 x int4
   WMMA on the GPU with the FFN split across the NPU: prefill 1,335 tok/s at 8K
   (806 with the Q4_K_XL GGUF and the NPU), plain decode 14.7 tok/s, HumanEval
@@ -34,7 +34,7 @@ speculative decoding on top, for Qwen, Inkling, Flint, GLM-5.3 Flash, Laguna and
 | Qwen3.6-35B-A3B | UD-Q4_K_XL | linear-attention and attention projections | MTP (embedded head), DFlash2, auto |
 | Qwen3.8-27B | UD-Q4_K_XL | FFN, attention and linear-attention projections | DFlash2, MTP, auto |
 | Qwen3.8 Flash-Next | UD-IQ4_XS | whole projections, two-bank lock-step | DFlash2 (default), MTP |
-| Inkling 2 Mini | UD-Q4_K_XL | q/gate/k/v and attention output, two-bank | DSpark (external drafter) |
+| Inkling 2 Mini | UD-Q4_K_XL | q/gate/k/v and attention output, two-bank | DFlash2 (default), DSpark |
 | Flint | UD-Q4_K_XL | shared expert and QKV, two-bank pipeline | prompt lookup (no draft model) |
 | GLM-5.3 Flash | AJ-IQ2_XXS / RCO-152E Q3_K_M | KDA q/k/v and shared expert, two-bank lock-step | DFlash2 with prompt-lookup drafts |
 | Laguna S 2.1 | UD-Q4_K_M | shared expert, two-bank pipeline | DFlash v1 (block-diffusion) |
@@ -55,12 +55,12 @@ text, with greedy chat requests to `gufo serve`. NPU numbers need the setup in
 | `-p 8192` | 2,466 | **2,822** (+14.4%) |
 | `-p 16384` | 2,254 | **2,516** (+11.6%) |
 
-| Decode, tok/s | plain | DSpark |
+| Decode, tok/s (temperature 1) | plain | DFlash2 (default) |
 | --- | --- | --- |
-| code | 33 | **74.6** |
-| JSON | 33 | **71.1** |
-| code at 37K context | | **54 to 59** |
-| code at 63K context | | **54 to 61** |
+| code | 33 | **60.6** |
+| JSON | 33 | **58.3** |
+| prose | 33 | **36.4** |
+| code at 25K context | | **51.7** |
 
 Details: [docs/models/inkling](docs/models/inkling/)
 
