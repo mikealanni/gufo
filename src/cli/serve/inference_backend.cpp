@@ -4169,10 +4169,10 @@ public:
                           message.content + message.framing_suffix,
                           message.thought});
       if (message.role == tokenization::ChatRole::kDeveloper)
-        messages.back().role = "developer";
+        messages.back().role = "system";
     }
     models::ling32::ChatTemplateOptions chat_options;
-    chat_options.enable_thinking = request.reasoning.enabled.value_or(false);
+    chat_options.enable_thinking = ThinkingEnabled(request);
     tokenization::TokenizerOptions options;
     options.parse_special_tokens = true;
     return tokenizer_->Encode(
@@ -4181,7 +4181,7 @@ public:
 
   [[nodiscard]] TextGenerationBackend::InitialOutputState InitialOutputState(
       const ChatRequest& request) const override {
-    return request.reasoning.enabled.value_or(false)
+    return ThinkingEnabled(request)
                ? TextGenerationBackend::InitialOutputState::kReasoning
                : TextGenerationBackend::InitialOutputState::kContent;
   }
@@ -4320,6 +4320,13 @@ public:
   }
 
 private:
+  /// The official template thinks by default; the minimal effort turns it off.
+  [[nodiscard]] static bool ThinkingEnabled(const ChatRequest& request) {
+    if (request.reasoning.effort == ReasoningEffort::kMinimal)
+      return false;
+    return request.reasoning.enabled.value_or(true);
+  }
+
   [[nodiscard]] bool IsStop(std::int32_t token) const {
     return std::find(stop_tokens_.begin(), stop_tokens_.end(), token) !=
            stop_tokens_.end();
