@@ -40,7 +40,13 @@ constexpr int kWinLen =
 constexpr std::size_t kMaxVerifyRows = 8;
 constexpr std::uint32_t kNpuSlice = 1024;
 constexpr int kFlashHd = 128;
-constexpr int kWmmaMinTokens = 32;
+// Batches of at least this many tokens take the matrix-core path (experts
+// sorted per expert so each weight row is read once); smaller ones, at most
+// kMaxVerifyRows, take the per-token decode kernels. In between, the decode
+// kernels read an expert once per token and the sorted path is faster.
+constexpr int kWmmaMinTokens = 9;
+// Rows the decode-path scratch is sized for.
+constexpr int kScratchRows = 32;
 constexpr float kMixEps = 1e-6F;
 constexpr int kTypeF32 = 0;
 constexpr int kTypeBf16 = 1;
@@ -6731,9 +6737,9 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
       sc.rrows_slot = static_cast<int*>(i.AllocBytes(rows * sizeof(int)));
     }
     sc.xq = static_cast<signed char*>(
-        i.AllocBytes(static_cast<std::size_t>(kWmmaMinTokens) * c.expert_used *
+        i.AllocBytes(static_cast<std::size_t>(kScratchRows) * c.expert_used *
                      std::max<std::size_t>(c.hidden_size, 3072) * 2));
-    sc.xqs = i.Alloc(static_cast<std::size_t>(kWmmaMinTokens) * c.expert_used *
+    sc.xqs = i.Alloc(static_cast<std::size_t>(kScratchRows) * c.expert_used *
                      std::max<std::size_t>(c.hidden_size, 3072) / 16);
     sc.blist = static_cast<int*>(
         i.AllocBytes(static_cast<std::size_t>(kMaxBatch / kFlashQ) *
@@ -6742,9 +6748,9 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
         static_cast<std::size_t>(kMaxBatch / kFlashQ) * c.num_heads * 4));
     {
       const std::size_t splits = (max_context + kSplitKeys - 1) / kSplitKeys;
-      sc.split_m = i.Alloc(kWmmaMinTokens * c.num_heads * splits);
-      sc.split_l = i.Alloc(kWmmaMinTokens * c.num_heads * splits);
-      sc.split_o = i.Alloc(kWmmaMinTokens * c.num_heads * splits * kFlashHd);
+      sc.split_m = i.Alloc(kScratchRows * c.num_heads * splits);
+      sc.split_l = i.Alloc(kScratchRows * c.num_heads * splits);
+      sc.split_o = i.Alloc(kScratchRows * c.num_heads * splits * kFlashHd);
     }
     sc.xh = static_cast<__half*>(
         i.AllocBytes(b * std::max<std::size_t>(qd, 2 * h) * 2));
