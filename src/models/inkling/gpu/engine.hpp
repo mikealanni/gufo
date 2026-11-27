@@ -89,6 +89,9 @@ public:
   [[nodiscard]] bool Draft(std::int32_t anchor, std::span<std::int32_t> out,
                            std::span<float> confidence,
                            float stop_confidence = 0.0F);
+  /// With both drafters loaded: which one Draft uses (true: DFlash2).
+  void SelectDrafter(bool dflash2);
+  [[nodiscard]] bool HasBothDrafters() const noexcept;
   /// Drops cache rows past `position`; later appends overwrite them.
   void Rewind(std::uint32_t position) noexcept;
   [[nodiscard]] std::uint32_t Position() const noexcept;

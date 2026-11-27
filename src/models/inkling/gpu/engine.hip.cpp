@@ -2646,7 +2646,8 @@ struct ModelState {
   std::vector<void*> allocations;
   std::size_t resident_bytes{0};
   bool has_draft{false};
-  bool d2{false};  // the loaded drafter is a DFlash2 block drafter
+  bool d2{false};          // a DFlash2 block drafter is loaded (tensors "d2.*")
+  bool has_dspark{false};  // the DSpark drafter is loaded (tensors "d.*")
   int d2_layers{5}, d2_window{2048}, d2_mask{200056};
   float d2_theta{10000.0F}, d2_softcap{30.0F};
   float draft_fuse[4][4]{};     // softmax of every row of dspark_fuse
@@ -3654,6 +3655,11 @@ struct Session::Impl : Scratch {
       *d2att{}, *d2proj{}, *d2conv{}, *d2log{}, *d2hp{}, *d2uv{}, *d2gate{},
       *d2up{}, *d2act{}, *d2pm{}, *d2pl{}, *d2po{};
   int *d2tok{}, *d2ids{};
+  float *d2x{}, *d2h{}, *d2tmp{}, *d2kb{}, *d2vb{}, *d2conf{};
+  int* d2out{};
+  std::uint32_t d2warmed{0};
+  bool d2ready{false};
+  bool prefer_d2{true};  // which drafter Draft uses when both are loaded
   static constexpr int kDraftWarmChunk = 256;
   static constexpr int kDraftSplit = 64;
   static constexpr int kDraftShortlistMax = 65536;
@@ -3725,7 +3731,7 @@ struct Session::Impl : Scratch {
     }
     if (feat != nullptr)
       out.push_back({feat, static_cast<std::size_t>(pos) * kTapCount * h * 2});
-    if (drafter && dready && !m->d2) {
+    if (drafter && dready && m->has_dspark) {
       for (int l = 0; l < 3; ++l) {
         const std::size_t rows =
             l == 1 ? std::min<std::size_t>(dwarm, dcap[l]) : dcap[l];
@@ -5816,13 +5822,12 @@ struct Session::Impl : Scratch {
   const float* DW(const std::string& n) const {
     return static_cast<const float*>(m->T("d." + n).dev);
   }
+  const float* DW2(const std::string& n) const {
+    return static_cast<const float*>(m->T("d2." + n).dev);
+  }
   void DraftEnsure() {
     if (dready)
       return;
-    if (m->d2) {
-      DraftEnsure2();
-      return;
-    }
     const int h = static_cast<int>(m->config.hidden_size);
     constexpr int kSlots = 8;
     const auto f = [&](std::size_t n) {
@@ -5917,7 +5922,7 @@ struct Session::Impl : Scratch {
   }
   bool Draft(std::int32_t anchor, std::int32_t* out, int count,
              float* conf_out = nullptr, float stop_conf = 0.0F) {
-    if (m->d2)
+    if (m->d2 && (!m->has_dspark || prefer_d2))
       return Draft2(anchor, out, count, conf_out);
     const int h = static_cast<int>(m->config.hidden_size);
     const float eps = m->config.rms_eps;
@@ -6007,7 +6012,7 @@ struct Session::Impl : Scratch {
   }
   // ---- DFlash2 drafter
   void DraftEnsure2() {
-    if (dready)
+    if (d2ready)
       return;
     const int h = static_cast<int>(m->config.hidden_size);
     const std::size_t vocab = m->config.vocab_unpadded;
@@ -6027,12 +6032,12 @@ struct Session::Impl : Scratch {
     d2ck = f(kChunk * 1024);
     d2cv = f(kChunk * 1024);
     d2emb = f(2 * h);
-    dx = f(8 * h);
-    dh = f(8 * h);
-    dtmp = f(8 * h);
+    d2x = f(8 * h);
+    d2h = f(8 * h);
+    d2tmp = f(8 * h);
     d2q = f(8 * 4096);
-    dkb = f(8 * 1024);
-    dvb = f(8 * 1024);
+    d2kb = f(8 * 1024);
+    d2vb = f(8 * 1024);
     d2att = f(8 * 4096);
     d2proj = f(8 * 576);
     d2conv = f(8 * h);
@@ -6046,40 +6051,40 @@ struct Session::Impl : Scratch {
     d2log = f(7 * vocab);
     d2hp = f(7 * 256);
     d2uv = f(7 * 16);
-    dconf = f(8);
+    d2conf = f(8);
     d2tok = static_cast<int*>(AllocBytes(2 * 4));
     d2ids = static_cast<int*>(AllocBytes(7 * 16 * 4));
-    dout = static_cast<int*>(AllocBytes(8 * 4));
-    dready = true;
+    d2out = static_cast<int*>(AllocBytes(8 * 4));
+    d2ready = true;
   }
   void DraftWarm2(int P) {
     const int h = static_cast<int>(m->config.hidden_size);
     const float eps = 1.0e-6F;
     const float theta = m->d2_theta;
-    const int start = std::max<int>(static_cast<int>(dwarmed),
+    const int start = std::max<int>(static_cast<int>(d2warmed),
                                     std::max(0, P - m->d2_window - 8));
     for (int p0 = start; p0 < P; p0 += kDraftWarmChunk) {
       const int n = std::min(kDraftWarmChunk, P - p0);
       const std::size_t count = static_cast<std::size_t>(n) * 4 * h;
       HalfToFloat<<<(count + 255) / 256, 256, 0, stream>>>(
           feat + static_cast<std::size_t>(p0) * 4 * h, d2cat, count);
-      Dense(m->T("d.fc.weight"), d2cat, 4 * h, d2th, h, n);
-      RmsRows(d2th, DW("enc.output_norm.weight"), d2ctx, n, h, h, h);
+      Dense(m->T("d2.fc.weight"), d2cat, 4 * h, d2th, h, n);
+      RmsRows(d2th, DW2("enc.output_norm.weight"), d2ctx, n, h, h, h);
       for (int l = 0; l < kD2Layers; ++l) {
         const std::string b = "blk." + std::to_string(l) + ".";
-        Dense(m->T("d." + b + "attn_k.weight"), d2ctx, h, d2ck, 1024, n);
-        Dense(m->T("d." + b + "attn_v.weight"), d2ctx, h, d2cv, 1024, n);
+        Dense(m->T("d2." + b + "attn_k.weight"), d2ctx, h, d2ck, 1024, n);
+        Dense(m->T("d2." + b + "attn_v.weight"), d2ctx, h, d2cv, 1024, n);
         DraftNormRope<<<dim3(n, 8), 128, 0, stream>>>(
-            d2ck, DW(b + "attn_k_norm.weight"), 8, p0, eps, true, theta);
+            d2ck, DW2(b + "attn_k_norm.weight"), 8, p0, eps, true, theta);
         DraftStoreCtx<<<n, 256, 0, stream>>>(d2ck, d2cv, d2k[l], d2v[l], p0,
                                              kD2Cap);
       }
     }
-    dwarmed = static_cast<std::uint32_t>(P);
+    d2warmed = static_cast<std::uint32_t>(P);
   }
   void D2Conv_(const float* in, const float* proj, const std::string& base,
                float* out, int which) {
-    D2Conv<<<8, 256, 0, stream>>>(in, proj, DW(base), out,
+    D2Conv<<<8, 256, 0, stream>>>(in, proj, DW2(base), out,
                                   static_cast<int>(m->config.hidden_size), 144,
                                   16, which);
   }
@@ -6092,9 +6097,9 @@ struct Session::Impl : Scratch {
     const int vocab = static_cast<int>(m->config.vocab_unpadded);
     if (feat == nullptr || !m->has_draft || P == 0)
       return false;
-    DraftEnsure();
-    if (dwarmed > static_cast<std::uint32_t>(P))
-      dwarmed = static_cast<std::uint32_t>(P);
+    DraftEnsure2();
+    if (d2warmed > static_cast<std::uint32_t>(P))
+      d2warmed = static_cast<std::uint32_t>(P);
     DraftWarm2(P);
     const int toks[2] = {anchor, m->d2_mask};
     HIP_OK(hipMemcpyAsync(d2tok, toks, 8, hipMemcpyHostToDevice, stream));
@@ -6107,62 +6112,63 @@ struct Session::Impl : Scratch {
       RmsRows(d2emb,
               static_cast<const float*>(m->T("token_embd_norm.weight").dev),
               d2emb, 2, h, h, h);
-    DraftSlotsInit<<<8, 256, 0, stream>>>(d2emb + h, d2emb, dx, h);
+    DraftSlotsInit<<<8, 256, 0, stream>>>(d2emb + h, d2emb, d2x, h);
     DraftAddNorm<<<8, 256, 0, stream>>>(
-        dx, nullptr, DW("blk.0.attn_norm.weight"), dh, h, eps);
+        d2x, nullptr, DW2("blk.0.attn_norm.weight"), d2h, h, eps);
     const int lo = std::max(0, P - m->d2_window + 1);
     const int total = P - lo + 8;
     const int nsplit = std::min(kDraftSplit, std::max(1, (total + 255) / 256));
     for (int l = 0; l < kD2Layers; ++l) {
       const std::string b = "blk." + std::to_string(l) + ".";
-      const std::string d = "d." + b;
-      Dense(m->T(d + "attn_conv_proj.weight"), dh, h, d2proj, 576, 8);
-      D2Conv_(dh, d2proj, b + "attn_conv_base", d2conv, 0);
+      const std::string d = "d2." + b;
+      Dense(m->T(d + "attn_conv_proj.weight"), d2h, h, d2proj, 576, 8);
+      D2Conv_(d2h, d2proj, b + "attn_conv_base", d2conv, 0);
       Dense(m->T(d + "attn_q.weight"), d2conv, h, d2q, 4096, 8);
-      Dense(m->T(d + "attn_k.weight"), d2conv, h, dkb, 1024, 8);
-      Dense(m->T(d + "attn_v.weight"), d2conv, h, dvb, 1024, 8);
+      Dense(m->T(d + "attn_k.weight"), d2conv, h, d2kb, 1024, 8);
+      Dense(m->T(d + "attn_v.weight"), d2conv, h, d2vb, 1024, 8);
       DraftNormRope<<<dim3(8, 32), 128, 0, stream>>>(
-          d2q, DW(b + "attn_q_norm.weight"), 32, P, eps, true, theta);
+          d2q, DW2(b + "attn_q_norm.weight"), 32, P, eps, true, theta);
       DraftNormRope<<<dim3(8, 8), 128, 0, stream>>>(
-          dkb, DW(b + "attn_k_norm.weight"), 8, P, eps, true, theta);
+          d2kb, DW2(b + "attn_k_norm.weight"), 8, P, eps, true, theta);
       D2AttnPartial<<<dim3(32, nsplit), 128, 0, stream>>>(
-          d2q, dkb, dvb, d2k[l], d2v[l], P, lo, kD2Cap, nsplit, 32, 4,
+          d2q, d2kb, d2vb, d2k[l], d2v[l], P, lo, kD2Cap, nsplit, 32, 4,
           m->d2_window, d2pm, d2pl, d2po);
       D2AttnCombine<<<dim3(8, 32), 128, 0, stream>>>(d2pm, d2pl, d2po, d2att,
                                                      nsplit, 32);
-      Dense(m->T(d + "attn_output.weight"), d2att, 4096, dtmp, h, 8);
-      D2Conv_(dtmp, d2proj, b + "attn_conv_base", d2conv, 1);
-      DraftAddNorm<<<8, 256, 0, stream>>>(dx, d2conv, DW(b + "ffn_norm.weight"),
-                                          dh, h, eps);
-      Dense(m->T(d + "ffn_conv_proj.weight"), dh, h, d2proj, 576, 8);
-      D2Conv_(dh, d2proj, b + "ffn_conv_base", d2conv, 0);
+      Dense(m->T(d + "attn_output.weight"), d2att, 4096, d2tmp, h, 8);
+      D2Conv_(d2tmp, d2proj, b + "attn_conv_base", d2conv, 1);
+      DraftAddNorm<<<8, 256, 0, stream>>>(
+          d2x, d2conv, DW2(b + "ffn_norm.weight"), d2h, h, eps);
+      Dense(m->T(d + "ffn_conv_proj.weight"), d2h, h, d2proj, 576, 8);
+      D2Conv_(d2h, d2proj, b + "ffn_conv_base", d2conv, 0);
       Dense(m->T(d + "ffn_gate.weight"), d2conv, h, d2gate, 6912, 8);
       Dense(m->T(d + "ffn_up.weight"), d2conv, h, d2up, 6912, 8);
       DraftSwiglu<<<(8 * 6912 + 255) / 256, 256, 0, stream>>>(d2gate, d2up,
                                                               d2act, 8 * 6912);
-      Dense(m->T(d + "ffn_down.weight"), d2act, 6912, dtmp, h, 8);
-      D2Conv_(dtmp, d2proj, b + "ffn_conv_base", d2conv, 1);
+      Dense(m->T(d + "ffn_down.weight"), d2act, 6912, d2tmp, h, 8);
+      D2Conv_(d2tmp, d2proj, b + "ffn_conv_base", d2conv, 1);
       const float* next =
           l + 1 < kD2Layers
-              ? DW("blk." + std::to_string(l + 1) + ".attn_norm.weight")
-              : DW("output_norm.weight");
-      DraftAddNorm<<<8, 256, 0, stream>>>(dx, d2conv, next, dh, h, eps);
+              ? DW2("blk." + std::to_string(l + 1) + ".attn_norm.weight")
+              : DW2("output_norm.weight");
+      DraftAddNorm<<<8, 256, 0, stream>>>(d2x, d2conv, next, d2h, h, eps);
     }
-    const float* rows = dh + h;  // draft positions 1..7
+    const float* rows = d2h + h;  // draft positions 1..7
     Dense(m->T("output.weight"), rows, h, d2log, vocab, 7, vocab);
     D2TopK<<<7, 256, 0, stream>>>(d2log, vocab, vocab, d2ids, d2uv);
-    Dense(m->T("d.selector_hidden.weight"), rows, h, d2hp, 256, 7);
+    Dense(m->T("d2.selector_hidden.weight"), rows, h, d2hp, 256, 7);
     D2Select<<<1, 256, 0, stream>>>(
         d2ids, d2uv, d2hp,
         static_cast<const unsigned short*>(
-            m->T("d.selector_predecessor.weight").dev),
+            m->T("d2.selector_predecessor.weight").dev),
         static_cast<const unsigned short*>(
-            m->T("d.selector_successor.weight").dev),
-        d2tok, 256, 7, m->d2_softcap, dout, dconf);
+            m->T("d2.selector_successor.weight").dev),
+        d2tok, 256, 7, m->d2_softcap, d2out, d2conf);
     const int steps = std::min(count, 7);
-    HIP_OK(hipMemcpyAsync(out, dout, steps * 4, hipMemcpyDeviceToHost, stream));
+    HIP_OK(
+        hipMemcpyAsync(out, d2out, steps * 4, hipMemcpyDeviceToHost, stream));
     if (conf_out != nullptr)
-      HIP_OK(hipMemcpyAsync(conf_out, dconf, steps * 4, hipMemcpyDeviceToHost,
+      HIP_OK(hipMemcpyAsync(conf_out, d2conf, steps * 4, hipMemcpyDeviceToHost,
                             stream));
     HIP_OK(hipStreamSynchronize(stream));
     if (conf_out != nullptr) {
@@ -6492,8 +6498,20 @@ std::uint32_t SessionSnapshot::position() const noexcept {
 }
 
 void Session::PrepareDraft() {
-  if (impl_->m->has_draft && impl_->feat != nullptr)
+  if (!impl_->m->has_draft || impl_->feat == nullptr)
+    return;
+  if (impl_->m->has_dspark)
     impl_->DraftEnsure();
+  if (impl_->m->d2)
+    impl_->DraftEnsure2();
+}
+
+void Session::SelectDrafter(bool dflash2) {
+  impl_->prefer_d2 = dflash2;
+}
+
+bool Session::HasBothDrafters() const noexcept {
+  return impl_->m->has_dspark && impl_->m->d2;
 }
 
 std::uint64_t Session::SnapshotBytes() const {
@@ -6546,14 +6564,8 @@ bool Session::RestoreSnapshot(const SessionSnapshot& snapshot,
     return false;
   }
   const auto& d = *snapshot.data_;
-  if (d.drafter && !i.dready) {
-    if (!i.m->has_draft) {
-      if (error_msg != nullptr)
-        *error_msg = "snapshot needs the drafter, which is not loaded";
-      return false;
-    }
+  if (d.drafter && !i.dready && i.m->has_dspark)
     i.DraftEnsure();
-  }
   const auto regions = i.SnapRegions(d.position, d.dwarmed, d.drafter);
   std::size_t offset = 0;
   for (const auto& r : regions) {
@@ -6572,7 +6584,8 @@ bool Session::RestoreSnapshot(const SessionSnapshot& snapshot,
                         i.stream));
   HIP_OK(hipStreamSynchronize(i.stream));
   i.position = d.position;
-  i.dwarmed = i.m->d2 ? 0 : d.dwarmed;
+  i.dwarmed = i.m->has_dspark ? d.dwarmed : 0;
+  i.d2warmed = 0;
   i.argmax_host[0] = d.argmax;
   i.logits_rows = 1;
   i.logits_last = 0;
@@ -6653,11 +6666,8 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
       sizeof(header) + vocab * sizeof(float) + header.body_bytes)
     return fail("snapshot payload size does not match its header");
   const bool drafter = header.drafter != 0;
-  if (drafter && !i.dready) {
-    if (!i.m->has_draft)
-      return fail("snapshot needs the drafter, which is not loaded");
+  if (drafter && !i.dready && i.m->has_dspark)
     i.DraftEnsure();
-  }
   const auto regions = i.SnapRegions(header.position, header.dwarmed, drafter);
   std::size_t total = 0;
   for (const auto& r : regions)
@@ -6678,7 +6688,8 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
                         i.stream));
   HIP_OK(hipStreamSynchronize(i.stream));
   i.position = header.position;
-  i.dwarmed = i.m->d2 ? 0 : header.dwarmed;
+  i.dwarmed = i.m->has_dspark ? header.dwarmed : 0;
+  i.d2warmed = 0;
   i.argmax_host[0] = header.argmax;
   i.logits_rows = 1;
   i.logits_last = 0;
@@ -6744,6 +6755,7 @@ void Session::KeepRows(std::uint32_t keep) {
   HIP_OK(hipStreamSynchronize(i.stream));
   i.position = i.pos_before_last + keep;
   i.dwarmed = std::min(i.dwarmed, i.position);
+  i.d2warmed = std::min(i.d2warmed, i.position);
   i.logits_last = static_cast<int>(keep) - 1;
   i.last_rows = static_cast<int>(keep);
 }
@@ -6761,6 +6773,7 @@ bool Session::Draft(std::int32_t anchor, std::span<std::int32_t> out,
 void Session::Rewind(std::uint32_t position) noexcept {
   impl_->position = position;
   impl_->dwarmed = std::min(impl_->dwarmed, position);
+  impl_->d2warmed = std::min(impl_->d2warmed, position);
 }
 std::uint32_t Session::Position() const noexcept {
   return impl_->position;
@@ -6773,6 +6786,7 @@ bool Session::GptqFinish(const std::string& dir, std::string* error) {
 void Session::Reset() noexcept {
   impl_->position = 0;
   impl_->dwarmed = 0;
+  impl_->d2warmed = 0;
   const Config& c = impl_->m->config;
   const std::size_t kv = static_cast<std::size_t>(c.num_kv) * c.head_dim;
   for (auto& s : impl_->slots) {
@@ -6804,6 +6818,8 @@ bool Model::LoadDrafter(const std::string& path, std::string* error) {
   if (!reader)
     return false;
   auto& st = *state_;
+  const bool is_d2 = reader->FindTensor("selector_hidden.weight") != nullptr;
+  const std::string prefix = is_d2 ? "d2." : "d.";
   for (const auto& info : reader->GetTensors()) {
     Tensor t;
     switch (info.type) {
@@ -6827,7 +6843,7 @@ bool Model::LoadDrafter(const std::string& path, std::string* error) {
     for (std::size_t d = 1; d < info.dimensions.size(); ++d)
       t.rows *= info.dimensions[d];
     t.row_bytes = info.size_bytes / t.rows;
-    const std::string name = "d." + std::string(info.name);
+    const std::string name = prefix + std::string(info.name);
     if (t.type == kTypeQ8) {
       void* tmp = nullptr;
       HIP_OK(hipMalloc(&tmp, info.size_bytes));
@@ -6891,7 +6907,9 @@ bool Model::LoadDrafter(const std::string& path, std::string* error) {
     }
     st.tensors.emplace(name, t);
   }
-  if (reader->FindTensor("selector_hidden.weight") != nullptr) {
+  if (!is_d2)
+    st.has_dspark = true;
+  if (is_d2) {
     st.d2 = true;
     if (const auto w =
             reader->GetMetadataUint32("dflash.attention.sliding_window"))

@@ -229,8 +229,16 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "drafter load failed: %s\n", err.c_str());
       return 1;
     }
+    if (const char* second = std::getenv("INKLING_DRAFT_B")) {
+      if (!model->LoadDrafter(second, &err)) {
+        std::fprintf(stderr, "second drafter load failed: %s\n", err.c_str());
+        return 1;
+      }
+    }
     auto session =
         model->CreateSession(std::max<std::uint32_t>(4096, kContext), &err);
+    if (const char* pick = std::getenv("INKLING_PICK"))
+      session->SelectDrafter(pick[0] == '2');
     std::vector<std::int32_t> prefix;
     for (int i = 0; i < kPrefix; ++i)
       prefix.push_back(static_cast<std::int32_t>(ids[i]));
