@@ -1388,8 +1388,8 @@ __global__ __launch_bounds__(256) void MlaSplitWmmaKernel(
   const int lane = tid & 31;
   const int col = lane & 15;
   const int hid = lane >> 4;
-  const int s = blockIdx.x;
-  const int row0 = blockIdx.y * kMwRows;
+  const int s = blockIdx.y;
+  const int row0 = blockIdx.x * kMwRows;
   const int rlast = min(row0 + kMwRows, nrows) - 1;
   const int len_max = pos0 + rlast / heads + 1;
   const int start = s * chunk;
@@ -2346,7 +2346,7 @@ int MlaAttendSplitWmma(const float* qabs, const float* qe, void* q16,
   MlaQHalfKernel<<<nrows, 192, 0, stream>>>(qabs, qe,
                                             static_cast<_Float16*>(q16),
                                             kRaonRank, kRaonRope);
-  MlaSplitWmmaKernel<<<dim3(splits, (nrows + kMwRows - 1) / kMwRows), 256, 0,
+  MlaSplitWmmaKernel<<<dim3((nrows + kMwRows - 1) / kMwRows, splits), 256, 0,
                        stream>>>(
       static_cast<const _Float16*>(q16), lat, extra, part, heads, nrows, pos0,
       chunk, splits, 1.0F / sqrtf(static_cast<float>(kRaonNoPe + kRaonRope)));
