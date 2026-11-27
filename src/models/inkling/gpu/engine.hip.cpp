@@ -1064,11 +1064,24 @@ __device__ __forceinline__ float4 Bf16x4(uint2 u) {
       __uint_as_float(u.y << 16), __uint_as_float(u.y & 0xFFFF0000U));
 }
 
+// up to three loop controllers of one visit batched along blockIdx.z
+struct CtlBatch {
+  float* cur[3];
+  const float* msg[3];
+  const void* down[3];
+  const void* gain[3];
+  const void* forget[3];
+  float* low[3];
+};
+
 template<bool H>
 __global__ void __launch_bounds__(kControlWaves * 32)
-    ControlLow(const float* cur, const float* msg, const void* down_v, int h,
-               float eps, float* low) {
+    ControlLow(CtlBatch b, int h, float eps) {
   __shared__ float red[2][kControlWaves];
+  const float* cur = b.cur[blockIdx.z];
+  const float* msg = b.msg[blockIdx.z];
+  const void* down_v = b.down[blockIdx.z];
+  float* low = b.low[blockIdx.z];
   const int row = blockIdx.x;
   const int wave = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
@@ -1140,9 +1153,13 @@ __global__ void __launch_bounds__(kControlWaves * 32)
 
 // cur += -tanh(forget) * cur + tanh(gain) * msg with gain/forget = W . low
 template<bool H>
-__global__ void ControlApply(float* cur, const float* msg, const float* low,
-                             const void* gain_v, const void* forget_v, int h) {
+__global__ void ControlApply(CtlBatch b, int h) {
   __shared__ float lw[kControlRank];
+  float* cur = b.cur[blockIdx.z];
+  const float* msg = b.msg[blockIdx.z];
+  const float* low = b.low[blockIdx.z];
+  const void* gain_v = b.gain[blockIdx.z];
+  const void* forget_v = b.forget[blockIdx.z];
   const int row = blockIdx.x;
   if (threadIdx.x < kControlRank)
     lw[threadIdx.x] =
@@ -4376,6 +4393,46 @@ struct Session::Impl : Scratch {
     MixRms<<<n, 256, nq * hh * sizeof(float), stream>>>(
         sp, cur_, query, nq, hh, n, np, m->config.rms_eps);
   }
+  void ControlLaunch(const CtlBatch& cb, int groups, bool half_w, int n) {
+    const int h = static_cast<int>(m->config.hidden_size);
+    if (half_w) {
+      ControlLow<true><<<dim3(n, kControlRank / kControlWaves, groups),
+                         kControlWaves * 32, 0, stream>>>(cb, h,
+                                                          m->config.rms_eps);
+      ControlApply<true>
+          <<<dim3(n, (h + 255) / 256, groups), 256, 0, stream>>>(cb, h);
+    } else {
+      ControlLow<false><<<dim3(n, kControlRank / kControlWaves, groups),
+                          kControlWaves * 32, 0, stream>>>(cb, h,
+                                                           m->config.rms_eps);
+      ControlApply<false>
+          <<<dim3(n, (h + 255) / 256, groups), 256, 0, stream>>>(cb, h);
+    }
+  }
+  // the three attention-input controllers of a visit in one launch pair;
+  // false when the small-batch half-weight path does not apply
+  bool ControlStep3(float* const cur_[3], const float* msgs3, std::uint32_t phys,
+                    int n) {
+    static const char* const kGroup[3] = {"attn", "k", "v"};
+    if (n >= kWmmaMinTokens || m->config.loop_gate_rank != kControlRank)
+      return false;
+    CtlBatch cb{};
+    for (int j = 0; j < 3; ++j) {
+      const std::string fb =
+          "blk." + std::to_string(phys) + ".loop_" + kGroup[j] + "_";
+      if (m->tensors.count(fb + "down.weight.h") == 0)
+        return false;
+      cb.cur[j] = cur_[j];
+      cb.msg[j] = msgs3 + j * static_cast<std::size_t>(m->config.hidden_size);
+      cb.down[j] = m->T(fb + "down.weight.h").dev;
+      cb.gain[j] = m->T(fb + "gain.weight.h").dev;
+      cb.forget[j] = m->T(fb + "forget.weight.h").dev;
+      cb.low[j] = low + static_cast<std::size_t>(j) * kMaxVerifyRows *
+                            kControlRank;
+    }
+    ControlLaunch(cb, 3, true, n);
+    return true;
+  }
   void ControlStep(float* cur_, const float* message, std::uint32_t phys,
                    const char* group, int n) {
     const int h = static_cast<int>(m->config.hidden_size);
@@ -4387,22 +4444,14 @@ struct Session::Impl : Scratch {
                                    std::getenv("INKLING_CTL_HALF")[0] != '0';
       const bool half_w =
           ctl_half && m->tensors.count(fb + "down.weight.h") != 0;
-      const auto wp = [&](const char* name) -> const void* {
-        return m->T(fb + name + (half_w ? ".h" : "")).dev;
-      };
-      if (half_w) {
-        ControlLow<true><<<dim3(n, kControlRank / kControlWaves),
-                           kControlWaves * 32, 0, stream>>>(
-            cur_, message, wp("down.weight"), h, m->config.rms_eps, low);
-        ControlApply<true><<<dim3(n, (h + 255) / 256), 256, 0, stream>>>(
-            cur_, message, low, wp("gain.weight"), wp("forget.weight"), h);
-      } else {
-        ControlLow<false><<<dim3(n, kControlRank / kControlWaves),
-                            kControlWaves * 32, 0, stream>>>(
-            cur_, message, wp("down.weight"), h, m->config.rms_eps, low);
-        ControlApply<false><<<dim3(n, (h + 255) / 256), 256, 0, stream>>>(
-            cur_, message, low, wp("gain.weight"), wp("forget.weight"), h);
-      }
+      CtlBatch cb{};
+      cb.cur[0] = cur_;
+      cb.msg[0] = message;
+      cb.down[0] = m->T(fb + "down.weight" + (half_w ? ".h" : "")).dev;
+      cb.gain[0] = m->T(fb + "gain.weight" + (half_w ? ".h" : "")).dev;
+      cb.forget[0] = m->T(fb + "forget.weight" + (half_w ? ".h" : "")).dev;
+      cb.low[0] = low;
+      ControlLaunch(cb, 1, half_w, n);
       return;
     }
     RmsRows(cur_, nullptr, big ? nullptr : cat, n, h, h, 2 * h,
@@ -4566,8 +4615,12 @@ struct Session::Impl : Scratch {
       }
       if (msgs_ != nullptr) {
         static const char* const kGroup[3] = {"attn", "k", "v"};
-        for (int j = 0; j < 3; ++j)
-          ControlStep(inp[j], msgs_ + j * nh_, p, kGroup[j], n);
+        static const bool ctl3 = std::getenv("INKLING_CTL_BATCH") == nullptr ||
+                                 std::getenv("INKLING_CTL_BATCH")[0] != '0';
+        const bool distinct = inp[0] != inp[1] && inp[1] != inp[2];
+        if (!(ctl3 && distinct && ControlStep3(inp, msgs_, p, n)))
+          for (int j = 0; j < 3; ++j)
+            ControlStep(inp[j], msgs_ + j * nh_, p, kGroup[j], n);
       }
       if (swa) {
         const float* w =
