@@ -1366,18 +1366,29 @@ __global__ void Route(const float* logits, const float* bias, int ne, int nu,
   __syncthreads();
   float sum = 0.0F;
   for (int k = 0; k < nu; ++k) {
-    best_v[e] = sel[e];
-    best_i[e] = e;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-      if (e < s && (best_v[e + s] > best_v[e] || (best_v[e + s] == best_v[e] &&
-                                                  best_i[e + s] < best_i[e]))) {
-        best_v[e] = best_v[e + s];
-        best_i[e] = best_i[e + s];
+    float bv = sel[e];
+    int bi = e;
+    for (int off = warpSize / 2; off > 0; off >>= 1) {
+      const float ov = __shfl_xor(bv, off);
+      const int oi = __shfl_xor(bi, off);
+      if (ov > bv || (ov == bv && oi < bi)) {
+        bv = ov;
+        bi = oi;
       }
-      __syncthreads();
     }
-    const int win = best_i[0];
+    if (e % warpSize == 0) {
+      best_v[e / warpSize] = bv;
+      best_i[e / warpSize] = bi;
+    }
+    __syncthreads();
+    int win = best_i[0];
+    float wv = best_v[0];
+    for (int w = 1; w < blockDim.x / warpSize; ++w) {
+      if (best_v[w] > wv || (best_v[w] == wv && best_i[w] < win)) {
+        wv = best_v[w];
+        win = best_i[w];
+      }
+    }
     if (e == 0) {
       ids[t * nu + k] = win;
       wts[t * nu + k] = prob[win];
