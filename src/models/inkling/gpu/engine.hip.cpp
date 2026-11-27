@@ -599,6 +599,48 @@ __global__ void Clip(float* x, const float* scale, int scale_rows, int dim,
     p[i] *= f;
 }
 
+struct ClipJob {
+  float* x;
+  const float* scale;
+  int scale_rows, dim, blocks, rows_per_token;
+  float threshold, tau_floor, tau_alpha;
+  const int* tau_pos;
+};
+struct ClipJobs {
+  ClipJob job[3];
+};
+
+// the three per-row clips of a decode attention visit in one launch; each
+// block runs exactly the arithmetic of Clip
+__global__ void ClipMulti(ClipJobs jobs) {
+  __shared__ float red[256];
+  int b = blockIdx.x;
+  int j = 0;
+  while (j < 2 && b >= jobs.job[j].blocks) {
+    b -= jobs.job[j].blocks;
+    ++j;
+  }
+  const ClipJob& J = jobs.job[j];
+  float* p = J.x + static_cast<std::size_t>(b) * J.dim;
+  const int sr = J.scale != nullptr ? b % J.scale_rows : 0;
+  float s = 0.0F;
+  for (int i = threadIdx.x; i < J.dim; i += blockDim.x) {
+    if (J.scale != nullptr)
+      p[i] *= J.scale[sr * J.dim + i];
+    s += p[i] * p[i];
+  }
+  s = BlockSum(s, red);
+  float f = fminf(1.0F, J.threshold / (sqrtf(s) + 1e-6F));
+  if (J.tau_pos != nullptr) {
+    const int token = b / J.rows_per_token;
+    f *= 1.0F + J.tau_alpha *
+                    logf(fmaxf(1.0F, static_cast<float>(*J.tau_pos + token + 1) /
+                                         J.tau_floor));
+  }
+  for (int i = threadIdx.x; i < J.dim; i += blockDim.x)
+    p[i] *= f;
+}
+
 // Warp-per-row variants of Clip and the per-head RMS norm for short rows
 // (dim <= 128): eight rows per 256-thread block, one shuffle reduction per row.
 __global__ void __launch_bounds__(256)
@@ -683,12 +725,10 @@ __global__ void TauScale(float* x, int per_token, const int* pos0,
     x[static_cast<std::size_t>(blockIdx.x) * per_token + i] *= tau;
 }
 
-__global__ void Conv(const float* cur, const float* w, const float* dyn,
-                     int heads, float* hist, float* out, int ch, int n,
-                     const float* add, float* win) {
-  const int c = blockIdx.x * blockDim.x + threadIdx.x;
-  if (c >= ch)
-    return;
+__device__ __forceinline__ void ConvOne(const float* cur, const float* w,
+                                         const float* dyn, int heads,
+                                         float* hist, float* out, int ch, int n,
+                                         const float* add, float* win, int c) {
   const int per = dyn != nullptr ? ch / heads : ch;
   const float norm =
       rsqrtf(static_cast<float>((dyn != nullptr ? 2 : 1) * kConvTaps + 1));
@@ -724,6 +764,28 @@ __global__ void Conv(const float* cur, const float* w, const float* dyn,
   }
   for (int k = 0; k < kHistory; ++k)
     hist[c * kHistory + k] = wn[k];
+}
+
+__global__ void Conv(const float* cur, const float* w, const float* dyn,
+                     int heads, float* hist, float* out, int ch, int n,
+                     const float* add, float* win) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= ch)
+    return;
+  ConvOne(cur, w, dyn, heads, hist, out, ch, n, add, win, c);
+}
+
+// the key and value convolutions of a decode visit: one thread runs the key
+// channel and then the value channel (the value output reuses the key input)
+__global__ void Conv2(const float* cur_a, const float* w_a, const float* dyn_a,
+                      float* hist_a, float* out_a, const float* cur_b,
+                      const float* w_b, const float* dyn_b, float* hist_b,
+                      float* out_b, int heads, int ch, int n) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= ch)
+    return;
+  ConvOne(cur_a, w_a, dyn_a, heads, hist_a, out_a, ch, n, nullptr, nullptr, c);
+  ConvOne(cur_b, w_b, dyn_b, heads, hist_b, out_b, ch, n, nullptr, nullptr, c);
 }
 
 __global__ void ConvT(const float* cur, const float* w, const float* dyn,
@@ -945,7 +1007,8 @@ __global__ void Mix(StatePtrs blocks, const float* cur, const float* query,
       wgt[q][s] = wgt[q][s] / den * inv[s];
   }
   __syncthreads();
-  for (int i = threadIdx.x; i < h; i += blockDim.x) {
+  for (int i = blockIdx.y * blockDim.x + threadIdx.x; i < h;
+       i += gridDim.y * blockDim.x) {
     float a[4] = {};
     for (int s = 0; s < ns; ++s) {
       const float v = (s < blocks.count ? blocks.p[s] : cur)[toff + i];
@@ -1063,11 +1126,24 @@ __device__ __forceinline__ float4 Bf16x4(uint2 u) {
       __uint_as_float(u.y << 16), __uint_as_float(u.y & 0xFFFF0000U));
 }
 
+// up to three loop controllers of one visit batched along blockIdx.z
+struct CtlBatch {
+  float* cur[3];
+  const float* msg[3];
+  const void* down[3];
+  const void* gain[3];
+  const void* forget[3];
+  float* low[3];
+};
+
 template<bool H>
 __global__ void __launch_bounds__(kControlWaves * 32)
-    ControlLow(const float* cur, const float* msg, const void* down_v, int h,
-               float eps, float* low) {
+    ControlLow(CtlBatch b, int h, float eps) {
   __shared__ float red[2][kControlWaves];
+  const float* cur = b.cur[blockIdx.z];
+  const float* msg = b.msg[blockIdx.z];
+  const void* down_v = b.down[blockIdx.z];
+  float* low = b.low[blockIdx.z];
   const int row = blockIdx.x;
   const int wave = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
@@ -1139,9 +1215,13 @@ __global__ void __launch_bounds__(kControlWaves * 32)
 
 // cur += -tanh(forget) * cur + tanh(gain) * msg with gain/forget = W . low
 template<bool H>
-__global__ void ControlApply(float* cur, const float* msg, const float* low,
-                             const void* gain_v, const void* forget_v, int h) {
+__global__ void ControlApply(CtlBatch b, int h) {
   __shared__ float lw[kControlRank];
+  float* cur = b.cur[blockIdx.z];
+  const float* msg = b.msg[blockIdx.z];
+  const float* low = b.low[blockIdx.z];
+  const void* gain_v = b.gain[blockIdx.z];
+  const void* forget_v = b.forget[blockIdx.z];
   const int row = blockIdx.x;
   if (threadIdx.x < kControlRank)
     lw[threadIdx.x] =
@@ -1348,18 +1428,29 @@ __global__ void Route(const float* logits, const float* bias, int ne, int nu,
   __syncthreads();
   float sum = 0.0F;
   for (int k = 0; k < nu; ++k) {
-    best_v[e] = sel[e];
-    best_i[e] = e;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-      if (e < s && (best_v[e + s] > best_v[e] || (best_v[e + s] == best_v[e] &&
-                                                  best_i[e + s] < best_i[e]))) {
-        best_v[e] = best_v[e + s];
-        best_i[e] = best_i[e + s];
+    float bv = sel[e];
+    int bi = e;
+    for (int off = warpSize / 2; off > 0; off >>= 1) {
+      const float ov = __shfl_xor(bv, off);
+      const int oi = __shfl_xor(bi, off);
+      if (ov > bv || (ov == bv && oi < bi)) {
+        bv = ov;
+        bi = oi;
       }
-      __syncthreads();
     }
-    const int win = best_i[0];
+    if (e % warpSize == 0) {
+      best_v[e / warpSize] = bv;
+      best_i[e / warpSize] = bi;
+    }
+    __syncthreads();
+    int win = best_i[0];
+    float wv = best_v[0];
+    for (int w = 1; w < blockDim.x / warpSize; ++w) {
+      if (best_v[w] > wv || (best_v[w] == wv && best_i[w] < win)) {
+        wv = best_v[w];
+        win = best_i[w];
+      }
+    }
     if (e == 0) {
       ids[t * nu + k] = win;
       wts[t * nu + k] = prob[win];
@@ -1631,7 +1722,8 @@ __global__ void CombineHalf(const __half* y, const float* wts, float* out,
 
 __global__ void Combine(const float* y, const float* wts, float* out, int nu,
                         int h, const float* down_scale, const int* ids) {
-  for (int i = threadIdx.x; i < h; i += blockDim.x) {
+  for (int i = blockIdx.y * blockDim.x + threadIdx.x; i < h;
+       i += gridDim.y * blockDim.x) {
     float a = 0.0F;
     for (int k = 0; k < nu; ++k) {
       const int eid = ids != nullptr ? ids[blockIdx.x * nu + k] : 0;
@@ -2684,6 +2776,8 @@ struct ModelState {
   std::uint32_t n_phys{0};
   std::unordered_map<std::string, Tensor> tensors;
   std::vector<void*> allocations;
+  // per-core-layer message queries (attn, k, v, ffn) laid out [cc][4][h]
+  float* mq_table{nullptr};
   std::size_t resident_bytes{0};
   bool has_draft{false};
   bool d2{false};          // a DFlash2 block drafter is loaded (tensors "d2.*")
@@ -2990,6 +3084,25 @@ std::shared_ptr<Model> Model::Load(const std::string& path,
         state->resident_bytes += count * 2;
         state->tensors.emplace(std::string(info.name) + ".h", th);
       }
+    }
+  }
+  {
+    const Tensor& res = state->T("loop_res_query.weight");
+    const Tensor& kv = state->T("loop_kv_res_query.weight");
+    const std::size_t hb = res.cols * 4;
+    const std::size_t ncc = res.rows / 2;
+    HIP_OK(hipMalloc(&state->mq_table, ncc * 4 * hb));
+    state->allocations.push_back(state->mq_table);
+    char* dst = reinterpret_cast<char*>(state->mq_table);
+    const char* r = static_cast<const char*>(res.dev);
+    const char* k = static_cast<const char*>(kv.dev);
+    for (std::size_t c = 0; c < ncc; ++c) {
+      const std::size_t src[4][2] = {{0, 2 * c}, {1, 2 * c}, {1, 2 * c + 1},
+                                     {0, 2 * c + 1}};
+      for (int j = 0; j < 4; ++j)
+        HIP_OK(hipMemcpy(dst + (c * 4 + j) * hb,
+                         (src[j][0] == 0 ? r : k) + src[j][1] * hb, hb,
+                         hipMemcpyDeviceToDevice));
     }
   }
   // F16 copy of every relative-bias table with one zero row appended
@@ -3624,6 +3737,13 @@ __global__ void ArgMaxRow(const float* x, int n, int* out, int* out2,
   int idx = 0;
   for (int i = threadIdx.x; i < n; i += blockDim.x) {
     const float v = x[i];
+    if (conf == nullptr) {
+      if (v > best) {
+        best = v;
+        idx = i;
+      }
+      continue;
+    }
     if (v > best) {
       sum = sum * expf(best - v) + 1.0F;
       best = v;
@@ -4327,7 +4447,11 @@ struct Session::Impl : Scratch {
           std::getenv("INKLING_MIX_THREADS") != nullptr
               ? std::atoi(std::getenv("INKLING_MIX_THREADS"))
               : 576;
-      Mix<<<n, mix_threads, 0, stream>>>(
+      static const int mix_split =
+          std::getenv("INKLING_MIX_SPLIT") != nullptr
+              ? std::atoi(std::getenv("INKLING_MIX_SPLIT"))
+              : 4;
+      Mix<<<dim3(n, mix_split), mix_threads, 0, stream>>>(
           sp, cur_, query, nq, static_cast<int>(m->config.hidden_size), n, out);
     }
   }
@@ -4342,6 +4466,46 @@ struct Session::Impl : Scratch {
     MixRms<<<n, 256, nq * hh * sizeof(float), stream>>>(
         sp, cur_, query, nq, hh, n, np, m->config.rms_eps);
   }
+  void ControlLaunch(const CtlBatch& cb, int groups, bool half_w, int n) {
+    const int h = static_cast<int>(m->config.hidden_size);
+    if (half_w) {
+      ControlLow<true><<<dim3(n, kControlRank / kControlWaves, groups),
+                         kControlWaves * 32, 0, stream>>>(cb, h,
+                                                          m->config.rms_eps);
+      ControlApply<true>
+          <<<dim3(n, (h + 255) / 256, groups), 256, 0, stream>>>(cb, h);
+    } else {
+      ControlLow<false><<<dim3(n, kControlRank / kControlWaves, groups),
+                          kControlWaves * 32, 0, stream>>>(cb, h,
+                                                           m->config.rms_eps);
+      ControlApply<false>
+          <<<dim3(n, (h + 255) / 256, groups), 256, 0, stream>>>(cb, h);
+    }
+  }
+  // the three attention-input controllers of a visit in one launch pair;
+  // false when the small-batch half-weight path does not apply
+  bool ControlStep3(float* const cur_[3], const float* msgs3, std::uint32_t phys,
+                    int n) {
+    static const char* const kGroup[3] = {"attn", "k", "v"};
+    if (n >= kWmmaMinTokens || m->config.loop_gate_rank != kControlRank)
+      return false;
+    CtlBatch cb{};
+    for (int j = 0; j < 3; ++j) {
+      const std::string fb =
+          "blk." + std::to_string(phys) + ".loop_" + kGroup[j] + "_";
+      if (m->tensors.count(fb + "down.weight.h") == 0)
+        return false;
+      cb.cur[j] = cur_[j];
+      cb.msg[j] = msgs3 + j * static_cast<std::size_t>(m->config.hidden_size);
+      cb.down[j] = m->T(fb + "down.weight.h").dev;
+      cb.gain[j] = m->T(fb + "gain.weight.h").dev;
+      cb.forget[j] = m->T(fb + "forget.weight.h").dev;
+      cb.low[j] = low + static_cast<std::size_t>(j) * kMaxVerifyRows *
+                            kControlRank;
+    }
+    ControlLaunch(cb, 3, true, n);
+    return true;
+  }
   void ControlStep(float* cur_, const float* message, std::uint32_t phys,
                    const char* group, int n) {
     const int h = static_cast<int>(m->config.hidden_size);
@@ -4353,22 +4517,14 @@ struct Session::Impl : Scratch {
                                    std::getenv("INKLING_CTL_HALF")[0] != '0';
       const bool half_w =
           ctl_half && m->tensors.count(fb + "down.weight.h") != 0;
-      const auto wp = [&](const char* name) -> const void* {
-        return m->T(fb + name + (half_w ? ".h" : "")).dev;
-      };
-      if (half_w) {
-        ControlLow<true><<<dim3(n, kControlRank / kControlWaves),
-                           kControlWaves * 32, 0, stream>>>(
-            cur_, message, wp("down.weight"), h, m->config.rms_eps, low);
-        ControlApply<true><<<dim3(n, (h + 255) / 256), 256, 0, stream>>>(
-            cur_, message, low, wp("gain.weight"), wp("forget.weight"), h);
-      } else {
-        ControlLow<false><<<dim3(n, kControlRank / kControlWaves),
-                            kControlWaves * 32, 0, stream>>>(
-            cur_, message, wp("down.weight"), h, m->config.rms_eps, low);
-        ControlApply<false><<<dim3(n, (h + 255) / 256), 256, 0, stream>>>(
-            cur_, message, low, wp("gain.weight"), wp("forget.weight"), h);
-      }
+      CtlBatch cb{};
+      cb.cur[0] = cur_;
+      cb.msg[0] = message;
+      cb.down[0] = m->T(fb + "down.weight" + (half_w ? ".h" : "")).dev;
+      cb.gain[0] = m->T(fb + "gain.weight" + (half_w ? ".h" : "")).dev;
+      cb.forget[0] = m->T(fb + "forget.weight" + (half_w ? ".h" : "")).dev;
+      cb.low[0] = low;
+      ControlLaunch(cb, 1, half_w, n);
       return;
     }
     RmsRows(cur_, nullptr, big ? nullptr : cat, n, h, h, 2 * h,
@@ -4532,8 +4688,12 @@ struct Session::Impl : Scratch {
       }
       if (msgs_ != nullptr) {
         static const char* const kGroup[3] = {"attn", "k", "v"};
-        for (int j = 0; j < 3; ++j)
-          ControlStep(inp[j], msgs_ + j * nh_, p, kGroup[j], n);
+        static const bool ctl3 = std::getenv("INKLING_CTL_BATCH") == nullptr ||
+                                 std::getenv("INKLING_CTL_BATCH")[0] != '0';
+        const bool distinct = inp[0] != inp[1] && inp[1] != inp[2];
+        if (!(ctl3 && distinct && ControlStep3(inp, msgs_, p, n)))
+          for (int j = 0; j < 3; ++j)
+            ControlStep(inp[j], msgs_ + j * nh_, p, kGroup[j], n);
       }
       if (swa) {
         const float* w =
@@ -4872,12 +5032,21 @@ struct Session::Impl : Scratch {
     (void)inp;
     (void)inh;
     (void)msgs_;
-    Convolve(tmp, m->T(m->P(p, "attn_k_conv.weight")), L.dk, nkv, sl.hist_k, k,
-             nkv * hd, n);
     float* vtmp = tmp;
     L.vtmp = vtmp;
-    Convolve(v, m->T(m->P(p, "attn_v_conv.weight")), L.dv, nkv, sl.hist_v, vtmp,
-             nkv * hd, n);
+    if (n < kWmmaMinTokens && !(all_rows && n <= static_cast<int>(kMaxVerifyRows))) {
+      const int ch = nkv * hd;
+      Conv2<<<(ch + 127) / 128, 128, 0, stream>>>(
+          tmp, static_cast<const float*>(m->T(m->P(p, "attn_k_conv.weight")).dev),
+          L.dk, sl.hist_k, k, v,
+          static_cast<const float*>(m->T(m->P(p, "attn_v_conv.weight")).dev),
+          L.dv, sl.hist_v, vtmp, nkv, ch, n);
+    } else {
+      Convolve(tmp, m->T(m->P(p, "attn_k_conv.weight")), L.dk, nkv, sl.hist_k,
+               k, nkv * hd, n);
+      Convolve(v, m->T(m->P(p, "attn_v_conv.weight")), L.dv, nkv, sl.hist_v,
+               vtmp, nkv * hd, n);
+    }
     const int* tau_p = swa ? nullptr : d_pos;
     const float tau_floor = static_cast<float>(c.log_scale_floor);
     if (big && hd <= 128 && nrel <= 128) {
@@ -4894,15 +5063,34 @@ struct Session::Impl : Scratch {
           nh, nrel, c.relative_clip, tau_p, nh, tau_floor, c.log_scale_alpha,
           n * nh);
     } else {
-      Clip<<<n * nh, 128, 0, stream>>>(
-          q, static_cast<const float*>(m->T(m->P(p, "attn_q_clip.weight")).dev),
-          nh, hd, c.qk_clip, tau_p, nh, tau_floor, c.log_scale_alpha);
-      Clip<<<n * nkv, 128, 0, stream>>>(k, nullptr, 1, hd, c.qk_clip);
+      ClipJobs cj{};
+      cj.job[0] = {q,
+                   static_cast<const float*>(
+                       m->T(m->P(p, "attn_q_clip.weight")).dev),
+                   nh,
+                   hd,
+                   n * nh,
+                   nh,
+                   c.qk_clip,
+                   tau_floor,
+                   c.log_scale_alpha,
+                   tau_p};
+      cj.job[1] = {k,    nullptr, 1,    hd,   n * nkv,
+                   1,    c.qk_clip, 1.0F, 0.0F, nullptr};
+      cj.job[2] = {r,
+                   static_cast<const float*>(
+                       m->T(m->P(p, "attn_rel_clip.weight")).dev),
+                   nh,
+                   nrel,
+                   n * nh,
+                   nh,
+                   c.relative_clip,
+                   tau_floor,
+                   c.log_scale_alpha,
+                   tau_p};
+      ClipMulti<<<cj.job[0].blocks + cj.job[1].blocks + cj.job[2].blocks, 128,
+                  0, stream>>>(cj);
       RmsRows(vtmp, nullptr, vtmp, n * nkv, hd, hd, hd);
-      Clip<<<n * nh, 128, 0, stream>>>(
-          r,
-          static_cast<const float*>(m->T(m->P(p, "attn_rel_clip.weight")).dev),
-          nh, nrel, c.relative_clip, tau_p, nh, tau_floor, c.log_scale_alpha);
     }
     StoreKv<<<n, 256, 0, stream>>>(k, vtmp, sl.k, sl.v, nkv * hd, d_pos,
                                    sl.ring, sl.vblocks);
@@ -5879,7 +6067,8 @@ struct Session::Impl : Scratch {
       } else {
         WmmaGemm<kTypeQ8><<<g2, kWmmaThreads, 0, stream>>>(a2);
       }
-      Combine<<<n, 256, 0, stream>>>(y, wts, moe, nu, h, nullptr, nullptr);
+      Combine<<<dim3(n, (h + 255) / 256), 256, 0, stream>>>(y, wts, moe, nu, h,
+                                                          nullptr, nullptr);
       return;
     }
     xrow = xrow_token;
@@ -5889,7 +6078,8 @@ struct Session::Impl : Scratch {
                                     c.situ_linear_beta);
     xrow = xrow_item;
     Routed(m->T(m->P(p, "ffn_down_exps.weight")), h, items, s_dn, act, y);
-    Combine<<<n, 256, 0, stream>>>(y, wts, moe, nu, h, nullptr, nullptr);
+    Combine<<<dim3(n, (h + 255) / 256), 256, 0, stream>>>(y, wts, moe, nu, h,
+                                                          nullptr, nullptr);
   }
 
   void Forward(std::span<const std::int32_t> tokens) {
@@ -6381,19 +6571,7 @@ struct Session::Impl : Scratch {
     const float* msgs_ = nullptr;
     if (st.pass > 0) {
       const std::uint32_t cc = st.ip - start;
-      const float* res =
-          static_cast<const float*>(m->T("loop_res_query.weight").dev);
-      const float* kv =
-          static_cast<const float*>(m->T("loop_kv_res_query.weight").dev);
-      float* mq = low;
-      HIP_OK(hipMemcpyAsync(mq, res + 2 * cc * h, h * 4,
-                            hipMemcpyDeviceToDevice, stream));
-      HIP_OK(hipMemcpyAsync(mq + h, kv + 2 * cc * h, h * 4,
-                            hipMemcpyDeviceToDevice, stream));
-      HIP_OK(hipMemcpyAsync(mq + 2 * h, kv + (2 * cc + 1) * h, h * 4,
-                            hipMemcpyDeviceToDevice, stream));
-      HIP_OK(hipMemcpyAsync(mq + 3 * h, res + (2 * cc + 1) * h, h * 4,
-                            hipMemcpyDeviceToDevice, stream));
+      const float* mq = m->mq_table + static_cast<std::size_t>(cc) * 4 * h;
       Mixer(R.bank, bank_out, mq, 4, R.n, msgs);
       msgs_ = msgs;
     }
@@ -6543,19 +6721,7 @@ struct Session::Impl : Scratch {
         // per-layer message queries (attn, k, v, ffn) from the global tables;
         // see inkling-port-state.md
         const std::uint32_t cc = ip - start;
-        const float* res =
-            static_cast<const float*>(m->T("loop_res_query.weight").dev);
-        const float* kv =
-            static_cast<const float*>(m->T("loop_kv_res_query.weight").dev);
-        float* mq = low;  // reuse as scratch: 4*h floats
-        HIP_OK(hipMemcpyAsync(mq, res + 2 * cc * h, h * 4,
-                              hipMemcpyDeviceToDevice, stream));
-        HIP_OK(hipMemcpyAsync(mq + h, kv + 2 * cc * h, h * 4,
-                              hipMemcpyDeviceToDevice, stream));
-        HIP_OK(hipMemcpyAsync(mq + 2 * h, kv + (2 * cc + 1) * h, h * 4,
-                              hipMemcpyDeviceToDevice, stream));
-        HIP_OK(hipMemcpyAsync(mq + 3 * h, res + (2 * cc + 1) * h, h * 4,
-                              hipMemcpyDeviceToDevice, stream));
+        const float* mq = m->mq_table + static_cast<std::size_t>(cc) * 4 * h;
         Mixer(bank, bank_out, mq, 4, n, msgs);
         Layer(il, ip, blocks, msgs, n);
         Tap(v++, n);
