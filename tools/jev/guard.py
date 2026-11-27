@@ -264,6 +264,7 @@ class GuardLog:
 
 
 LIGHT_TTL = 900
+START_SLACK_S = 2
 LEARNED_FILE = os.path.expanduser("~/.gufo/jev-log/learned-heavy.json")
 LEARNED_MAX = 200
 LEARNED_TTL = 30 * 86400
@@ -273,7 +274,8 @@ LEARN_SKIP = ("lemonade", "ollama", "llama-server", "xorg", "kwin", "gnome",
 LEARN_SKIP_NAMES = {"gufo", "gufo-server", "guard.py", "run-gufo.sh", "run-gufo-jev.sh",
                     "run-jev-guard.sh", "jev-stop.sh", "jev-ctl.sh"}
 GENERIC_TOKENS = {"python", "python3", "bash", "sh", "echo", "true", "false", "cat",
-                  "grep", "head", "tail", "sleep", "time", "nohup", "setsid", "env"}
+                  "grep", "head", "tail", "sleep", "time", "nohup", "setsid", "env",
+                  "docker", "podman", "logs", "compose", "journalctl", "systemctl"}
 LEARNED = {}
 
 
@@ -314,6 +316,17 @@ def proc_chain(pid, depth=4):
         if pid <= 1:
             break
     return out
+
+
+def proc_start_time(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            ticks = int(f.read().rsplit(")", 1)[1].split()[19])
+        with open("/proc/uptime") as f:
+            up = float(f.read().split()[0])
+        return time.time() - up + ticks / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError):
+        return None
 
 
 def learn_key(cmdline, cwd=None):
@@ -888,7 +901,10 @@ class Guard:
             return
         now = time.time()
         self.pending_lights = [p for p in self.pending_lights if now - p["ts"] < LIGHT_TTL]
+        started = proc_start_time(pid)
         for light in reversed(self.pending_lights):
+            if started is not None and light["ts"] > started + START_SLACK_S:
+                continue
             if light_matches(light["text"], chain):
                 self.jev_log.set_outcome(light["request_id"], light["hash"], "diverged", note)
                 self.pending_lights.remove(light)
