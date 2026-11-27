@@ -4188,8 +4188,13 @@ public:
         request.tool_choice == ChatRequest::ToolChoice::kRequired;
     tokenization::TokenizerOptions options;
     options.parse_special_tokens = true;
-    return tokenizer_->Encode(
-        models::ling32::RenderPrompt(messages, chat_options), options);
+    const std::string prompt =
+        models::ling32::RenderPrompt(messages, chat_options);
+    if (const char* dump = std::getenv("LING_DUMP_PROMPT")) {
+      std::ofstream out(dump, std::ios::trunc);
+      out << prompt;
+    }
+    return tokenizer_->Encode(prompt, options);
   }
 
   /// The server parses and constrains the Qwen XML call dialect.
