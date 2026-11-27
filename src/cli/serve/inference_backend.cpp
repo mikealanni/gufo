@@ -4430,8 +4430,13 @@ public:
     if (piece == "<|end_message|>") {
       const Phase ended = phase_;
       phase_ = Phase::kNone;
-      if (ended == Phase::kThinking)
-        return "\n</think>\n\n";
+      if (ended == Phase::kThinking) {
+        // the model sometimes writes the closing tag itself
+        const bool closed = think_closed_;
+        think_closed_ = false;
+        think_tail_.clear();
+        return closed ? std::string() : std::string("\n</think>\n\n");
+      }
       if (ended == Phase::kTool)
         return NativeCall();
       return {};
@@ -4447,6 +4452,13 @@ public:
     if (phase_ == Phase::kTool) {
       tool_ += piece;
       return {};
+    }
+    if (phase_ == Phase::kThinking) {
+      think_tail_ += piece;
+      if (think_tail_.find("</think>") != std::string::npos)
+        think_closed_ = true;
+      if (think_tail_.size() > 8)
+        think_tail_.erase(0, think_tail_.size() - 8);
     }
     return std::string(piece);
   }
@@ -4477,6 +4489,8 @@ private:
 
   Phase phase_{Phase::kNone};
   std::string tool_;
+  std::string think_tail_;
+  bool think_closed_{false};
 };
 
 std::vector<std::uint8_t> InklingCompatibilityIdentity(
