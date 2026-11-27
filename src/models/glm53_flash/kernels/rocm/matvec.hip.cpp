@@ -302,6 +302,32 @@ int MatvecBatched(int type_code, const void* w, const float* x, float* out,
   return hipGetLastError() == hipSuccess ? 0 : -3;
 }
 
+int MatvecBatchedTokens(int type_code, const void* w, const float* x,
+                        float* out, int m, int k, int channels, int tokens,
+                        void* scratch, hipStream_t stream) {
+  if (w == nullptr || x == nullptr || out == nullptr || scratch == nullptr ||
+      type_code == kTypeF32 || m <= 0 || k <= 0 || channels <= 0 ||
+      tokens <= 0 || tokens > MMVQ_MAX_BATCH_SIZE) {
+    return -1;
+  }
+  const auto type = static_cast<ggml_type>(type_code);
+  const std::int64_t padded =
+      GGML_PAD(static_cast<std::int64_t>(k), MATRIX_ROW_PADDING);
+  const std::int64_t rows = static_cast<std::int64_t>(channels) * tokens;
+  ds4_quantize_row_q8_1_hip(
+      x, nullptr, scratch, type, k, k, static_cast<std::int64_t>(k) * rows,
+      static_cast<std::int64_t>(k) * rows, padded, rows, 1, 1, stream);
+  const int blck = static_cast<int>(ggml_blck_size(type));
+  const int stride_row_x = k / blck;
+  const int row_blocks = static_cast<int>(padded / QK8_1);
+  ds4_ggml_hip_mm_fusion_args_device fusion = {};
+  mul_mat_vec_q_switch_type(
+      w, type, scratch, nullptr, fusion, out, k, m, tokens, stride_row_x,
+      channels * row_blocks, channels * m, channels, channels, channels,
+      m * stride_row_x, row_blocks, m, 1, 1, 0, 0, 0, 0, stream);
+  return hipGetLastError() == hipSuccess ? 0 : -3;
+}
+
 int MatvecExpertsTokens(int type_code, const void* w, const float* x,
                         float* out, int m, int k, int n_experts, int n_used,
                         int n_tokens, const int* ids, bool x_per_expert,

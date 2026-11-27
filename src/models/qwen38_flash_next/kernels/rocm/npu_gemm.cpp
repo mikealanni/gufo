@@ -743,6 +743,23 @@ bool NpuGemm::Submit(hipStream_t stream, int a_id, const int* b_ids,
   return true;
 }
 
+std::uint64_t NpuGemm::SubmitHost(int a_id, const int* b_ids, const int* c_ids,
+                                  int count, int program) {
+  Call call{impl_.get(),
+            a_id,
+            {b_ids, b_ids + count},
+            {c_ids, c_ids + count},
+            ++impl_->submitted,
+            program};
+  const std::uint64_t ticket = call.ticket;
+  impl_->Enqueue(std::move(call));
+  return ticket;
+}
+
+void NpuGemm::WaitHost(std::uint64_t ticket) {
+  impl_->WaitNow(ticket);
+}
+
 bool NpuGemm::RunSync(hipStream_t stream, int a_id, int b_id, int c_id,
                       int program) {
   auto* call =

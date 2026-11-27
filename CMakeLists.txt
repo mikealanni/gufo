@@ -87,6 +87,9 @@ add_subdirectory(src/models/glm53_flash)
 # Ling-3.2-Air (`bailingmoe3`) — CPU reference and artifact validation.
 add_subdirectory(src/models/ling32)
 
+# Raon-1 mini (`raon1`) — RDA + NoPE MLA hybrid MoE with mHC residuals.
+add_subdirectory(src/models/raon1)
+
 add_subdirectory(src/models/qwen3_tts)
 
 # Qwen3-ASR — model-private 1.7B speech recognition runtime.
@@ -244,7 +247,8 @@ target_link_libraries(gufo_llm_cli PUBLIC gufo_core gufo_flint gufo_laguna
   gufo_glm53_flash gufo_ling32)
 if(ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_llm_cli PUBLIC gufo_deepseek_v4_flash
-    gufo_qwen38_flash_next gufo_glm53_flash_engine gufo_inkling gufo_ling32_gpu)
+    gufo_qwen38_flash_next gufo_glm53_flash_engine gufo_raon1_engine
+    gufo_inkling gufo_ling32_gpu)
 endif()
 
 add_library(gufo_logging STATIC src/cli/serve/logging.cpp src/cli/serve/trace.cpp)
@@ -361,7 +365,7 @@ target_compile_definitions(gufo PRIVATE
 
 if (ENGINE_ENABLE_HIP)
   target_link_libraries(gufo PRIVATE gufo_deepseek_v4_flash
-    gufo_glm53_flash_engine gufo_ling32 gufo_ling32_gpu)
+    gufo_glm53_flash_engine gufo_raon1_engine gufo_ling32 gufo_ling32_gpu)
 endif()
 target_link_libraries(gufo PRIVATE gufo_qwen3_tts gufo_qwen3_asr)
 

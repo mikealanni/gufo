@@ -20,6 +20,9 @@ struct QwenDFlashConfig {
   /// extracted.
   std::vector<std::uint32_t> target_layer_ids;
 
+  /// Width of each captured target tap; zero means the drafter hidden size.
+  std::uint32_t target_hidden_size{0};
+
   /// Total diffusion block size, including the committed anchor token.
   std::uint32_t block_size{0};
 

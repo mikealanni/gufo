@@ -37,6 +37,9 @@ class Model;
 namespace gufo::models::glm53_flash {
 class Model;
 }
+namespace gufo::models::raon1 {
+class Model;
+}
 
 namespace gufo::models::qwen38_flash_next {
 class Model;
@@ -162,7 +165,7 @@ public:
             TextPrefillPolicy prefill_policy = {},
             TextSchedulerPolicy scheduler_policy = {});
   /// Installs a previously loaded Ling-3.2 model with request-owned sessions.
-  /// No snapshot/fork support yet (the engine has none).
+  /// Continuation snapshots live in host memory and, when configured, on disk.
   /// `mtp` drafts with the model's own MTP layer for plain greedy requests.
   bool load(std::shared_ptr<models::ling32::gpu::Model> model,
             std::unique_ptr<tokenization::QwenTokenizer> tokenizer,
@@ -170,6 +173,16 @@ public:
             std::uint32_t max_context = 0, std::size_t session_count = 1,
             TextPrefillPolicy prefill_policy = {},
             TextSchedulerPolicy scheduler_policy = {}, bool mtp = false);
+  /// Installs a previously loaded Raon-1 model with request-owned sessions.
+  /// No snapshot/fork support yet (the engine has none).
+  bool load(std::shared_ptr<models::raon1::Model> model,
+            std::unique_ptr<tokenization::QwenTokenizer> tokenizer,
+            std::vector<std::int32_t> stop_tokens, std::string* error,
+            std::uint32_t max_context = 0, std::size_t session_count = 1,
+            TextPrefillPolicy prefill_policy = {},
+            TextSchedulerPolicy scheduler_policy = {}, bool draft = false,
+            TextDiskCacheConfig disk_cache_config = {},
+            TextRunnerRamCacheOptions ram_cache_config = {});
 
   /// Installs a previously loaded GLM-5.3-Flash model with request-owned
   /// sessions, the artifact's tokenizer, and host-memory continuation

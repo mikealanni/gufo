@@ -6164,8 +6164,8 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
         (void)j;
 #pragma unroll
         for (int c = 0; c < 4; ++c)
-          q_code[c] = *reinterpret_cast<const uint4*>(d_ptr + (kb0 * 32) +
-                                                      (c * 16));
+          q_code[c] =
+              *reinterpret_cast<const uint4*>(d_ptr + (kb0 * 32) + (c * 16));
         q_sc = *reinterpret_cast<const std::uint32_t*>(d_ptr + k + (kb0 * 2));
       } else if constexpr (kQ8) {
         // block_q8_0 is 34 bytes, so the code loads are 2-byte aligned.
@@ -6537,10 +6537,9 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
           // Q8_0: the block's 32 signed bytes are chunks 2 kb and 2 kb + 1;
           // flipping the sign bit carries q + 128, which the 1152 magic
           // takes back out.
-          const uint4 c0 =
-              kQ8R ? q_cur[2 * kb] : s_codes[swizzle(row, 2 * kb)];
-          const uint4 c1 = kQ8R ? q_cur[(2 * kb) + 1]
-                               : s_codes[swizzle(row, (2 * kb) + 1)];
+          const uint4 c0 = kQ8R ? q_cur[2 * kb] : s_codes[swizzle(row, 2 * kb)];
+          const uint4 c1 =
+              kQ8R ? q_cur[(2 * kb) + 1] : s_codes[swizzle(row, (2 * kb) + 1)];
           const std::uint32_t words[8] = {c0.x, c0.y, c0.z, c0.w,
                                           c1.x, c1.y, c1.z, c1.w};
 #pragma unroll
@@ -8400,6 +8399,39 @@ bool RoutedNvfp4SituGemmF16(const void* w_gate_up, const __half* x,
 #undef INKLING_SITU_LAUNCH
 }
 
+/// Paired Q4_K gate/up GEMM with the SiTU activation (situ = device pair
+/// {beta, linear_beta}) and F16 output rows; tile_rows 48 or 128.
+bool RoutedQ4KSituGemmF16(const void* gate, const void* up, const __half* x,
+                          const std::int32_t* tiles, std::uint32_t n_tiles,
+                          std::uint32_t tile_rows,
+                          const std::int32_t* pad_bounds,
+                          const std::int32_t* rows_in,
+                          const std::int32_t* rows_out, __half* out_half,
+                          std::size_t ff, std::size_t k, const float* situ,
+                          hipStream_t stream) {
+  if (ff == 0 || k == 0 || k % 256 != 0 || n_tiles == 0 ||
+      out_half == nullptr || situ == nullptr) {
+    return false;
+  }
+  const dim3 grid(static_cast<unsigned int>((ff + 63) / 64), n_tiles);
+#define RAON_SITU_LAUNCH(BN)                                                   \
+  hipLaunchKernelGGL(                                                          \
+      (RoutedF16GEMMKernel<WeightType::kQ4_K, 128, BN, 2, true, false, true>), \
+      grid, dim3(kThreads), 0, stream, gate, x, tiles, pad_bounds, rows_in,    \
+      rows_out, situ, nullptr, out_half, ff, k, up, nullptr, 1.0F, nullptr, 0)
+  switch (tile_rows) {
+    case 48:
+      RAON_SITU_LAUNCH(48);
+      return true;
+    case 128:
+      RAON_SITU_LAUNCH(128);
+      return true;
+    default:
+      return false;
+  }
+#undef RAON_SITU_LAUNCH
+}
+
 // Additive experiment: RoutedF16GEMMKernel<kQ8_0, 128, 128, 2> directly,
 // bypassing LaunchRoutedF16's `if constexpr (BN > 64) return false` guard
 // for Q8_0. That guard reflects a limit measured on Flash-Next's shapes;
@@ -9837,6 +9869,48 @@ __global__ void NpuEncodeWeightsQuantKernel(
   NpuEncodeGroup(v, out + g * 9);
 }
 
+__global__ void EmbedQuantKernel(const std::uint8_t* __restrict__ w,
+                                 std::uint32_t type, std::size_t row_bytes,
+                                 const std::int32_t* __restrict__ tokens,
+                                 float* __restrict__ res, std::uint32_t hidden,
+                                 std::uint32_t streams) {
+  const std::size_t t = blockIdx.x;
+  const std::uint8_t* row = w + row_bytes * static_cast<std::size_t>(tokens[t]);
+  for (std::uint32_t s16 = threadIdx.x; s16 < hidden / 16; s16 += blockDim.x) {
+    gufo::hip::QuantSub16 sub;
+    gufo::hip::DecodeQuantSub16(static_cast<gufo::core::GgmlType>(type), row,
+                                s16, sub);
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+      const float v = (sub.scale * static_cast<float>(sub.q[i])) - sub.offset;
+      for (std::uint32_t st = 0; st < streams; ++st) {
+        res[(t * streams + st) * hidden + s16 * 16 + i] = v;
+      }
+    }
+  }
+}
+
+__global__ void DequantRowsHalfKernel(const std::uint8_t* __restrict__ w,
+                                      std::uint32_t type, std::size_t row_bytes,
+                                      std::size_t rows, std::uint32_t k,
+                                      __half* __restrict__ out) {
+  const std::size_t g = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
+  const std::size_t subs = k / 16;
+  if (g >= rows * subs) {
+    return;
+  }
+  const std::size_t r = g / subs;
+  const std::uint32_t s = static_cast<std::uint32_t>(g % subs);
+  gufo::hip::QuantSub16 sub;
+  gufo::hip::DecodeQuantSub16(static_cast<gufo::core::GgmlType>(type),
+                              w + r * row_bytes, s, sub);
+#pragma unroll
+  for (int i = 0; i < 16; ++i) {
+    out[r * k + s * 16 + i] =
+        __float2half((sub.scale * static_cast<float>(sub.q[i])) - sub.offset);
+  }
+}
+
 /// One Q8_0 block of the output per thread: the 32 weights of a row of a
 /// K-quant or IQ tensor, rescaled to int8 with a half scale.
 __global__ void RequantToQ8_0Kernel(const std::uint8_t* __restrict__ src,
@@ -9889,7 +9963,8 @@ __global__ void NpuDecodeOutputKernel(const std::uint8_t* __restrict__ in,
                                       bool accumulate,
                                       std::uint32_t valid_cols) {
   const std::size_t g = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
-  const std::size_t total_groups = std::size_t{NpuPaddedRows(tokens)} * cols / 8;
+  const std::size_t total_groups =
+      std::size_t{NpuPaddedRows(tokens)} * cols / 8;
   // Blocks that lie fully inside the stream stage their 256 groups (2304
   // bytes) with coalesced 16-byte loads instead of nine byte loads each.
   __shared__ __align__(16) std::uint8_t staged[256 * 9];
@@ -9922,8 +9997,7 @@ __global__ void NpuDecodeOutputKernel(const std::uint8_t* __restrict__ in,
   if (row >= tokens || (valid_cols != 0 && col >= valid_cols)) {
     return;
   }
-  const std::uint8_t* p =
-      full_block ? staged + threadIdx.x * 9 : in + g * 9;
+  const std::uint8_t* p = full_block ? staged + threadIdx.x * 9 : in + g * 9;
   const float mult = ldexpf(1.0F, static_cast<int>(p[0]) - 127) / 64.0F;
   float* dst = out + row * out_pitch + col0 + col;
   if (((out_pitch | col0) & 3) != 0) {
@@ -10066,6 +10140,27 @@ void NpuEncodeWeightsQuant(const void* weights, std::uint32_t type,
       NpuEncodeWeightsQuantKernel, dim3(Blocks(groups)), dim3(kThreads), 0,
       stream, static_cast<const std::uint8_t*>(weights), type, row_bytes,
       static_cast<std::uint8_t*>(dst), row0, cols, k_slice, k_offset, k_valid);
+}
+
+void EmbedTokensQuant(const void* table, std::uint32_t type,
+                      const std::int32_t* tokens, float* res,
+                      std::uint32_t n_tokens, std::uint32_t hidden,
+                      std::uint32_t streams, hipStream_t stream) {
+  const std::size_t row_bytes = gufo::quant::QuantizedRowBytes(
+      static_cast<gufo::core::GgmlType>(type), hidden);
+  hipLaunchKernelGGL(EmbedQuantKernel, dim3(n_tokens), dim3(128), 0, stream,
+                     static_cast<const std::uint8_t*>(table), type, row_bytes,
+                     tokens, res, hidden, streams);
+}
+
+void DequantRowsToHalf(const void* weights, std::uint32_t type, std::uint32_t k,
+                       std::size_t rows, __half* out, hipStream_t stream) {
+  const std::size_t row_bytes = gufo::quant::QuantizedRowBytes(
+      static_cast<gufo::core::GgmlType>(type), k);
+  const std::size_t groups = rows * (k / 16);
+  hipLaunchKernelGGL(
+      DequantRowsHalfKernel, dim3(Blocks(groups)), dim3(kThreads), 0, stream,
+      static_cast<const std::uint8_t*>(weights), type, row_bytes, rows, k, out);
 }
 
 void RequantToQ8_0(const void* src, std::uint32_t type, std::uint32_t k,
@@ -10270,6 +10365,34 @@ bool RequantQ8_0ToQ4_1(const void* src, void* dst, std::size_t blocks,
       RequantQ8ToQ4_1Kernel, dim3(Blocks(blocks)), dim3(kThreads), 0, stream,
       static_cast<const Q8_0Block*>(src), static_cast<Q4_1Block*>(dst), blocks);
   return hipGetLastError() == hipSuccess;
+}
+
+bool DenseHalfWeightGemmWide(const __half* w, const __half* x, float* out,
+                             std::size_t batch, std::size_t m, std::size_t k,
+                             hipStream_t stream) {
+  if (batch < 1024 || m == 0 || k == 0 || k % 32 != 0 || m > 16384) {
+    return DenseHalfWeightGemm(w, x, out, batch, m, k, stream, 0);
+  }
+  constexpr int kWideBM = 256;
+  constexpr int kBN = 128;
+  const dim3 grid(static_cast<unsigned int>((batch + kBN - 1) / kBN),
+                  static_cast<unsigned int>((m + kWideBM - 1) / kWideBM));
+  // Eight row waves per weight fragment, with row tiles grouped per token
+  // tile: 16 to 39 TFLOPS on the 5120 x 2560 and 2560 x 5120 projections.
+  if (m == 2560) {
+    hipLaunchKernelGGL((DenseF16GEMMKernel<kWideBM, kBN, 2, 8, 1, 2, false,
+                                           false, false, true, false>),
+                       grid, dim3(kThreads), 0, stream, w, x, out, batch, m, k,
+                       nullptr, nullptr, nullptr, nullptr, nullptr,
+                       AttentionProjectionOutput{}, 0, 0);
+  } else {
+    hipLaunchKernelGGL((DenseF16GEMMKernel<kWideBM, kBN, 2, 8, 1, 1, false,
+                                           false, false, true, false>),
+                       grid, dim3(kThreads), 0, stream, w, x, out, batch, m, k,
+                       nullptr, nullptr, nullptr, nullptr, nullptr,
+                       AttentionProjectionOutput{}, 0, 0);
+  }
+  return true;
 }
 
 bool DenseHalfWeightGemm(const __half* w, const __half* x, float* out,

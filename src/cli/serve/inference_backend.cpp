@@ -61,6 +61,7 @@
 #include "src/models/qwen/hip/mtp.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
 #include "src/models/qwen38_flash_next/jev_model.hpp"
+#include "src/models/raon1/engine.hpp"
 #if defined(GUFO_NPU)
 #include "src/models/qwen38_flash_next/jev_npu.hpp"
 #endif
@@ -4018,6 +4019,429 @@ private:
   std::size_t session_bytes_{0};
 };
 
+constexpr std::string_view kRaon1StateAbi = "raon1-rocm-session-v1";
+constexpr std::uint32_t kRaon1SnapshotPayloadVersion = 1;
+
+std::vector<std::uint8_t> Raon1CompatibilityIdentity(
+    std::string_view artifact_fingerprint, std::uint32_t max_context) {
+  if (!IsSha256Hex(artifact_fingerprint)) {
+    throw std::invalid_argument(
+        "Raon-1 disk cache requires an artifact fingerprint");
+  }
+  std::ostringstream identity;
+  identity << "schema=gufo-text-continuation-v2\n"
+           << "model_kind=raon1\n"
+           << "artifact_id=" << core::kGgufIdentityScheme << ':'
+           << artifact_fingerprint << '\n'
+           << "tokenizer=embedded-in-artifact\n"
+           << "chat_template=qwen-chat-v1\n"
+           << "state_abi=" << kRaon1StateAbi << '\n'
+           << "payload_layout=raon1-rocm-session-snapshot-v"
+           << kRaon1SnapshotPayloadVersion << '\n'
+           << "context_tokens=" << max_context << '\n'
+           << "position_policy=absolute-v1\n"
+           << "adapters=none\n";
+  const std::string canonical = identity.str();
+  return {canonical.begin(), canonical.end()};
+}
+
+using Raon1Model = models::raon1::Model;
+using Raon1Session = models::raon1::Session;
+
+std::vector<std::int32_t> Raon1EngineTokens(
+    std::span<const TextRunnerToken> tokens) {
+  std::vector<std::int32_t> converted;
+  converted.reserve(tokens.size());
+  for (const auto token : tokens) {
+    if (token > static_cast<TextRunnerToken>(
+                    std::numeric_limits<std::int32_t>::max())) {
+      throw std::invalid_argument("Raon-1 token ID exceeds engine range");
+    }
+    converted.push_back(static_cast<std::int32_t>(token));
+  }
+  return converted;
+}
+
+class Raon1TextRunnerSnapshot final : public TextRunnerSnapshot {
+public:
+  Raon1TextRunnerSnapshot(std::shared_ptr<Raon1Model> model,
+                          std::vector<std::uint8_t> bytes, std::size_t position)
+      : model(std::move(model)), bytes(std::move(bytes)), position(position) {}
+
+  [[nodiscard]] std::size_t PayloadBytes() const noexcept override {
+    return bytes.size();
+  }
+
+  std::shared_ptr<Raon1Model> model;
+  std::vector<std::uint8_t> bytes;
+  std::size_t position;
+};
+
+class Raon1TextRunnerState final : public TextRunnerState {
+public:
+  Raon1TextRunnerState(const std::shared_ptr<Raon1Model>& model,
+                       std::uint32_t max_context, bool draft) {
+    (void)max_context;
+    std::string error;
+    session_ = model->CreateSession(&error, draft);
+    if (session_ == nullptr) {
+      throw std::runtime_error("Failed to create Raon-1 session: " + error);
+    }
+  }
+
+  void Invalidate() noexcept override {
+    session_->Reset();
+    position_ = 0;
+  }
+  [[nodiscard]] TextRunnerMeasuredResources MeasuredResources()
+      const noexcept override {
+    return {.per_request_state_bytes = 0, .temporary_scratch_bytes = 0};
+  }
+
+  [[nodiscard]] Raon1Session& session() const { return *session_; }
+  [[nodiscard]] std::size_t position() const noexcept { return position_; }
+  void set_position(std::size_t position) noexcept { position_ = position; }
+
+private:
+  std::unique_ptr<Raon1Session> session_;
+  std::size_t position_{0};
+};
+
+Raon1TextRunnerState& RequireRaon1State(TextRunnerState& state) {
+  auto* raon1 = dynamic_cast<Raon1TextRunnerState*>(&state);
+  if (raon1 == nullptr)
+    throw std::logic_error("text runner state is not Raon-1");
+  return *raon1;
+}
+
+const Raon1TextRunnerState& RequireRaon1State(const TextRunnerState& state) {
+  const auto* raon1 = dynamic_cast<const Raon1TextRunnerState*>(&state);
+  if (raon1 == nullptr)
+    throw std::logic_error("text runner state is not Raon-1");
+  return *raon1;
+}
+
+class Raon1TextRunner final : public HipTextModelRunner {
+public:
+  static constexpr std::size_t kPrefillChunk = 8192;
+
+  Raon1TextRunner(std::shared_ptr<Raon1Model> model,
+                  std::unique_ptr<tokenization::QwenTokenizer> tokenizer,
+                  std::vector<std::int32_t> stop_tokens,
+                  std::uint32_t max_context, bool draft,
+                  std::string artifact_fingerprint = {})
+      : model_(std::move(model)),
+        tokenizer_(std::move(tokenizer)),
+        stop_tokens_(std::move(stop_tokens)),
+        max_context_(max_context),
+        draft_(draft),
+        chat_(tokenization::QwenChatTemplate::CreateDefault()) {
+    if (!artifact_fingerprint.empty() && model_->SnapshotSupported()) {
+      persistence_ = TextRunnerPersistenceDescriptor{
+          .compatibility_identity =
+              Raon1CompatibilityIdentity(artifact_fingerprint, max_context_),
+          .payload_version = kRaon1SnapshotPayloadVersion,
+      };
+    }
+  }
+
+  [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
+    return {
+        .model_id = "KRAON Raon-1 mini",
+        .state_abi = std::string(kRaon1StateAbi),
+        .max_context = max_context_,
+        .capabilities =
+            TextRunnerCapabilities{
+                .incremental_prefill = true,
+                .snapshot = model_->SnapshotSupported(),
+                .fork = model_->SnapshotSupported(),
+                .final_token_advance_required = false,
+                .incremental_text_is_exact = true,
+                .multi_token_decode = draft_,
+                .prefix_reuse = true,
+                .prefill_grid_tokens = 8192,
+            },
+        .persistence = persistence_,
+    };
+  }
+
+  [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
+    std::size_t free_bytes = 0;
+    std::size_t total_bytes = 0;
+    std::optional<std::size_t> capacity;
+    if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess)
+      capacity = free_bytes;
+    return {
+        .resident_weights_bytes = model_->ResidentBytes(),
+        .state_capacity_bytes = capacity,
+        .per_request_state_bytes = 0,
+        .temporary_scratch_bytes = 0,
+        .retained_snapshot_capacity_bytes = HostSnapshotBudgetBytes(),
+        .retained_snapshot_ceiling_bytes = HostSnapshotCeilingBytes(),
+        .requires_device_runtime_lock = true,
+    };
+  }
+
+  [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
+    return {{.kind = TextExecutionPlanKind::kSerial, .physical_width = 1}};
+  }
+
+  [[nodiscard]] std::shared_ptr<const sampling::ConstraintVocabulary>
+  BuildConstraintVocabulary() const override {
+    return std::make_shared<const sampling::ConstraintVocabulary>(
+        tokenizer_->GetVocabSize(), [this](std::uint32_t id) {
+          return sampling::ConstraintVocabulary::Piece{
+              tokenizer_->DecodeTokenCopy(id), IsStop(id)};
+        });
+  }
+
+  [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
+      std::string_view text) const override {
+    return tokenizer_->Encode(text);
+  }
+
+  [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
+      const ChatRequest& request) const override {
+    return tokenization::QwenChatTemplate::RenderAndTokenize(
+        *tokenizer_, request.messages,
+        request.tool_choice == ChatRequest::ToolChoice::kNone
+            ? std::span<const tokenization::ChatTool>{}
+            : std::span<const tokenization::ChatTool>{request.tools},
+        QwenChatOptions(request, max_context_));
+  }
+
+  [[nodiscard]] sampling::JsonConstraint::ToolFormat ToolFormat()
+      const override {
+    return sampling::JsonConstraint::ToolFormat::kQwen;
+  }
+
+  [[nodiscard]] TextGenerationBackend::InitialOutputState InitialOutputState(
+      const ChatRequest& request) const override {
+    return QwenChatOptions(request, max_context_).enable_thinking
+               ? TextGenerationBackend::InitialOutputState::kReasoning
+               : TextGenerationBackend::InitialOutputState::kContent;
+  }
+
+  [[nodiscard]] ReasoningTags ReasoningBudgetTags() const override {
+    return {"<think>", "</think>", {"</think>", "<tool_call>"}};
+  }
+
+  [[nodiscard]] std::string Decode(
+      std::span<const TextRunnerToken> tokens) const override {
+    return tokenizer_->Decode(tokens);
+  }
+
+  [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
+    return std::make_unique<Raon1TextRunnerState>(model_, max_context_, draft_);
+  }
+
+  void PreparePrefixReuse(
+      TextRunnerState& state,
+      std::span<const TextRunnerToken> prefix) const override {
+    if (RequireRaon1State(state).position() != prefix.size())
+      throw std::logic_error("Raon-1 reused prefix does not match checkpoint");
+  }
+
+  [[nodiscard]] TextPrefillStep Prefill(
+      TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t max_input_tokens) const override {
+    auto& raon1 = RequireRaon1State(state);
+    if (offset != raon1.position())
+      throw std::logic_error("Raon-1 prefill offset does not match state");
+    if (offset >= prompt.size())
+      throw std::logic_error("Raon-1 prefill has no remaining input");
+    const std::size_t consumed = std::min<std::size_t>(
+        {max_input_tokens, prompt.size() - offset, kPrefillChunk});
+    const auto chunk = Raon1EngineTokens(prompt.subspan(offset, consumed));
+    std::string error;
+    raon1.session().SetPromptEnd(static_cast<std::uint32_t>(prompt.size()));
+    if (!raon1.session().Sync(chunk, &error)) {
+      raon1.Invalidate();
+      throw std::runtime_error("Raon-1 prefill failed: " + error);
+    }
+    raon1.set_position(offset + consumed);
+    return {.consumed_tokens = consumed,
+            .decode_ready = offset + consumed == prompt.size()};
+  }
+
+  [[nodiscard]] TextDecodeSelection SelectNext(
+      TextRunnerState& state, sampling::SamplerState& sampler) const override {
+    auto& raon1 = RequireRaon1State(state);
+    if (raon1.position() >= max_context_)
+      return {.stop = true, .piece = {}};
+    const auto logits = raon1.session().Logits();
+    if (logits.empty())
+      throw std::runtime_error("Raon-1 token selection has no logits");
+    const auto token = static_cast<std::int32_t>(sampler.Sample(logits));
+    if (IsStop(token))
+      return {.stop = true, .token = 0, .piece = {}};
+    return {.stop = false,
+            .token = static_cast<TextRunnerToken>(token),
+            .piece = std::string(tokenizer_->DecodeToken(token))};
+  }
+
+  void Advance(TextRunnerState& state, TextRunnerToken token) const override {
+    auto& raon1 = RequireRaon1State(state);
+    const std::int32_t input = Raon1EngineTokens({&token, 1}).front();
+    std::string error;
+    if (!raon1.session().Evaluate(input, &error)) {
+      raon1.Invalidate();
+      throw std::runtime_error("Raon-1 decode failed: " + error);
+    }
+    raon1.set_position(raon1.position() + 1);
+  }
+
+  [[nodiscard]] std::optional<TextDecodeSelection> PreviewFirstToken(
+      TextRunnerState& state, sampling::SamplerState& sampler) const override {
+    return SelectNext(state, sampler);
+  }
+
+  [[nodiscard]] TextDecodeStep DecodeStep(
+      TextRunnerState& state, std::size_t max_tokens,
+      sampling::SamplerState& sampler) const override {
+    if (max_tokens == 1 || !draft_)
+      return TextModelRunner::DecodeStep(state, max_tokens, sampler);
+    if (max_tokens == 0)
+      throw std::invalid_argument(
+          "Raon-1 decode budget must be at least one token");
+    auto& raon1 = RequireRaon1State(state);
+    if (raon1.position() >= max_context_)
+      return {.selections = {}, .stop = true};
+    const auto before = raon1.session().Statistics();
+    sampling::SamplerState working_sampler = sampler;
+    Raon1Session::DecodeResult decoded;
+    std::string error;
+    const auto budget = std::min<std::size_t>(
+        max_tokens, std::uint64_t{models::raon1::kMaxDraftTokens} + 1);
+    if (!raon1.session().DecodeStep(
+            budget, working_sampler, &decoded,
+            [this](std::int32_t token) { return IsStop(token); }, &error)) {
+      raon1.Invalidate();
+      throw std::runtime_error("Raon-1 decode failed: " + error);
+    }
+    sampler.CopyDrawStateFrom(working_sampler);
+    TextDecodeStep step;
+    step.stop = decoded.stop;
+    for (const std::int32_t token : decoded.tokens) {
+      step.selections.push_back({
+          .stop = false,
+          .token = static_cast<TextRunnerToken>(token),
+          .piece = std::string(tokenizer_->DecodeToken(token)),
+      });
+    }
+    raon1.set_position(raon1.session().Position());
+    const auto after = raon1.session().Statistics();
+    step.draft_rounds = after.cycles - before.cycles;
+    step.draft_tokens = after.drafted - before.drafted;
+    step.draft_accepted_tokens = after.accepted - before.accepted;
+    step.suffix_draft_tokens = after.history_drafted - before.history_drafted;
+    step.suffix_accepted_tokens =
+        after.history_accepted - before.history_accepted;
+    return step;
+  }
+
+  [[nodiscard]] std::size_t SnapshotPayloadBytes(
+      const TextRunnerState& state) const override {
+    return RequireRaon1State(state).session().SnapshotBytes();
+  }
+
+  [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Snapshot(
+      const TextRunnerState& state) const override {
+    const auto& raon1 = RequireRaon1State(state);
+    std::vector<std::uint8_t> bytes(raon1.session().SnapshotBytes());
+    std::string error;
+    if (!raon1.session().SaveSnapshot(bytes, &error))
+      throw std::runtime_error("Raon-1 snapshot failed: " + error);
+    return std::make_unique<Raon1TextRunnerSnapshot>(model_, std::move(bytes),
+                                                     raon1.position());
+  }
+
+  void RestoreOrFork(TextRunnerState& state,
+                     const TextRunnerSnapshot& snapshot) const override {
+    const auto* raon1_snapshot =
+        dynamic_cast<const Raon1TextRunnerSnapshot*>(&snapshot);
+    if (raon1_snapshot == nullptr || raon1_snapshot->model.get() != model_.get())
+      throw std::invalid_argument(
+          "Raon-1 snapshot does not belong to this model");
+    auto& restored = RequireRaon1State(state);
+    std::string error;
+    if (!restored.session().RestoreSnapshot(raon1_snapshot->bytes, &error)) {
+      restored.Invalidate();
+      throw std::runtime_error("Raon-1 snapshot restore failed: " + error);
+    }
+    restored.set_position(raon1_snapshot->position);
+  }
+
+  [[nodiscard]] std::size_t PersistentSnapshotPayloadBytes(
+      const TextRunnerSnapshot& snapshot) const override {
+    return RequireRaon1Snapshot(snapshot).bytes.size();
+  }
+
+  [[nodiscard]] std::size_t SerializePersistentSnapshot(
+      const TextRunnerSnapshot& snapshot,
+      std::span<std::uint8_t> destination) const override {
+    const auto& bytes = RequireRaon1Snapshot(snapshot).bytes;
+    if (destination.size() != bytes.size()) {
+      throw std::invalid_argument(
+          "Raon-1 persistent snapshot serialization failed");
+    }
+    std::memcpy(destination.data(), bytes.data(), bytes.size());
+    return destination.size();
+  }
+
+  void StreamPersistentSnapshot(const TextRunnerSnapshot& snapshot,
+                                const SnapshotSink& sink) const override {
+    sink(RequireRaon1Snapshot(snapshot).bytes);
+  }
+
+  void RestorePersistentSnapshot(
+      TextRunnerState& state,
+      std::span<const std::uint8_t> payload) const override {
+    auto& restored = RequireRaon1State(state);
+    std::string error;
+    if (!restored.session().RestoreSnapshot(payload, &error)) {
+      restored.Invalidate();
+      throw std::runtime_error("Raon-1 persistent snapshot restore failed: " +
+                               error);
+    }
+    const std::uint32_t position = restored.session().Position();
+    if (position == 0 || position > max_context_) {
+      restored.Invalidate();
+      throw std::runtime_error(
+          "Raon-1 persistent snapshot restored an invalid position");
+    }
+    restored.set_position(position);
+  }
+
+  [[nodiscard]] std::size_t CheckpointPosition(
+      const TextRunnerState& state) const override {
+    return RequireRaon1State(state).position();
+  }
+
+private:
+  [[nodiscard]] const Raon1TextRunnerSnapshot& RequireRaon1Snapshot(
+      const TextRunnerSnapshot& snapshot) const {
+    const auto* raon1 = dynamic_cast<const Raon1TextRunnerSnapshot*>(&snapshot);
+    if (raon1 == nullptr || raon1->model.get() != model_.get())
+      throw std::invalid_argument(
+          "Raon-1 snapshot does not belong to this model");
+    return *raon1;
+  }
+
+  [[nodiscard]] bool IsStop(std::int32_t token) const {
+    return std::find(stop_tokens_.begin(), stop_tokens_.end(), token) !=
+           stop_tokens_.end();
+  }
+
+  std::shared_ptr<Raon1Model> model_;
+  std::unique_ptr<tokenization::QwenTokenizer> tokenizer_;
+  std::vector<std::int32_t> stop_tokens_;
+  std::optional<TextRunnerPersistenceDescriptor> persistence_;
+  std::uint32_t max_context_;
+  bool draft_{false};
+  std::unique_ptr<tokenization::QwenChatTemplate> chat_;
+};
+
 constexpr std::string_view kLing32StateAbi = "ling32-rocm-session-v1";
 
 using Ling32Model = models::ling32::gpu::Model;
@@ -6029,6 +6453,74 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                 std::move(resolved_disk_cache_config), ram_cache_config);
   }
 
+  if (reader->GetMetadataString("general.architecture") == "raon1") {
+    if (!vision_model_path.empty()) {
+      SetError(error, "Raon-1 does not support --mmproj");
+      return false;
+    }
+    const bool raon_dflash =
+        speculative_config.backend == TextSpeculativeBackend::kDFlash;
+    if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
+        !raon_dflash) {
+      SetError(error, "Raon-1 HTTP models support only DFlash2 drafting");
+      return false;
+    }
+    if (raon_dflash && speculative_config.draft_model_path.empty()) {
+      SetError(error, "Raon-1 DFlash2 HTTP decoding requires --dflash-model");
+      return false;
+    }
+    std::string tokenizer_error;
+    auto tokenizer =
+        tokenization::QwenTokenizer::CreateFromGguf(*reader, &tokenizer_error);
+    if (tokenizer == nullptr) {
+      SetError(error, "Raon-1 tokenizer failed: " + tokenizer_error);
+      return false;
+    }
+    std::vector<std::int32_t> stop_tokens;
+    for (const char* key :
+         {"tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id",
+          "tokenizer.ggml.eom_token_id"}) {
+      if (const auto id = reader->GetMetadataUint32(key))
+        stop_tokens.push_back(static_cast<std::int32_t>(*id));
+    }
+    if (const auto* meta =
+            reader->FindMetadata("tokenizer.ggml.eog_token_ids")) {
+      if (const auto* ids =
+              std::get_if<std::vector<std::int64_t>>(&meta->value)) {
+        for (const auto id : *ids)
+          stop_tokens.push_back(static_cast<std::int32_t>(id));
+      } else if (const auto* ids =
+                     std::get_if<std::vector<std::uint64_t>>(&meta->value)) {
+        for (const auto id : *ids)
+          stop_tokens.push_back(static_cast<std::int32_t>(id));
+      }
+    }
+    models::raon1::EngineOptions engine_options;
+    engine_options.max_context = max_context != 0 ? max_context : 32768;
+    if (raon_dflash) {
+      engine_options.dflash_model_path = speculative_config.draft_model_path;
+      engine_options.max_draft_tokens = std::min<std::uint32_t>(
+          speculative_config.max_draft_tokens, models::raon1::kMaxDraftTokens);
+    }
+    auto model =
+        models::raon1::Model::Load(model_path, engine_options, &load_error);
+    if (model == nullptr) {
+      SetError(error, "Failed to create Raon-1 model: " + load_error);
+      return false;
+    }
+    if (DiskCacheEnabled(resolved_disk_cache_config) &&
+        resolved_disk_cache_config.model_artifact_fingerprint.empty() &&
+        !FingerprintArtifact(
+            "Raon-1", *reader,
+            &resolved_disk_cache_config.model_artifact_fingerprint, error)) {
+      return false;
+    }
+    return load(std::move(model), std::move(tokenizer), std::move(stop_tokens),
+                error, max_context, session_count, prefill_policy,
+                scheduler_policy, raon_dflash,
+                std::move(resolved_disk_cache_config), ram_cache_config);
+  }
+
   if (reader->GetMetadataString("general.architecture") == "deepseek4") {
     if (!vision_model_path.empty()) {
       SetError(error, "DeepSeek does not support --mmproj");
@@ -6903,6 +7395,64 @@ bool InferenceBackend::load(
     auto runner_pool = std::make_shared<TextRunnerPool>(
         std::move(runner), session_count, std::nullopt,
         TextRunnerRamCacheOptions{});
+    new_state->scheduler = std::make_shared<TextGenerationScheduler>(
+        std::move(runner_pool), prefill_policy, scheduler_policy);
+    {
+      const std::lock_guard<std::mutex> lock(impl_->state_mutex);
+      impl_->state = std::move(new_state);
+    }
+    return true;
+  } catch (const std::exception& exception) {
+    SetError(error, exception.what());
+    return false;
+  }
+}
+
+bool InferenceBackend::load(
+    std::shared_ptr<models::raon1::Model> model,
+    std::unique_ptr<tokenization::QwenTokenizer> tokenizer,
+    std::vector<std::int32_t> stop_tokens, std::string* error,
+    std::uint32_t max_context, std::size_t session_count,
+    TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
+    bool draft, TextDiskCacheConfig disk_cache_config,
+    TextRunnerRamCacheOptions ram_cache_config) {
+  if (model == nullptr || tokenizer == nullptr) {
+    SetError(error, "Raon-1 model and tokenizer must not be null");
+    return false;
+  }
+  const std::uint32_t model_context = model->config().context_length;
+  if (max_context == 0)
+    max_context = std::min(model_context, 32768U);
+  if (session_count == 0) {
+    SetError(error, "HTTP session count must be at least one");
+    return false;
+  }
+  if (max_context < 2 || max_context > model_context) {
+    SetError(error, "HTTP context exceeds the loaded Raon-1 model context");
+    return false;
+  }
+  try {
+    auto new_state = std::make_shared<Impl::State>();
+    new_state->sampling_defaults.model = sampling::TextModelPreset::kRaon1;
+    new_state->sampling_defaults.supplied = {};
+    new_state->supports_images = false;
+    auto runner = std::make_shared<Raon1TextRunner>(
+        std::move(model), std::move(tokenizer), std::move(stop_tokens),
+        max_context, draft, disk_cache_config.model_artifact_fingerprint);
+    new_state->model_id = runner->Descriptor().model_id;
+    new_state->max_context = max_context;
+    std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
+    if (DiskCacheEnabled(disk_cache_config) &&
+        runner->Descriptor().persistence.has_value()) {
+      runner_disk_cache = TextRunnerDiskCacheOptions{
+          .directory = std::move(disk_cache_config.directory),
+          .capacity_bytes = disk_cache_config.capacity_bytes,
+          .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
+      };
+    }
+    auto runner_pool = std::make_shared<TextRunnerPool>(
+        std::move(runner), session_count, std::move(runner_disk_cache),
+        ram_cache_config);
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
     {

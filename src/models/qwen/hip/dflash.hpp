@@ -258,7 +258,10 @@ public:
     return model_->GetConfig().hidden_size;
   }
   [[nodiscard]] std::size_t GetTargetFeaturesSize() const noexcept {
-    return model_->GetDFlashConfig().target_layer_ids.size() * GetHiddenSize();
+    const auto& df = model_->GetDFlashConfig();
+    return df.target_layer_ids.size() * (df.target_hidden_size != 0
+                                             ? df.target_hidden_size
+                                             : GetHiddenSize());
   }
   [[nodiscard]] std::uint32_t GetInjectedContextLength() const noexcept {
     return injected_context_len_;

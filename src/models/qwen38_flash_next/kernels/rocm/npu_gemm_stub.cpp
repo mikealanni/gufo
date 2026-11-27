@@ -93,6 +93,12 @@ void* NpuGemm::Staged(hipStream_t /*stream*/, int /*id*/) {
   return nullptr;
 }
 
+std::uint64_t NpuGemm::SubmitHost(int, const int*, const int*, int, int) {
+  return 0;
+}
+
+void NpuGemm::WaitHost(std::uint64_t) {}
+
 std::uint64_t NpuGemm::Ticket() const noexcept {
   return 0;
 }

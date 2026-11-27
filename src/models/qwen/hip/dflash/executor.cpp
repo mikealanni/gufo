@@ -259,7 +259,10 @@ void QwenDFlashGpuExecutor::Allocate() {
   const std::size_t q_dim = cfg.AttentionSize();
   const std::size_t block_size = df_cfg.block_size;
   const std::size_t num_layers = df_cfg.num_layers;
-  const std::size_t enc_in_dim = df_cfg.target_layer_ids.size() * hidden_size;
+  const std::size_t enc_in_dim =
+      df_cfg.target_layer_ids.size() * (df_cfg.target_hidden_size != 0
+                                            ? df_cfg.target_hidden_size
+                                            : hidden_size);
   const std::size_t dynamic_size =
       2U * df_cfg.conv_kernel_size * (hidden_size / df_cfg.conv_group_size);
 
@@ -652,7 +655,8 @@ QwenGpuMemoryUsage QwenDFlashGpuExecutor::EstimateMemoryUsage(
       config.intermediate_size,
       kernels::DFlashSelectorScratchElements(config.vocab_size));
   const std::size_t scratch_elements =
-      injection * draft.target_layer_ids.size() * hidden +
+      injection * draft.target_layer_ids.size() *
+          (draft.target_hidden_size != 0 ? draft.target_hidden_size : hidden) +
       shared * (2U * hidden + 2U * kv) +
       block * (3U * hidden + dynamic + 2U * config.AttentionSize() +
                2U * ffn_scratch_width + config.vocab_size +

@@ -37,6 +37,12 @@ int MatvecBatched(int type_code, const void* w, const float* x, float* out,
                   int m, int k, int channels, void* scratch,
                   hipStream_t stream);
 
+// MatvecBatched for up to eight tokens in one launch: x is [token][channel][k]
+// and out is [token][channel][m], with the weight slab chosen by channel.
+int MatvecBatchedTokens(int type_code, const void* w, const float* x,
+                        float* out, int m, int k, int channels, int tokens,
+                        void* scratch, hipStream_t stream);
+
 // Routed-expert matvec: out[i * m + row] = sum_k W[ids[i]][row][k] * x_i[k]
 // for i < n_used, with W stacked [n_experts][m][k] in its block format. x is
 // one [k] row shared by all experts, or [n_used][k] when x_per_expert.

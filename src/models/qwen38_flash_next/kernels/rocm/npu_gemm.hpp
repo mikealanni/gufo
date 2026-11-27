@@ -64,6 +64,14 @@ public:
   /// writing C buffers c_ids[i]. The runs execute in order on the NPU.
   bool Submit(hipStream_t stream, int a_id, const int* b_ids, const int* c_ids,
               int count, int program = 0);
+  /// Host-thread variants for callers that run several streams: SubmitHost
+  /// enqueues the runs immediately (the caller must have synchronized the
+  /// stream that wrote the operands) and returns the ticket, WaitHost blocks
+  /// the calling thread until that ticket has finished. They never use a HIP
+  /// host callback, so one blocked waiter cannot stall another stream.
+  std::uint64_t SubmitHost(int a_id, const int* b_ids, const int* c_ids,
+                           int count, int program = 0);
+  void WaitHost(std::uint64_t ticket);
   /// Submit + Wait for one run in a single stream callback: the run executes
   /// inline on the HIP callback thread, saving the worker-thread handoff and
   /// one callback hop per GEMM. Do not mix with outstanding Submit calls.
