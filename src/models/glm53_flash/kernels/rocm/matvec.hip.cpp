@@ -278,6 +278,36 @@ int Matvec(int type_code, const void* w, const float* x, float* out, int m,
   return hipGetLastError() == hipSuccess ? 0 : -3;
 }
 
+int QuantizeActivations(const float* x, int n, int k, void* q,
+                        hipStream_t stream) {
+  if (x == nullptr || q == nullptr || n <= 0 || k <= 0 || n > MMVQ_MAX_BATCH_SIZE)
+    return -1;
+  const std::int64_t padded =
+      GGML_PAD(static_cast<std::int64_t>(k), MATRIX_ROW_PADDING);
+  ds4_quantize_row_q8_1_hip(
+      x, nullptr, q, GGML_TYPE_Q6_K, k, k, static_cast<std::int64_t>(k) * n,
+      static_cast<std::int64_t>(k) * n, padded, n, 1, 1, stream);
+  return hipGetLastError() == hipSuccess ? 0 : -3;
+}
+
+int MatvecQuantized(int type_code, const void* w, const void* q, float* out,
+                    int m, int n, int k, hipStream_t stream) {
+  if (w == nullptr || q == nullptr || out == nullptr || m <= 0 || n <= 0 ||
+      k <= 0 || type_code == kTypeF32 || n > MMVQ_MAX_BATCH_SIZE)
+    return -1;
+  const auto type = static_cast<ggml_type>(type_code);
+  const std::int64_t padded =
+      GGML_PAD(static_cast<std::int64_t>(k), MATRIX_ROW_PADDING);
+  const int blck = static_cast<int>(ggml_blck_size(type));
+  const int stride_row_x = k / blck;
+  const int stride_col_y = static_cast<int>(padded / QK8_1);
+  ds4_ggml_hip_mm_fusion_args_device fusion = {};
+  mul_mat_vec_q_switch_type(w, type, q, nullptr, fusion, out, k, m, n,
+                            stride_row_x, stride_col_y, m, 1, 1, 1, 0,
+                            n * stride_col_y, 0, 1, 1, 0, 0, 0, 0, stream);
+  return hipGetLastError() == hipSuccess ? 0 : -3;
+}
+
 int MatvecBatched(int type_code, const void* w, const float* x, float* out,
                   int m, int k, int channels, void* scratch,
                   hipStream_t stream) {

@@ -144,6 +144,15 @@ private:
   const DeviceTensor* Find(const std::string& name) const;
   bool Resolve(std::string* error);
   bool AllocScratch(std::string* error);
+  // Quantize one activation once and let the following Matvec calls on it
+  // (q/k/v/g, q_a/kv_a, shared gate/up) share the Q8_1 copy; PreqEnd clears it.
+  void PreqBegin(const float* x, int n, int k);
+  void PreqEnd() { preq_x_ = nullptr; }
+  const float* preq_x_{nullptr};
+  int preq_n_{0};
+  int preq_k_{0};
+  void* preq_buf_{nullptr};
+  std::size_t preq_bytes_{0};
   bool Matvec(const DeviceTensor& w, const float* x, float* y, int m, int n,
               std::string* error);
   bool MatvecRows(const DeviceTensor& w, std::uint64_t row0, int m,

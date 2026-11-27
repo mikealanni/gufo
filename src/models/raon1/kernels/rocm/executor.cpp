@@ -1110,9 +1110,46 @@ std::unique_ptr<Executor::Session> Executor::CreateSession(std::string* error) {
   return s;
 }
 
+void Executor::PreqBegin(const float* x, int n, int k) {
+  static const bool on = std::getenv("GUFO_RAON1_PREQ") == nullptr ||
+                         std::getenv("GUFO_RAON1_PREQ")[0] != '0';
+  preq_x_ = nullptr;
+  if (!on || n > 8)
+    return;
+  const std::size_t need = glm53_flash::rocm::MatvecScratchBytes(n, k);
+  if (preq_bytes_ < need) {
+    if (preq_buf_ != nullptr)
+      (void)hipFree(preq_buf_);
+    preq_buf_ = nullptr;
+    preq_bytes_ = 0;
+    if (hipMalloc(&preq_buf_, need) != hipSuccess) {
+      preq_buf_ = nullptr;
+      return;
+    }
+    preq_bytes_ = need;
+  }
+  if (glm53_flash::rocm::QuantizeActivations(x, n, k, preq_buf_, stream_) != 0)
+    return;
+  preq_x_ = x;
+  preq_n_ = n;
+  preq_k_ = k;
+}
+
 bool Executor::Matvec(const DeviceTensor& w, const float* x, float* y, int m,
                       int n, std::string* error) {
   int rc = -1;
+  if (preq_x_ != nullptr && x == preq_x_ && n == preq_n_ &&
+      static_cast<int>(w.cols) == preq_k_ && w.type != 0 && w.type != 15 &&
+      n < kHalfGemmMin) {
+    rc = glm53_flash::rocm::MatvecQuantized(w.type, w.data, preq_buf_, y, m, n,
+                                            static_cast<int>(w.cols), stream_);
+    if (rc != 0) {
+      if (error)
+        *error = "quantized matvec failed";
+      return false;
+    }
+    return true;
+  }
   if (n >= kHalfGemmMin && xh_ != nullptr && half_w_.count(w.data) != 0) {
     const __half* x16 = xh_;
     if (x == B().hint_src[0] && B().hint_buf[0] != nullptr) {
@@ -1545,7 +1582,8 @@ bool Executor::RunBatch(Session& session, std::span<const std::int32_t> tokens,
       NpuOp qkvg_op;
       if (on_npu) {
         NpuQkvgBegin(l, n, &qkvg_op);
-      } else if (!Matvec(get(l, "attn_q.weight"), sc_->attn_in, sc_->q, inner,
+      } else if ((PreqBegin(sc_->attn_in, n, static_cast<int>(H)), false) ||
+                 !Matvec(get(l, "attn_q.weight"), sc_->attn_in, sc_->q, inner,
                          n, error) ||
                  !Matvec(get(l, "attn_k.weight"), sc_->attn_in, sc_->k, inner,
                          n, error) ||
@@ -1565,6 +1603,7 @@ bool Executor::RunBatch(Session& session, std::span<const std::int32_t> tokens,
                      config_.num_heads, n, error)) {
         return false;
       }
+      PreqEnd();
       if (on_npu)
         NpuQkvgEnd(qkvg_op, n);
       if (recording_ && !rec_.empty() && n <= kMaxVerify) {
@@ -1610,8 +1649,10 @@ bool Executor::RunBatch(Session& session, std::span<const std::int32_t> tokens,
         return false;
       }
     } else {
+      PreqBegin(sc_->attn_in, n, static_cast<int>(H));
       if (!Matvec(get(l, "attn_q_a.weight"), sc_->attn_in, sc_->qr,
                   config_.q_lora_rank, n, error)) {
+        PreqEnd();
         return false;
       }
       norm(sc_->qr, get(l, "attn_q_a_norm.weight"), config_.q_lora_rank, n,
@@ -1620,8 +1661,10 @@ bool Executor::RunBatch(Session& session, std::span<const std::int32_t> tokens,
                   error) ||
           !Matvec(get(l, "attn_kv_a_mqa.weight"), sc_->attn_in, sc_->kv,
                   config_.q_lora_rank, n, error)) {
+        PreqEnd();
         return false;
       }
+      PreqEnd();
       const auto& kb = get(l, "attn_k_b.weight");
       const auto& vb = get(l, "attn_v_b.weight");
       KvNorm(sc_->kv,
@@ -1987,12 +2030,15 @@ bool Executor::RunBatch(Session& session, std::span<const std::int32_t> tokens,
                                sl * npu_->n(), false, stream_,
                                valid == 1024U ? 0U : valid);
         }
-      } else if (!Matvec(get(l, "ffn_gate_shexp.weight"), sc_->ffn_in, sc_->gf,
+      } else if ((PreqBegin(sc_->ffn_in, n, static_cast<int>(H)), false) ||
+                 !Matvec(get(l, "ffn_gate_shexp.weight"), sc_->ffn_in, sc_->gf,
                          config_.expert_ff, n, error) ||
                  !Matvec(get(l, "ffn_up_shexp.weight"), sc_->ffn_in, sc_->uf,
                          config_.expert_ff, n, error)) {
+        PreqEnd();
         return false;
       }
+      PreqEnd();
       SituAct(sc_->gf, sc_->uf, sc_->act, n * config_.expert_ff,
               config_.situ_beta, config_.situ_linear_beta, stream_);
       if (!Matvec(get(l, "ffn_down_shexp.weight"), sc_->act, sc_->dpart, H, n,
