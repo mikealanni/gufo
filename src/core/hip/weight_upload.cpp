@@ -9,6 +9,7 @@
 #include <array>
 #include <cerrno>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -23,6 +24,25 @@ namespace {
 constexpr std::size_t kAlignment = 4096;
 constexpr std::size_t kChunkBytes = 16ULL << 20;
 constexpr std::size_t kReaders = 16;
+
+// Files up to a third of the machine's memory are read through the page cache:
+// a restart then reads the weights from memory instead of the disk (about 25
+// GB/s against 4), and the first load costs the same. Larger files stay
+// O_DIRECT so they do not evict everything else. GUFO_UPLOAD_DIRECT=1 or
+// GUFO_UPLOAD_BUFFERED=1 override the choice.
+bool UseBufferedReads(std::uint64_t file_size) {
+  if (const char* e = std::getenv("GUFO_UPLOAD_DIRECT");
+      e != nullptr && e[0] == '1')
+    return false;
+  if (const char* e = std::getenv("GUFO_UPLOAD_BUFFERED");
+      e != nullptr && e[0] == '1')
+    return true;
+  const long pages = ::sysconf(_SC_PHYS_PAGES);
+  const long page_size = ::sysconf(_SC_PAGESIZE);
+  return pages > 0 && page_size > 0 &&
+         file_size <= static_cast<std::uint64_t>(pages) *
+                          static_cast<std::uint64_t>(page_size) / 3;
+}
 
 bool ReadFully(int fd, void* buffer, std::uint64_t offset, std::size_t length,
                std::size_t required) {
@@ -50,6 +70,7 @@ struct WeightUpload::State {
   struct Shard {
     int fd{-1};
     int direct_fd{-1};
+    bool keep_cache{false};
     std::uint64_t size{0};
   };
   struct Slot {
@@ -140,8 +161,10 @@ struct WeightUpload::State {
         return "shard read failed: " + std::string(std::strerror(errno));
       }
       payload = slot.buffer;
-      (void)::posix_fadvise(shard.fd, static_cast<off_t>(task.offset),
-                            static_cast<off_t>(task.size), POSIX_FADV_DONTNEED);
+      if (!shard.keep_cache)
+        (void)::posix_fadvise(shard.fd, static_cast<off_t>(task.offset),
+                              static_cast<off_t>(task.size),
+                              POSIX_FADV_DONTNEED);
     }
     auto status = hipMemcpyAsync(task.destination, payload, task.size,
                                  hipMemcpyHostToDevice, slot.stream);
@@ -200,8 +223,11 @@ std::unique_ptr<WeightUpload> WeightUpload::Create(
     shard.size = static_cast<std::uint64_t>(info.st_size);
     // Reopening the retained descriptor creates an independent O_DIRECT file
     // description without resolving the original, replaceable pathname.
-    const auto path = "/proc/self/fd/" + std::to_string(shard.fd);
-    shard.direct_fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+    shard.keep_cache = UseBufferedReads(shard.size);
+    if (!shard.keep_cache) {
+      const auto path = "/proc/self/fd/" + std::to_string(shard.fd);
+      shard.direct_fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+    }
   }
   for (auto& slot : s.slots) {
     if (hipHostMalloc(&slot.buffer, kChunkBytes + kAlignment) != hipSuccess ||

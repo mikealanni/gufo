@@ -4653,8 +4653,10 @@ public:
   }
 
   void Warmup() const {
-    const char* disabled = std::getenv("GUFO_WARMUP");
-    if (disabled != nullptr && disabled[0] == '0')
+    // A warmup pass costs more start-up time (about 4 s) than it saves the
+    // first request (about 0.1 s): it runs only when GUFO_WARMUP=1.
+    const char* enabled = std::getenv("GUFO_WARMUP");
+    if (enabled == nullptr || enabled[0] != '1')
       return;
     try {
       const std::size_t room = max_context_ > 128 ? max_context_ - 128 : 0;

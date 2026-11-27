@@ -2765,11 +2765,30 @@ std::shared_ptr<Model> Model::Load(const std::string& path,
     }
   }
   gufo::hip::TensorUpload tensor_upload(*reader);
+  struct LoadTimer {
+    std::chrono::steady_clock::time_point start{
+        std::chrono::steady_clock::now()};
+    double upload_ms{0.0};
+    bool on{std::getenv("INKLING_LOAD_TIMING") != nullptr};
+    ~LoadTimer() {
+      if (on)
+        std::fprintf(stderr,
+                     "inkling load: tensors %.0f ms, of which upload %.0f ms\n",
+                     std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - start)
+                         .count(),
+                     upload_ms);
+    }
+  } load_timer;
   const auto upload = [&](const gufo::core::GgufTensorInfo& info,
                           void* device) -> hipError_t {
     std::string upload_error;
-    return tensor_upload.Upload(info, device, &upload_error) ? hipSuccess
-                                                             : hipErrorUnknown;
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = tensor_upload.Upload(info, device, &upload_error);
+    load_timer.upload_ms += std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t0)
+                                .count();
+    return ok ? hipSuccess : hipErrorUnknown;
   };
   const auto npu_name = [](std::string_view n) {
     for (const char* suffix :
