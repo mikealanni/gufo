@@ -204,6 +204,7 @@ private:
     float* dpart{nullptr};
     float* parts{nullptr};
     float* mla_part{nullptr};
+    float* mla_qh{nullptr};
     float* quant_scratch{nullptr};
     int* argmax{nullptr};
     int* tok{nullptr};

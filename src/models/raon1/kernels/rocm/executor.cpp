@@ -145,7 +145,7 @@ Executor::Scratch::~Scratch() {
       x,    y,          pre,     post, comb,  attn_in, block, ffn_in, ffn_out,
       head, logits,     q,       k,    v,     fa,      gproj, beta,   delta,
       g2,   decay,      rda_out, qr,   mla_q, mla_qe,  kv,    qabs,   ctx,
-      gate, moe_logits, weights, gf,   uf,    act,     dpart, parts,  mla_part};
+      gate, moe_logits, weights, gf,   uf,    act,     dpart, parts,  mla_part, mla_qh};
   for (const float* p : ptrs)
     hipFree(const_cast<float*>(p));
   hipFree(ids);
@@ -1036,6 +1036,9 @@ bool Executor::AllocScratch(std::string* error) {
              static_cast<std::size_t>(config_.num_heads) * kMlaPartSplits *
                  (rank + 2),
              "mla_part", kMaxVerify) ||
+      !alloc(sc_->mla_qh,
+             static_cast<std::size_t>(config_.num_heads) * (rank + 64) / 2,
+             "mla_qh", kMaxVerify) ||
       !alloc(sc_->parts, static_cast<std::size_t>(use) * H, "parts")) {
     return false;
   }
@@ -1842,6 +1845,16 @@ bool Executor::RunBatch(Session& session, std::span<const std::int32_t> tokens,
             attended = true;
           }
         }
+        static const bool wmma_attn = [] {
+          const char* v = std::getenv("GUFO_RAON1_MLA_WMMA");
+          return v == nullptr || v[0] != '0';
+        }();
+        if (!attended && wmma_attn && n <= kMaxVerify &&
+            MlaAttendSplitWmma(sc_->qabs, sc_->mla_qe, sc_->mla_qh, st.lat,
+                               st.extra, sc_->mla_part, sc_->ctx,
+                               static_cast<int>(config_.num_heads),
+                               static_cast<int>(pos0), n, stream_) == 0)
+          attended = true;
         for (int t0 = 0; !attended && t0 < n; t0 += kMaxVerify) {
           const int cnt = std::min<int>(kMaxVerify, n - t0);
           if (MlaAttendSplit(sc_->qabs + t0 * abs_dim,

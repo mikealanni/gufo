@@ -96,6 +96,10 @@ int RdaRecur(const float* q, const float* k, const float* v, const float* decay,
 /// [t][heads][rank]. `part` needs tokens * heads * kMlaPartSplits * (rank + 2)
 /// floats.
 inline constexpr int kMlaPartSplits = 128;
+int MlaAttendSplitWmma(const float* qabs, const float* qe, void* q16,
+                       const float* lat, const float* extra, float* part,
+                       float* ctx, int heads, int pos0, int tokens,
+                       hipStream_t stream);
 int MlaAttendSplit(const float* qabs, const float* qe, const float* lat,
                    const float* extra, float* part, float* ctx, int heads,
                    int rank, int rope, int pos0, int tokens,

@@ -1347,6 +1347,228 @@ __global__ __launch_bounds__(kMlaSplitThreads) void MlaSplitTileKernel(
   }
 }
 
+
+using mw_v16h = __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
+using mw_v8f = __attribute__((__vector_size__(8 * sizeof(float)))) float;
+
+constexpr int kMwRows = 32;
+constexpr int kMwKeys = 16;
+constexpr int kMwDim = kRaonRank + kRaonRope;
+constexpr int kMwKs = kMwDim + 8;
+constexpr int kMwVs = 24;
+constexpr int kMwPs = 24;
+
+__global__ void MlaQHalfKernel(const float* __restrict__ qabs,
+                               const float* __restrict__ qe,
+                               _Float16* __restrict__ out, int rank,
+                               int rope) {
+  const std::size_t row = blockIdx.x;
+  for (int i = threadIdx.x; i < rank + rope; i += blockDim.x) {
+    const float v = i < rank ? qabs[row * rank + i] : qe[row * rope + i - rank];
+    out[row * (rank + rope) + i] = static_cast<_Float16>(v);
+  }
+}
+
+// Absorbed MLA attention on WMMA. A block owns 32 (token, head) rows and one
+// key split; the latent keys are staged once per 16-key tile and shared by
+// every row. Writes the same partials as MlaSplitTileKernel.
+__global__ __launch_bounds__(256) void MlaSplitWmmaKernel(
+    const _Float16* __restrict__ q16, const float* __restrict__ lat,
+    const float* __restrict__ extra, float* __restrict__ part, int heads,
+    int nrows, int pos0, int chunk, int splits, float scale) {
+  constexpr int rank = kRaonRank;
+  constexpr int rope = kRaonRope;
+  __shared__ __attribute__((aligned(16))) _Float16 Ks[kMwKeys][kMwKs];
+  __shared__ __attribute__((aligned(16))) _Float16 Vt[rank][kMwVs];
+  __shared__ __attribute__((aligned(16))) float Sp[4][kMwRows][kMwKeys];
+  __shared__ __attribute__((aligned(16))) _Float16 Ps[kMwRows][kMwPs];
+  __shared__ float corr_s[kMwRows];
+  const int tid = threadIdx.x;
+  const int wave = tid >> 5;
+  const int lane = tid & 31;
+  const int col = lane & 15;
+  const int hid = lane >> 4;
+  const int s = blockIdx.x;
+  const int row0 = blockIdx.y * kMwRows;
+  const int rlast = min(row0 + kMwRows, nrows) - 1;
+  const int len_max = pos0 + rlast / heads + 1;
+  const int start = s * chunk;
+  const int srow = tid >> 3;
+  const int sub = tid & 7;
+  const int grow = row0 + srow;
+  float* base_out = part + (static_cast<std::size_t>(grow) * splits + s) *
+                               (rank + 2);
+  if (start >= len_max) {
+    if (sub == 0 && grow < nrows) {
+      base_out[rank] = -INFINITY;
+      base_out[rank + 1] = 0.0F;
+    }
+    return;
+  }
+  const int end = min(len_max, start + chunk);
+  const int len_row =
+      grow < nrows ? pos0 + grow / heads + 1 : 0;
+  const int limit = min(len_row, end);
+
+  const int rt = wave & 1;
+  const int qq = wave >> 1;
+  mw_v16h qa[9];
+#pragma unroll
+  for (int j = 0; j < 9; ++j) {
+    const int r = row0 + rt * 16 + col;
+    qa[j] = r < nrows ? *reinterpret_cast<const mw_v16h*>(
+                            q16 + static_cast<std::size_t>(r) * kMwDim +
+                            (qq * 9 + j) * 16)
+                      : mw_v16h{};
+  }
+  mw_v8f o[2][4];
+#pragma unroll
+  for (int a = 0; a < 2; ++a)
+#pragma unroll
+    for (int b = 0; b < 4; ++b)
+      o[a][b] = mw_v8f{};
+  float m = -INFINITY;
+  float lsum = 0.0F;
+
+  float4 pre_lat[8];
+  float4 pre_rope;
+  auto fetch = [&](int base) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int idx = tid + i * 256;
+      const int k = idx >> 7;
+      const int c = idx & 127;
+      const int p = base + k;
+      pre_lat[i] = p < end ? *reinterpret_cast<const float4*>(
+                                 lat + static_cast<std::size_t>(p) * rank +
+                                 c * 4)
+                           : make_float4(0.F, 0.F, 0.F, 0.F);
+    }
+    const int k = tid >> 4;
+    const int c = tid & 15;
+    const int p = base + k;
+    pre_rope = p < end ? *reinterpret_cast<const float4*>(
+                             extra + static_cast<std::size_t>(p) * rope + c * 4)
+                       : make_float4(0.F, 0.F, 0.F, 0.F);
+  };
+  auto stage = [&]() {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int idx = tid + i * 256;
+      const int k = idx >> 7;
+      const int c = idx & 127;
+      const _Float16 h0 = static_cast<_Float16>(pre_lat[i].x);
+      const _Float16 h1 = static_cast<_Float16>(pre_lat[i].y);
+      const _Float16 h2 = static_cast<_Float16>(pre_lat[i].z);
+      const _Float16 h3 = static_cast<_Float16>(pre_lat[i].w);
+      Ks[k][c * 4 + 0] = h0;
+      Ks[k][c * 4 + 1] = h1;
+      Ks[k][c * 4 + 2] = h2;
+      Ks[k][c * 4 + 3] = h3;
+      Vt[c * 4 + 0][k] = h0;
+      Vt[c * 4 + 1][k] = h1;
+      Vt[c * 4 + 2][k] = h2;
+      Vt[c * 4 + 3][k] = h3;
+    }
+    const int k = tid >> 4;
+    const int c = tid & 15;
+    Ks[k][rank + c * 4 + 0] = static_cast<_Float16>(pre_rope.x);
+    Ks[k][rank + c * 4 + 1] = static_cast<_Float16>(pre_rope.y);
+    Ks[k][rank + c * 4 + 2] = static_cast<_Float16>(pre_rope.z);
+    Ks[k][rank + c * 4 + 3] = static_cast<_Float16>(pre_rope.w);
+  };
+
+  fetch(start);
+  for (int base = start; base < end; base += kMwKeys) {
+    __syncthreads();
+    stage();
+    __syncthreads();
+    if (base + kMwKeys < end)
+      fetch(base + kMwKeys);
+    {
+      mw_v8f acc = mw_v8f{};
+#pragma unroll
+      for (int j = 0; j < 9; ++j) {
+        const mw_v16h b = *reinterpret_cast<const mw_v16h*>(
+            &Ks[col][(qq * 9 + j) * 16]);
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(qa[j], b, acc);
+      }
+#pragma unroll
+      for (int i = 0; i < 8; ++i)
+        Sp[qq][rt * 16 + 2 * i + hid][col] = acc[i];
+    }
+    __syncthreads();
+    {
+      float v[2];
+#pragma unroll
+      for (int e = 0; e < 2; ++e) {
+        const int key = sub * 2 + e;
+        const float sc = (Sp[0][srow][key] + Sp[1][srow][key] +
+                          Sp[2][srow][key] + Sp[3][srow][key]) *
+                         scale;
+        v[e] = base + key < limit ? sc : -INFINITY;
+      }
+      float mx = fmaxf(v[0], v[1]);
+      mx = fmaxf(mx, __shfl_xor(mx, 1, 8));
+      mx = fmaxf(mx, __shfl_xor(mx, 2, 8));
+      mx = fmaxf(mx, __shfl_xor(mx, 4, 8));
+      const float mn = fmaxf(m, mx);
+      const float corr = mn == -INFINITY ? 1.0F : __expf(m - mn);
+      float psum = 0.0F;
+#pragma unroll
+      for (int e = 0; e < 2; ++e) {
+        const float p = v[e] == -INFINITY ? 0.0F : __expf(v[e] - mn);
+        psum += p;
+        Ps[srow][sub * 2 + e] = static_cast<_Float16>(p);
+      }
+      lsum = lsum * corr + psum;
+      m = mn;
+      if (sub == 0)
+        corr_s[srow] = corr;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int a = 0; a < 2; ++a) {
+      const mw_v16h pa =
+          *reinterpret_cast<const mw_v16h*>(&Ps[a * 16 + col][0]);
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const float c = corr_s[a * 16 + 2 * i + hid];
+#pragma unroll
+        for (int b = 0; b < 4; ++b)
+          o[a][b][i] *= c;
+      }
+#pragma unroll
+      for (int b = 0; b < 4; ++b) {
+        const mw_v16h vb = *reinterpret_cast<const mw_v16h*>(
+            &Vt[wave * 64 + b * 16 + col][0]);
+        o[a][b] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pa, vb, o[a][b]);
+      }
+    }
+  }
+  lsum += __shfl_xor(lsum, 1, 8);
+  lsum += __shfl_xor(lsum, 2, 8);
+  lsum += __shfl_xor(lsum, 4, 8);
+  if (sub == 0 && grow < nrows) {
+    base_out[rank] = m;
+    base_out[rank + 1] = lsum;
+  }
+#pragma unroll
+  for (int a = 0; a < 2; ++a) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int r = row0 + a * 16 + 2 * i + hid;
+      if (r >= nrows)
+        continue;
+      float* out = part + (static_cast<std::size_t>(r) * splits + s) *
+                              (rank + 2);
+#pragma unroll
+      for (int b = 0; b < 4; ++b)
+        out[wave * 64 + b * 16 + col] = o[a][b][i];
+    }
+  }
+}
+
 __global__ __launch_bounds__(kMlaSplitThreads) void MlaCombineKernel(
     const float* __restrict__ part, float* __restrict__ ctx, int heads,
     int rank, int splits) {
@@ -2109,6 +2331,27 @@ int MlaAttendSplit(const float* qabs, const float* qe, const float* lat,
       1.0F / sqrtf(static_cast<float>(kRaonNoPe + kRaonRope)));
   MlaCombineKernel<<<dim3(heads, tokens), kMlaSplitThreads, 0, stream>>>(
       part, ctx, heads, rank, splits);
+  return hipGetLastError() == hipSuccess ? 0 : -1;
+}
+
+int MlaAttendSplitWmma(const float* qabs, const float* qe, void* q16,
+                       const float* lat, const float* extra, float* part,
+                       float* ctx, int heads, int pos0, int tokens,
+                       hipStream_t stream) {
+  const int nrows = tokens * heads;
+  const int max_len = pos0 + tokens;
+  int chunk = std::max(256, (max_len + kMlaMaxSplits - 1) / kMlaMaxSplits);
+  chunk = (chunk + 63) / 64 * 64;
+  const int splits = (max_len + chunk - 1) / chunk;
+  MlaQHalfKernel<<<nrows, 192, 0, stream>>>(qabs, qe,
+                                            static_cast<_Float16*>(q16),
+                                            kRaonRank, kRaonRope);
+  MlaSplitWmmaKernel<<<dim3(splits, (nrows + kMwRows - 1) / kMwRows), 256, 0,
+                       stream>>>(
+      static_cast<const _Float16*>(q16), lat, extra, part, heads, nrows, pos0,
+      chunk, splits, 1.0F / sqrtf(static_cast<float>(kRaonNoPe + kRaonRope)));
+  MlaCombineKernel<<<dim3(heads, tokens), kMlaSplitThreads, 0, stream>>>(
+      part, ctx, heads, kRaonRank, splits);
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
