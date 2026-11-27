@@ -725,12 +725,10 @@ __global__ void TauScale(float* x, int per_token, const int* pos0,
     x[static_cast<std::size_t>(blockIdx.x) * per_token + i] *= tau;
 }
 
-__global__ void Conv(const float* cur, const float* w, const float* dyn,
-                     int heads, float* hist, float* out, int ch, int n,
-                     const float* add, float* win) {
-  const int c = blockIdx.x * blockDim.x + threadIdx.x;
-  if (c >= ch)
-    return;
+__device__ __forceinline__ void ConvOne(const float* cur, const float* w,
+                                         const float* dyn, int heads,
+                                         float* hist, float* out, int ch, int n,
+                                         const float* add, float* win, int c) {
   const int per = dyn != nullptr ? ch / heads : ch;
   const float norm =
       rsqrtf(static_cast<float>((dyn != nullptr ? 2 : 1) * kConvTaps + 1));
@@ -766,6 +764,28 @@ __global__ void Conv(const float* cur, const float* w, const float* dyn,
   }
   for (int k = 0; k < kHistory; ++k)
     hist[c * kHistory + k] = wn[k];
+}
+
+__global__ void Conv(const float* cur, const float* w, const float* dyn,
+                     int heads, float* hist, float* out, int ch, int n,
+                     const float* add, float* win) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= ch)
+    return;
+  ConvOne(cur, w, dyn, heads, hist, out, ch, n, add, win, c);
+}
+
+// the key and value convolutions of a decode visit: one thread runs the key
+// channel and then the value channel (the value output reuses the key input)
+__global__ void Conv2(const float* cur_a, const float* w_a, const float* dyn_a,
+                      float* hist_a, float* out_a, const float* cur_b,
+                      const float* w_b, const float* dyn_b, float* hist_b,
+                      float* out_b, int heads, int ch, int n) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= ch)
+    return;
+  ConvOne(cur_a, w_a, dyn_a, heads, hist_a, out_a, ch, n, nullptr, nullptr, c);
+  ConvOne(cur_b, w_b, dyn_b, heads, hist_b, out_b, ch, n, nullptr, nullptr, c);
 }
 
 __global__ void ConvT(const float* cur, const float* w, const float* dyn,
@@ -5012,12 +5032,21 @@ struct Session::Impl : Scratch {
     (void)inp;
     (void)inh;
     (void)msgs_;
-    Convolve(tmp, m->T(m->P(p, "attn_k_conv.weight")), L.dk, nkv, sl.hist_k, k,
-             nkv * hd, n);
     float* vtmp = tmp;
     L.vtmp = vtmp;
-    Convolve(v, m->T(m->P(p, "attn_v_conv.weight")), L.dv, nkv, sl.hist_v, vtmp,
-             nkv * hd, n);
+    if (n < kWmmaMinTokens && !(all_rows && n <= static_cast<int>(kMaxVerifyRows))) {
+      const int ch = nkv * hd;
+      Conv2<<<(ch + 127) / 128, 128, 0, stream>>>(
+          tmp, static_cast<const float*>(m->T(m->P(p, "attn_k_conv.weight")).dev),
+          L.dk, sl.hist_k, k, v,
+          static_cast<const float*>(m->T(m->P(p, "attn_v_conv.weight")).dev),
+          L.dv, sl.hist_v, vtmp, nkv, ch, n);
+    } else {
+      Convolve(tmp, m->T(m->P(p, "attn_k_conv.weight")), L.dk, nkv, sl.hist_k,
+               k, nkv * hd, n);
+      Convolve(v, m->T(m->P(p, "attn_v_conv.weight")), L.dv, nkv, sl.hist_v,
+               vtmp, nkv * hd, n);
+    }
     const int* tau_p = swa ? nullptr : d_pos;
     const float tau_floor = static_cast<float>(c.log_scale_floor);
     if (big && hd <= 128 && nrel <= 128) {
