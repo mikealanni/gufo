@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -2235,13 +2236,15 @@ bool Executor::SaveSnapshot(const Session& session, std::span<std::uint8_t> out,
       static_cast<std::size_t>(session.position) * config_.kv_lora_rank * 4;
   const std::size_t rope =
       static_cast<std::size_t>(session.position) * config_.qk_rope_head_dim * 4;
+  const auto t_wait = std::chrono::steady_clock::now();
   hipStreamSynchronize(stream_);
+  const auto t_copy = std::chrono::steady_clock::now();
   std::uint8_t* dst = out.data();
   auto copy = [&](const void* src, std::size_t bytes) {
     if (bytes == 0)
       return true;
-    const bool ok =
-        hipMemcpy(dst, src, bytes, hipMemcpyDeviceToHost) == hipSuccess;
+    const bool ok = hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToHost,
+                                   stream_) == hipSuccess;
     dst += bytes;
     return ok;
   };
@@ -2256,7 +2259,15 @@ bool Executor::SaveSnapshot(const Session& session, std::span<std::uint8_t> out,
       return false;
     }
   }
-  return true;
+  const bool done = hipStreamSynchronize(stream_) == hipSuccess;
+  if (std::getenv("RAON1_SNAP_LOG") != nullptr)
+    std::fprintf(stderr, "raon1: snapshot wait-for-gpu %.1f ms, copy %.1f ms\n",
+                 std::chrono::duration<double, std::milli>(t_copy - t_wait)
+                     .count(),
+                 std::chrono::duration<double, std::milli>(
+                     std::chrono::steady_clock::now() - t_copy)
+                     .count());
+  return done;
 }
 
 bool Executor::RestoreSnapshot(Session& session, std::uint32_t position,

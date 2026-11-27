@@ -4062,10 +4062,91 @@ std::vector<std::int32_t> Raon1EngineTokens(
   return converted;
 }
 
+// Snapshot buffers are recycled: a fresh multi-GB buffer pays first-touch page
+// faults on every capture (~9 GB/s), a reused one is already resident.
+class Raon1SnapshotPool {
+public:
+  static Raon1SnapshotPool& Instance() {
+    static Raon1SnapshotPool pool;
+    return pool;
+  }
+  struct HostFree {
+    void operator()(std::uint8_t* p) const noexcept {
+      if (p != nullptr)
+        (void)hipHostFree(p);
+    }
+  };
+  using Buffer = std::unique_ptr<std::uint8_t[], HostFree>;
+  Buffer Get(std::size_t size, std::size_t* capacity) {
+    {
+      const std::lock_guard lock(mutex_);
+      for (std::size_t i = 0; i < free_.size(); ++i) {
+        if (free_[i].second >= size) {
+          auto buffer = std::move(free_[i].first);
+          *capacity = free_[i].second;
+          free_.erase(free_.begin() + static_cast<std::ptrdiff_t>(i));
+          return buffer;
+        }
+      }
+    }
+    // headroom: the next turn's snapshot is a little larger and must still fit
+    constexpr std::size_t kRound = std::size_t{64} << 20;
+    const std::size_t want = size + size / 4;
+    const std::size_t cap = (want + kRound - 1) / kRound * kRound;
+    // pinned once, then reused: device-to-host copies into it run at DMA speed
+    void* mem = nullptr;
+    if (hipHostMalloc(&mem, cap, hipHostMallocDefault) != hipSuccess)
+      throw std::bad_alloc();
+    *capacity = cap;
+    return Buffer(static_cast<std::uint8_t*>(mem));
+  }
+  void Put(Buffer buffer, std::size_t capacity) {
+    constexpr std::size_t kMaxPooled = 3;
+    const std::lock_guard lock(mutex_);
+    if (free_.size() < kMaxPooled)
+      free_.emplace_back(std::move(buffer), capacity);
+  }
+
+private:
+  std::mutex mutex_;
+  std::vector<std::pair<Buffer, std::size_t>> free_;
+};
+
+class Raon1SnapshotBytes {
+public:
+  explicit Raon1SnapshotBytes(std::size_t size) : size_(size) {
+    data_ = Raon1SnapshotPool::Instance().Get(size, &capacity_);
+  }
+  ~Raon1SnapshotBytes() {
+    if (data_ != nullptr)
+      Raon1SnapshotPool::Instance().Put(std::move(data_), capacity_);
+  }
+  Raon1SnapshotBytes(const Raon1SnapshotBytes&) = delete;
+  Raon1SnapshotBytes& operator=(const Raon1SnapshotBytes&) = delete;
+  Raon1SnapshotBytes(Raon1SnapshotBytes&&) noexcept = default;
+  Raon1SnapshotBytes& operator=(Raon1SnapshotBytes&&) noexcept = default;
+  [[nodiscard]] std::uint8_t* data() noexcept { return data_.get(); }
+  [[nodiscard]] const std::uint8_t* data() const noexcept {
+    return data_.get();
+  }
+  [[nodiscard]] std::size_t size() const noexcept { return size_; }
+  [[nodiscard]] std::span<std::uint8_t> span() noexcept {
+    return {data_.get(), size_};
+  }
+  [[nodiscard]] std::span<const std::uint8_t> span() const noexcept {
+    return {data_.get(), size_};
+  }
+
+private:
+  Raon1SnapshotPool::Buffer data_;
+  std::size_t capacity_{0};
+  std::size_t size_{0};
+};
+
 class Raon1TextRunnerSnapshot final : public TextRunnerSnapshot {
 public:
   Raon1TextRunnerSnapshot(std::shared_ptr<Raon1Model> model,
-                          std::vector<std::uint8_t> bytes, std::size_t position)
+                          Raon1SnapshotBytes bytes, std::size_t position)
       : model(std::move(model)), bytes(std::move(bytes)), position(position) {}
 
   [[nodiscard]] std::size_t PayloadBytes() const noexcept override {
@@ -4073,7 +4154,7 @@ public:
   }
 
   std::shared_ptr<Raon1Model> model;
-  std::vector<std::uint8_t> bytes;
+  Raon1SnapshotBytes bytes;
   std::size_t position;
 };
 
@@ -4348,10 +4429,17 @@ public:
   [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Snapshot(
       const TextRunnerState& state) const override {
     const auto& raon1 = RequireRaon1State(state);
-    std::vector<std::uint8_t> bytes(raon1.session().SnapshotBytes());
+    const auto snap_t0 = std::chrono::steady_clock::now();
+    Raon1SnapshotBytes bytes(raon1.session().SnapshotBytes());
     std::string error;
-    if (!raon1.session().SaveSnapshot(bytes, &error))
+    if (!raon1.session().SaveSnapshot(bytes.span(), &error))
       throw std::runtime_error("Raon-1 snapshot failed: " + error);
+    if (std::getenv("RAON1_SNAP_LOG") != nullptr)
+      std::fprintf(stderr, "raon1: snapshot %.2f GB in %.1f ms\n",
+                   static_cast<double>(bytes.size()) / 1e9,
+                   std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - snap_t0)
+                       .count());
     return std::make_unique<Raon1TextRunnerSnapshot>(model_, std::move(bytes),
                                                      raon1.position());
   }
@@ -4365,7 +4453,7 @@ public:
           "Raon-1 snapshot does not belong to this model");
     auto& restored = RequireRaon1State(state);
     std::string error;
-    if (!restored.session().RestoreSnapshot(raon1_snapshot->bytes, &error)) {
+    if (!restored.session().RestoreSnapshot(raon1_snapshot->bytes.span(), &error)) {
       restored.Invalidate();
       throw std::runtime_error("Raon-1 snapshot restore failed: " + error);
     }
@@ -4391,7 +4479,7 @@ public:
 
   void StreamPersistentSnapshot(const TextRunnerSnapshot& snapshot,
                                 const SnapshotSink& sink) const override {
-    sink(RequireRaon1Snapshot(snapshot).bytes);
+    sink(RequireRaon1Snapshot(snapshot).bytes.span());
   }
 
   void RestorePersistentSnapshot(
