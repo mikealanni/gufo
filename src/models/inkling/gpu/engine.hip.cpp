@@ -182,7 +182,8 @@ template<int TY>
 __global__ void GemmDp4(const unsigned char* w, std::size_t row_bytes, int cols,
                         int rows, const int* group, const int* xrow,
                         const float* scale, const signed char* xq,
-                        const float* xs, float* y, const int* skip = nullptr) {
+                        const float* xs, float* y, const int* skip = nullptr,
+                        bool nt = false) {
   if (skip != nullptr && *skip != 0)
     return;
   const int lane = threadIdx.x % warpSize;
@@ -222,7 +223,17 @@ __global__ void GemmDp4(const unsigned char* w, std::size_t row_bytes, int cols,
       a = Dot4(w1.w, x1.w, a);
       acc += static_cast<float>(a) * d * xsp[u];
     } else {
-      const uint4 q = *reinterpret_cast<const uint4*>(row + u * 16);
+      uint4 q;
+      if (nt) {
+        // expert weights are read once: loads that do not allocate in the
+        // last-level cache keep the prefetched dense weights there
+        typedef unsigned int U32x4 __attribute__((ext_vector_type(4)));
+        const U32x4 t = __builtin_nontemporal_load(
+            reinterpret_cast<const U32x4*>(row + u * 16));
+        q = make_uint4(t.x, t.y, t.z, t.w);
+      } else {
+        q = *reinterpret_cast<const uint4*>(row + u * 16);
+      }
       const float d0 = Ue4m3(row[(cols >> 1) + u * 2]);
       const float d1 = Ue4m3(row[(cols >> 1) + u * 2 + 1]);
       const unsigned int lo = 0x0F0F0F0FU;
@@ -286,6 +297,125 @@ __global__ void GemmDp4Q8N(const unsigned char* w, std::size_t row_bytes,
       a += __shfl_down(a, off);
     if (lane == 0)
       y[static_cast<std::size_t>(t) * ldy + r] = a;
+  }
+}
+
+struct TouchList {
+  const void* p[12];
+  std::size_t bytes[12];
+  int n;
+};
+
+// Reads every range of the list (a cache prefetch: nothing is written).
+__global__ void __launch_bounds__(256)
+    TouchKernel(TouchList l, unsigned int* sink) {
+  unsigned int acc = 0;
+  for (int k = 0; k < l.n; ++k) {
+    const uint4* base = static_cast<const uint4*>(l.p[k]);
+    const std::size_t cnt = l.bytes[k] / 16;
+    for (std::size_t i =
+             static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < cnt; i += static_cast<std::size_t>(gridDim.x) * blockDim.x) {
+      const uint4 v = base[i];
+      acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+  }
+  if (acc == 0x9E3779B1U)
+    sink[0] = acc;
+}
+
+// Quantizes up to three distinct [rows][cols] inputs in one launch (blockIdx.z
+// selects the input) into xq [3][rows * cols] and xs [3][rows * cols / 32].
+__global__ void QuantRowsMulti(const float* x0, const float* x1,
+                               const float* x2, signed char* xq, float* xs,
+                               int cols, int rows_cap) {
+  const int z = blockIdx.z;
+  const float* x = z == 0 ? x0 : (z == 1 ? x1 : x2);
+  const int row = blockIdx.x;
+  const int unit = blockIdx.y;
+  const int lane = threadIdx.x;
+  const std::size_t off = static_cast<std::size_t>(z) * rows_cap;
+  const float v = x[static_cast<std::size_t>(row) * cols + unit * 32 + lane];
+  float amax = fabsf(v);
+  for (int o = 16; o > 0; o >>= 1)
+    amax = fmaxf(amax, __shfl_xor(amax, o));
+  const float sc = amax / 127.0F;
+  const float q = sc > 0.0F ? roundf(v / sc) : 0.0F;
+  xq[off * cols + static_cast<std::size_t>(row) * cols + unit * 32 + lane] =
+      static_cast<signed char>(q);
+  if (lane == 0)
+    xs[off * (cols / 32) + static_cast<std::size_t>(row) * (cols / 32) + unit] =
+        sc;
+}
+
+struct MultiSeg {
+  const unsigned char* w;
+  std::size_t row_bytes;
+  float* y;
+  std::size_t ldy;
+  int rows;
+  int xi;      // which quantized input
+  int block0;  // first block of this matrix
+};
+struct MultiArgs {
+  MultiSeg seg[6];
+  int nseg;
+  int cols;
+  int rows_cap;
+  const signed char* xq;
+  const float* xs;
+};
+
+// Several Q8_0 matrices over (up to three) quantized inputs in one launch; the
+// arithmetic of every row is that of GemmDp4Q8N<NT>.
+template<int NT>
+__global__ void GemmDp4Q8Multi(MultiArgs a) {
+  int si = 0;
+  while (si + 1 < a.nseg &&
+         static_cast<int>(blockIdx.x) >= a.seg[si + 1].block0)
+    ++si;
+  const MultiSeg& sg = a.seg[si];
+  const int lane = threadIdx.x % warpSize;
+  const int r = (blockIdx.x - sg.block0) * (blockDim.x / warpSize) +
+                threadIdx.x / warpSize;
+  if (r >= sg.rows)
+    return;
+  const int cols = a.cols;
+  const signed char* xq =
+      a.xq + static_cast<std::size_t>(sg.xi) * a.rows_cap * cols;
+  const float* xs =
+      a.xs + static_cast<std::size_t>(sg.xi) * a.rows_cap * (cols / 32);
+  const unsigned char* row = sg.w + static_cast<std::size_t>(r) * sg.row_bytes;
+  float acc[NT] = {};
+  for (int u = lane; u < cols / 32; u += warpSize) {
+    const float d =
+        __half2float(*reinterpret_cast<const __half*>(row + cols + u * 2));
+    const uint4* wv = reinterpret_cast<const uint4*>(row + u * 32);
+    const uint4 w0 = wv[0];
+    const uint4 w1 = wv[1];
+    for (int t = 0; t < NT; ++t) {
+      const uint4* xv = reinterpret_cast<const uint4*>(
+          xq + static_cast<std::size_t>(t) * cols + u * 32);
+      const uint4 x0 = xv[0];
+      const uint4 x1 = xv[1];
+      int acci = Dot4(w0.x, x0.x, 0);
+      acci = Dot4(w0.y, x0.y, acci);
+      acci = Dot4(w0.z, x0.z, acci);
+      acci = Dot4(w0.w, x0.w, acci);
+      acci = Dot4(w1.x, x1.x, acci);
+      acci = Dot4(w1.y, x1.y, acci);
+      acci = Dot4(w1.z, x1.z, acci);
+      acci = Dot4(w1.w, x1.w, acci);
+      acc[t] += static_cast<float>(acci) * d *
+                xs[static_cast<std::size_t>(t) * (cols / 32) + u];
+    }
+  }
+  for (int t = 0; t < NT; ++t) {
+    float v = acc[t];
+    for (int off = warpSize / 2; off > 0; off >>= 1)
+      v += __shfl_down(v, off);
+    if (lane == 0)
+      sg.y[static_cast<std::size_t>(t) * sg.ldy + r] = v;
   }
 }
 
@@ -3704,6 +3834,12 @@ struct Session::Impl : Scratch {
     return p;
   }
   ~Impl() {
+    if (pf_stream != nullptr)
+      (void)hipStreamDestroy(pf_stream);
+    if (pf_fork != nullptr)
+      (void)hipEventDestroy(pf_fork);
+    if (pf_join != nullptr)
+      (void)hipEventDestroy(pf_join);
     if (graph_exec != nullptr)
       (void)hipGraphExecDestroy(graph_exec);
     if (graph != nullptr)
@@ -3768,6 +3904,119 @@ struct Session::Impl : Scratch {
     }
     *ntiles = (n + bn - 1) / bn;
     return dense_bounds_buf;
+  }
+  // Decode-sized batches (1 to 8 rows): the Q8_0 matrices of one layer visit
+  // run in one launch after one quantize launch (instead of a quantize and a
+  // GEMV launch per matrix). False when a matrix is not Q8_0 of K 2304.
+  // Decode steps: the dense weights of a layer visit are read on a side
+  // stream while the latency-bound mixes, controllers and attention run (the
+  // DRAM is idle then), so the GEMVs that follow find them in the last-level
+  // cache.
+  hipStream_t pf_stream{nullptr};
+  hipEvent_t pf_fork{nullptr}, pf_join{nullptr};
+  unsigned int* pf_sink{nullptr};
+  bool pf_open{false};
+  bool pf_on{std::getenv("INKLING_DECODE_PREFETCH") != nullptr &&
+             std::getenv("INKLING_DECODE_PREFETCH")[0] == '1'};
+  bool expert_nt{std::getenv("INKLING_EXPERT_NT") != nullptr &&
+                 std::getenv("INKLING_EXPERT_NT")[0] == '1'};
+  static constexpr int kPrefetchBlocks = 8;
+  void Prefetch(std::initializer_list<const Tensor*> ts, int n) {
+    if (!pf_on || pf_stream == nullptr || n > static_cast<int>(kMaxVerifyRows))
+      return;
+    TouchList l{};
+    for (const Tensor* t : ts) {
+      if (l.n < 12 && t->dev != nullptr) {
+        l.p[l.n] = t->dev;
+        l.bytes[l.n] = static_cast<std::size_t>(t->rows) * t->row_bytes;
+        ++l.n;
+      }
+    }
+    if (l.n == 0)
+      return;
+    HIP_OK(hipEventRecord(pf_fork, stream));
+    HIP_OK(hipStreamWaitEvent(pf_stream, pf_fork, 0));
+    TouchKernel<<<kPrefetchBlocks, 256, 0, pf_stream>>>(l, pf_sink);
+    pf_open = true;
+  }
+  void PrefetchJoin() {
+    if (!pf_open)
+      return;
+    HIP_OK(hipEventRecord(pf_join, pf_stream));
+    HIP_OK(hipStreamWaitEvent(stream, pf_join, 0));
+    pf_open = false;
+  }
+  struct MultiMat {
+    const Tensor* w;
+    const float* x;
+    float* y;
+    int ldy;
+  };
+  signed char* xqm{nullptr};
+  float* xqsm{nullptr};
+  bool DenseMulti(const MultiMat* mats, int count, int n) {
+    static const bool enabled = std::getenv("INKLING_FUSE_PROJ") == nullptr ||
+                                std::getenv("INKLING_FUSE_PROJ")[0] != '0';
+    if (!enabled || no_dp4 || n < 1 || n > 8 || count > 6)
+      return false;
+    const int cols = 2304;
+    for (int i = 0; i < count; ++i)
+      if (mats[i].w->type != kTypeQ8 ||
+          static_cast<int>(mats[i].w->cols) != cols)
+        return false;
+    if (xqm == nullptr)
+      return false;
+    const float* xin[3] = {nullptr, nullptr, nullptr};
+    int nx = 0;
+    MultiArgs a{};
+    a.nseg = count;
+    a.cols = cols;
+    a.rows_cap = 8;
+    a.xq = xqm;
+    a.xs = xqsm;
+    int block = 0;
+    const int rpb = kThreads * 2 / 32;
+    for (int i = 0; i < count; ++i) {
+      int xi = -1;
+      for (int j = 0; j < nx; ++j)
+        if (xin[j] == mats[i].x)
+          xi = j;
+      if (xi < 0) {
+        if (nx == 3)
+          return false;
+        xin[nx] = mats[i].x;
+        xi = nx++;
+      }
+      a.seg[i] = {static_cast<const unsigned char*>(mats[i].w->dev),
+                  mats[i].w->row_bytes,
+                  mats[i].y,
+                  static_cast<std::size_t>(mats[i].ldy),
+                  static_cast<int>(mats[i].w->rows),
+                  xi,
+                  block};
+      block += (static_cast<int>(mats[i].w->rows) + rpb - 1) / rpb;
+    }
+    QuantRowsMulti<<<dim3(n, cols / 32, nx), 32, 0, stream>>>(
+        xin[0], nx > 1 ? xin[1] : xin[0], nx > 2 ? xin[2] : xin[0], xqm, xqsm,
+        cols, 8);
+    switch (n) {
+#define INKLING_MULTI(NT)                                      \
+  case NT:                                                     \
+    GemmDp4Q8Multi<NT><<<block, kThreads * 2, 0, stream>>>(a); \
+    break;
+      INKLING_MULTI(1)
+      INKLING_MULTI(2)
+      INKLING_MULTI(3)
+      INKLING_MULTI(4)
+      INKLING_MULTI(5)
+      INKLING_MULTI(6)
+      INKLING_MULTI(7)
+      INKLING_MULTI(8)
+#undef INKLING_MULTI
+      default:
+        return false;
+    }
+    return true;
   }
   void Dense(const Tensor& w, const float* xin, std::size_t ldx, float* yout,
              std::size_t ldy, int n, int rows = -1,
@@ -3917,7 +4166,7 @@ struct Session::Impl : Scratch {
         GemmDp4<kTypeNvfp4><<<g8, kThreads * 2, 0, stream>>>(
             static_cast<const unsigned char*>(w.dev), w.row_bytes,
             static_cast<int>(w.cols), rows, ids_flat, xrow, scale, xq, xqs,
-            yout);
+            yout, nullptr, expert_nt);
       } else {
         GemmDp4<kTypeQ8><<<g8, kThreads * 2, 0, stream>>>(
             static_cast<const unsigned char*>(w.dev), w.row_bytes,
@@ -4056,6 +4305,7 @@ struct Session::Impl : Scratch {
     float* vtmp{nullptr};
     std::uint64_t ticket{0};
     bool npu_on{false};
+    bool gate_done{false};
     bool out_npu{false};
   };
 
@@ -4383,18 +4633,31 @@ struct Session::Impl : Scratch {
       NpuQkvBegin(L, 0);
     xq_src = nullptr;
     xq_reuse = true;
-    if (!L.npu_on || (npu_mask & 1) == 0)
+    bool fused = false;
+    L.gate_done = false;
+    if (!L.npu_on && n <= static_cast<int>(kMaxVerifyRows)) {
+      const MultiMat mats[5] = {
+          {&m->T(m->P(p, "attn_q.weight")), inp[0], q, nh * hd},
+          {&m->T(m->P(p, "attn_rel.weight")), inp[0], r, nrel * nh},
+          {&m->T(m->P(p, "attn_k.weight")), inp[1], tmp, nkv * hd},
+          {&m->T(m->P(p, "attn_v.weight")), inp[2], v, nkv * hd},
+          {&m->T(m->P(p, "attn_gate.weight")), inp[0], gate, nh * hd}};
+      fused = DenseMulti(mats, 5, n);
+      L.gate_done = fused;
+    }
+    if (!fused && (!L.npu_on || (npu_mask & 1) == 0))
       Dense(m->T(m->P(p, "attn_q.weight")), inp[0], h, q, nh * hd, n, -1,
             inh[0]);
-    Dense(m->T(m->P(p, "attn_rel.weight")), inp[0], h, r, nrel * nh, n, -1,
-          inh[0]);
-    if (!L.npu_on || (npu_mask & 4) == 0)
+    if (!fused)
+      Dense(m->T(m->P(p, "attn_rel.weight")), inp[0], h, r, nrel * nh, n, -1,
+            inh[0]);
+    if (!fused && (!L.npu_on || (npu_mask & 4) == 0))
       Dense(m->T(m->P(p, "attn_k.weight")), inp[1], h, tmp, nkv * hd, n, -1,
             inh[1]);
     if (!swa)
       Dense(m->T(m->P(p, "attn_k_conv_proj.weight")), inp[1], h, dyn_k,
             kConvTaps * nkv, n, -1, inh[1]);
-    if (!L.npu_on || (npu_mask & 8) == 0)
+    if (!fused && (!L.npu_on || (npu_mask & 8) == 0))
       Dense(m->T(m->P(p, "attn_v.weight")), inp[2], h, v, nkv * hd, n, -1,
             inh[2]);
     if (!swa) {
@@ -4445,7 +4708,7 @@ struct Session::Impl : Scratch {
         NpuQkvEnd(L, r0);
       }
     }
-    if (!L.npu_on || (npu_mask & 2) == 0)
+    if (!L.gate_done && (!L.npu_on || (npu_mask & 2) == 0))
       Dense(m->T(m->P(p, "attn_gate.weight")), inp[0], h, gate, nh * hd, n, -1,
             inh[0]);
   }
@@ -4793,9 +5056,20 @@ struct Session::Impl : Scratch {
              std::vector<const float*>& blocks, const float* msgs_, int n) {
     LayerCtx L;
     BeginLayer(L, slot, ip, msgs_, n);
+    if (pf_on) {
+      const std::uint32_t pp = L.p;
+      Prefetch(
+          {&m->T(m->P(pp, "attn_q.weight")),
+           &m->T(m->P(pp, "attn_gate.weight")),
+           &m->T(m->P(pp, "attn_k.weight")), &m->T(m->P(pp, "attn_v.weight")),
+           &m->T(m->P(pp, "attn_rel.weight"))},
+          n);
+    }
     LayerFront(L, blocks);
     LayerQkvBegin(L);
     LayerQkvEnd(L);
+    if (pf_on)
+      Prefetch({&m->T(m->P(L.p, "attn_output.weight"))}, n);
     LayerAttn(L);
     LayerOut1a(L);
     LayerOut1b(L, blocks);
@@ -6155,6 +6429,7 @@ struct Session::Impl : Scratch {
       Layer(il, il, blocks, nullptr, n);
       Tap(v++, n);
     }
+    PrefetchJoin();
     Mixer(blocks, cur,
           static_cast<const float*>(m->T("output_res_query.weight").dev), 1, n,
           x);
@@ -6717,6 +6992,13 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
     sc.bank_out = i.Alloc(b * h);
     sc.d_logits = i.Alloc(kMaxVerifyRows * c.vocab_padded);
     i.d_argmax = static_cast<int*>(i.AllocBytes(kMaxVerifyRows * 4));
+    HIP_OK(hipStreamCreateWithFlags(&i.pf_stream, hipStreamNonBlocking));
+    HIP_OK(hipEventCreateWithFlags(&i.pf_fork, hipEventDisableTiming));
+    HIP_OK(hipEventCreateWithFlags(&i.pf_join, hipEventDisableTiming));
+    i.pf_sink = static_cast<unsigned int*>(i.AllocBytes(64));
+    i.xqm = static_cast<signed char*>(i.AllocBytes(std::size_t{3} * 8 * 2304));
+    i.xqsm = static_cast<float*>(
+        i.AllocBytes(std::size_t{3} * 8 * (2304 / 32) * sizeof(float)));
     sc.d_pos = static_cast<int*>(i.AllocBytes(4));
     if (state_->npu) {
       std::string npu_error;
