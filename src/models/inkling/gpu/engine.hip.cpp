@@ -945,7 +945,8 @@ __global__ void Mix(StatePtrs blocks, const float* cur, const float* query,
       wgt[q][s] = wgt[q][s] / den * inv[s];
   }
   __syncthreads();
-  for (int i = threadIdx.x; i < h; i += blockDim.x) {
+  for (int i = blockIdx.y * blockDim.x + threadIdx.x; i < h;
+       i += gridDim.y * blockDim.x) {
     float a[4] = {};
     for (int s = 0; s < ns; ++s) {
       const float v = (s < blocks.count ? blocks.p[s] : cur)[toff + i];
@@ -4328,7 +4329,11 @@ struct Session::Impl : Scratch {
           std::getenv("INKLING_MIX_THREADS") != nullptr
               ? std::atoi(std::getenv("INKLING_MIX_THREADS"))
               : 576;
-      Mix<<<n, mix_threads, 0, stream>>>(
+      static const int mix_split =
+          std::getenv("INKLING_MIX_SPLIT") != nullptr
+              ? std::atoi(std::getenv("INKLING_MIX_SPLIT"))
+              : 4;
+      Mix<<<dim3(n, mix_split), mix_threads, 0, stream>>>(
           sp, cur_, query, nq, static_cast<int>(m->config.hidden_size), n, out);
     }
   }
