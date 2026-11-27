@@ -3626,6 +3626,13 @@ __global__ void ArgMaxRow(const float* x, int n, int* out, int* out2,
   int idx = 0;
   for (int i = threadIdx.x; i < n; i += blockDim.x) {
     const float v = x[i];
+    if (conf == nullptr) {
+      if (v > best) {
+        best = v;
+        idx = i;
+      }
+      continue;
+    }
     if (v > best) {
       sum = sum * expf(best - v) + 1.0F;
       best = v;
