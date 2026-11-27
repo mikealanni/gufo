@@ -4496,7 +4496,8 @@ struct Session::Impl : Scratch {
       if (m->tensors.count(fb + "down.weight.h") == 0)
         return false;
       cb.cur[j] = cur_[j];
-      cb.msg[j] = msgs3 + j * static_cast<std::size_t>(m->config.hidden_size);
+      cb.msg[j] = msgs3 + static_cast<std::size_t>(j) * n *
+                              m->config.hidden_size;
       cb.down[j] = m->T(fb + "down.weight.h").dev;
       cb.gain[j] = m->T(fb + "gain.weight.h").dev;
       cb.forget[j] = m->T(fb + "forget.weight.h").dev;
