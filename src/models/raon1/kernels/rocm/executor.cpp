@@ -1833,11 +1833,22 @@ bool Executor::RunBatch(Session& session, std::span<const std::int32_t> tokens,
                          local_start, static_cast<int>(pos0), n, stream_);
             GatherKvFloat(st.lat, st.extra, mla_->kpos, nk, mla_->lat_g,
                           mla_->extra_g, stream_);
-            if (MlaAttendSplit(sc_->qabs, sc_->mla_qe, mla_->lat_g,
-                               mla_->extra_g, sc_->mla_part, sc_->ctx,
-                               static_cast<int>(config_.num_heads), rank,
-                               static_cast<int>(config_.qk_rope_head_dim),
-                               nk - n, n, stream_) != 0) {
+            static const bool wmma_sparse = [] {
+              const char* v = std::getenv("GUFO_RAON1_MLA_WMMA");
+              return v == nullptr || v[0] != '0';
+            }();
+            if ((wmma_sparse
+                     ? MlaAttendSplitWmma(sc_->qabs, sc_->mla_qe, sc_->mla_qh,
+                                          mla_->lat_g, mla_->extra_g,
+                                          sc_->mla_part, sc_->ctx,
+                                          static_cast<int>(config_.num_heads),
+                                          nk - n, n, stream_)
+                     : MlaAttendSplit(
+                           sc_->qabs, sc_->mla_qe, mla_->lat_g, mla_->extra_g,
+                           sc_->mla_part, sc_->ctx,
+                           static_cast<int>(config_.num_heads), rank,
+                           static_cast<int>(config_.qk_rope_head_dim), nk - n,
+                           n, stream_)) != 0) {
               if (error)
                 *error = "MLA attention failed";
               return false;
@@ -2367,7 +2378,13 @@ bool Executor::RestoreSnapshot(Session& session, std::uint32_t position,
         *error = "snapshot restore failed";
       return false;
     }
+    if (sparse_.on && st.pool != nullptr && position > 0 && !config_.IsRda(l)) {
+      const int blocks = static_cast<int>((position + 63) / 64);
+      PoolUpdate(st.lat, st.pool, 0, blocks, static_cast<int>(position),
+                 stream_);
+    }
   }
+  hipStreamSynchronize(stream_);
   return true;
 }
 

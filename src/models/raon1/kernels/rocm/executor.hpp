@@ -103,7 +103,7 @@ public:
   /// recurrent state; requires SetRecording(true) and SaveState before it.
   bool Rollback(Session& session, std::uint32_t keep, std::string* error);
   void SetRecording(bool on) { recording_ = on; }
-  [[nodiscard]] bool SnapshotSupported() const noexcept { return !sparse_.on; }
+  [[nodiscard]] bool SnapshotSupported() const noexcept { return true; }
   [[nodiscard]] std::size_t SnapshotBytes(const Session& session) const;
   bool SaveSnapshot(const Session& session, std::span<std::uint8_t> out,
                     std::string* error);
