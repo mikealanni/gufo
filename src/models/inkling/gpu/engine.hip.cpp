@@ -1056,8 +1056,16 @@ constexpr int kControlWaves = 8;
 
 // low[row][r] = down[r] . [rms(cur[row]); rms(msg[row])] for 8 outputs per
 // block
+// BF16 weight values (the checkpoint's own precision) widen exactly
+__device__ __forceinline__ float4 Bf16x4(uint2 u) {
+  return make_float4(
+      __uint_as_float(u.x << 16), __uint_as_float(u.x & 0xFFFF0000U),
+      __uint_as_float(u.y << 16), __uint_as_float(u.y & 0xFFFF0000U));
+}
+
+template<bool H>
 __global__ void __launch_bounds__(kControlWaves * 32)
-    ControlLow(const float* cur, const float* msg, const float* down, int h,
+    ControlLow(const float* cur, const float* msg, const void* down_v, int h,
                float eps, float* low) {
   __shared__ float red[2][kControlWaves];
   const int row = blockIdx.x;
@@ -1093,13 +1101,31 @@ __global__ void __launch_bounds__(kControlWaves * 32)
   const float ic = rsqrtf(tc / static_cast<float>(h) + eps);
   const float im = rsqrtf(tm / static_cast<float>(h) + eps);
   const int r = blockIdx.y * kControlWaves + wave;
-  const float* w = down + static_cast<std::size_t>(r) * 2 * h;
-  const float4* wa = reinterpret_cast<const float4*>(w);
-  const float4* wb = reinterpret_cast<const float4*>(w + h);
+  const float4* wa = nullptr;
+  const float4* wb = nullptr;
+  const uint2* ha = nullptr;
+  const uint2* hb = nullptr;
+  if constexpr (H) {
+    const unsigned short* w = static_cast<const unsigned short*>(down_v) +
+                              static_cast<std::size_t>(r) * 2 * h;
+    ha = reinterpret_cast<const uint2*>(w);
+    hb = reinterpret_cast<const uint2*>(w + h);
+  } else {
+    const float* w =
+        static_cast<const float*>(down_v) + static_cast<std::size_t>(r) * 2 * h;
+    wa = reinterpret_cast<const float4*>(w);
+    wb = reinterpret_cast<const float4*>(w + h);
+  }
   float acc = 0.0F;
   for (int i = lane; i < h / 4; i += 32) {
-    const float4 a = wa[i];
-    const float4 b = wb[i];
+    float4 a, b;
+    if constexpr (H) {
+      a = Bf16x4(ha[i]);
+      b = Bf16x4(hb[i]);
+    } else {
+      a = wa[i];
+      b = wb[i];
+    }
     const float4 cv = c4[i];
     const float4 mv = m4[i];
     acc += (a.x * cv.x + a.y * cv.y + a.z * cv.z + a.w * cv.w) * ic +
@@ -1112,9 +1138,9 @@ __global__ void __launch_bounds__(kControlWaves * 32)
 }
 
 // cur += -tanh(forget) * cur + tanh(gain) * msg with gain/forget = W . low
+template<bool H>
 __global__ void ControlApply(float* cur, const float* msg, const float* low,
-                             const float* gain_w, const float* forget_w,
-                             int h) {
+                             const void* gain_v, const void* forget_v, int h) {
   __shared__ float lw[kControlRank];
   const int row = blockIdx.x;
   if (threadIdx.x < kControlRank)
@@ -1124,15 +1150,25 @@ __global__ void ControlApply(float* cur, const float* msg, const float* low,
   const int j = blockIdx.y * blockDim.x + threadIdx.x;
   if (j >= h)
     return;
-  const float4* g4 = reinterpret_cast<const float4*>(
-      gain_w + static_cast<std::size_t>(j) * kControlRank);
-  const float4* f4 = reinterpret_cast<const float4*>(
-      forget_w + static_cast<std::size_t>(j) * kControlRank);
   float g = 0.0F;
   float f = 0.0F;
   for (int k = 0; k < kControlRank / 4; ++k) {
-    const float4 gv = g4[k];
-    const float4 fv = f4[k];
+    float4 gv, fv;
+    if constexpr (H) {
+      gv = Bf16x4(reinterpret_cast<const uint2*>(
+          static_cast<const unsigned short*>(gain_v) +
+          static_cast<std::size_t>(j) * kControlRank)[k]);
+      fv = Bf16x4(reinterpret_cast<const uint2*>(
+          static_cast<const unsigned short*>(forget_v) +
+          static_cast<std::size_t>(j) * kControlRank)[k]);
+    } else {
+      gv = reinterpret_cast<const float4*>(static_cast<const float*>(gain_v) +
+                                           static_cast<std::size_t>(j) *
+                                               kControlRank)[k];
+      fv = reinterpret_cast<const float4*>(static_cast<const float*>(forget_v) +
+                                           static_cast<std::size_t>(j) *
+                                               kControlRank)[k];
+    }
     g += gv.x * lw[4 * k] + gv.y * lw[4 * k + 1] + gv.z * lw[4 * k + 2] +
          gv.w * lw[4 * k + 3];
     f += fv.x * lw[4 * k] + fv.y * lw[4 * k + 1] + fv.z * lw[4 * k + 2] +
@@ -2924,6 +2960,37 @@ std::shared_ptr<Model> Model::Load(const std::string& path,
     state->allocations.push_back(t.dev);
     state->resident_bytes += info.size_bytes;
     state->tensors.emplace(std::string(info.name), t);
+    // The loop controllers are F32 in the GGUF but BF16 in the checkpoint:
+    // when every value is exactly a BF16, decode reads a half-size copy.
+    const std::string_view nm = info.name;
+    const auto ends = [&](std::string_view suffix) {
+      return nm.size() >= suffix.size() &&
+             nm.substr(nm.size() - suffix.size()) == suffix;
+    };
+    if (t.type == kTypeF32 && info.data != nullptr &&
+        nm.find(".loop_") != std::string_view::npos &&
+        (ends("down.weight") || ends("gain.weight") || ends("forget.weight"))) {
+      const std::size_t count = info.size_bytes / 4;
+      const auto* w = static_cast<const std::uint32_t*>(info.data);
+      bool exact = true;
+      for (std::size_t i = 0; i < count && exact; ++i)
+        exact = (w[i] & 0xFFFFU) == 0;
+      if (exact) {
+        std::vector<std::uint16_t> half(count);
+        for (std::size_t i = 0; i < count; ++i)
+          half[i] = static_cast<std::uint16_t>(w[i] >> 16);
+        Tensor th = t;
+        th.type = kTypeBf16;
+        th.row_bytes = t.row_bytes / 2;
+        th.dev = nullptr;
+        HIP_OK(hipMalloc(&th.dev, count * 2));
+        HIP_OK(
+            hipMemcpy(th.dev, half.data(), count * 2, hipMemcpyHostToDevice));
+        state->allocations.push_back(th.dev);
+        state->resident_bytes += count * 2;
+        state->tensors.emplace(std::string(info.name) + ".h", th);
+      }
+    }
   }
   // F16 copy of every relative-bias table with one zero row appended
   for (std::uint32_t il = 0; il < state->n_phys; ++il) {
@@ -4256,7 +4323,11 @@ struct Session::Impl : Scratch {
       MixBig<<<n, 256, 0, stream>>>(
           sp, cur_, query, nq, static_cast<int>(m->config.hidden_size), n, out);
     } else {
-      Mix<<<n, 256, 0, stream>>>(
+      static const int mix_threads =
+          std::getenv("INKLING_MIX_THREADS") != nullptr
+              ? std::atoi(std::getenv("INKLING_MIX_THREADS"))
+              : 576;
+      Mix<<<n, mix_threads, 0, stream>>>(
           sp, cur_, query, nq, static_cast<int>(m->config.hidden_size), n, out);
     }
   }
@@ -4278,15 +4349,26 @@ struct Session::Impl : Scratch {
     if (!big && m->config.loop_gate_rank == kControlRank) {
       const std::string fb =
           "blk." + std::to_string(phys) + ".loop_" + group + "_";
-      ControlLow<<<dim3(n, kControlRank / kControlWaves), kControlWaves * 32, 0,
-                   stream>>>(
-          cur_, message,
-          static_cast<const float*>(m->T(fb + "down.weight").dev), h,
-          m->config.rms_eps, low);
-      ControlApply<<<dim3(n, (h + 255) / 256), 256, 0, stream>>>(
-          cur_, message, low,
-          static_cast<const float*>(m->T(fb + "gain.weight").dev),
-          static_cast<const float*>(m->T(fb + "forget.weight").dev), h);
+      static const bool ctl_half = std::getenv("INKLING_CTL_HALF") == nullptr ||
+                                   std::getenv("INKLING_CTL_HALF")[0] != '0';
+      const bool half_w =
+          ctl_half && m->tensors.count(fb + "down.weight.h") != 0;
+      const auto wp = [&](const char* name) -> const void* {
+        return m->T(fb + name + (half_w ? ".h" : "")).dev;
+      };
+      if (half_w) {
+        ControlLow<true><<<dim3(n, kControlRank / kControlWaves),
+                           kControlWaves * 32, 0, stream>>>(
+            cur_, message, wp("down.weight"), h, m->config.rms_eps, low);
+        ControlApply<true><<<dim3(n, (h + 255) / 256), 256, 0, stream>>>(
+            cur_, message, low, wp("gain.weight"), wp("forget.weight"), h);
+      } else {
+        ControlLow<false><<<dim3(n, kControlRank / kControlWaves),
+                            kControlWaves * 32, 0, stream>>>(
+            cur_, message, wp("down.weight"), h, m->config.rms_eps, low);
+        ControlApply<false><<<dim3(n, (h + 255) / 256), 256, 0, stream>>>(
+            cur_, message, low, wp("gain.weight"), wp("forget.weight"), h);
+      }
       return;
     }
     RmsRows(cur_, nullptr, big ? nullptr : cat, n, h, h, 2 * h,
