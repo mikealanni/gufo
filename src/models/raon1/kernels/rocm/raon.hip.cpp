@@ -1379,7 +1379,6 @@ __global__ __launch_bounds__(256) void MlaSplitWmmaKernel(
   constexpr int rank = kRaonRank;
   constexpr int rope = kRaonRope;
   __shared__ __attribute__((aligned(16))) _Float16 Ks[kMwKeys][kMwKs];
-  __shared__ __attribute__((aligned(16))) _Float16 Vt[rank][kMwVs];
   __shared__ __attribute__((aligned(16))) float Sp[4][kMwRows][kMwKeys];
   __shared__ __attribute__((aligned(16))) _Float16 Ps[kMwRows][kMwPs];
   __shared__ float corr_s[kMwRows];
@@ -1465,10 +1464,6 @@ __global__ __launch_bounds__(256) void MlaSplitWmmaKernel(
       Ks[k][c * 4 + 1] = h1;
       Ks[k][c * 4 + 2] = h2;
       Ks[k][c * 4 + 3] = h3;
-      Vt[c * 4 + 0][k] = h0;
-      Vt[c * 4 + 1][k] = h1;
-      Vt[c * 4 + 2][k] = h2;
-      Vt[c * 4 + 3][k] = h3;
     }
     const int k = tid >> 4;
     const int c = tid & 15;
@@ -1527,6 +1522,13 @@ __global__ __launch_bounds__(256) void MlaSplitWmmaKernel(
         corr_s[srow] = corr;
     }
     __syncthreads();
+    mw_v16h vb[4];
+#pragma unroll
+    for (int b = 0; b < 4; ++b) {
+#pragma unroll
+      for (int kk = 0; kk < 16; ++kk)
+        vb[b][kk] = Ks[kk][wave * 64 + b * 16 + col];
+    }
 #pragma unroll
     for (int a = 0; a < 2; ++a) {
       const mw_v16h pa =
@@ -1539,11 +1541,8 @@ __global__ __launch_bounds__(256) void MlaSplitWmmaKernel(
           o[a][b][i] *= c;
       }
 #pragma unroll
-      for (int b = 0; b < 4; ++b) {
-        const mw_v16h vb = *reinterpret_cast<const mw_v16h*>(
-            &Vt[wave * 64 + b * 16 + col][0]);
-        o[a][b] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pa, vb, o[a][b]);
-      }
+      for (int b = 0; b < 4; ++b)
+        o[a][b] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pa, vb[b], o[a][b]);
     }
   }
   lsum += __shfl_xor(lsum, 1, 8);
