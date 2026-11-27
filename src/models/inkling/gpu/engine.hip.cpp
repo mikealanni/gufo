@@ -6775,6 +6775,38 @@ struct SnapshotHeader {
 // Snapshots live in GPU-allocated memory (the RAM is shared with the CPU):
 // capture and restore are device-to-device copies at memory speed, while a
 // device-to-host copy runs at only ~8 GB/s here. Freed buffers are recycled.
+// device-to-device region copy (a kernel moves ~4x faster than the copy engine)
+__global__ void CopyBytes(const unsigned char* src, unsigned char* dst,
+                          std::size_t bytes) {
+  const std::size_t n16 = bytes / 16;
+  const uint4* s4 = reinterpret_cast<const uint4*>(src);
+  uint4* d4 = reinterpret_cast<uint4*>(dst);
+  const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x +
+                       threadIdx.x;
+       i < n16; i += stride)
+    d4[i] = s4[i];
+  for (std::size_t i = n16 * 16 + static_cast<std::size_t>(blockIdx.x) *
+                                      blockDim.x + threadIdx.x;
+       i < bytes; i += stride)
+    dst[i] = src[i];
+}
+
+static void CopyDev(void* dst, const void* src, std::size_t bytes,
+                    hipStream_t stream) {
+  static const bool kernel = std::getenv("INKLING_SNAP_KERNEL") == nullptr ||
+                             std::getenv("INKLING_SNAP_KERNEL")[0] != '0';
+  const auto a = reinterpret_cast<std::uintptr_t>(src);
+  const auto b = reinterpret_cast<std::uintptr_t>(dst);
+  if (kernel && bytes >= (1U << 16) && a % 16 == 0 && b % 16 == 0) {
+    CopyBytes<<<1024, 256, 0, stream>>>(
+        static_cast<const unsigned char*>(src),
+        static_cast<unsigned char*>(dst), bytes);
+    return;
+  }
+  HIP_OK(hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToDevice, stream));
+}
+
 class SnapshotDevicePool {
 public:
   static SnapshotDevicePool& Instance() {
@@ -6897,9 +6929,8 @@ std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(std::string* error_msg) {
   for (const auto& r : regions) {
     if (r.bytes > 0) {
       if (d.dev != nullptr)
-        HIP_OK(hipMemcpyAsync(static_cast<unsigned char*>(d.dev) + offset,
-                              r.dev, r.bytes, hipMemcpyDeviceToDevice,
-                              i.stream));
+        CopyDev(static_cast<unsigned char*>(d.dev) + offset, r.dev, r.bytes,
+                i.stream);
       else
         HIP_OK(hipMemcpyAsync(d.bytes.get() + offset, r.dev, r.bytes,
                               hipMemcpyDeviceToHost, i.stream));
@@ -6940,9 +6971,8 @@ bool Session::RestoreSnapshot(const SessionSnapshot& snapshot,
   for (const auto& r : regions) {
     if (r.bytes > 0) {
       if (d.dev != nullptr)
-        HIP_OK(hipMemcpyAsync(r.dev,
-                              static_cast<const unsigned char*>(d.dev) + offset,
-                              r.bytes, hipMemcpyDeviceToDevice, i.stream));
+        CopyDev(r.dev, static_cast<const unsigned char*>(d.dev) + offset,
+                r.bytes, i.stream);
       else
         HIP_OK(hipMemcpyAsync(r.dev, d.bytes.get() + offset, r.bytes,
                               hipMemcpyHostToDevice, i.stream));
