@@ -1631,7 +1631,8 @@ __global__ void CombineHalf(const __half* y, const float* wts, float* out,
 
 __global__ void Combine(const float* y, const float* wts, float* out, int nu,
                         int h, const float* down_scale, const int* ids) {
-  for (int i = threadIdx.x; i < h; i += blockDim.x) {
+  for (int i = blockIdx.y * blockDim.x + threadIdx.x; i < h;
+       i += gridDim.y * blockDim.x) {
     float a = 0.0F;
     for (int k = 0; k < nu; ++k) {
       const int eid = ids != nullptr ? ids[blockIdx.x * nu + k] : 0;
@@ -5879,7 +5880,8 @@ struct Session::Impl : Scratch {
       } else {
         WmmaGemm<kTypeQ8><<<g2, kWmmaThreads, 0, stream>>>(a2);
       }
-      Combine<<<n, 256, 0, stream>>>(y, wts, moe, nu, h, nullptr, nullptr);
+      Combine<<<dim3(n, (h + 255) / 256), 256, 0, stream>>>(y, wts, moe, nu, h,
+                                                          nullptr, nullptr);
       return;
     }
     xrow = xrow_token;
@@ -5889,7 +5891,8 @@ struct Session::Impl : Scratch {
                                     c.situ_linear_beta);
     xrow = xrow_item;
     Routed(m->T(m->P(p, "ffn_down_exps.weight")), h, items, s_dn, act, y);
-    Combine<<<n, 256, 0, stream>>>(y, wts, moe, nu, h, nullptr, nullptr);
+    Combine<<<dim3(n, (h + 255) / 256), 256, 0, stream>>>(y, wts, moe, nu, h,
+                                                          nullptr, nullptr);
   }
 
   void Forward(std::span<const std::int32_t> tokens) {
