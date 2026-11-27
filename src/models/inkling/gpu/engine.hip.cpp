@@ -6772,7 +6772,59 @@ struct SnapshotHeader {
   std::uint64_t body_bytes{0};
 };
 
+// Snapshots live in GPU-allocated memory (the RAM is shared with the CPU):
+// capture and restore are device-to-device copies at memory speed, while a
+// device-to-host copy runs at only ~8 GB/s here. Freed buffers are recycled.
+class SnapshotDevicePool {
+public:
+  static SnapshotDevicePool& Instance() {
+    static SnapshotDevicePool pool;
+    return pool;
+  }
+  void* Get(std::size_t size, std::size_t* capacity) {
+    constexpr std::size_t kRound = std::size_t{256} << 20;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      for (std::size_t i = 0; i < free_.size(); ++i) {
+        if (free_[i].second >= size) {
+          void* p = free_[i].first;
+          *capacity = free_[i].second;
+          free_.erase(free_.begin() + static_cast<std::ptrdiff_t>(i));
+          return p;
+        }
+      }
+    }
+    const std::size_t cap = (size + kRound - 1) / kRound * kRound;
+    void* p = nullptr;
+    if (hipMalloc(&p, cap) != hipSuccess) {
+      (void)hipGetLastError();
+      return nullptr;
+    }
+    *capacity = cap;
+    return p;
+  }
+  void Put(void* p, std::size_t capacity) {
+    constexpr std::size_t kMaxPooled = 2;
+    std::lock_guard<std::mutex> lock(mu_);
+    if (free_.size() >= kMaxPooled) {
+      (void)hipFree(p);
+      return;
+    }
+    free_.emplace_back(p, capacity);
+  }
+
+private:
+  std::mutex mu_;
+  std::vector<std::pair<void*, std::size_t>> free_;
+};
+
 struct SessionSnapshot::Data {
+  ~Data() {
+    if (dev != nullptr)
+      SnapshotDevicePool::Instance().Put(dev, dev_capacity);
+  }
+  void* dev{nullptr};
+  std::size_t dev_capacity{0};
   bool sparse{false};
   std::uint32_t position{0};
   std::uint32_t dwarmed{0};
@@ -6822,6 +6874,7 @@ std::uint64_t Session::SnapshotBytes() const {
 std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(std::string* error_msg) {
   auto& i = *impl_;
   (void)error_msg;
+  const auto snap_t0 = std::chrono::steady_clock::now();
   auto snapshot = std::unique_ptr<SessionSnapshot>(new SessionSnapshot());
   snapshot->data_ = std::make_unique<SessionSnapshot::Data>();
   auto& d = *snapshot->data_;
@@ -6833,12 +6886,24 @@ std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(std::string* error_msg) {
   const auto regions = i.SnapRegions(d.position, d.dwarmed, d.drafter);
   for (const auto& r : regions)
     d.size += r.bytes;
-  d.bytes.reset(new unsigned char[d.size]);
+  static const bool on_device =
+      std::getenv("INKLING_SNAP_DEVICE") == nullptr ||
+      std::getenv("INKLING_SNAP_DEVICE")[0] != '0';
+  if (on_device)
+    d.dev = SnapshotDevicePool::Instance().Get(d.size, &d.dev_capacity);
+  if (d.dev == nullptr)
+    d.bytes.reset(new unsigned char[d.size]);
   std::size_t offset = 0;
   for (const auto& r : regions) {
-    if (r.bytes > 0)
-      HIP_OK(hipMemcpyAsync(d.bytes.get() + offset, r.dev, r.bytes,
-                            hipMemcpyDeviceToHost, i.stream));
+    if (r.bytes > 0) {
+      if (d.dev != nullptr)
+        HIP_OK(hipMemcpyAsync(static_cast<unsigned char*>(d.dev) + offset,
+                              r.dev, r.bytes, hipMemcpyDeviceToDevice,
+                              i.stream));
+      else
+        HIP_OK(hipMemcpyAsync(d.bytes.get() + offset, r.dev, r.bytes,
+                              hipMemcpyDeviceToHost, i.stream));
+    }
     offset += r.bytes;
   }
   const std::size_t v = i.m->config.vocab_unpadded;
@@ -6848,6 +6913,13 @@ std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(std::string* error_msg) {
       v * sizeof(float), hipMemcpyDeviceToHost, i.stream));
   d.argmax = i.argmax_host[i.logits_last];
   HIP_OK(hipStreamSynchronize(i.stream));
+  if (std::getenv("INKLING_SNAP_LOG") != nullptr)
+    std::fprintf(stderr, "inkling: snapshot pos %u size %.2f GB %s in %.1f ms\n",
+                 d.position, static_cast<double>(d.size) / 1e9,
+                 d.dev != nullptr ? "device" : "host",
+                 std::chrono::duration<double, std::milli>(
+                     std::chrono::steady_clock::now() - snap_t0)
+                     .count());
   return snapshot;
 }
 
@@ -6866,9 +6938,15 @@ bool Session::RestoreSnapshot(const SessionSnapshot& snapshot,
   const auto regions = i.SnapRegions(d.position, d.dwarmed, d.drafter);
   std::size_t offset = 0;
   for (const auto& r : regions) {
-    if (r.bytes > 0)
-      HIP_OK(hipMemcpyAsync(r.dev, d.bytes.get() + offset, r.bytes,
-                            hipMemcpyHostToDevice, i.stream));
+    if (r.bytes > 0) {
+      if (d.dev != nullptr)
+        HIP_OK(hipMemcpyAsync(r.dev,
+                              static_cast<const unsigned char*>(d.dev) + offset,
+                              r.bytes, hipMemcpyDeviceToDevice, i.stream));
+      else
+        HIP_OK(hipMemcpyAsync(r.dev, d.bytes.get() + offset, r.bytes,
+                              hipMemcpyHostToDevice, i.stream));
+    }
     offset += r.bytes;
   }
   if (offset != d.size) {
@@ -6925,7 +7003,27 @@ void SessionSnapshot::StreamPayload(
   std::memcpy(head.data() + sizeof(header), data_->logits.data(),
               data_->logits.size() * sizeof(float));
   sink(head);
-  sink(std::span<const std::uint8_t>(data_->bytes.get(), data_->size));
+  if (data_->dev == nullptr) {
+    sink(std::span<const std::uint8_t>(data_->bytes.get(), data_->size));
+    return;
+  }
+  // device-resident: stage through pinned chunks on the persistence worker
+  constexpr std::size_t kChunk = std::size_t{64} << 20;
+  hipStream_t st = nullptr;
+  HIP_OK(hipStreamCreateWithFlags(&st, hipStreamNonBlocking));
+  void* stage = nullptr;
+  HIP_OK(hipHostMalloc(&stage, kChunk, hipHostMallocDefault));
+  for (std::size_t o = 0; o < data_->size; o += kChunk) {
+    const std::size_t n = std::min(kChunk, data_->size - o);
+    HIP_OK(hipMemcpyAsync(stage,
+                          static_cast<const unsigned char*>(data_->dev) + o, n,
+                          hipMemcpyDeviceToHost, st));
+    HIP_OK(hipStreamSynchronize(st));
+    sink(std::span<const std::uint8_t>(static_cast<const std::uint8_t*>(stage),
+                                       n));
+  }
+  (void)hipHostFree(stage);
+  (void)hipStreamDestroy(st);
 }
 
 bool SessionSnapshot::CopyPayloadTo(
