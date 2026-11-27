@@ -2686,6 +2686,8 @@ struct ModelState {
   std::uint32_t n_phys{0};
   std::unordered_map<std::string, Tensor> tensors;
   std::vector<void*> allocations;
+  // per-core-layer message queries (attn, k, v, ffn) laid out [cc][4][h]
+  float* mq_table{nullptr};
   std::size_t resident_bytes{0};
   bool has_draft{false};
   bool d2{false};          // a DFlash2 block drafter is loaded (tensors "d2.*")
@@ -2992,6 +2994,25 @@ std::shared_ptr<Model> Model::Load(const std::string& path,
         state->resident_bytes += count * 2;
         state->tensors.emplace(std::string(info.name) + ".h", th);
       }
+    }
+  }
+  {
+    const Tensor& res = state->T("loop_res_query.weight");
+    const Tensor& kv = state->T("loop_kv_res_query.weight");
+    const std::size_t hb = res.cols * 4;
+    const std::size_t ncc = res.rows / 2;
+    HIP_OK(hipMalloc(&state->mq_table, ncc * 4 * hb));
+    state->allocations.push_back(state->mq_table);
+    char* dst = reinterpret_cast<char*>(state->mq_table);
+    const char* r = static_cast<const char*>(res.dev);
+    const char* k = static_cast<const char*>(kv.dev);
+    for (std::size_t c = 0; c < ncc; ++c) {
+      const std::size_t src[4][2] = {{0, 2 * c}, {1, 2 * c}, {1, 2 * c + 1},
+                                     {0, 2 * c + 1}};
+      for (int j = 0; j < 4; ++j)
+        HIP_OK(hipMemcpy(dst + (c * 4 + j) * hb,
+                         (src[j][0] == 0 ? r : k) + src[j][1] * hb, hb,
+                         hipMemcpyDeviceToDevice));
     }
   }
   // F16 copy of every relative-bias table with one zero row appended
@@ -6396,19 +6417,7 @@ struct Session::Impl : Scratch {
     const float* msgs_ = nullptr;
     if (st.pass > 0) {
       const std::uint32_t cc = st.ip - start;
-      const float* res =
-          static_cast<const float*>(m->T("loop_res_query.weight").dev);
-      const float* kv =
-          static_cast<const float*>(m->T("loop_kv_res_query.weight").dev);
-      float* mq = low;
-      HIP_OK(hipMemcpyAsync(mq, res + 2 * cc * h, h * 4,
-                            hipMemcpyDeviceToDevice, stream));
-      HIP_OK(hipMemcpyAsync(mq + h, kv + 2 * cc * h, h * 4,
-                            hipMemcpyDeviceToDevice, stream));
-      HIP_OK(hipMemcpyAsync(mq + 2 * h, kv + (2 * cc + 1) * h, h * 4,
-                            hipMemcpyDeviceToDevice, stream));
-      HIP_OK(hipMemcpyAsync(mq + 3 * h, res + (2 * cc + 1) * h, h * 4,
-                            hipMemcpyDeviceToDevice, stream));
+      const float* mq = m->mq_table + static_cast<std::size_t>(cc) * 4 * h;
       Mixer(R.bank, bank_out, mq, 4, R.n, msgs);
       msgs_ = msgs;
     }
@@ -6558,19 +6567,7 @@ struct Session::Impl : Scratch {
         // per-layer message queries (attn, k, v, ffn) from the global tables;
         // see inkling-port-state.md
         const std::uint32_t cc = ip - start;
-        const float* res =
-            static_cast<const float*>(m->T("loop_res_query.weight").dev);
-        const float* kv =
-            static_cast<const float*>(m->T("loop_kv_res_query.weight").dev);
-        float* mq = low;  // reuse as scratch: 4*h floats
-        HIP_OK(hipMemcpyAsync(mq, res + 2 * cc * h, h * 4,
-                              hipMemcpyDeviceToDevice, stream));
-        HIP_OK(hipMemcpyAsync(mq + h, kv + 2 * cc * h, h * 4,
-                              hipMemcpyDeviceToDevice, stream));
-        HIP_OK(hipMemcpyAsync(mq + 2 * h, kv + (2 * cc + 1) * h, h * 4,
-                              hipMemcpyDeviceToDevice, stream));
-        HIP_OK(hipMemcpyAsync(mq + 3 * h, res + (2 * cc + 1) * h, h * 4,
-                              hipMemcpyDeviceToDevice, stream));
+        const float* mq = m->mq_table + static_cast<std::size_t>(cc) * 4 * h;
         Mixer(bank, bank_out, mq, 4, n, msgs);
         Layer(il, ip, blocks, msgs, n);
         Tap(v++, n);
