@@ -6826,7 +6826,9 @@ public:
         }
       }
     }
-    const std::size_t cap = (size + kRound - 1) / kRound * kRound;
+    // headroom: the next turn's snapshot is a little larger and must still fit
+    const std::size_t want = size + size / 4;
+    const std::size_t cap = (want + kRound - 1) / kRound * kRound;
     void* p = nullptr;
     if (hipMalloc(&p, cap) != hipSuccess) {
       (void)hipGetLastError();
@@ -6836,7 +6838,7 @@ public:
     return p;
   }
   void Put(void* p, std::size_t capacity) {
-    constexpr std::size_t kMaxPooled = 2;
+    constexpr std::size_t kMaxPooled = 3;
     std::lock_guard<std::mutex> lock(mu_);
     if (free_.size() >= kMaxPooled) {
       (void)hipFree(p);
