@@ -225,11 +225,15 @@ __global__ void GemmDp4(const unsigned char* w, std::size_t row_bytes, int cols,
     } else {
       uint4 q;
       if (nt) {
-        // expert weights are read once: loads that do not allocate in the
-        // last-level cache keep the prefetched dense weights there
+        // expert weights are read once: buffer loads with DLC do not allocate
+        // in the last-level cache, which keeps the prefetched dense weights
+        // there (the resource is the wave-uniform row)
         typedef unsigned int U32x4 __attribute__((ext_vector_type(4)));
-        const U32x4 t = __builtin_nontemporal_load(
-            reinterpret_cast<const U32x4*>(row + u * 16));
+        const __amdgpu_buffer_rsrc_t rs = __builtin_amdgcn_make_buffer_rsrc(
+            const_cast<unsigned char*>(row), static_cast<short>(0), 0x7FFFFFFF,
+            0x31004000);
+        const U32x4 t = __builtin_bit_cast(
+            U32x4, __builtin_amdgcn_raw_buffer_load_b128(rs, u * 16, 0, 4));
         q = make_uint4(t.x, t.y, t.z, t.w);
       } else {
         q = *reinterpret_cast<const uint4*>(row + u * 16);
@@ -3922,13 +3926,31 @@ struct Session::Impl : Scratch {
   hipEvent_t pf_fork{nullptr}, pf_join{nullptr};
   unsigned int* pf_sink{nullptr};
   bool pf_open{false};
-  bool pf_on{std::getenv("INKLING_DECODE_PREFETCH") != nullptr &&
-             std::getenv("INKLING_DECODE_PREFETCH")[0] == '1'};
-  bool expert_nt{std::getenv("INKLING_EXPERT_NT") != nullptr &&
-                 std::getenv("INKLING_EXPERT_NT")[0] == '1'};
+  bool pf_on{std::getenv("INKLING_DECODE_PREFETCH") == nullptr ||
+             std::getenv("INKLING_DECODE_PREFETCH")[0] != '0'};
+  bool expert_nt{std::getenv("INKLING_EXPERT_NT") == nullptr ||
+                 std::getenv("INKLING_EXPERT_NT")[0] != '0'};
   static constexpr int kPrefetchBlocks = 8;
+  std::vector<std::uint32_t> visit_slots;  // slots of a step's visits, in order
+  int visit_i{0};
+  void BuildVisits() {
+    const Config& c = m->config;
+    visit_slots.clear();
+    visit_i = 0;
+    for (std::uint32_t il = 0; il < c.loop_core_start; ++il)
+      visit_slots.push_back(il);
+    for (std::uint32_t pass = 0; pass < c.loop_num_loops; ++pass)
+      for (std::uint32_t ip = c.loop_core_start; ip < c.loop_core_end; ++ip)
+        visit_slots.push_back(
+            pass == 0 ? ip
+                      : m->n_phys +
+                            (pass - 1) * (c.loop_core_end - c.loop_core_start) +
+                            (ip - c.loop_core_start));
+    for (std::uint32_t il = c.loop_core_end; il < m->n_phys; ++il)
+      visit_slots.push_back(il);
+  }
   void Prefetch(std::initializer_list<const Tensor*> ts, int n) {
-    if (!pf_on || pf_stream == nullptr || n > static_cast<int>(kMaxVerifyRows))
+    if (!pf_on || pf_stream == nullptr || n != 1)  // graph-captured step only
       return;
     TouchList l{};
     for (const Tensor* t : ts) {
@@ -4172,7 +4194,7 @@ struct Session::Impl : Scratch {
         GemmDp4<kTypeNvfp4><<<g8, kThreads * 2, 0, stream>>>(
             static_cast<const unsigned char*>(w.dev), w.row_bytes,
             static_cast<int>(w.cols), rows, ids_flat, xrow, scale, xq, xqs,
-            yout, nullptr, expert_nt);
+            yout, nullptr, expert_nt && items <= m->config.expert_used);
       } else {
         GemmDp4<kTypeQ8><<<g8, kThreads * 2, 0, stream>>>(
             static_cast<const unsigned char*>(w.dev), w.row_bytes,
@@ -4312,6 +4334,7 @@ struct Session::Impl : Scratch {
     std::uint64_t ticket{0};
     bool npu_on{false};
     bool gate_done{false};
+    int vi{0};  // index of the visit in the decode step
     bool out_npu{false};
   };
 
@@ -5052,6 +5075,9 @@ struct Session::Impl : Scratch {
         ControlStep(x, msgs_ + 3 * nh_, p, "mlp", n);
       RmsRows(x, ffn_w, x, n, h, h, h, big ? xhx : nullptr);
     }
+    if (pf_on && L.vi + 1 < static_cast<int>(visit_slots.size()))
+      Prefetch({&m->T(m->P(m->Phys(visit_slots[L.vi + 1]), "attn_q.weight"))},
+               n);
     Moe(p, n, big ? xhx : nullptr);
     Convolve(moe, m->T(m->P(p, "ffn_post_conv.weight")), nullptr, 1,
              sl.hist_ffn, cur, h, n, ffn_inp);
@@ -5062,20 +5088,22 @@ struct Session::Impl : Scratch {
              std::vector<const float*>& blocks, const float* msgs_, int n) {
     LayerCtx L;
     BeginLayer(L, slot, ip, msgs_, n);
+    L.vi = visit_i++;
     if (pf_on) {
+      // q was read during the previous visit's expert input; the first visit
+      // reads it now, the gate projection beside the attention inputs
       const std::uint32_t pp = L.p;
       Prefetch(
-          {&m->T(m->P(pp, "attn_q.weight")),
-           &m->T(m->P(pp, "attn_gate.weight")),
-           &m->T(m->P(pp, "attn_k.weight")), &m->T(m->P(pp, "attn_v.weight")),
-           &m->T(m->P(pp, "attn_rel.weight"))},
+          {&m->T(m->P(pp, L.vi == 0 ? "attn_q.weight" : "attn_gate.weight"))},
           n);
     }
     LayerFront(L, blocks);
     LayerQkvBegin(L);
     LayerQkvEnd(L);
     if (pf_on)
-      Prefetch({&m->T(m->P(L.p, "attn_output.weight"))}, n);
+      Prefetch({&m->T(m->P(L.p, "attn_output.weight")),
+                &m->T(m->P(L.p, "ffn_gate_inp.weight"))},
+               n);
     LayerAttn(L);
     LayerOut1a(L);
     LayerOut1b(L, blocks);
@@ -6382,6 +6410,7 @@ struct Session::Impl : Scratch {
             cur, n, h, h, h);
     pool_used = 0;
     int v = 0;
+    BuildVisits();
     std::vector<const float*> blocks;
     const std::uint32_t start = c.loop_core_start, end = c.loop_core_end;
     for (std::uint32_t il = 0; il < start; ++il) {
