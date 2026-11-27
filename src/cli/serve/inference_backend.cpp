@@ -41,6 +41,7 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/platform/pages.hpp"
+#include "src/core/speculative/prompt_lookup.hpp"
 #include "src/core/speculative/speculative_verifier.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
@@ -4546,6 +4547,7 @@ public:
   void Invalidate() noexcept override {
     session_->Reset();
     position_ = 0;
+    ClearLookup();
   }
   [[nodiscard]] TextRunnerMeasuredResources MeasuredResources()
       const noexcept override {
@@ -4560,6 +4562,19 @@ public:
   double draft_yield{2.0};
   std::size_t plain_steps{0};
   InklingOutputTranslator translator;
+  /// Prompt lookup: copies of earlier text in this session are proposed as
+  /// drafts. `committed` holds the engine tokens whose state is in the
+  /// session (empty after a restore until the next prefill supplies them).
+  speculative::PromptLookup<std::int32_t> lookup;
+  std::vector<std::int32_t> committed;
+  std::size_t lookup_start{0};
+  std::size_t lookup_proposed{0};
+  bool lookup_active{false};
+  void ClearLookup() {
+    lookup.Clear();
+    committed.clear();
+    lookup_active = false;
+  }
 
 private:
   std::unique_ptr<InklingSession> session_;
@@ -4820,6 +4835,7 @@ public:
     if (RequireInklingState(state).position() != prefix.size())
       throw std::logic_error("Inkling reused prefix does not match checkpoint");
     RequireInklingState(state).translator = {};
+    RequireInklingState(state).lookup.BeginRequest();
   }
 
   [[nodiscard]] TextPrefillStep Prefill(
@@ -4834,11 +4850,21 @@ public:
     const std::size_t consumed = std::min<std::size_t>(
         {max_input_tokens, prompt.size() - offset, kPrefillChunk});
     const auto chunk = InklingEngineTokens(prompt.subspan(offset, consumed));
+    if (offset == 0)
+      inkling.lookup.BeginRequest();
+    if (inkling.committed.size() != offset) {
+      // after a restore the session's tokens are the prompt's cached prefix
+      inkling.committed = InklingEngineTokens(prompt.first(offset));
+      inkling.lookup.Clear();
+      inkling.lookup.BeginRequest();
+    }
     std::string error;
     if (!inkling.session().Append(chunk, &error)) {
       inkling.Invalidate();
       throw std::runtime_error("Inkling prefill failed: " + error);
     }
+    inkling.committed.insert(inkling.committed.end(), chunk.begin(),
+                             chunk.end());
     inkling.set_position(offset + consumed);
     return {.consumed_tokens = consumed,
             .decode_ready = offset + consumed == prompt.size()};
@@ -4875,6 +4901,8 @@ public:
       throw std::runtime_error("Inkling decode failed: " + error);
     }
     inkling.set_position(inkling.position() + 1);
+    if (inkling.committed.size() + 1 == inkling.position())
+      inkling.committed.push_back(input);
     inkling.translator.Feed(tokenizer_->DecodeToken(token));
   }
 
@@ -4891,8 +4919,10 @@ public:
         inkling.position() + 2 > max_context_) {
       return TextModelRunner::DecodeStep(state, max_tokens, sampler);
     }
-    if (inkling.draft_yield < kMinDraftYield &&
-        ++inkling.plain_steps % kProbeInterval != 0) {
+    const bool lookup_ready = inkling.committed.size() == inkling.position();
+    const bool plain_turn = inkling.draft_yield < kMinDraftYield &&
+                            ++inkling.plain_steps % kProbeInterval != 0;
+    if (plain_turn && !lookup_ready) {
       return TextModelRunner::DecodeStep(state, max_tokens, sampler);
     }
     std::size_t width = std::min<std::size_t>(
@@ -4912,16 +4942,26 @@ public:
     std::vector<std::int32_t> block(width + 1, anchor);
     std::vector<float> confidence(width);
     std::string error;
-    if (!session.Draft(anchor, {block.data() + 1, width}, confidence,
-                       kDraftConfidence)) {
-      return TextModelRunner::DecodeStep(state, max_tokens, sampler);
-    }
     std::size_t keep = 0;
-    while (keep < width && confidence[keep] >= kDraftConfidence)
-      ++keep;
+    inkling.lookup_active = false;
+    if (lookup_ready) {
+      keep = TryCopy(inkling, anchor, sampler.config().temperature > 0.0F,
+                     {block.data() + 1, width});
+      inkling.lookup_active = keep > 0;
+    }
     if (keep == 0) {
-      inkling.draft_yield += kYieldSmoothing * (1.0 - inkling.draft_yield);
-      return TextModelRunner::DecodeStep(state, max_tokens, sampler);
+      if (plain_turn)
+        return TextModelRunner::DecodeStep(state, max_tokens, sampler);
+      if (!session.Draft(anchor, {block.data() + 1, width}, confidence,
+                         kDraftConfidence)) {
+        return TextModelRunner::DecodeStep(state, max_tokens, sampler);
+      }
+      while (keep < width && confidence[keep] >= kDraftConfidence)
+        ++keep;
+      if (keep == 0) {
+        inkling.draft_yield += kYieldSmoothing * (1.0 - inkling.draft_yield);
+        return TextModelRunner::DecodeStep(state, max_tokens, sampler);
+      }
     }
     width = keep;
     block.resize(width + 1);
@@ -4958,6 +4998,19 @@ public:
     }
     session.KeepRows(static_cast<std::uint32_t>(kept));
     inkling.set_position(inkling.position() + kept);
+    if (inkling.committed.size() + kept == inkling.position()) {
+      inkling.committed.insert(
+          inkling.committed.end(), block.begin(),
+          block.begin() + static_cast<std::ptrdiff_t>(kept));
+    } else {
+      inkling.committed.clear();
+    }
+    if (inkling.lookup_active) {
+      inkling.lookup.Observe(inkling.lookup_start, inkling.lookup_proposed,
+                             kept - 1);
+      step.suffix_draft_tokens = width;
+      step.suffix_accepted_tokens = kept - 1;
+    }
     sampler.CopyDrawStateFrom(working);
     step.stop = stopped;
     step.draft_rounds = 1;
@@ -4966,6 +5019,43 @@ public:
     inkling.draft_yield +=
         kYieldSmoothing * (static_cast<double>(kept) - inkling.draft_yield);
     return step;
+  }
+
+  /// Proposes a copy of earlier session text when the end of the context
+  /// (committed tokens plus the anchor) matches it; returns the tokens written.
+  [[nodiscard]] std::size_t TryCopy(InklingTextRunnerState& inkling,
+                                    std::int32_t anchor, bool sampled,
+                                    std::span<std::int32_t> out) const {
+    using Lookup = speculative::PromptLookup<std::int32_t>;
+    static const bool enabled = std::getenv("INKLING_LOOKUP") == nullptr ||
+                                std::getenv("INKLING_LOOKUP")[0] != '0';
+    const std::size_t size = inkling.committed.size();
+    if (!enabled || out.empty() || size != inkling.position() ||
+        !inkling.lookup.Step(size))
+      return 0;
+    const std::size_t minimum =
+        sampled ? Lookup::kSampledMinMatch : Lookup::kMinMatch;
+    inkling.lookup.Extend(inkling.committed, sampled);
+    const std::int32_t tail[1] = {anchor};
+    const auto match = inkling.lookup.Find(inkling.committed, tail, minimum);
+    if (match.length == 0)
+      return 0;
+    const auto vocab =
+        static_cast<std::int32_t>(model_->config().vocab_unpadded);
+    std::size_t count = 0;
+    for (std::size_t source = match.start; count < out.size(); ++source) {
+      const std::int32_t token = source < size    ? inkling.committed[source]
+                                 : source == size ? anchor
+                                                  : out[source - size - 1];
+      if (token < 0 || token >= vocab || IsStop(token))
+        break;
+      out[count++] = token;
+    }
+    if (count == 0)
+      return 0;
+    inkling.lookup_start = match.start;
+    inkling.lookup_proposed = count;
+    return count;
   }
 
   [[nodiscard]] std::size_t SnapshotPayloadBytes(
@@ -5007,6 +5097,7 @@ public:
     }
     inkling.set_position(restored->position);
     inkling.translator = {};
+    inkling.ClearLookup();
   }
 
   [[nodiscard]] std::size_t PersistentSnapshotPayloadBytes(
@@ -5043,6 +5134,7 @@ public:
     }
     inkling.set_position(inkling.session().Position());
     inkling.translator = {};
+    inkling.ClearLookup();
   }
 
   [[nodiscard]] std::size_t CheckpointPosition(
