@@ -339,6 +339,7 @@ bool Session::DecodeStep(std::size_t max_tokens,
     result->stop = true;
     return true;
   }
+  const auto t_entry = std::chrono::steady_clock::now();
   const bool sampled = sampler.config().uses_random_sampling();
   const bool gpu_greedy =
       !sampled && sampler.config().can_use_unmodified_argmax();
@@ -537,6 +538,7 @@ bool Session::DecodeStep(std::size_t max_tokens,
         stderr, "SPEC k=%u keep=%u draft=%.2f verify=%.2f accept+inject=%.2f\n",
         k, keep, ms(t_start, t_drafted), ms(t_drafted, t_verified),
         ms(t_verified, t_end));
+    std::fprintf(stderr, "ANCHOR %.2f\n", ms(t_entry, t_start));
   }
   if (correction) {
     sampler.DeferSample(static_cast<sampling::TokenId>(*correction));
