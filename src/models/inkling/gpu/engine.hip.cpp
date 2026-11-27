@@ -599,6 +599,48 @@ __global__ void Clip(float* x, const float* scale, int scale_rows, int dim,
     p[i] *= f;
 }
 
+struct ClipJob {
+  float* x;
+  const float* scale;
+  int scale_rows, dim, blocks, rows_per_token;
+  float threshold, tau_floor, tau_alpha;
+  const int* tau_pos;
+};
+struct ClipJobs {
+  ClipJob job[3];
+};
+
+// the three per-row clips of a decode attention visit in one launch; each
+// block runs exactly the arithmetic of Clip
+__global__ void ClipMulti(ClipJobs jobs) {
+  __shared__ float red[256];
+  int b = blockIdx.x;
+  int j = 0;
+  while (j < 2 && b >= jobs.job[j].blocks) {
+    b -= jobs.job[j].blocks;
+    ++j;
+  }
+  const ClipJob& J = jobs.job[j];
+  float* p = J.x + static_cast<std::size_t>(b) * J.dim;
+  const int sr = J.scale != nullptr ? b % J.scale_rows : 0;
+  float s = 0.0F;
+  for (int i = threadIdx.x; i < J.dim; i += blockDim.x) {
+    if (J.scale != nullptr)
+      p[i] *= J.scale[sr * J.dim + i];
+    s += p[i] * p[i];
+  }
+  s = BlockSum(s, red);
+  float f = fminf(1.0F, J.threshold / (sqrtf(s) + 1e-6F));
+  if (J.tau_pos != nullptr) {
+    const int token = b / J.rows_per_token;
+    f *= 1.0F + J.tau_alpha *
+                    logf(fmaxf(1.0F, static_cast<float>(*J.tau_pos + token + 1) /
+                                         J.tau_floor));
+  }
+  for (int i = threadIdx.x; i < J.dim; i += blockDim.x)
+    p[i] *= f;
+}
+
 // Warp-per-row variants of Clip and the per-head RMS norm for short rows
 // (dim <= 128): eight rows per 256-thread block, one shuffle reduction per row.
 __global__ void __launch_bounds__(256)
@@ -4992,15 +5034,34 @@ struct Session::Impl : Scratch {
           nh, nrel, c.relative_clip, tau_p, nh, tau_floor, c.log_scale_alpha,
           n * nh);
     } else {
-      Clip<<<n * nh, 128, 0, stream>>>(
-          q, static_cast<const float*>(m->T(m->P(p, "attn_q_clip.weight")).dev),
-          nh, hd, c.qk_clip, tau_p, nh, tau_floor, c.log_scale_alpha);
-      Clip<<<n * nkv, 128, 0, stream>>>(k, nullptr, 1, hd, c.qk_clip);
+      ClipJobs cj{};
+      cj.job[0] = {q,
+                   static_cast<const float*>(
+                       m->T(m->P(p, "attn_q_clip.weight")).dev),
+                   nh,
+                   hd,
+                   n * nh,
+                   nh,
+                   c.qk_clip,
+                   tau_floor,
+                   c.log_scale_alpha,
+                   tau_p};
+      cj.job[1] = {k,    nullptr, 1,    hd,   n * nkv,
+                   1,    c.qk_clip, 1.0F, 0.0F, nullptr};
+      cj.job[2] = {r,
+                   static_cast<const float*>(
+                       m->T(m->P(p, "attn_rel_clip.weight")).dev),
+                   nh,
+                   nrel,
+                   n * nh,
+                   nh,
+                   c.relative_clip,
+                   tau_floor,
+                   c.log_scale_alpha,
+                   tau_p};
+      ClipMulti<<<cj.job[0].blocks + cj.job[1].blocks + cj.job[2].blocks, 128,
+                  0, stream>>>(cj);
       RmsRows(vtmp, nullptr, vtmp, n * nkv, hd, hd, hd);
-      Clip<<<n * nh, 128, 0, stream>>>(
-          r,
-          static_cast<const float*>(m->T(m->P(p, "attn_rel_clip.weight")).dev),
-          nh, nrel, c.relative_clip, tau_p, nh, tau_floor, c.log_scale_alpha);
     }
     StoreKv<<<n, 256, 0, stream>>>(k, vtmp, sl.k, sl.v, nkv * hd, d_pos,
                                    sl.ring, sl.vblocks);
