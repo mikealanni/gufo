@@ -14,6 +14,12 @@ speculative decoding on top, for Qwen, Inkling, Flint, GLM-5.3 Flash, Laguna, Li
   leaves no background service behind. A server started with `GUFO_THINK=off`
   keeps thinking off for every request. See [docs/JEV.md](docs/JEV.md) and the
   [setup guide](docs/JEV-SETUP.md).
+- **Raon-1 mini** on the GPU with DFlash2 speculation (default) and NPU prefill. Two
+  banks pipeline the prefill, attention is block-sparse above 16K tokens with the system
+  prompt and tool definitions always attended, and two requests (`JOBS=2`) decode at the
+  same time. Reasoning effort maps to a thinking budget. `gufo bench`: prefill 2,935 tok/s
+  at 4K and 2,770 at 8K, plain decode 52.6 tok/s at 4K depth and 42.7 at 128K. See
+  [docs/models/raon1](docs/models/raon1/README.md).
 - **Inkling 2 Mini** (26.4B MoE, 3.4B active, looped middle layers) on the GPU with
   DFlash2 speculation (default) and NPU prefill. Up to 256K context with block-sparse
   attention, tool calls, a reasoning channel, and the same RAM and disk
@@ -201,21 +207,17 @@ Details: [docs/models/ling-3.2](docs/models/ling-3.2/)
 
 ### Raon-1 mini
 
-| Prefill, tok/s (real text) | GPU + NPU, two banks |
-| --- | --- |
-| `-p 4096` | 3,103 |
-| `-p 8192` | 3,010 |
-
-| Depth, `-p 4096`, plain decode | pp, tok/s | tg, tok/s |
+| `gufo bench`, real text | pp, tok/s | tg, tok/s (plain decode) |
 | --- | --- | --- |
+| 4K | 2,935 | 52.6 |
+| 8K | 2,770 | 51.4 |
+| 16K | 2,762 | 48.9 |
 | 32K | 2,539 | 44.4 |
 | 64K | 2,502 | 43.8 |
 | 128K | 2,499 | 42.7 |
 
-| Decode (DFlash2, temperature 1), tok/s | speculative |
-| --- | --- |
-| source code, 6K context | 63 to 73 |
-| thinking prose, 10K context | 36 to 39 |
+pp is a fresh prompt of that length on GPU + NPU with two banks; tg is decode at that depth.
+Speculative decoding is not measured by `gufo bench` for this model.
 
 Above 16K tokens attention is block-sparse, with the system prompt and tool definitions always
 attended while decoding. Two simultaneous requests (`JOBS=2`) run at about two thirds of the
