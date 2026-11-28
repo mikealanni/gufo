@@ -1,10 +1,12 @@
 #include "src/models/raon1/kernels/rocm/executor.hpp"
 
+#include <sys/mman.h>
+
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
-#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -39,6 +41,16 @@ namespace {
 using gufo::core::GgmlType;
 
 constexpr std::size_t kUploadChunk = 64U << 20;
+constexpr std::uintptr_t kPageMask = 4095;
+
+// A tensor read through the file mapping stays faulted in for the life of the
+// process unless its pages are dropped; the weights live on the device.
+void ReleaseMapped(const void* data, std::size_t bytes) {
+  const auto begin = reinterpret_cast<std::uintptr_t>(data) & ~kPageMask;
+  const auto end =
+      (reinterpret_cast<std::uintptr_t>(data) + bytes + kPageMask) & ~kPageMask;
+  ::madvise(reinterpret_cast<void*>(begin), end - begin, MADV_DONTNEED);
+}
 
 std::string P(std::uint32_t layer, const char* name) {
   return "blk." + std::to_string(layer) + "." + name;
@@ -142,10 +154,11 @@ void DequantRowHost(const core::GgufTensorInfo& t, std::uint64_t row,
 
 Executor::Scratch::~Scratch() {
   const float* ptrs[] = {
-      x,    y,          pre,     post, comb,  attn_in, block, ffn_in, ffn_out,
-      head, logits,     q,       k,    v,     fa,      gproj, beta,   delta,
-      g2,   decay,      rda_out, qr,   mla_q, mla_qe,  kv,    qabs,   ctx,
-      gate, moe_logits, weights, gf,   uf,    act,     dpart, parts,  mla_part, mla_qh};
+      x,       y,     pre,    post,     comb,       attn_in, block, ffn_in,
+      ffn_out, head,  logits, q,        k,          v,       fa,    gproj,
+      beta,    delta, g2,     decay,    rda_out,    qr,      mla_q, mla_qe,
+      kv,      qabs,  ctx,    gate,     moe_logits, weights, gf,    uf,
+      act,     dpart, parts,  mla_part, mla_qh};
   for (const float* p : ptrs)
     hipFree(const_cast<float*>(p));
   hipFree(ids);
@@ -227,6 +240,7 @@ std::unique_ptr<Executor> Executor::Create(const std::string& path,
   }
   if (!e->Resolve(error) || !e->AllocScratch(error))
     return nullptr;
+  e->uploader_.reset();
   if (!e->AllocPrefill(true, error) || !e->BuildHalfWeights(error))
     return nullptr;
   if (!options.dflash_layers.empty()) {
@@ -321,6 +335,8 @@ bool Executor::UploadImpl(const std::string& name,
           dst[i] = __float2half_rn(row[i]);
       }
       const std::size_t offset = static_cast<std::size_t>(r0) * cols;
+      ReleaseMapped(static_cast<const char*>(t.data) + r0 * row_bytes,
+                    rows * row_bytes);
       if (hipMemcpy(static_cast<char*>(d.data) + offset * sizeof(__half),
                     chunk.data(), rows * cols * sizeof(__half),
                     hipMemcpyHostToDevice) != hipSuccess) {
@@ -337,10 +353,11 @@ bool Executor::UploadImpl(const std::string& name,
         *error = "hipMalloc failed for " + name;
       return false;
     }
-    if (hipMemcpy(d.data, t.data, t.size_bytes, hipMemcpyHostToDevice) !=
-        hipSuccess) {
+    if (uploader_ == nullptr)
+      uploader_ = std::make_unique<::gufo::hip::TensorUpload>(*reader_);
+    if (!uploader_->Upload(t, d.data, error)) {
       hipFree(d.data);
-      if (error)
+      if (error != nullptr && error->empty())
         *error = "upload failed for " + name;
       return false;
     }
@@ -355,6 +372,7 @@ bool Executor::UploadImpl(const std::string& name,
       for (std::size_t i = 0; i < elems; ++i)
         host[i] = Bf16(h[i]);
     }
+    ReleaseMapped(t.data, t.size_bytes);
     if (hipMalloc(&d.data, host.size() * sizeof(float)) != hipSuccess ||
         hipMemcpy(d.data, host.data(), host.size() * sizeof(float),
                   hipMemcpyHostToDevice) != hipSuccess) {
@@ -468,12 +486,15 @@ bool Executor::AllocPrefill(bool first, std::string* error) {
       !alloc2(reinterpret_cast<void**>(&mla_->scores),
               (static_cast<std::size_t>(options_.max_context) / 64 + 2) * 4) ||
       !alloc2(reinterpret_cast<void**>(&mla_->sel), 128 * 4) ||
-      !alloc2(reinterpret_cast<void**>(&mla_->kpos),
-              (static_cast<std::size_t>(kMlaBlock) * kSparseGatherBlocks) * 4) ||
+      !alloc2(
+          reinterpret_cast<void**>(&mla_->kpos),
+          (static_cast<std::size_t>(kMlaBlock) * kSparseGatherBlocks) * 4) ||
       !alloc2(reinterpret_cast<void**>(&mla_->lat_g),
-              static_cast<std::size_t>(kMlaBlock) * kSparseGatherBlocks * 512 * 4) ||
-      !alloc2(reinterpret_cast<void**>(&mla_->extra_g),
-              static_cast<std::size_t>(kMlaBlock) * kSparseGatherBlocks * 64 * 4)) {
+              static_cast<std::size_t>(kMlaBlock) * kSparseGatherBlocks * 512 *
+                  4) ||
+      !alloc2(
+          reinterpret_cast<void**>(&mla_->extra_g),
+          static_cast<std::size_t>(kMlaBlock) * kSparseGatherBlocks * 64 * 4)) {
     if (error)
       *error = "MLA prefill scratch alloc failed";
     return false;
@@ -862,6 +883,14 @@ bool Executor::AddBank(std::string* error) {
       AllocNpuBank(*raw, error);
   cur_bank_ = previous;
   return ok;
+}
+
+bool Executor::EnsureBanks(int count, std::string* error) {
+  while (BankCount() < count) {
+    if (!AddBank(error))
+      return false;
+  }
+  return true;
 }
 
 bool Executor::PrefillMoe(std::uint32_t l, int n, std::string* error) {
@@ -1284,7 +1313,8 @@ bool Executor::Evaluate(Session& session, std::int32_t token,
 bool Executor::EvaluateBatch(Session& session,
                              std::span<const std::int32_t> tokens,
                              std::string* error) {
-  logit_bank_ = 0;
+  if (cur_bank_ == nullptr)
+    logit_bank_ = 0;
   if (tokens.size() >= static_cast<std::size_t>(kMoeGemmMin))
     EnsureFull(session.position + static_cast<std::uint32_t>(tokens.size()));
   if (!RunBatch(session, tokens, error, session.position, nullptr, nullptr,
@@ -1612,8 +1642,8 @@ bool Executor::RunBatch(Session& session, std::span<const std::int32_t> tokens,
       PreqEnd();
       if (on_npu)
         NpuQkvgEnd(qkvg_op, n);
-      if (recording_ && !rec_.empty() && n <= kMaxVerify) {
-        auto& r = rec_[l];
+      if (B().recording && !B().rec.empty() && n <= kMaxVerify) {
+        auto& r = B().rec[l];
         const int cnt = n;
         const float* srcs[7] = {sc_->q,  sc_->k,    sc_->v,    sc_->gproj,
                                 sc_->g2, sc_->beta, sc_->delta};
@@ -1688,8 +1718,8 @@ bool Executor::RunBatch(Session& session, std::span<const std::int32_t> tokens,
         PoolUpdate(st.lat, st.pool, first_block, last_block - first_block + 1,
                    static_cast<int>(pos0 + n), stream_);
       }
-      bool use_sparse = sparse_.on && st.pool != nullptr &&
-                        n >= kMoeGemmMin && mla_ != nullptr &&
+      bool use_sparse = sparse_.on && st.pool != nullptr && n >= kMoeGemmMin &&
+                        mla_ != nullptr &&
                         static_cast<int>(pos0) >= sparse_.min_depth;
       if (use_sparse) {
         // The protected prefix plus the local window can already cover the
@@ -1703,8 +1733,8 @@ bool Executor::RunBatch(Session& session, std::span<const std::int32_t> tokens,
             0, std::min(sparse_.k, probe_local / 64 - probe_sink / 64));
         const int probe_nk = probe_sink + probe_kk * 64 +
                              static_cast<int>(pos0) - probe_local + n;
-        use_sparse = probe_kk > 0 &&
-                     probe_nk <= static_cast<int>(kMlaBlock) * kSparseGatherBlocks;
+        use_sparse = probe_kk > 0 && probe_nk <= static_cast<int>(kMlaBlock) *
+                                                     kSparseGatherBlocks;
       }
       if (use_sparse) {
         const std::size_t heads = config_.num_heads;
@@ -1845,7 +1875,8 @@ bool Executor::RunBatch(Session& session, std::span<const std::int32_t> tokens,
           const int kk = std::max(0, std::min(sparse_.k, score_end - lo));
           const int nk =
               sink_rows + kk * 64 + static_cast<int>(pos0) - local_start + n;
-          if (kk > 0 && nk <= static_cast<int>(kMlaBlock) * kSparseGatherBlocks) {
+          if (kk > 0 &&
+              nk <= static_cast<int>(kMlaBlock) * kSparseGatherBlocks) {
             SparseSelect(nullptr, nullptr, sc_->qabs, st.pool, mla_->scores,
                          mla_->sel, mla_->kpos, n, lo, score_end, kk, sink_rows,
                          local_start, static_cast<int>(pos0), n, stream_);
@@ -2110,7 +2141,7 @@ bool Executor::RunBatch(Session& session, std::span<const std::int32_t> tokens,
     ArgmaxRows(sc_->logits, hr, config_.vocab_size, sc_->argmax, stream_);
   }
   if (head)
-    last_rows_ = hr;
+    B().last_rows = hr;
   return true;
 }
 
@@ -2136,12 +2167,12 @@ bool Executor::SaveState(Session& session, std::string* error) {
       }
     }
   }
-  if (rec_.empty()) {
-    rec_.assign(layers_, Rec{});
+  if (B().rec.empty()) {
+    B().rec.assign(layers_, Rec{});
     for (std::uint32_t l = 0; l < layers_; ++l) {
       if (!config_.IsRda(l))
         continue;
-      auto& r = rec_[l];
+      auto& r = B().rec[l];
       float** ptrs[] = {&r.q, &r.k, &r.v, &r.gproj, &r.g2};
       for (float** p : ptrs) {
         if (hipMalloc(reinterpret_cast<void**>(p), kMaxVerify * inner * 4) !=
@@ -2176,7 +2207,7 @@ bool Executor::SaveState(Session& session, std::string* error) {
 
 bool Executor::Rollback(Session& session, std::uint32_t keep,
                         std::string* error) {
-  if (session.snap_conv.empty() || rec_.empty() || keep == 0 ||
+  if (session.snap_conv.empty() || B().rec.empty() || keep == 0 ||
       keep > static_cast<std::uint32_t>(kMaxVerify)) {
     if (error)
       *error = "rollback without a saved state";
@@ -2195,7 +2226,7 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
                    hipMemcpyDeviceToDevice, stream_);
     hipMemcpyAsync(st.state, session.snap_state[l], state_bytes,
                    hipMemcpyDeviceToDevice, stream_);
-    const auto& r = rec_[l];
+    const auto& r = B().rec[l];
     auto get = [&](const char* nm) -> const DeviceTensor& {
       return *Find(P(l, nm));
     };
@@ -2228,7 +2259,7 @@ std::vector<std::int32_t> Executor::GreedyRows(std::uint32_t rows) {
 
 bool Executor::ReadLogitRows(std::uint32_t first, std::uint32_t count,
                              float* dst) {
-  if (first + count > static_cast<std::uint32_t>(last_rows_))
+  if (first + count > static_cast<std::uint32_t>(LB().last_rows))
     return false;
   hipMemcpyAsync(
       dst, LS()->logits + static_cast<std::size_t>(first) * config_.vocab_size,
@@ -2251,7 +2282,7 @@ bool Executor::WriteLogitRow(std::uint32_t row, const float* src) {
   hipMemcpyAsync(LS()->argmax + row, &best, sizeof(best), hipMemcpyHostToDevice,
                  stream_);
   hipStreamSynchronize(stream_);
-  last_rows_ = std::max<int>(last_rows_, static_cast<int>(row) + 1);
+  LB().last_rows = std::max<int>(LB().last_rows, static_cast<int>(row) + 1);
   return true;
 }
 
@@ -2264,11 +2295,12 @@ const DeviceTensor* Executor::Output() const {
 }
 
 bool Executor::Logits(Session&, float* dst, std::string* error) {
-  if (hipMemcpyAsync(dst,
-                     LS()->logits + static_cast<std::size_t>(last_rows_ - 1) *
-                                        config_.vocab_size,
-                     config_.vocab_size * sizeof(float), hipMemcpyDeviceToHost,
-                     stream_) != hipSuccess) {
+  if (hipMemcpyAsync(
+          dst,
+          LS()->logits +
+              static_cast<std::size_t>(LB().last_rows - 1) * config_.vocab_size,
+          config_.vocab_size * sizeof(float), hipMemcpyDeviceToHost,
+          stream_) != hipSuccess) {
     if (error)
       *error = "logit copy failed";
     return false;
@@ -2280,7 +2312,7 @@ bool Executor::Logits(Session&, float* dst, std::string* error) {
 std::vector<float> Executor::Logits(Session&) {
   std::vector<float> out(config_.vocab_size);
   if (hipMemcpy(out.data(),
-                LS()->logits + static_cast<std::size_t>(last_rows_ - 1) *
+                LS()->logits + static_cast<std::size_t>(LB().last_rows - 1) *
                                    config_.vocab_size,
                 config_.vocab_size * sizeof(float),
                 hipMemcpyDeviceToHost) != hipSuccess) {
@@ -2291,7 +2323,7 @@ std::vector<float> Executor::Logits(Session&) {
 
 std::int32_t Executor::Argmax(Session&, std::string*) {
   std::int32_t out = 0;
-  hipMemcpy(&out, LS()->argmax + (last_rows_ - 1), sizeof(out),
+  hipMemcpy(&out, LS()->argmax + (LB().last_rows - 1), sizeof(out),
             hipMemcpyDeviceToHost);
   return out;
 }
@@ -2349,12 +2381,12 @@ bool Executor::SaveSnapshot(const Session& session, std::span<std::uint8_t> out,
   }
   const bool done = hipStreamSynchronize(stream_) == hipSuccess;
   if (std::getenv("RAON1_SNAP_LOG") != nullptr)
-    std::fprintf(stderr, "raon1: snapshot wait-for-gpu %.1f ms, copy %.1f ms\n",
-                 std::chrono::duration<double, std::milli>(t_copy - t_wait)
-                     .count(),
-                 std::chrono::duration<double, std::milli>(
-                     std::chrono::steady_clock::now() - t_copy)
-                     .count());
+    std::fprintf(
+        stderr, "raon1: snapshot wait-for-gpu %.1f ms, copy %.1f ms\n",
+        std::chrono::duration<double, std::milli>(t_copy - t_wait).count(),
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_copy)
+            .count());
   return done;
 }
 

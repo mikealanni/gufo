@@ -1347,8 +1347,8 @@ __global__ __launch_bounds__(kMlaSplitThreads) void MlaSplitTileKernel(
   }
 }
 
-
-using mw_v16h = __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
+using mw_v16h =
+    __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
 using mw_v8f = __attribute__((__vector_size__(8 * sizeof(float)))) float;
 
 constexpr int kMwRows = 32;
@@ -1360,8 +1360,7 @@ constexpr int kMwPs = 24;
 
 __global__ void MlaQHalfKernel(const float* __restrict__ qabs,
                                const float* __restrict__ qe,
-                               _Float16* __restrict__ out, int rank,
-                               int rope) {
+                               _Float16* __restrict__ out, int rank, int rope) {
   const std::size_t row = blockIdx.x;
   for (int i = threadIdx.x; i < rank + rope; i += blockDim.x) {
     const float v = i < rank ? qabs[row * rank + i] : qe[row * rope + i - rank];
@@ -1395,8 +1394,8 @@ __global__ __launch_bounds__(256) void MlaSplitWmmaKernel(
   const int srow = tid >> 3;
   const int sub = tid & 7;
   const int grow = row0 + srow;
-  float* base_out = part + (static_cast<std::size_t>(grow) * splits + s) *
-                               (rank + 2);
+  float* base_out =
+      part + (static_cast<std::size_t>(grow) * splits + s) * (rank + 2);
   if (start >= len_max) {
     if (sub == 0 && grow < nrows) {
       base_out[rank] = -INFINITY;
@@ -1405,8 +1404,7 @@ __global__ __launch_bounds__(256) void MlaSplitWmmaKernel(
     return;
   }
   const int end = min(len_max, start + chunk);
-  const int len_row =
-      grow < nrows ? pos0 + grow / heads + 1 : 0;
+  const int len_row = grow < nrows ? pos0 + grow / heads + 1 : 0;
   const int limit = min(len_row, end);
 
   const int rt = wave & 1;
@@ -1438,10 +1436,10 @@ __global__ __launch_bounds__(256) void MlaSplitWmmaKernel(
       const int k = idx >> 7;
       const int c = idx & 127;
       const int p = base + k;
-      pre_lat[i] = p < end ? *reinterpret_cast<const float4*>(
-                                 lat + static_cast<std::size_t>(p) * rank +
-                                 c * 4)
-                           : make_float4(0.F, 0.F, 0.F, 0.F);
+      pre_lat[i] = p < end
+                       ? *reinterpret_cast<const float4*>(
+                             lat + static_cast<std::size_t>(p) * rank + c * 4)
+                       : make_float4(0.F, 0.F, 0.F, 0.F);
     }
     const int k = tid >> 4;
     const int c = tid & 15;
@@ -1484,8 +1482,8 @@ __global__ __launch_bounds__(256) void MlaSplitWmmaKernel(
       mw_v8f acc = mw_v8f{};
 #pragma unroll
       for (int j = 0; j < 9; ++j) {
-        const mw_v16h b = *reinterpret_cast<const mw_v16h*>(
-            &Ks[col][(qq * 9 + j) * 16]);
+        const mw_v16h b =
+            *reinterpret_cast<const mw_v16h*>(&Ks[col][(qq * 9 + j) * 16]);
         acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(qa[j], b, acc);
       }
 #pragma unroll
@@ -1542,7 +1540,8 @@ __global__ __launch_bounds__(256) void MlaSplitWmmaKernel(
       }
 #pragma unroll
       for (int b = 0; b < 4; ++b)
-        o[a][b] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pa, vb[b], o[a][b]);
+        o[a][b] =
+            __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pa, vb[b], o[a][b]);
     }
   }
   lsum += __shfl_xor(lsum, 1, 8);
@@ -1559,8 +1558,8 @@ __global__ __launch_bounds__(256) void MlaSplitWmmaKernel(
       const int r = row0 + a * 16 + 2 * i + hid;
       if (r >= nrows)
         continue;
-      float* out = part + (static_cast<std::size_t>(r) * splits + s) *
-                              (rank + 2);
+      float* out =
+          part + (static_cast<std::size_t>(r) * splits + s) * (rank + 2);
 #pragma unroll
       for (int b = 0; b < 4; ++b)
         out[wave * 64 + b * 16 + col] = o[a][b][i];
@@ -2342,9 +2341,8 @@ int MlaAttendSplitWmma(const float* qabs, const float* qe, void* q16,
   int chunk = std::max(256, (max_len + kMlaMaxSplits - 1) / kMlaMaxSplits);
   chunk = (chunk + 63) / 64 * 64;
   const int splits = (max_len + chunk - 1) / chunk;
-  MlaQHalfKernel<<<nrows, 192, 0, stream>>>(qabs, qe,
-                                            static_cast<_Float16*>(q16),
-                                            kRaonRank, kRaonRope);
+  MlaQHalfKernel<<<nrows, 192, 0, stream>>>(
+      qabs, qe, static_cast<_Float16*>(q16), kRaonRank, kRaonRope);
   MlaSplitWmmaKernel<<<dim3((nrows + kMwRows - 1) / kMwRows, splits), 256, 0,
                        stream>>>(
       static_cast<const _Float16*>(q16), lat, extra, part, heads, nrows, pos0,

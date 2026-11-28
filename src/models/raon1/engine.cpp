@@ -209,6 +209,10 @@ struct SnapshotHeader {
 };
 }  // namespace
 
+void Session::BindBank(int index) noexcept {
+  executor_->BindThreadToBank(index);
+}
+
 bool Session::SnapshotSupported() const noexcept {
   return executor_->SnapshotSupported();
 }
@@ -597,6 +601,10 @@ std::shared_ptr<Model> Model::Load(const std::string& path,
       return nullptr;
   }
   return model;
+}
+
+bool Model::EnsureBanks(int count, std::string* error) {
+  return executor_->EnsureBanks(count, error);
 }
 
 bool Model::SnapshotSupported() const noexcept {

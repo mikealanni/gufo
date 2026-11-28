@@ -75,6 +75,9 @@ public:
   [[nodiscard]] bool RestoreSnapshot(std::span<const std::uint8_t> in,
                                      std::string* error = nullptr);
   void SetPromptEnd(std::uint32_t end) noexcept { prompt_end_ = end; }
+  /// Binds the calling thread to executor bank `index` (negative: default).
+  /// Sessions decoding at the same time must run on different banks.
+  void BindBank(int index) noexcept;
   [[nodiscard]] std::vector<float> Logits(std::string* error = nullptr) const;
   [[nodiscard]] std::int32_t Argmax(std::string* error = nullptr) const;
   [[nodiscard]] std::span<const std::int32_t> Tokens() const noexcept {
@@ -130,6 +133,9 @@ public:
   [[nodiscard]] std::size_t ResidentBytes() const noexcept;
   [[nodiscard]] std::string ModelName() const;
   [[nodiscard]] bool SnapshotSupported() const noexcept;
+  /// Makes sure `count` executor banks exist so that many sessions can decode
+  /// concurrently, one per bank.
+  [[nodiscard]] bool EnsureBanks(int count, std::string* error = nullptr);
 
 private:
   Model() = default;

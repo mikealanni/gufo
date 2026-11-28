@@ -4263,10 +4263,6 @@ public:
     };
   }
 
-  [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
-    return {{.kind = TextExecutionPlanKind::kSerial, .physical_width = 1}};
-  }
-
   [[nodiscard]] std::shared_ptr<const sampling::ConstraintVocabulary>
   BuildConstraintVocabulary() const override {
     return std::make_shared<const sampling::ConstraintVocabulary>(
@@ -4305,6 +4301,26 @@ public:
 
   [[nodiscard]] ReasoningTags ReasoningBudgetTags() const override {
     return {"<think>", "</think>", {"</think>", "<tool_call>"}};
+  }
+
+  /// Raon's template has only a thinking switch, so the effort jev (or the
+  /// client) picks scales the reasoning budget: low is a short plan, high a
+  /// long one, and minimal/xhigh/max leave thinking uncapped.
+  [[nodiscard]] std::optional<std::size_t> DefaultReasoningBudget(
+      ReasoningEffort effort) const override {
+    switch (effort) {
+      case ReasoningEffort::kLow:
+        return 1024;
+      case ReasoningEffort::kMedium:
+        return 4096;
+      case ReasoningEffort::kHigh:
+        return 16384;
+      case ReasoningEffort::kMinimal:
+      case ReasoningEffort::kXHigh:
+      case ReasoningEffort::kMax:
+        return std::nullopt;
+    }
+    return std::nullopt;
   }
 
   [[nodiscard]] std::string Decode(
@@ -4421,6 +4437,84 @@ public:
     return step;
   }
 
+  // Two agents dispatched at once decode at the same time: each request runs on
+  // its own executor bank from its own host thread. The two banks are the ones
+  // the two-bank prefill already owns, so this costs no extra memory.
+  static constexpr std::size_t kMaxConcurrentDecodes = 2;
+
+  [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
+    std::vector<TextExecutionPlan> plans{
+        {.kind = TextExecutionPlanKind::kSerial, .physical_width = 1}};
+    for (std::size_t width = 2; width <= kMaxConcurrentDecodes; ++width) {
+      plans.push_back(
+          {.kind = TextExecutionPlanKind::kBatched, .physical_width = width});
+    }
+    return plans;
+  }
+
+  /// Runs `work(index)` for each request on its own thread bound to bank
+  /// `index`. False, with nothing run, when the banks cannot be provided.
+  template<typename Work>
+  [[nodiscard]] bool RunOnBanks(std::size_t count, Work&& work) const {
+    std::string error;
+    if (count < 2 || count > kMaxConcurrentDecodes ||
+        !model_->EnsureBanks(static_cast<int>(count), &error)) {
+      return false;
+    }
+    std::vector<std::thread> workers;
+    workers.reserve(count);
+    for (std::size_t index = 0; index < count; ++index)
+      workers.emplace_back([&work, index] { work(index); });
+    for (auto& worker : workers)
+      worker.join();
+    return true;
+  }
+
+  [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
+      std::span<const TextRunnerDecode> decodes) const override {
+    std::vector<TextDecodeStep> steps(decodes.size());
+    const bool ran = RunOnBanks(decodes.size(), [&](std::size_t index) {
+      auto& session = RequireRaon1State(decodes[index].state.get()).session();
+      session.BindBank(static_cast<int>(index));
+      try {
+        steps[index] =
+            DecodeStep(decodes[index].state.get(), decodes[index].max_tokens,
+                       decodes[index].sampler.get());
+      } catch (...) {
+        steps[index] = {};
+        steps[index].failure = std::current_exception();
+      }
+      session.BindBank(-1);
+    });
+    if (!ran)
+      return TextModelRunner::DecodeBatch(decodes);
+    for (auto& step : steps) {
+      if (!step.failure) {
+        step.execution_plan = {.kind = TextExecutionPlanKind::kBatched,
+                               .physical_width = decodes.size()};
+      }
+    }
+    return steps;
+  }
+
+  void AdvanceBatch(
+      std::span<const TextRunnerAdvance> advances) const override {
+    const bool ran = RunOnBanks(advances.size(), [&](std::size_t index) {
+      const auto& advance = advances[index];
+      auto& session = RequireRaon1State(advance.state.get()).session();
+      session.BindBank(static_cast<int>(index));
+      try {
+        Advance(advance.state.get(), advance.token);
+      } catch (...) {
+        if (advance.failure)
+          *advance.failure = std::current_exception();
+      }
+      session.BindBank(-1);
+    });
+    if (!ran)
+      TextModelRunner::AdvanceBatch(advances);
+  }
+
   [[nodiscard]] std::size_t SnapshotPayloadBytes(
       const TextRunnerState& state) const override {
     return RequireRaon1State(state).session().SnapshotBytes();
@@ -4448,12 +4542,14 @@ public:
                      const TextRunnerSnapshot& snapshot) const override {
     const auto* raon1_snapshot =
         dynamic_cast<const Raon1TextRunnerSnapshot*>(&snapshot);
-    if (raon1_snapshot == nullptr || raon1_snapshot->model.get() != model_.get())
+    if (raon1_snapshot == nullptr ||
+        raon1_snapshot->model.get() != model_.get())
       throw std::invalid_argument(
           "Raon-1 snapshot does not belong to this model");
     auto& restored = RequireRaon1State(state);
     std::string error;
-    if (!restored.session().RestoreSnapshot(raon1_snapshot->bytes.span(), &error)) {
+    if (!restored.session().RestoreSnapshot(raon1_snapshot->bytes.span(),
+                                            &error)) {
       restored.Invalidate();
       throw std::runtime_error("Raon-1 snapshot restore failed: " + error);
     }

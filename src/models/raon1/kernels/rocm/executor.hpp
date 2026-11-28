@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/core/hip/weight_upload.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/npu_gemm.hpp"
 #include "src/models/raon1/runtime/config.hpp"
 
@@ -102,7 +103,7 @@ public:
   /// Undoes the last forward and re-applies only its first `keep` tokens to the
   /// recurrent state; requires SetRecording(true) and SaveState before it.
   bool Rollback(Session& session, std::uint32_t keep, std::string* error);
-  void SetRecording(bool on) { recording_ = on; }
+  void SetRecording(bool on) { B().recording = on; }
   [[nodiscard]] bool SnapshotSupported() const noexcept { return true; }
   [[nodiscard]] std::size_t SnapshotBytes(const Session& session) const;
   bool SaveSnapshot(const Session& session, std::span<std::uint8_t> out,
@@ -132,7 +133,7 @@ public:
 
   [[nodiscard]] const Config& config() const { return config_; }
   [[nodiscard]] std::uint32_t layers() const { return layers_; }
-  [[nodiscard]] hipStream_t stream() const { return banks_[0]->stream; }
+  [[nodiscard]] hipStream_t stream() const { return B().stream; }
   [[nodiscard]] std::size_t ResidentBytes() const noexcept;
 
 private:
@@ -161,6 +162,10 @@ private:
                  std::string* error);
 
   std::unique_ptr<core::GgufReader> reader_;
+  /// Streams quantized tensors disk-to-device through the file descriptor so
+  /// the GGUF mapping is never faulted in; dropped once every tensor is
+  /// resident.
+  std::unique_ptr<::gufo::hip::TensorUpload> uploader_;
   Config config_;
   ExecutorOptions options_;
   std::uint32_t layers_{0};
@@ -212,7 +217,6 @@ private:
     __half* f16{nullptr};
     ~Scratch();
   };
-  int last_rows_{1};
   struct Rec {
     float* q{nullptr};
     float* k{nullptr};
@@ -222,8 +226,6 @@ private:
     float* beta{nullptr};
     float* delta{nullptr};
   };
-  std::vector<Rec> rec_;
-  bool recording_{false};
   bool tap_input_{false};
   /// Opt-in block-sparse long-context prefill attention (GUFO_RAON1_SPARSE=
   /// "k,window,min_depth"): sink + local window + top-k 64-row blocks by a
@@ -306,6 +308,12 @@ private:
     std::size_t mmq_bytes{0};
     std::uint32_t mla_cap{0};
     float* capture{nullptr};
+    /// Per-bank decode state: operand records for the recurrent rollback, the
+    /// recording switch and the logit rows of the last forward. Two sessions
+    /// can decode at once only because none of this is shared.
+    std::vector<Rec> rec;
+    bool recording{false};
+    int last_rows{1};
     std::uint32_t cap_rows{0};
     std::uint32_t cap_pos{0};
     const float* hint_src[2]{nullptr, nullptr};
@@ -340,8 +348,29 @@ private:
   [[nodiscard]] Bank& B() const {
     return cur_bank_ != nullptr ? *cur_bank_ : *banks_[0];
   }
-  [[nodiscard]] Scratch* LS() const { return banks_[logit_bank_]->sc.get(); }
+  /// The bank that holds the logits of the last forward: the calling thread's
+  /// bank when it is bound, otherwise the one the last forward finished on.
+  [[nodiscard]] Bank& LB() const {
+    return cur_bank_ != nullptr ? *cur_bank_ : *banks_[logit_bank_];
+  }
+  [[nodiscard]] Scratch* LS() const { return LB().sc.get(); }
   bool AddBank(std::string* error);
+
+public:
+  /// At least `count` banks exist; each can run one session's decode at a time.
+  [[nodiscard]] bool EnsureBanks(int count, std::string* error);
+  [[nodiscard]] int BankCount() const {
+    return static_cast<int>(banks_.size());
+  }
+  /// Binds the calling thread to bank `index` for every later call on it
+  /// (negative restores the default bank). Threads running different
+  /// sessions concurrently must be bound to different banks.
+  void BindThreadToBank(int index) {
+    cur_bank_ =
+        index >= 0 && index < BankCount() ? banks_[index].get() : nullptr;
+  }
+
+private:
   /// XDNA2 offload (GUFO_NPU_DIR): the RDA layers' q/k/v/g projections run as
   /// 4 x 5 slices of 1024 outputs on the NPU for 1024-token chunks while the
   /// bank's stream is free for the other banks' GPU work.
