@@ -220,7 +220,9 @@ void PackDFlashWeights(speculative::QwenDFlashWeights& weights,
   const std::size_t attention = cfg.AttentionSize();
   const std::size_t kv =
       static_cast<std::size_t>(cfg.num_key_value_heads) * cfg.head_dim;
-  const std::size_t enc_in_dim = df_cfg.target_layer_ids.size() * hidden;
+  const std::size_t enc_in_dim =
+      df_cfg.target_layer_ids.size() *
+      (df_cfg.target_hidden_size != 0 ? df_cfg.target_hidden_size : hidden);
 
   // Feature Fusion Encoder
   weights.fc_norm =

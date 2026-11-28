@@ -396,6 +396,12 @@ bool DequantizeHalf(const void* w, core::GgmlType type, __half* out,
 bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
                   std::size_t m, std::size_t k, hipStream_t stream,
                   std::size_t ldx = 0);
+/// DenseHalfWeightGemm with a launch plan tuned for 1024+ token batches over
+/// F16 weights of 1k-16k rows (2x on K = 2560 and 5120); smaller batches use
+/// DenseHalfWeightGemm unchanged.
+bool DenseHalfWeightGemmWide(const __half* w, const __half* x, float* out,
+                             std::size_t batch, std::size_t m, std::size_t k,
+                             hipStream_t stream);
 /// DenseF16Gemm's tile plan over F16 weight rows [m][k] (a dequantized copy).
 bool DenseHalfWeightGemm(const __half* w, const __half* x, float* out,
                          std::size_t batch, std::size_t m, std::size_t k,
@@ -426,6 +432,15 @@ void NpuEncodeWeightsQuant(const void* weights, std::uint32_t type,
                            std::uint32_t cols, std::uint32_t k_slice,
                            std::uint32_t k_offset, std::uint32_t k_valid,
                            void* dst, hipStream_t stream);
+/// res[t][s][hidden] = row tokens[t] of a quantized table (any `type` the NPU
+/// weight encoder decodes), replicated over `streams`.
+void EmbedTokensQuant(const void* table, std::uint32_t type,
+                      const std::int32_t* tokens, float* res,
+                      std::uint32_t n_tokens, std::uint32_t hidden,
+                      std::uint32_t streams, hipStream_t stream);
+/// Dequantizes `rows` rows of k weights (`type` a core::GgmlType value) to F16.
+void DequantRowsToHalf(const void* weights, std::uint32_t type, std::uint32_t k,
+                       std::size_t rows, __half* out, hipStream_t stream);
 /// Re-encodes `rows` rows of k weights (any K-quant or IQ `type`, a
 /// core::GgmlType value) as Q8_0 into dst (rows * k / 32 * 34 bytes).
 void RequantToQ8_0(const void* src, std::uint32_t type, std::uint32_t k,
@@ -543,6 +558,17 @@ bool RoutedNvfp4SituGemmF16(const void* w_gate_up, const __half* x,
                             std::size_t ff, std::size_t k,
                             const float* expert_scale, const float* situ,
                             hipStream_t stream);
+
+/// Paired Q4_K gate/up GEMM with the SiTU activation (`situ`: device pair
+/// {beta, linear_beta}) and F16 output rows [slot][ff]; tile_rows 48 or 128.
+bool RoutedQ4KSituGemmF16(const void* gate, const void* up, const __half* x,
+                          const std::int32_t* tiles, std::uint32_t n_tiles,
+                          std::uint32_t tile_rows,
+                          const std::int32_t* pad_bounds,
+                          const std::int32_t* rows_in,
+                          const std::int32_t* rows_out, __half* out_half,
+                          std::size_t ff, std::size_t k, const float* situ,
+                          hipStream_t stream);
 
 /// Experimental 128-row-per-tile variant of RoutedF16Gemm for Q8_0 only,
 /// bypassing the tile_rows<=64 limit RoutedF16Gemm enforces for that type.

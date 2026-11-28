@@ -320,6 +320,10 @@ std::optional<QwenDFlashWeights> QwenDFlashWeights::LoadFromGguf(
       !conv_kernel_size.has_value() && !selector_rank.has_value();
   df_cfg.is_v1 = is_v1;
   df_cfg.block_size = *block_size;
+  if (const auto target_hidden =
+          reader.GetMetadataUint32(prefix + "target_hidden_size")) {
+    df_cfg.target_hidden_size = *target_hidden;
+  }
   df_cfg.conv_kernel_size = conv_kernel_size.value_or(0);
   df_cfg.conv_group_size = conv_group_size.value_or(0);
   df_cfg.selector_rank = selector_rank.value_or(0);
@@ -432,7 +436,9 @@ std::optional<QwenDFlashWeights> QwenDFlashWeights::LoadFromGguf(
     }
   }
 
-  const std::size_t encoder_input = df_cfg.target_layer_ids.size() * hidden;
+  const std::size_t tap_width =
+      df_cfg.target_hidden_size != 0 ? df_cfg.target_hidden_size : hidden;
+  const std::size_t encoder_input = df_cfg.target_layer_ids.size() * tap_width;
   if (!BindRequiredTensor(reader, "fc.weight", hidden * encoder_input, true,
                           weights.fc_projection, error_msg) ||
       !BindRequiredTensor(reader, "enc.output_norm.weight", hidden, false,

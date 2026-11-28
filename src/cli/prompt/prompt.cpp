@@ -47,6 +47,7 @@
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
+#include "src/models/raon1/engine.hpp"
 #endif
 
 namespace gufo::cli {
@@ -268,6 +269,10 @@ bool IsDeepSeekV4Flash(const core::GgufReader& reader) {
 
 bool IsLaguna(const core::GgufReader& reader) {
   return reader.GetMetadataString("general.architecture") == "laguna";
+}
+
+bool IsRaon1(const core::GgufReader& reader) {
+  return reader.GetMetadataString("general.architecture") == "raon1";
 }
 
 int RunLagunaPromptCPU(const PromptOptions& opt, const core::GgufReader& reader,
@@ -1486,6 +1491,169 @@ int RunGlmChat(const PromptOptions& opt, const core::GgufReader& reader,
   }
   return 0;
 }
+
+int RunRaon1PromptGPU(const PromptOptions& opt, const core::GgufReader& reader,
+                      std::chrono::steady_clock::time_point load_start) {
+  std::string error;
+  const bool dflash = opt.speculative_backend == "dflash2";
+  if (!opt.speculative_backend.empty() && !dflash) {
+    std::cerr << "Raon-1 supports only --speculative dflash2\n";
+    return 2;
+  }
+  if (dflash && opt.dflash_model_path.empty()) {
+    std::cerr << "Raon-1 DFlash2 requires --dflash-model\n";
+    return 2;
+  }
+  auto tokenizer = tokenization::QwenTokenizer::CreateFromGguf(reader, &error);
+  if (!tokenizer) {
+    std::cerr << "Raon-1 tokenizer failed: " << error << '\n';
+    return 1;
+  }
+  models::raon1::EngineOptions engine_options;
+  engine_options.max_context = 131072;
+  if (dflash) {
+    engine_options.dflash_model_path = opt.dflash_model_path;
+    engine_options.max_draft_tokens = std::min<std::uint32_t>(
+        opt.draft_tokens, models::raon1::kMaxDraftTokens);
+  }
+  auto model =
+      models::raon1::Model::Load(opt.model_path, engine_options, &error);
+  if (!model) {
+    std::cerr << "Raon-1 GPU load failed: " << error << '\n';
+    PrintModelLoadTime(load_start, false);
+    return 1;
+  }
+  PrintModelLoadTime(load_start, true);
+
+  std::string rendered = opt.prompt_text;
+  if (opt.use_chat_template) {
+    auto chat = tokenization::QwenChatTemplate::CreateFromGguf(reader, &error);
+    if (!chat) {
+      std::cerr << "Raon-1 chat template failed: " << error << '\n';
+      return 1;
+    }
+    std::vector<tokenization::ChatMessage> messages;
+    if (!opt.system_prompt.empty())
+      messages.emplace_back(tokenization::ChatRole::kSystem, opt.system_prompt);
+    messages.emplace_back(tokenization::ChatRole::kUser, opt.prompt_text);
+    auto formatted =
+        chat->Render(messages,
+                     tokenization::ResolveQwenChatOptions(
+                         PromptReasoningOptions(opt), opt.add_vision_id),
+                     &error);
+    if (!formatted) {
+      std::cerr << "Raon-1 prompt rendering failed: " << error << '\n';
+      return 1;
+    }
+    rendered = std::move(*formatted);
+  }
+  tokenization::TokenizerOptions encode_options;
+  encode_options.parse_special_tokens = true;
+  const auto prompt = tokenizer->Encode(rendered, encode_options);
+  if (prompt.empty()) {
+    std::cerr << "Raon-1 prompt produced no tokens\n";
+    return 1;
+  }
+  if (prompt.size() + opt.max_tokens >= engine_options.max_context) {
+    std::cerr << "Raon-1 prompt and output exceed the "
+              << engine_options.max_context << "-token CLI context\n";
+    return 1;
+  }
+
+  auto session = model->CreateSession(&error, dflash);
+  if (!session) {
+    std::cerr << "Raon-1 session failed: " << error << '\n';
+    return 1;
+  }
+  const std::vector<std::int32_t> engine_prompt(prompt.begin(), prompt.end());
+  const auto start = std::chrono::steady_clock::now();
+  if (!session->Sync(engine_prompt, &error)) {
+    std::cerr << "Raon-1 prefill failed: " << error << '\n';
+    return 1;
+  }
+  const auto prefill_end = std::chrono::steady_clock::now();
+
+  const auto stop_tokens = FlintStopTokens(reader);
+  const auto is_stop = [&](tokenization::TokenId token) {
+    return std::find(stop_tokens.begin(), stop_tokens.end(), token) !=
+           stop_tokens.end();
+  };
+  sampling::SamplerState sampler(opt.sampling, prompt);
+  std::vector<tokenization::TokenId> generated;
+  if (dflash) {
+    bool stopped = false;
+    while (generated.size() < opt.max_tokens && !stopped) {
+      models::raon1::Session::DecodeResult decoded;
+      if (!session->DecodeStep(opt.max_tokens - generated.size(), sampler,
+                               &decoded, is_stop, &error)) {
+        std::cerr << "\nRaon-1 decode failed: " << error << '\n';
+        return 1;
+      }
+      for (const auto token : decoded.tokens) {
+        std::cout << tokenizer->DecodeToken(token) << std::flush;
+        generated.push_back(static_cast<tokenization::TokenId>(token));
+      }
+      stopped = decoded.stop;
+    }
+    std::cout << '\n';
+    if (opt.verbose) {
+      const auto end = std::chrono::steady_clock::now();
+      const auto stats = session->Statistics();
+      const double decode_s =
+          std::chrono::duration<double>(end - prefill_end).count();
+      std::cout << "Prefill: "
+                << std::chrono::duration<double>(prefill_end - start).count()
+                << " s\nDecode: " << decode_s << " s, " << generated.size()
+                << " tokens, "
+                << static_cast<double>(generated.size()) / decode_s
+                << " tok/s; cycles=" << stats.cycles
+                << " drafted=" << stats.drafted
+                << " accepted=" << stats.accepted
+                << " history_drafted=" << stats.history_drafted
+                << " history_accepted=" << stats.history_accepted << '\n';
+    }
+    return 0;
+  }
+  auto logits = session->Logits(&error);
+  if (logits.empty()) {
+    std::cerr << "Raon-1 logits failed: " << error << '\n';
+    return 1;
+  }
+  auto token = sampler.Sample(logits);
+  while (generated.size() < opt.max_tokens && !is_stop(token)) {
+    sampler.Accept(token);
+    const auto piece = tokenizer->DecodeToken(token);
+    std::cout << piece << std::flush;
+    generated.push_back(token);
+    if (generated.size() >= opt.max_tokens)
+      break;
+    if (!session->Evaluate(static_cast<std::int32_t>(token), &error)) {
+      std::cerr << "\nRaon-1 decode failed: " << error << '\n';
+      return 1;
+    }
+    logits = session->Logits(&error);
+    if (logits.empty()) {
+      std::cerr << "\nRaon-1 logits failed: " << error << '\n';
+      return 1;
+    }
+    token = sampler.Sample(logits);
+  }
+  std::cout << '\n';
+  if (opt.verbose) {
+    const auto seconds = [](auto a, auto b) {
+      return std::chrono::duration<double>(b - a).count();
+    };
+    const auto end = std::chrono::steady_clock::now();
+    std::cout << "Prefill: " << seconds(start, prefill_end) << " s\n"
+              << "Decode: " << seconds(prefill_end, end) << " s\n"
+              << "Generated " << generated.size() << " tokens on ROCm in "
+              << seconds(start, end) << " s ("
+              << static_cast<double>(generated.size()) / seconds(start, end)
+              << " tok/s)\n";
+    PrintTokenTrace(generated);
+  }
+  return 0;
+}
 #endif
 
 std::shared_ptr<models::deepseek_v4_flash::Model> LoadDeepSeekModel(
@@ -2207,6 +2375,19 @@ int RunPrompt(std::span<const char* const> args) {
 #endif
     return RunLagunaPromptCPU(opt, *reader, model_load_start);
   }
+  if (IsRaon1(*reader)) {
+    if (!opt.image_paths.empty() || !opt.vision_model_path.empty()) {
+      std::cerr << "Raon-1 does not support image input\n";
+      return 2;
+    }
+#ifdef ENGINE_ENABLE_HIP
+    if (!opt.force_cpu)
+      return RunRaon1PromptGPU(opt, *reader, model_load_start);
+#endif
+    std::cerr << "Raon-1 requires ENGINE_ENABLE_HIP=ON\n";
+    PrintModelLoadTime(model_load_start, false);
+    return 1;
+  }
   if (IsFlint(*reader)) {
     if (!opt.image_paths.empty() || !opt.vision_model_path.empty()) {
       std::cerr << "Flint does not support image input\n";
@@ -2452,6 +2633,19 @@ int RunChat(std::span<const char* const> args) {
       return 2;
     }
     return RunGlmChat(opt, *reader, model_load_start);
+  }
+  if (IsRaon1(*reader)) {
+    if (!opt.image_paths.empty() || !opt.vision_model_path.empty()) {
+      std::cerr << "Raon-1 does not support image input\n";
+      return 2;
+    }
+#ifdef ENGINE_ENABLE_HIP
+    if (!opt.force_cpu)
+      return RunRaon1PromptGPU(opt, *reader, model_load_start);
+#endif
+    std::cerr << "Raon-1 requires ENGINE_ENABLE_HIP=ON\n";
+    PrintModelLoadTime(model_load_start, false);
+    return 1;
   }
   if (IsDeepSeekV4Flash(*reader)) {
     if (!opt.image_paths.empty() || !opt.vision_model_path.empty()) {

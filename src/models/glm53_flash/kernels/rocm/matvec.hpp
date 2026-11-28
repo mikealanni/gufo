@@ -29,6 +29,12 @@ std::size_t MatvecScratchBytes(int n, int k);
 int Matvec(int ggml_type, const void* w, const float* x, float* out, int m,
            int n, int k, void* scratch, hipStream_t stream);
 
+// Quantize n activation rows once (q holds MatvecScratchBytes(n, k)) and run
+// several matrices against them with MatvecQuantized.
+int QuantizeActivations(const float* x, int n, int k, void* q, hipStream_t stream);
+int MatvecQuantized(int ggml_type, const void* w, const void* q, float* out,
+                    int m, int n, int k, hipStream_t stream);
+
 // Per-channel matvec: out[c * m + row] = sum_k W[c][row][k] * x[c * k + k'],
 // for `channels` stacked weight slabs of m rows each (attn_k_b / attn_v_b
 // heads). scratch must hold MatvecScratchBytes(channels, k). Returns 0 on
@@ -36,6 +42,12 @@ int Matvec(int ggml_type, const void* w, const float* x, float* out, int m,
 int MatvecBatched(int type_code, const void* w, const float* x, float* out,
                   int m, int k, int channels, void* scratch,
                   hipStream_t stream);
+
+// MatvecBatched for up to eight tokens in one launch: x is [token][channel][k]
+// and out is [token][channel][m], with the weight slab chosen by channel.
+int MatvecBatchedTokens(int type_code, const void* w, const float* x,
+                        float* out, int m, int k, int channels, int tokens,
+                        void* scratch, hipStream_t stream);
 
 // Routed-expert matvec: out[i * m + row] = sum_k W[ids[i]][row][k] * x_i[k]
 // for i < n_used, with W stacked [n_experts][m][k] in its block format. x is

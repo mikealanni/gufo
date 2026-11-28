@@ -5,8 +5,10 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -40,6 +42,7 @@
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
+#include "src/models/raon1/engine.hpp"
 #endif
 
 namespace gufo::cli {
@@ -1382,6 +1385,10 @@ bool IsLaguna(const core::GgufReader& reader) {
   return reader.GetMetadataString("general.architecture") == "laguna";
 }
 
+bool IsRaon1(const core::GgufReader& reader) {
+  return reader.GetMetadataString("general.architecture") == "raon1";
+}
+
 // Compares logits from one multi-token Append (exercises whatever
 // per-layer attention path the token count selects, e.g. WMMA) against
 // the same tokens appended one at a time (always n=1 per call), on a
@@ -1825,6 +1832,198 @@ int RunLing32Benchmark(const BenchOptions& options,
   return 0;
 }
 
+int RunRaon1Benchmark(const BenchOptions& options,
+                      const std::shared_ptr<const core::GgufReader>& reader,
+                      std::chrono::steady_clock::time_point model_load_start) {
+  namespace raon1 = models::raon1;
+  if (options.concurrency != std::vector<std::size_t>{1}) {
+    std::cerr << "Error: Raon-1 bench supports C1 only\n";
+    return 1;
+  }
+  if (!options.speculative_backend.empty()) {
+    std::cerr << "Error: Raon-1 bench does not support speculation yet\n";
+    return 1;
+  }
+  const auto max_or_zero = [](const std::vector<std::size_t>& values) {
+    return values.empty() ? std::size_t{0}
+                          : *std::max_element(values.begin(), values.end());
+  };
+  const std::size_t max_depth = max_or_zero(options.n_depths);
+  const std::size_t max_prompt = max_or_zero(options.n_prompts);
+  const std::size_t max_generation = max_or_zero(options.n_gens);
+  const std::size_t required_context =
+      std::max({std::size_t{4096}, max_depth + max_prompt + 1,
+                std::max<std::size_t>(max_depth, 16) + max_generation + 1});
+  if (required_context > 262144) {
+    std::cerr << "Error: Raon-1 bench context exceeds 262144 tokens\n";
+    return 1;
+  }
+
+  std::string error;
+  auto tokenizer = tokenization::QwenTokenizer::CreateFromGguf(*reader, &error);
+  if (!tokenizer) {
+    std::cerr << "Raon-1 tokenizer failed: " << error << '\n';
+    return 1;
+  }
+  raon1::EngineOptions engine_options;
+  engine_options.max_context = static_cast<std::uint32_t>(required_context);
+  auto model = raon1::Model::Load(options.model_path, engine_options, &error);
+  if (!model) {
+    std::cerr << "Error creating Raon-1 model: " << error << '\n';
+    PrintModelLoadTime(model_load_start, false);
+    return 1;
+  }
+  PrintModelLoadTime(model_load_start);
+
+  std::vector<std::int32_t> nll_tokens;
+  std::vector<std::int32_t> tokens;
+  {
+    std::string text =
+        "The quick brown fox jumps over the lazy dog. "
+        "Strix Halo executes this deterministic benchmark sequence. ";
+    if (const char* path = std::getenv("GUFO_BENCH_TEXT")) {
+      std::ifstream in(path);
+      text.assign(std::istreambuf_iterator<char>(in),
+                  std::istreambuf_iterator<char>());
+    }
+    const auto pattern =
+        tokenizer->Encode(text, tokenization::TokenizerOptions{});
+    if (pattern.empty()) {
+      std::cerr << "Error: benchmark token pattern is empty\n";
+      return 1;
+    }
+    nll_tokens.assign(pattern.begin(), pattern.end());
+    tokens.resize(required_context);
+    for (std::size_t i = 0; i < tokens.size(); ++i)
+      tokens[i] = static_cast<std::int32_t>(pattern[i % pattern.size()]);
+  }
+  const auto nll_env = std::getenv("GUFO_BENCH_NLL");
+  if (nll_env != nullptr) {
+    const std::size_t count = std::min<std::size_t>(
+        nll_tokens.size(), static_cast<std::size_t>(std::atoll(nll_env)));
+    auto session = model->CreateSession(&error);
+    if (!session || count < 2) {
+      std::cerr << "NLL: no session or text\n";
+      return 1;
+    }
+    double total = 0.0;
+    for (std::size_t i = 0; i + 1 < count; ++i) {
+      const std::int32_t token = nll_tokens[i];
+      if (!session->Sync(std::span(&token, 1), &error)) {
+        std::cerr << "NLL: decode failed: " << error << '\n';
+        return 1;
+      }
+      const auto logits = session->Logits(&error);
+      float maximum = logits[0];
+      for (const float v : logits)
+        maximum = std::max(maximum, v);
+      double sum = 0.0;
+      for (const float v : logits)
+        sum += std::exp(static_cast<double>(v - maximum));
+      total += std::log(sum) + maximum - logits[nll_tokens[i + 1]];
+    }
+    std::cout << "NLL " << total / static_cast<double>(count - 1) << " over "
+              << count - 1 << " tokens\n";
+    return 0;
+  }
+
+  const double size_gib =
+      static_cast<double>(reader->GetSize()) / (1024.0 * 1024.0 * 1024.0);
+  std::cout << "| " << std::left << std::setw(32) << "model"
+            << " | " << std::right << std::setw(10) << "size"
+            << " | " << std::left << std::setw(10) << "backend"
+            << " | " << std::right << std::setw(18) << "test"
+            << " | " << std::right << std::setw(21) << "t/s"
+            << " |\n"
+            << "| " << std::string(32, '-') << " | " << std::string(10, '-')
+            << " | " << std::string(10, '-') << " | " << std::string(18, '-')
+            << " | " << std::string(21, '-') << " |\n";
+  std::ostringstream size_text;
+  size_text << std::fixed << std::setprecision(2) << size_gib << " GiB";
+  const auto print_result = [&](std::string_view test_name,
+                                const BenchStats& stats) {
+    std::ostringstream throughput;
+    throughput << std::fixed << std::setprecision(2) << stats.mean << " ± "
+               << stats.stddev;
+    std::cout << "| " << std::left << std::setw(32) << "Raon-1" << " | "
+              << std::right << std::setw(10) << size_text.str() << " | "
+              << std::left << std::setw(10) << "ROCm (HIP)"
+              << " | " << std::right << std::setw(18) << test_name << " | "
+              << std::right << std::setw(21) << throughput.str() << " |\n"
+              << std::flush;
+  };
+
+  for (const std::size_t depth : options.n_depths) {
+    for (const std::size_t prompt_length : options.n_prompts) {
+      std::vector<double> runs;
+      for (std::size_t repetition = 0; repetition <= options.repetitions;
+           ++repetition) {
+        auto session = model->CreateSession(&error);
+        if (!session) {
+          std::cerr << "Error creating Raon-1 session: " << error << '\n';
+          return 1;
+        }
+        if (depth > 0 &&
+            !session->Sync(std::span(tokens).first(depth), &error)) {
+          std::cerr << "Error preparing depth: " << error << '\n';
+          return 1;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        if (!session->Sync(std::span(tokens).subspan(depth, prompt_length),
+                           &error)) {
+          std::cerr << "Error running prefill: " << error << '\n';
+          return 1;
+        }
+        const double seconds = std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() - start)
+                                   .count();
+        if (repetition > 0)
+          runs.push_back(static_cast<double>(prompt_length) / seconds);
+      }
+      print_result(MakeTestName("pp", prompt_length, depth),
+                   ComputeStats(runs));
+    }
+
+    for (const std::size_t generation_length : options.n_gens) {
+      const std::size_t prefix_length = depth > 0 ? depth : 16;
+      std::vector<double> runs;
+      for (std::size_t repetition = 0; repetition < options.repetitions;
+           ++repetition) {
+        auto session = model->CreateSession(&error);
+        if (!session ||
+            !session->Sync(std::span(tokens).first(prefix_length), &error)) {
+          std::cerr << "Error preparing generation: " << error << '\n';
+          return 1;
+        }
+        std::int32_t next = tokens[prefix_length % tokens.size()];
+        for (int warm = 0; warm < 2; ++warm) {
+          if (!session->Evaluate(next, &error)) {
+            std::cerr << "Error running Raon-1 decode: " << error << '\n';
+            return 1;
+          }
+          next = tokens[(prefix_length + warm + 1) % tokens.size()];
+        }
+        const auto start = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < generation_length; ++i) {
+          if (!session->Evaluate(next, &error)) {
+            std::cerr << "Error running Raon-1 decode: " << error << '\n';
+            return 1;
+          }
+          next = tokens[(prefix_length + i + 3) % tokens.size()];
+        }
+        const double seconds = std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() - start)
+                                   .count();
+        runs.push_back(static_cast<double>(generation_length) / seconds);
+      }
+      print_result(MakeTestName("tg", generation_length, depth),
+                   ComputeStats(runs));
+    }
+  }
+  std::cout << '\n';
+  return 0;
+}
+
 bool IsGlm53Flash(const core::GgufReader& reader) {
   const auto architecture = reader.GetMetadataString("general.architecture");
   return architecture == "glm5next" || architecture == "glm5-next";
@@ -2238,6 +2437,9 @@ int RunBench(std::span<const char* const> args) {
   }
   if (IsLaguna(*reader)) {
     return RunLagunaBenchmark(opt, reader, model_load_start);
+  }
+  if (IsRaon1(*reader)) {
+    return RunRaon1Benchmark(opt, reader, model_load_start);
   }
   if (IsLing32(*reader)) {
     return RunLing32Benchmark(opt, reader, model_load_start);
