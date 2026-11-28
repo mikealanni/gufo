@@ -201,21 +201,17 @@ Details: [docs/models/ling-3.2](docs/models/ling-3.2/)
 
 ### Raon-1 mini
 
-| Prefill, tok/s (real text) | GPU + NPU, two banks |
-| --- | --- |
-| `-p 4096` | 3,103 |
-| `-p 8192` | 3,010 |
-
-| Depth, `-p 4096`, plain decode | pp, tok/s | tg, tok/s |
+| `gufo bench`, real text | pp, tok/s | tg, tok/s (plain decode) |
 | --- | --- | --- |
+| 4K | 2,935 | 52.6 |
+| 8K | 2,770 | 51.4 |
+| 16K | 2,762 | 48.9 |
 | 32K | 2,539 | 44.4 |
 | 64K | 2,502 | 43.8 |
 | 128K | 2,499 | 42.7 |
 
-| Decode (DFlash2, temperature 1), tok/s | speculative |
-| --- | --- |
-| source code, 6K context | 63 to 73 |
-| thinking prose, 10K context | 36 to 39 |
+pp is a fresh prompt of that length on GPU + NPU with two banks; tg is decode at that depth.
+Speculative decoding is not measured by `gufo bench` for this model.
 
 Above 16K tokens attention is block-sparse, with the system prompt and tool definitions always
 attended while decoding. Two simultaneous requests (`JOBS=2`) run at about two thirds of the
