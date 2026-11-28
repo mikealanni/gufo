@@ -1120,7 +1120,44 @@ void SamplerState::PrepareSelected(std::span<const float> logits) {
           std::exp((candidate.value - maximum) / config_.temperature);
     }
     if (selected_mass < static_cast<double>(config_.top_p) * full_softmax_sum) {
-      select_all();
+      // The nucleus is wider than the first selection. Grow the sorted prefix
+      // geometrically against the exact normalizer instead of sorting the whole
+      // vocabulary; the prefix order is the full sort's order (total order).
+      constexpr std::size_t kGrowth = 8;
+      candidate_scratch_.clear();
+      candidate_scratch_.reserve(logits.size());
+      for_each_adjusted([&](std::size_t index, double adjusted) {
+        candidate_scratch_.push_back({
+            .token = static_cast<TokenId>(index),
+            .value = adjusted,
+        });
+      });
+      const double target =
+          static_cast<double>(config_.top_p) * full_softmax_sum;
+      std::size_t prefix = initial_keep * kGrowth;
+      for (;;) {
+        prefix = std::min(prefix, candidate_scratch_.size());
+        if (prefix < candidate_scratch_.size()) {
+          std::nth_element(
+              candidate_scratch_.begin(),
+              candidate_scratch_.begin() + static_cast<std::ptrdiff_t>(prefix),
+              candidate_scratch_.end(), IsBetterProbability);
+        }
+        std::sort(candidate_scratch_.begin(),
+                  candidate_scratch_.begin() +
+                      static_cast<std::ptrdiff_t>(prefix),
+                  IsBetterProbability);
+        double mass = 0.0;
+        for (std::size_t i = 0; i < prefix; ++i) {
+          mass += std::exp((candidate_scratch_[i].value - maximum) /
+                           config_.temperature);
+        }
+        if (mass >= target || prefix == candidate_scratch_.size()) {
+          candidate_scratch_.resize(prefix);
+          break;
+        }
+        prefix *= kGrowth;
+      }
     }
   } else {
     select_all();
