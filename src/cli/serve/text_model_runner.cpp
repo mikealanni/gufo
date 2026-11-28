@@ -561,6 +561,7 @@ TextDecodeStep TextModelRunner::DecodeStep(
         .draft_tokens = 0,
         .draft_accepted_tokens = 0,
         .stop = true,
+        .terminal_logprobs = std::move(selection.logprobs),
     };
   }
   const TextRunnerToken token = selection.token;

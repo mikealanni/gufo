@@ -237,6 +237,8 @@ struct ServerLogOptions {
 constexpr std::string_view kLogLevelHelp =
     "Log verbosity: error, warn, info or debug (default: info)";
 constexpr std::string_view kVerboseHelp = "Shorthand for --log-level=debug";
+constexpr std::string_view kAllowLogprobsHelp =
+    "Allow requests for generated-token log probabilities (default: off)";
 constexpr std::string_view kTraceHelp =
     "Append text request bodies, rendered prompts, generated text and replies "
     "to PATH as JSON Lines; the file holds client content";
@@ -579,6 +581,7 @@ void PrintServeHelp(std::string_view program_name,
   }
 
   if (subcommand == "llm") {
+    bool allow_logprobs = false;
     std::string model;
     std::string served_model_name;
     std::uint32_t max_context = 0;
@@ -644,6 +647,8 @@ void PrintServeHelp(std::string_view program_name,
         "Sampling Defaults", &max_tokens);
     RegisterSamplingOptions(parser, &sampling_config, "Sampling Defaults", true,
                             true);
+    parser.AddFlag("", "--allow-logprobs", kAllowLogprobsHelp, "Server",
+                   &allow_logprobs);
 
     // Reasoning Defaults
     parser.AddOption(
@@ -851,6 +856,7 @@ int RunServe(std::span<const char* const> args) {
       static_cast<std::size_t>(8) * 1024 * 1024;
   std::string api_key;
   ServerLogOptions log_options;
+  bool allow_logprobs = false;
 
   // Identify the modality only after leading server options. The selected
   // parser consumes every option together, so --served-model-name -v and
@@ -1215,6 +1221,8 @@ int RunServe(std::span<const char* const> args) {
         "Sampling Defaults", &max_tokens);
     RegisterSamplingOptions(llm_parser, &sampling_config, "Sampling Defaults",
                             true, true);
+    llm_parser.AddFlag("", "--allow-logprobs", kAllowLogprobsHelp, "Server",
+                       &allow_logprobs);
     llm_parser.AddOption(
         "", "--think", "MODE",
         "Default reasoning mode: on, off, or auto (default: model)",
@@ -1592,6 +1600,7 @@ int RunServe(std::span<const char* const> args) {
                 device_lost.store(true);
                 ShutdownAfterDeviceLoss();
               },
+          .allow_logprobs = allow_logprobs,
       },
       images);
   std::string err;

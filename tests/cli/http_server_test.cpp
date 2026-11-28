@@ -28,6 +28,7 @@
 
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/trace.hpp"
+#include "src/core/json.hpp"
 
 namespace {
 
@@ -209,9 +210,31 @@ public:
       result.finish_reason = FinishReason::kStopSequence;
       result.stop_sequence = forced_stop_sequence;
     }
+    if (sampling.logprobs && !scored_pieces.empty()) {
+      result.text.clear();
+      result.completion_tokens = scored_pieces.size();
+      for (const auto& [emitted, spelling] : scored_pieces) {
+        result.text += emitted;
+        result.logprobs.push_back({{{3, spelling, -3.0}}, spelling.size()});
+        if (token)
+          (void)token(
+              gufo::server::TokenPiece(emitted, &result.logprobs.back()));
+      }
+      return result;
+    }
+    if (sampling.logprobs) {
+      gufo::server::DecodedLogprobs probabilities;
+      probabilities.source_bytes = result.text.size();
+      probabilities.entries.push_back({3, result.text, -3.0});
+      if (*sampling.logprobs > 0)
+        probabilities.entries.push_back({1, "alternative", -0.5});
+      result.logprobs.push_back(std::move(probabilities));
+    }
     if (token && failure != 8) {
       std::this_thread::sleep_for(token_delay);
-      (void)token(result.text);
+      (void)token(gufo::server::TokenPiece(
+          result.text,
+          result.logprobs.empty() ? nullptr : &result.logprobs.front()));
     }
     if (failure == 6)
       throw std::runtime_error("context exceeded");
@@ -239,6 +262,7 @@ public:
   std::atomic<bool> last_ignore_eos{false};
   std::atomic<bool> last_cache_prompt{true};
   std::vector<PromptProgress> progress;
+  std::vector<std::pair<std::string, std::string>> scored_pieces;
   // Report a scheduler admission before generation, as the HIP backend does.
   std::atomic<bool> admit{false};
   std::chrono::milliseconds token_delay{0};
@@ -3040,6 +3064,160 @@ void TestRawCompletionCachePrompt() {
   }
 }
 
+void TestLogprobsStartupPolicy() {
+  assert(!gufo::server::HttpServerOptions{}.allow_logprobs);
+  for (bool allow : {false, true}) {
+    RunningServer server({.allow_logprobs = allow});
+    const auto catalog = server.Send("GET /v1/models HTTP/1.1\r\n\r\n");
+    ExpectStatus(catalog, 200);
+    const auto models =
+        gufo::json::parse(catalog.substr(catalog.find("\r\n\r\n") + 4));
+    const auto& model = models.find("data")->items().front();
+    assert(model.find("capabilities")->find("logprobs")->as_bool() == allow);
+
+    struct Endpoint {
+      const char* path;
+      const char* input;
+      const char* selected;
+      const char* skipped;
+    };
+    for (const Endpoint endpoint :
+         {Endpoint{
+              "/v1/chat/completions",
+              R"({"model":"test","messages":[{"role":"user","content":"hi"}]})",
+              R"({"logprobs":true})", R"({"logprobs":false})"},
+          Endpoint{"/v1/completions", R"({"prompt":"hi"})", R"({"logprobs":0})",
+                   R"({"logprobs":null})"},
+          Endpoint{"/v1/responses", R"({"input":"hi"})",
+                   R"({"include":["message.output_text.logprobs"]})",
+                   R"({"include":[],"top_logprobs":3})"}}) {
+      for (const bool stream : {false, true}) {
+        for (const auto& [fields, requested] :
+             {std::pair{"{}", false}, std::pair{endpoint.skipped, false},
+              std::pair{endpoint.selected, true}}) {
+          auto body = gufo::json::parse(endpoint.input);
+          const auto options = gufo::json::parse(fields);
+          for (const auto& [key, value] : options.members())
+            body[key] = value;
+          body["stream"] = stream;
+          const auto before = server.backend->calls.load();
+          const auto response = server.Post(endpoint.path, body.dump());
+          if (requested && !allow) {
+            ExpectStatus(response, 400);
+            assert(response.find(R"("code":"logprobs_disabled")") !=
+                   std::string::npos);
+            assert(response.find("--allow-logprobs") != std::string::npos);
+            assert(server.backend->calls == before);
+          } else {
+            ExpectStatus(response, 200);
+            assert(server.backend->LastCall().sampling.logprobs.has_value() ==
+                   requested);
+          }
+        }
+      }
+    }
+  }
+}
+
+void TestResponsesLogprobsOptions() {
+  RunningServer server({.allow_logprobs = true});
+  for (const bool stream : {false, true}) {
+    for (const auto* count : {"null", "0", "3", "20"}) {
+      const auto response = server.Post(
+          "/v1/responses",
+          std::string(
+              R"({"input":"hello","include":["message.output_text.logprobs"],"top_logprobs":)") +
+              count + R"(,"stream":)" + (stream ? "true}" : "false}"));
+      ExpectStatus(response, 200);
+      const auto requested =
+          std::string_view(count) == "null" ? 0 : std::stoi(count);
+      assert(server.backend->LastCall().sampling.logprobs == requested);
+      assert(response.find(R"("token":"ok")") != std::string::npos);
+      assert(response.find(R"("logprob":-3)") != std::string::npos);
+      assert(response.find(R"("bytes":[111,107])") != std::string::npos);
+    }
+  }
+  for (const auto* options :
+       {R"("top_logprobs":-1)", R"("top_logprobs":21)", R"("top_logprobs":1.5)",
+        R"("top_logprobs":true)", R"("top_logprobs":"3")", R"("include":[1])",
+        R"("include":"message.output_text.logprobs")", R"("logprobs":true)"}) {
+    const auto before = server.backend->calls.load();
+    ExpectStatus(
+        server.Post("/v1/responses",
+                    std::string(R"({"input":"hello",)") + options + "}"),
+        400);
+    assert(server.backend->calls == before);
+  }
+  for (const auto* options :
+       {R"("include":null)", R"("include":[])", R"("top_logprobs":3)",
+        R"("include":["reasoning.encrypted_content"] )"}) {
+    ExpectStatus(
+        server.Post("/v1/responses",
+                    std::string(R"({"input":"hello",)") + options + "}"),
+        200);
+    assert(!server.backend->LastCall().sampling.logprobs);
+  }
+}
+
+void TestRawCompletionLogprobs() {
+  RunningServer server({.allow_logprobs = true});
+  for (const bool stream : {false, true}) {
+    for (const int count : {0, 1, 20}) {
+      const auto response = server.Post(
+          "/v1/completions", std::string(R"({"prompt":"hello","logprobs":)") +
+                                 std::to_string(count) + R"(,"stream":)" +
+                                 (stream ? "true}" : "false}"));
+      ExpectStatus(response, 200);
+      assert(response.find(R"("tokens":["ok"])") != std::string::npos);
+      assert(response.find(R"("token_logprobs":[-3])") != std::string::npos);
+      assert(response.find(R"("text_offset":[0])") != std::string::npos);
+      assert(response.find(
+                 count ? R"("top_logprobs":[{"ok":-3,"alternative":-0.5}])"
+                       : R"("top_logprobs":[{"ok":-3}])") != std::string::npos);
+    }
+  }
+  for (const auto* value : {"true", "false", "-1", "21", "1.5", "\"1\""}) {
+    const auto before = server.backend->calls.load();
+    ExpectStatus(server.Post("/v1/completions",
+                             std::string(R"({"prompt":"hello","logprobs":)") +
+                                 value + "}"),
+                 400);
+    assert(server.backend->calls == before);
+  }
+  ExpectStatus(
+      server.Post("/v1/completions", R"({"prompt":"hello","logprobs":null})"),
+      200);
+  // Filtered text can be held across pieces and UTF-8 can finish in a later
+  // token. Both transports count characters in the same reported token list.
+  const auto offsets = [&](const std::string& expected) {
+    const auto body = R"({"prompt":"hello","logprobs":0,"stream":)";
+    const auto buffered =
+        server.Post("/v1/completions", std::string(body) + "false}");
+    ExpectStatus(buffered, 200);
+    assert(buffered.find("\"text_offset\":" + expected) != std::string::npos);
+    const auto streamed =
+        server.Post("/v1/completions", std::string(body) + "true}");
+    ExpectStatus(streamed, 200);
+    auto actual = gufo::json::Value::array();
+    std::istringstream lines(ChunkedBody(streamed));
+    for (std::string line; std::getline(lines, line);) {
+      if (!line.starts_with("data: {"))
+        continue;
+      const auto frame = gufo::json::parse(line.substr(6));
+      for (const auto& choice : frame.find("choices")->items())
+        if (const auto* values = choice.find("logprobs");
+            values && !values->is_null())
+          for (const auto& start : values->find("text_offset")->items())
+            actual.push_back(start);
+    }
+    assert(actual.dump() == expected);
+  };
+  server.backend->scored_pieces = {{"", "a"}, {"ac", "c"}};
+  offsets("[0,1]");
+  server.backend->scored_pieces = {{"A\xc3", ""}, {"\xa9", "Aé"}};
+  offsets("[0,0]");
+}
+
 void TestRawCompletionPromptProgress() {
   RunningServer server;
   server.backend->progress = {
@@ -3100,6 +3278,9 @@ int main() {
   TestGenerationFailureLogsCause();
   TestDeviceLoss();
   TestDeviceLossWhileWriterBlocked();
+  TestRawCompletionLogprobs();
+  TestLogprobsStartupPolicy();
+  TestResponsesLogprobsOptions();
   TestRawCompletionPromptProgress();
   TestRawCompletionCachePrompt();
   TestCompatibilityStopSequences();

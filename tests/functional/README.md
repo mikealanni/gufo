@@ -296,6 +296,8 @@ RAM, disk and restart settings once their contracts pass.
 | --- | --- |
 | `discovery` | Health, readiness, model ID/context and advertised text/image inputs; no generation |
 | `responses` | SDK buffered, streaming and async Responses |
+| `logprobs` | Generated-token probabilities on Chat and raw Completions with `--allow-logprobs`. Covers buffered and streamed replies, greedy and sampled output, usage, candidate limits, finite values and UTF-8 bytes |
+| `responses-logprobs` | Responses probabilities with `--allow-logprobs` and counts 0/3/20. Covers buffered and streamed replies, greedy and sampled output, usage, SDK accumulation, delta/done events, finite scores and UTF-8 bytes |
 | `stops` | Text, Unicode, reasoning and tool stops; peer isolation |
 | `conversation` | Thinking/efforts, images, cancellation and RAM reuse |
 | `image-inputs` | PNG, JPEG and WebP uploads in Chat and Responses; URL spellings, bad uploads and recovery; Messages image blocks in a user turn and a tool result |
@@ -360,7 +362,8 @@ controls on main, stop at
 continue into the newly supported image-bearing tool outputs. A text-only
 model must not qualify the image suite by skipping its assertions.
 
-Repeat `--suite` to select affected tests; `--suite all` explicitly runs all. For long
+When running the logprobs suites, including through `--suite all`, pass
+`--allow-logprobs` in the server command. Repeat `--suite` to select affected tests. For long
 contexts, use server `--context 32768`; actual prompt depth is recorded. `cache`
 uses its own 8 GiB disk budget and 1 GiB staging area inside the output directory;
 the runner removes that disk cache when the run ends, keeping reports and logs.

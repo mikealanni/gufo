@@ -162,7 +162,34 @@ void CheckGreedyAcceptance() {
 }
 }  // namespace
 
+void CheckLogprobs() {
+  constexpr std::array<float, 3> logits{2, 1, -1};
+  for (const float temperature : {0.F, 0.8F}) {
+    SamplingConfig config;
+    config.temperature = temperature;
+    config.seed = 73;
+    DsparkSamplerBridge plain{SamplerState(config)};
+    config.logprobs = 2;
+    DsparkSamplerBridge observed{SamplerState(config)};
+    const auto* a = plain.hook();
+    const auto* b = observed.hook();
+    const auto token = b->sample(b->ctx, logits.data(), logits.size());
+    Expect(token == a->sample(a->ctx, logits.data(), logits.size()) &&
+               observed.rng_state() == plain.rng_state(),
+           "logprobs preserve DSpark draws");
+    const double z = std::log(std::exp(2.) + std::exp(1.) + std::exp(-1.));
+    Expect(observed.logprobs().size() == 1 &&
+               std::abs(observed.logprobs()[0].selected.logprob -
+                        (logits[token] - z)) < 1e-12,
+           "DSpark reports the raw target distribution");
+    b->observe(b->ctx, logits.data(), logits.size(), 2);
+    Expect(observed.logprobs().back().selected.token == 2,
+           "a previously drawn correction keeps its target probability");
+  }
+}
+
 int main() {
+  CheckLogprobs();
   const float nan = std::numeric_limits<float>::quiet_NaN();
   const float inf = std::numeric_limits<float>::infinity();
   const float extreme[]{-3e35F, -2e35F, -1e35F};

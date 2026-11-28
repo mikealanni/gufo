@@ -512,6 +512,11 @@ if (BUILD_TESTING)
   add_test(NAME sampling_test COMMAND sampling_test)
   set_tests_properties(sampling_test PROPERTIES LABELS "cpu;sampling")
 
+  add_executable(logprobs_test tests/cli/logprobs_test.cpp)
+  target_link_libraries(logprobs_test PRIVATE gufo_core)
+  add_test(NAME logprobs_test COMMAND logprobs_test)
+  set_tests_properties(logprobs_test PROPERTIES LABELS "cpu;server;api;openai")
+
   add_executable(openai_chat_test
     tests/cli/openai_chat_test.cpp
     src/cli/serve/logging.cpp
@@ -1131,7 +1136,7 @@ if (BUILD_TESTING)
     set_tests_properties(gfx1151_acceptance_test PROPERTIES LABELS "hip;gpu;benchmarks")
 
     add_executable(speculative_verification_test tests/core/test_speculative_verification.cpp)
-    target_link_libraries(speculative_verification_test PRIVATE gufo_core hip::host roc::hipblas roc::rocblas)
+    target_link_libraries(speculative_verification_test PRIVATE gufo_core gufo_cache hip::host roc::hipblas roc::rocblas)
     add_test(NAME speculative_verification_test COMMAND speculative_verification_test)
     set_tests_properties(speculative_verification_test PROPERTIES LABELS "hip;gpu;speculative")
   endif()

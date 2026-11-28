@@ -79,6 +79,11 @@ struct SessionTable {
   std::vector<std::shared_ptr<const ScheduledRequest>> requests;
 };
 
+struct OutputPiece {
+  std::string text;
+  std::optional<DecodedLogprobs> logprobs;
+};
+
 struct ScheduledRequest {
   std::uint64_t id{0};
   std::string client_id{"anonymous"};
@@ -117,10 +122,11 @@ struct ScheduledRequest {
   bool preview_stops{false};
   std::size_t generated_output_bytes{0};
   StopSequenceFilter stop_filter;
+  LogprobDecoder logprob_decoder;
 
   std::mutex output_mutex;
   std::condition_variable output_condition;
-  std::deque<std::string> output_pieces;
+  std::deque<OutputPiece> output_pieces;
   std::optional<TextGenerationBackend::PromptProgress> pending_progress;
   // Set at admission for streams; the consumer reports its start at most once.
   bool admitted{false};
@@ -200,8 +206,9 @@ void PublishTerminal(const std::shared_ptr<ScheduledRequest>& request,
 /// Queue cost of one streamed piece. A token whose decoded text is empty still
 /// occupies a queue slot, so it is charged one byte: a zero cost would let an
 /// unbounded number of them accumulate behind a slow consumer.
-[[nodiscard]] std::size_t QueuedPieceCost(std::string_view piece) noexcept {
-  return std::max<std::size_t>(piece.size(), 1);
+[[nodiscard]] std::size_t QueuedPieceCost(const OutputPiece& piece) noexcept {
+  return std::max<std::size_t>(piece.text.size(), 1) +
+         (piece.logprobs ? piece.logprobs->StorageBytes() : 0);
 }
 
 // Debug-only backpressure line, extracted from the publish path: the fast
@@ -231,10 +238,13 @@ void LogBackpressure(const std::shared_ptr<ScheduledRequest>& request,
 }
 
 [[nodiscard]] bool PublishPiece(
-    const std::shared_ptr<ScheduledRequest>& request, std::string piece) {
+    const std::shared_ptr<ScheduledRequest>& request, std::string text,
+    const DecodedLogprobs* logprobs = nullptr) {
   if (!request->publish_token_pieces) {
     return true;
   }
+  OutputPiece piece{std::move(text),
+                    logprobs ? std::optional(*logprobs) : std::nullopt};
   const std::size_t piece_bytes = QueuedPieceCost(piece);
   std::string_view reason;
   std::size_t buffered = 0;
@@ -1263,6 +1273,7 @@ struct TextGenerationScheduler::Impl {
     const auto decode_start = Clock::now();
     const auto selection = request->runner_request.SelectNext();
     if (selection.stop) {
+      PublishTerminalLogprobs(request, selection.logprobs);
       request->result.decode_ms +=
           std::chrono::duration<double, std::milli>(Clock::now() - decode_start)
               .count();
@@ -1283,6 +1294,32 @@ struct TextGenerationScheduler::Impl {
     }
     request->advance_pending = true;
     return PrepareDecode(request);
+  }
+
+  const DecodedLogprobs* RetainLogprobs(
+      const std::shared_ptr<ScheduledRequest>& request,
+      const std::optional<sampling::TokenLogprobs>& values,
+      std::size_t source_bytes) {
+    if (!values)
+      return nullptr;
+    auto decoded =
+        request->logprob_decoder.DecodeToken(*values, [&](auto token) {
+          return runner_pool->runner().Decode(std::span(&token, 1));
+        });
+    decoded.source_bytes = source_bytes;
+    // Metadata is bounded by the token budget, not the text byte limit: at
+    // top_logprobs 20 that limit would end a default request near 600 tokens.
+    request->result.logprobs.push_back(std::move(decoded));
+    return &request->result.logprobs.back();
+  }
+
+  void PublishTerminalLogprobs(
+      const std::shared_ptr<ScheduledRequest>& request,
+      const std::optional<sampling::TokenLogprobs>& values) {
+    if (const auto* decoded = RetainLogprobs(request, values, 0))
+      if (!PublishPiece(request, {}, decoded))
+        throw TextGenerationError(TextGenerationErrorCode::kOutputBackpressure,
+                                  "logprobs exceed buffered output limit");
   }
 
   [[nodiscard]] bool PublishSelection(
@@ -1311,6 +1348,8 @@ struct TextGenerationScheduler::Impl {
       return false;
     }
     request->generated_output_bytes += selection.piece.size();
+    const auto* logprobs =
+        RetainLogprobs(request, selection.logprobs, selection.piece.size());
     request->result.tokens.push_back(selection.token);
     request->live_generated_tokens.store(request->result.tokens.size(),
                                          std::memory_order_relaxed);
@@ -1318,8 +1357,8 @@ struct TextGenerationScheduler::Impl {
     const auto piece = request->stop_filter.enabled()
                            ? request->stop_filter.Push(selection.piece)
                            : selection.piece;
-    if ((!piece.empty() || !request->stop_filter.enabled()) &&
-        !PublishPiece(request, piece)) {
+    if ((!piece.empty() || !request->stop_filter.enabled() || logprobs) &&
+        !PublishPiece(request, piece, logprobs)) {
       CompleteFailure(request,
                       std::make_exception_ptr(TextGenerationError(
                           TextGenerationErrorCode::kOutputBackpressure,
@@ -1413,6 +1452,7 @@ struct TextGenerationScheduler::Impl {
         return;
       }
       if (step.stop) {
+        PublishTerminalLogprobs(request, step.terminal_logprobs);
         CompleteSuccess(request, TextGenerationBackend::FinishReason::kStop);
         return;
       }
@@ -1436,6 +1476,8 @@ struct TextGenerationScheduler::Impl {
           return false;
         request->preview_token = preview->token;
       }
+      if (preview && preview->stop)
+        PublishTerminalLogprobs(request, preview->logprobs);
       request->preview_stops = preview && preview->stop;
       request->result.decode_ms += std::chrono::duration<double, std::milli>(
                                        Clock::now() - preview_start)
@@ -1729,6 +1771,7 @@ struct TextGenerationScheduler::Impl {
           CompleteSuccess(item.request,
                           TextGenerationBackend::FinishReason::kStopSequence);
         } else if (step.stop) {
+          PublishTerminalLogprobs(item.request, step.terminal_logprobs);
           CompleteSuccess(item.request,
                           TextGenerationBackend::FinishReason::kStop);
         } else if (item.request->result.tokens.size() >=
@@ -2063,7 +2106,7 @@ TextGenerationScheduler::Result TextGenerationScheduler::Request::Wait(
   std::exception_ptr scheduler_failure;
 
   while (true) {
-    std::string piece;
+    OutputPiece piece;
     std::optional<TextGenerationBackend::PromptProgress> progress;
     bool start = false;
     bool has_piece = false;
@@ -2129,7 +2172,8 @@ TextGenerationScheduler::Result TextGenerationScheduler::Request::Wait(
       deliver(on_progress, *progress);
     }
     if (has_piece && deliver_pieces && on_token) {
-      deliver(on_token, piece);
+      deliver(on_token, TokenPiece(piece.text, piece.logprobs ? &*piece.logprobs
+                                                              : nullptr));
     }
     if (terminal) {
       break;

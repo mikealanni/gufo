@@ -44,6 +44,7 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/openai_chat.hpp"
 #include "src/cli/serve/poison.hpp"
+#include "src/cli/serve/responses_logprobs.hpp"
 #include "src/cli/serve/sampling_request.hpp"
 #include "src/cli/serve/stop_sequences.hpp"
 #include "src/cli/serve/trace.hpp"
@@ -701,6 +702,7 @@ struct CompatibilityAllowances {
   bool stream{false};
   bool stream_options{false};
   bool ignore_eos{false};
+  bool logprobs{false};
   bool response_controls{false};
   bool thinking{false};
   bool output_config{false};
@@ -770,6 +772,7 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
     if (field != allowances.stop_field &&
         !(field == "stream_options" && allowances.stream_options) &&
         !(field == "ignore_eos" && allowances.ignore_eos) &&
+        !(field == "logprobs" && allowances.logprobs) &&
         !(field == "thinking" && allowances.thinking) &&
         !(field == "output_config" && allowances.output_config) &&
         !((field == "tools" || field == "tool_choice") && allowances.tools) &&
@@ -777,10 +780,7 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
         !(allowances.response_controls &&
           (field == "text" || field == "reasoning" || field == "tools" ||
            field == "tool_choice" || field == "parallel_tool_calls" ||
-           // include is a standard Responses field (for example encrypted
-           // reasoning); gufo keeps no server-side conversation, so its value
-           // is accepted and ignored.
-           field == "include"))) {
+           field == "include" || field == "top_logprobs"))) {
       return InvalidCompatibilityRequest("request field '" + field +
                                          "' is not supported on this endpoint");
     }
@@ -814,7 +814,7 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
 HttpResponse ListModels(TextGenerationBackend* backend,
                         const VideoJobService* video_jobs,
                         const TtsService* tts, const AsrService* asr,
-                        const ImageService* images) {
+                        const ImageService* images, bool allow_logprobs) {
   json::Value resp = json::Value::object();
   resp["object"] = "list";
   json::Value data = json::Value::array();
@@ -824,6 +824,7 @@ HttpResponse ListModels(TextGenerationBackend* backend,
     model["object"] = "model";
     model["created"] = Now();
     model["owned_by"] = "gufo";
+    model["capabilities"]["logprobs"] = allow_logprobs;
     if (backend->max_context() > 0)
       model["context_length"] =
           static_cast<std::size_t>(backend->max_context());
@@ -888,8 +889,8 @@ HttpResponse ListModels(TextGenerationBackend* backend,
   return Ok(resp);
 }
 
-HttpResponse OpenAiCompletions(const HttpRequest& req,
-                               TextGenerationBackend& b) try {
+HttpResponse OpenAiCompletions(const HttpRequest& req, TextGenerationBackend& b,
+                               bool allow_logprobs) try {
   json::Value body;
   try {
     body = json::parse(req.body);
@@ -908,9 +909,14 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                                                 .stream = true,
                                                 .stream_options = true,
                                                 .ignore_eos = true,
+                                                .logprobs = true,
                                             })) {
     return std::move(*error);
   }
+  if (const auto error = ParseLogprobs(body, false, &sampling_config))
+    return InvalidCompatibilityRequest(error->message);
+  if (auto error = CheckLogprobsAllowed(sampling_config, allow_logprobs))
+    return std::move(*error);
   const auto* stream_field = body.find("stream");
   const bool stream = stream_field != nullptr && stream_field->as_bool();
   bool include_usage = false;
@@ -978,8 +984,11 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
         .streaming_body =
             [generation = std::move(generation), id, created, model,
              include_usage, return_progress,
+             logprobs = sampling_config.logprobs,
              stream_log](const HttpResponse::BodyWriter& writer) {
               bool started = return_progress;
+              std::optional<json::Value> pending_logprobs;
+              std::size_t text_offset = 0;
               const auto write_chunk =
                   [&](std::string_view piece, std::string_view finish_reason,
                       const json::Value* usage = nullptr,
@@ -995,7 +1004,10 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                       json::Value choice = json::Value::object();
                       choice["text"] = std::string(piece);
                       choice["index"] = 0;
-                      choice["logprobs"] = json::Value();
+                      choice["logprobs"] = pending_logprobs
+                                               ? std::move(*pending_logprobs)
+                                               : json::Value();
+                      pending_logprobs.reset();
                       choice["finish_reason"] =
                           finish_reason.empty()
                               ? json::Value()
@@ -1026,8 +1038,11 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
               }
               try {
                 const auto result = generation->Wait(
-                    [&](std::string_view piece) {
-                      const auto text = decoder.Push(piece, false);
+                    [&](const TokenPiece& piece) {
+                      if (logprobs && piece.logprobs)
+                        pending_logprobs = CompletionLogprobs(
+                            std::span(piece.logprobs, 1), text_offset);
+                      const auto text = decoder.Push(piece.text, false);
                       connected = write_chunk(text, {});
                       return connected;
                     },
@@ -1106,7 +1121,8 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
   json::Value c = json::Value::object();
   c["text"] = core::Utf8Decoder{}.Push(res.text, true);
   c["index"] = 0;
-  c["logprobs"] = json::Value();
+  c["logprobs"] = sampling_config.logprobs ? CompletionLogprobs(res.logprobs)
+                                           : json::Value();
   c["finish_reason"] =
       res.finish_reason == TextGenerationBackend::FinishReason::kLength
           ? "length"
@@ -1124,8 +1140,8 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
              "invalid_prompt");
 }
 
-HttpResponse OpenAiResponses(const HttpRequest& req,
-                             TextGenerationBackend& b) try {
+HttpResponse OpenAiResponses(const HttpRequest& req, TextGenerationBackend& b,
+                             bool allow_logprobs) try {
   json::Value body;
   try {
     body = json::parse(req.body);
@@ -1146,6 +1162,11 @@ HttpResponse OpenAiResponses(const HttpRequest& req,
           {.stream = true, .response_controls = true})) {
     return std::move(*error);
   }
+  if (const auto error = ParseResponsesLogprobs(body, &sampling_config))
+    return Err(400, "Bad Request", error->message.c_str(),
+               "invalid_request_error", error->code.c_str());
+  if (auto error = CheckLogprobsAllowed(sampling_config, allow_logprobs))
+    return std::move(*error);
 
   std::vector<tokenization::ChatMessage> messages;
   if (const auto* instructions = body.find("instructions")) {
@@ -1837,9 +1858,14 @@ void HttpServer::register_routes() {
     return;
   }
   // ---- OpenAI ----
-  add("POST", "/v1/completions", OpenAiCompletions);
-  add("POST", "/v1/chat/completions", HandleOpenAiChat);
-  add("POST", "/v1/responses", OpenAiResponses);
+  const auto text_route = [allow = options_.allow_logprobs](auto handler) {
+    return [allow, handler](const HttpRequest& req, TextGenerationBackend& b) {
+      return handler(req, b, allow);
+    };
+  };
+  add("POST", "/v1/completions", text_route(OpenAiCompletions));
+  add("POST", "/v1/chat/completions", text_route(HandleOpenAiChat));
+  add("POST", "/v1/responses", text_route(OpenAiResponses));
   add("POST", "/v1/embeddings", NotImplemented);
 
   // ---- Anthropic ----
@@ -2107,7 +2133,7 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
   if (req.method == "GET" &&
       (req.path == "/v1/models" || req.path == "/models")) {
     return ListModels(backend_.get(), video_jobs_.get(), tts_.get(), asr_.get(),
-                      images_.get());
+                      images_.get(), options_.allow_logprobs);
   }
   if (req.path == "/v1/images/generations" || req.path == "/v1/images/edits") {
     if (!images_)

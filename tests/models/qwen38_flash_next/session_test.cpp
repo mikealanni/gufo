@@ -868,12 +868,17 @@ void CheckServingEos(const std::shared_ptr<qfn::Model>& model) {
       });
   sampling::SamplingConfig config;
   config.constraint = std::move(constraint);
+  config.logprobs = 2;
   const std::array<std::string, 2> prompts{
       "EOS fixture one: continue red, blue,",
       "EOS fixture two: continue green, yellow,"};
   std::array<Backend::Result, 2> references;
   for (std::size_t row = 0; row < prompts.size(); ++row) {
     references[row] = backend.complete(prompts[row], 8, config);
+    Require(references[row].logprobs.size() == 2 &&
+                model->IsStopToken(
+                    references[row].logprobs.back().entries.front().id),
+            "constrained EOS must retain its raw token probability");
     Require(
         references[row].tokens.size() == 1 &&
             !model->IsStopToken(references[row].tokens.front()),
@@ -895,6 +900,9 @@ void CheckServingEos(const std::shared_ptr<qfn::Model>& model) {
   std::size_t batched = 0;
   for (std::size_t row = 0; row < pending.size(); ++row) {
     const auto result = pending[row].get();
+    Require(result.logprobs.size() == 2 &&
+                model->IsStopToken(result.logprobs.back().entries.front().id),
+            "batched cached EOS must retain token metadata");
     Require(result.tokens == references[row].tokens,
             "batched EOS accounting differs from the scalar checkpoint");
     batched += result.physical_execution_width > 1;
@@ -1075,7 +1083,92 @@ void CheckServingSampling(const std::shared_ptr<qfn::Model>& model) {
   }
 }
 
+void CheckLogprobs(const std::shared_ptr<qfn::Model>& model) {
+  const auto prompt = model->Tokenize(
+      "Continue this list: red blue green red blue green red blue green");
+  const std::vector<sampling::TokenId> history(prompt.begin(), prompt.end());
+  struct Trace {
+    std::vector<std::int32_t> tokens;
+    std::uint64_t rng, drafted, accepted;
+  };
+  for (const std::size_t width : {1U, 8U}) {
+    for (const float temperature : {0.F, 0.7F}) {
+      const auto run = [&](bool observe) {
+        std::string error;
+        auto session = model->CreateSession(
+            gufo::core::SessionMode::kSpeculative, 256, &error);
+        Require(session && session->Sync(prompt, &error), error);
+        sampling::SamplingConfig config;
+        config.temperature = temperature;
+        config.top_k = 20;
+        config.seed = 73;
+        if (observe)
+          config.logprobs = 5;
+        sampling::SamplerState sampler(config, history);
+        Trace trace{};
+        while (trace.tokens.size() < 32) {
+          std::vector<float> frontier;
+          if (observe) {
+            const auto logits = session->Logits();
+            frontier.assign(logits.begin(), logits.end());
+          }
+          qfn::Session::DecodeResult step;
+          const auto budget = std::min(width, 32 - trace.tokens.size());
+          Require(session->DecodeStep(budget, sampler, &step, &error, false),
+                  error);
+          Require(!step.tokens.empty(), "empty logprobs decode step");
+          Require(step.logprobs.size() == (observe ? step.tokens.size() : 0),
+                  "logprob count does not match collection mode");
+          if (observe) {
+            // This is the exact target row that selected the anchor. A
+            // serial replay can use different quantized kernels than a wide
+            // verification step, even with an identical emitted prefix.
+            const double maximum =
+                *std::max_element(frontier.begin(), frontier.end());
+            double sum = 0;
+            for (const auto value : frontier)
+              sum += std::exp(double(value) - maximum);
+            const auto check = [&](const sampling::TokenLogprob& entry) {
+              const auto expected =
+                  double(frontier.at(entry.token)) - maximum - std::log(sum);
+              Require(std::abs(entry.logprob - expected) < 1e-5,
+                      "anchor score disagrees with the raw target row");
+            };
+            check(step.logprobs.front().selected);
+            for (const auto& entry : step.logprobs.front().top)
+              check(entry);
+            for (std::size_t i = 0; i < step.tokens.size(); ++i)
+              Require(step.logprobs[i].selected.token ==
+                          static_cast<sampling::TokenId>(step.tokens[i]),
+                      "score belongs to another generated token");
+          }
+          trace.tokens.insert(trace.tokens.end(), step.tokens.begin(),
+                              step.tokens.end());
+        }
+        const auto stats = session->Statistics();
+        trace.rng = sampler.rng_state();
+        trace.drafted = stats.drafted;
+        trace.accepted = stats.accepted;
+        return trace;
+      };
+      const auto plain = run(false);
+      const auto scored = run(true);
+      Require(plain.tokens == scored.tokens && plain.rng == scored.rng &&
+                  plain.drafted == scored.drafted &&
+                  plain.accepted == scored.accepted,
+              "collecting probabilities changed decoding");
+      if (width > 1)
+        Require(scored.drafted > 0, "expected a speculative decode step");
+      std::cout << "logprobs width=" << width << " temperature=" << temperature
+                << " drafted=" << scored.drafted
+                << " accepted=" << scored.accepted << std::endl;
+    }
+  }
+}
+
 int main(int argc, char** argv) {
+  const bool logprobs_only =
+      argc == 6 && std::string_view(argv[5]) == "--logprobs-only";
   const bool execution_only =
       argc == 7 && std::string_view(argv[5]) == "--execution-only";
   std::uint32_t execution_tokens = 4096;
@@ -1089,12 +1182,13 @@ int main(int argc, char** argv) {
       argc == 6 && std::string_view(argv[5]) == "--cache-only";
   const bool eos_only = argc == 6 && std::string_view(argv[5]) == "--eos-only";
   if ((argc != 5 && !batch_only && !prefill_only && !sampling_only &&
-       !cache_only && !eos_only && !execution_only) ||
+       !cache_only && !eos_only && !execution_only && !logprobs_only) ||
       std::string_view(argv[1]) != "--model" ||
       std::string_view(argv[3]) != "--mtp-model") {
     std::cerr << "Usage: session_test --model FIRST.gguf --mtp-model MTP.gguf "
                  "[--batch-only | --prefill-only | --sampling-only | "
-                 "--cache-only | --eos-only | --execution-only TOKENS]\n";
+                 "--cache-only | --eos-only | --logprobs-only | "
+                 "--execution-only TOKENS]\n";
     return 77;
   }
   if (execution_only) {
@@ -1116,6 +1210,10 @@ int main(int argc, char** argv) {
          .max_draft_tokens = 7},
         &error);
     Require(model != nullptr, error);
+    if (logprobs_only) {
+      CheckLogprobs(model);
+      return 0;
+    }
     if (execution_only) {
       CheckExecutionModes(model, execution_tokens);
       return 0;

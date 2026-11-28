@@ -162,6 +162,8 @@ public:
   struct DecodeResult {
     std::vector<std::int32_t> tokens;
     bool stop{false};
+    std::vector<sampling::TokenLogprobs> logprobs;
+    std::optional<sampling::TokenLogprobs> terminal_logprobs;
   };
   /// Greedy decoding verifies deterministic drafts. Sampled decoding draws
   /// compact MTP proposals and uses target/draft rejection with a residual

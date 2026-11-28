@@ -1337,10 +1337,15 @@ bool Session::PrepareDecode(const DecodeRequest& request,
             std::chrono::steady_clock::now() - anchor_t0)
             .count());
   }
+  auto anchor_logprobs =
+      sampling::CollectLogprobs(logits_, anchor, sampler.config().logprobs);
   if (is_stop(anchor)) {
+    result->terminal_logprobs = std::move(anchor_logprobs);
     result->stop = true;
     return true;
   }
+  if (anchor_logprobs)
+    result->logprobs.push_back(std::move(*anchor_logprobs));
   // Retrieval drafts: the token history may already contain what follows this
   // phrase. The index includes the anchor, which is committed in every outcome.
   // A greedy session decoding alone - or a sampled one whose rows verify
@@ -1618,6 +1623,7 @@ bool Session::FinishDecode(const DecodeRequest& request,
   }
   std::uint32_t keep = 1;
   std::optional<std::int32_t> correction;
+  std::optional<std::int32_t> stop_token;
   bool cpu_rows = false;
   const auto download_remaining = [&](std::uint32_t first) {
     verify_logits_.resize(std::max<std::size_t>(exec.max_speculative(), k) *
@@ -1669,6 +1675,7 @@ bool Session::FinishDecode(const DecodeRequest& request,
         continue;
       }
       if (is_stop(prediction.index)) {
+        stop_token = prediction.index;
         result->stop = true;
         break;
       }
@@ -1716,6 +1723,7 @@ bool Session::FinishDecode(const DecodeRequest& request,
         g_mtp_log.Record(keep, accepted, rank, true);
       }
       if (is_stop(token)) {
+        stop_token = token;
         result->stop = true;
         break;
       }
@@ -1729,12 +1737,31 @@ bool Session::FinishDecode(const DecodeRequest& request,
     }
     const auto decision = VerifyDraft(std::span<const float>(verify_logits_)
                                           .subspan((keep - 1) * vocab, vocab),
-                                      chain[keep], sampler, is_stop);
+                                      chain[keep], sampler, [&](auto token) {
+                                        if (!is_stop(token))
+                                          return false;
+                                        stop_token = token;
+                                        return true;
+                                      });
     if (decision != DraftDecision::kAccept) {
       result->stop = decision == DraftDecision::kStop;
       break;
     }
     ++keep;
+  }
+  if (sampler.config().logprobs) {
+    const auto rows = keep - 1 + (stop_token ? 1 : 0);
+    std::vector<float> raw(rows * vocab);
+    if (rows && !exec.ReadVerificationRows(0, raw, error_msg))
+      return false;
+    for (std::uint32_t i = 1; i < keep; ++i)
+      result->logprobs.push_back(*sampling::CollectLogprobs(
+          std::span<const float>(raw).subspan((i - 1) * vocab, vocab), chain[i],
+          sampler.config().logprobs));
+    if (stop_token)
+      result->terminal_logprobs = sampling::CollectLogprobs(
+          std::span<const float>(raw).subspan((keep - 1) * vocab, vocab),
+          *stop_token, sampler.config().logprobs);
   }
   if (!exec.Rollback(
           *session_, keep, error_msg,

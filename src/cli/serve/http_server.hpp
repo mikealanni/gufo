@@ -98,6 +98,7 @@ struct HttpServerOptions {
   /// a lost device. Health, readiness and generation answer 503 `device_lost`
   /// from then on; the hook decides how the process exits.
   std::function<void()> on_device_lost{};
+  bool allow_logprobs{false};
 };
 
 /// True for a numeric IPv4 or IPv6 literal `HttpServer` can bind. Host names

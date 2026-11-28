@@ -137,6 +137,8 @@ public:
   struct DecodeResult {
     std::vector<std::int32_t> tokens;
     bool stop{false};
+    std::vector<sampling::TokenLogprobs> logprobs;
+    std::optional<sampling::TokenLogprobs> terminal_logprobs;
   };
   /// Samples the next token from the last logits and returns it with every
   /// draft token the target accepts. History drafts and DFlash proposals are
