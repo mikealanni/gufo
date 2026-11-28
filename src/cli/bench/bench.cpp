@@ -1875,6 +1875,7 @@ int RunRaon1Benchmark(const BenchOptions& options,
   }
   PrintModelLoadTime(model_load_start);
 
+  std::vector<std::int32_t> nll_tokens;
   std::vector<std::int32_t> tokens;
   {
     std::string text =
@@ -1891,9 +1892,39 @@ int RunRaon1Benchmark(const BenchOptions& options,
       std::cerr << "Error: benchmark token pattern is empty\n";
       return 1;
     }
+    nll_tokens.assign(pattern.begin(), pattern.end());
     tokens.resize(required_context);
     for (std::size_t i = 0; i < tokens.size(); ++i)
       tokens[i] = static_cast<std::int32_t>(pattern[i % pattern.size()]);
+  }
+  const auto nll_env = std::getenv("GUFO_BENCH_NLL");
+  if (nll_env != nullptr) {
+    const std::size_t count = std::min<std::size_t>(
+        nll_tokens.size(), static_cast<std::size_t>(std::atoll(nll_env)));
+    auto session = model->CreateSession(&error);
+    if (!session || count < 2) {
+      std::cerr << "NLL: no session or text\n";
+      return 1;
+    }
+    double total = 0.0;
+    for (std::size_t i = 0; i + 1 < count; ++i) {
+      const std::int32_t token = nll_tokens[i];
+      if (!session->Sync(std::span(&token, 1), &error)) {
+        std::cerr << "NLL: decode failed: " << error << '\n';
+        return 1;
+      }
+      const auto logits = session->Logits(&error);
+      float maximum = logits[0];
+      for (const float v : logits)
+        maximum = std::max(maximum, v);
+      double sum = 0.0;
+      for (const float v : logits)
+        sum += std::exp(static_cast<double>(v - maximum));
+      total += std::log(sum) + maximum - logits[nll_tokens[i + 1]];
+    }
+    std::cout << "NLL " << total / static_cast<double>(count - 1) << " over "
+              << count - 1 << " tokens\n";
+    return 0;
   }
 
   const double size_gib =
