@@ -1143,10 +1143,10 @@ void SamplerState::PrepareSelected(std::span<const float> logits) {
               candidate_scratch_.begin() + static_cast<std::ptrdiff_t>(prefix),
               candidate_scratch_.end(), IsBetterProbability);
         }
-        std::sort(candidate_scratch_.begin(),
-                  candidate_scratch_.begin() +
-                      static_cast<std::ptrdiff_t>(prefix),
-                  IsBetterProbability);
+        std::sort(
+            candidate_scratch_.begin(),
+            candidate_scratch_.begin() + static_cast<std::ptrdiff_t>(prefix),
+            IsBetterProbability);
         double mass = 0.0;
         for (std::size_t i = 0; i < prefix; ++i) {
           mass += std::exp((candidate_scratch_[i].value - maximum) /
