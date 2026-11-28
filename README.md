@@ -14,6 +14,12 @@ speculative decoding on top, for Qwen, Inkling, Flint, GLM-5.3 Flash, Laguna, Li
   leaves no background service behind. A server started with `GUFO_THINK=off`
   keeps thinking off for every request. See [docs/JEV.md](docs/JEV.md) and the
   [setup guide](docs/JEV-SETUP.md).
+- **Raon-1 mini** on the GPU with DFlash2 speculation (default) and NPU prefill. Two
+  banks pipeline the prefill, attention is block-sparse above 16K tokens with the system
+  prompt and tool definitions always attended, and two requests (`JOBS=2`) decode at the
+  same time. Reasoning effort maps to a thinking budget. `gufo bench`: prefill 2,935 tok/s
+  at 4K and 2,770 at 8K, plain decode 52.6 tok/s at 4K depth and 42.7 at 128K. See
+  [docs/models/raon1](docs/models/raon1/README.md).
 - **Inkling 2 Mini** (26.4B MoE, 3.4B active, looped middle layers) on the GPU with
   DFlash2 speculation (default) and NPU prefill. Up to 256K context with block-sparse
   attention, tool calls, a reasoning channel, and the same RAM and disk
