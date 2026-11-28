@@ -257,6 +257,7 @@ private:
   };
   std::unordered_map<std::uint32_t, void*> down_q8_;
   static constexpr std::uint32_t kMlaBlock = 2048;
+  static constexpr std::uint32_t kSparseGatherBlocks = 24;
   struct MlaPrefill {
     __half* lat16{nullptr};
     float* knope{nullptr};

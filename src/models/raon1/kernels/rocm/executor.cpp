@@ -207,14 +207,16 @@ std::unique_ptr<Executor> Executor::Create(const std::string& path,
                    : e->config_.num_layers;
   if (const char* v = std::getenv("GUFO_RAON1_SPARSE")) {
     e->sparse_.on = true;
-    int k = 0, w = 0, d = 0;
-    const int got = std::sscanf(v, "%d,%d,%d", &k, &w, &d);
+    int k = 0, w = 0, d = 0, sk = 0;
+    const int got = std::sscanf(v, "%d,%d,%d,%d", &k, &w, &d, &sk);
     if (got >= 1 && k > 0)
       e->sparse_.k = std::min(k, 128);
     if (got >= 2 && w > 0)
       e->sparse_.window = w;
     if (got >= 3 && d > 0)
       e->sparse_.min_depth = d;
+    if (got >= 4 && sk > 0)
+      e->sparse_.sink = sk;
   }
   e->banks_.push_back(std::make_unique<Bank>());
   if (hipStreamCreate(&e->banks_[0]->stream) != hipSuccess) {
@@ -466,11 +468,11 @@ bool Executor::AllocPrefill(bool first, std::string* error) {
               (static_cast<std::size_t>(options_.max_context) / 64 + 2) * 4) ||
       !alloc2(reinterpret_cast<void**>(&mla_->sel), 128 * 4) ||
       !alloc2(reinterpret_cast<void**>(&mla_->kpos),
-              (static_cast<std::size_t>(kMlaBlock) * 8) * 4) ||
+              (static_cast<std::size_t>(kMlaBlock) * kSparseGatherBlocks) * 4) ||
       !alloc2(reinterpret_cast<void**>(&mla_->lat_g),
-              static_cast<std::size_t>(kMlaBlock) * 8 * 512 * 4) ||
+              static_cast<std::size_t>(kMlaBlock) * kSparseGatherBlocks * 512 * 4) ||
       !alloc2(reinterpret_cast<void**>(&mla_->extra_g),
-              static_cast<std::size_t>(kMlaBlock) * 8 * 64 * 4)) {
+              static_cast<std::size_t>(kMlaBlock) * kSparseGatherBlocks * 64 * 4)) {
     if (error)
       *error = "MLA prefill scratch alloc failed";
     return false;
@@ -1685,9 +1687,24 @@ bool Executor::RunBatch(Session& session, std::span<const std::int32_t> tokens,
         PoolUpdate(st.lat, st.pool, first_block, last_block - first_block + 1,
                    static_cast<int>(pos0 + n), stream_);
       }
-      const bool use_sparse = sparse_.on && st.pool != nullptr &&
-                              n >= kMoeGemmMin && mla_ != nullptr &&
-                              static_cast<int>(pos0) >= sparse_.min_depth;
+      bool use_sparse = sparse_.on && st.pool != nullptr &&
+                        n >= kMoeGemmMin && mla_ != nullptr &&
+                        static_cast<int>(pos0) >= sparse_.min_depth;
+      if (use_sparse) {
+        // The protected prefix plus the local window can already cover the
+        // whole context (nothing left to score); attention is then exact.
+        const int probe_local =
+            pos0 > static_cast<std::uint32_t>(sparse_.window)
+                ? static_cast<int>((pos0 - sparse_.window) / 64 * 64)
+                : 0;
+        const int probe_sink = std::min(sparse_.sink, probe_local);
+        const int probe_kk = std::max(
+            0, std::min(sparse_.k, probe_local / 64 - probe_sink / 64));
+        const int probe_nk = probe_sink + probe_kk * 64 +
+                             static_cast<int>(pos0) - probe_local + n;
+        use_sparse = probe_kk > 0 &&
+                     probe_nk <= static_cast<int>(kMlaBlock) * kSparseGatherBlocks;
+      }
       if (use_sparse) {
         const std::size_t heads = config_.num_heads;
         const int local_start =
@@ -1700,7 +1717,7 @@ bool Executor::RunBatch(Session& session, std::span<const std::int32_t> tokens,
         const int kk = std::max(0, std::min(sparse_.k, score_end - lo));
         const int nk =
             sink_rows + kk * 64 + static_cast<int>(pos0) - local_start + n;
-        if (kk > 0 && nk <= static_cast<int>(kMlaBlock) * 8) {
+        if (kk > 0 && nk <= static_cast<int>(kMlaBlock) * kSparseGatherBlocks) {
           QNopeMean(sc_->mla_q, sc_->dpart, n, static_cast<int>(heads),
                     static_cast<int>(config_.qk_nope_head_dim),
                     static_cast<int>(config_.qk_rope_head_dim), stream_);
@@ -1827,7 +1844,7 @@ bool Executor::RunBatch(Session& session, std::span<const std::int32_t> tokens,
           const int kk = std::max(0, std::min(sparse_.k, score_end - lo));
           const int nk =
               sink_rows + kk * 64 + static_cast<int>(pos0) - local_start + n;
-          if (kk > 0 && nk <= static_cast<int>(kMlaBlock) * 8) {
+          if (kk > 0 && nk <= static_cast<int>(kMlaBlock) * kSparseGatherBlocks) {
             SparseSelect(nullptr, nullptr, sc_->qabs, st.pool, mla_->scores,
                          mla_->sel, mla_->kpos, n, lo, score_end, kk, sink_rows,
                          local_start, static_cast<int>(pos0), n, stream_);
