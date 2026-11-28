@@ -234,6 +234,7 @@ private:
     int window{1536};
     int min_depth{12288};
     int sink{256};
+    int sink_decode{256};
   } sparse_;
   struct Prefill {
     __half* x16{nullptr};

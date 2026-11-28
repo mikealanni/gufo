@@ -207,8 +207,8 @@ std::unique_ptr<Executor> Executor::Create(const std::string& path,
                    : e->config_.num_layers;
   if (const char* v = std::getenv("GUFO_RAON1_SPARSE")) {
     e->sparse_.on = true;
-    int k = 0, w = 0, d = 0, sk = 0;
-    const int got = std::sscanf(v, "%d,%d,%d,%d", &k, &w, &d, &sk);
+    int k = 0, w = 0, d = 0, sk = 0, sd = 0;
+    const int got = std::sscanf(v, "%d,%d,%d,%d,%d", &k, &w, &d, &sk, &sd);
     if (got >= 1 && k > 0)
       e->sparse_.k = std::min(k, 128);
     if (got >= 2 && w > 0)
@@ -217,6 +217,7 @@ std::unique_ptr<Executor> Executor::Create(const std::string& path,
       e->sparse_.min_depth = d;
     if (got >= 4 && sk > 0)
       e->sparse_.sink = sk;
+    e->sparse_.sink_decode = got >= 5 && sd > 0 ? sd : e->sparse_.sink;
   }
   e->banks_.push_back(std::make_unique<Bank>());
   if (hipStreamCreate(&e->banks_[0]->stream) != hipSuccess) {
@@ -1838,7 +1839,7 @@ bool Executor::RunBatch(Session& session, std::span<const std::int32_t> tokens,
               pos0 > static_cast<std::uint32_t>(sparse_.window)
                   ? static_cast<int>((pos0 - sparse_.window) / 64 * 64)
                   : 0;
-          const int sink_rows = std::min(sparse_.sink, local_start);
+          const int sink_rows = std::min(sparse_.sink_decode, local_start);
           const int lo = sink_rows / 64;
           const int score_end = local_start / 64;
           const int kk = std::max(0, std::min(sparse_.k, score_end - lo));
