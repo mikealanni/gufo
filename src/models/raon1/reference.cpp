@@ -469,12 +469,12 @@ void ReferenceModel::HcMix(std::span<const float> x, const std::string& prefix,
   rho = std::max(rho, 0.0F);
   const float gamma = Sigmoid(scale[3]);
   const float denom = 1.0F + rho;
-  const bool llama_order = EnvFlag("GUFO_RAON1_HC_LLAMA");
+  const bool reference_order = EnvFlag("GUFO_RAON1_HC_REFERENCE_ORDER");
   for (std::uint32_t dst = 0; dst < hc; ++dst) {
     for (std::uint32_t src = 0; src < hc; ++src) {
       const float b = (dst == src ? 0.5F : 0.0F) + 0.5F * inv_hc;
       const float phi =
-          b + (llama_order ? e[src * hc + dst] : e[dst * hc + src]) / denom;
+          b + (reference_order ? e[src * hc + dst] : e[dst * hc + src]) / denom;
       comb[dst + hc * src] =
           (1.0F - gamma) * (dst == src ? 1.0F : 0.0F) + gamma * phi;
     }
@@ -763,7 +763,7 @@ void ReferenceModel::FfnBlock(std::uint32_t layer, std::span<const float> fin,
     const auto it = tensors_.find(P(layer, "ffn_effort_steer.weight"));
     if (it != tensors_.end()) {
       const float* cvec = Load(P(layer, "ffn_effort_steer.weight")).w();
-      if (!EnvFlag("GUFO_RAON1_EFFORT_LLAMA")) {
+      if (!EnvFlag("GUFO_RAON1_EFFORT_REFERENCE")) {
         // HF: applied to the MoE branch before the mHC write-back.
         for (std::uint32_t c = 0; c < H; ++c) {
           ffn_out[c] = static_cast<float>(static_cast<double>(ffn_out[c]) +
@@ -786,7 +786,7 @@ const std::vector<float>& ReferenceModel::Evaluate(Session& session,
     std::copy_n(row.data(), H, session.x.data() + s * H);
   }
 
-  const bool effort_llama = EnvFlag("GUFO_RAON1_EFFORT_LLAMA");
+  const bool effort_reference = EnvFlag("GUFO_RAON1_EFFORT_REFERENCE");
   for (std::uint32_t layer = 0; layer < n_layers(); ++layer) {
     const bool mla = config_.IsMla(layer);
 
@@ -858,7 +858,7 @@ const std::vector<float>& ReferenceModel::Evaluate(Session& session,
       DumpVector(("x_ffn_post_s" + std::to_string(s)).c_str(), layer,
                  std::span<const float>(session.x).subspan(s * H, H));
     }
-    if (effort_llama) {
+    if (effort_reference) {
       const auto it = tensors_.find(P(layer, "ffn_effort_steer.weight"));
       if (it != tensors_.end()) {
         const float* cvec = Load(P(layer, "ffn_effort_steer.weight")).w();
