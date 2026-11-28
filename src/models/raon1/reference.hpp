@@ -14,7 +14,7 @@
 namespace gufo::models::raon1 {
 
 // Correctness-first float32 forward for Raon-1 mini on CPU. One token at a
-// time, every format dequantized on demand; mirrors the llama.cpp `raon1`
+// time, every format dequantized on demand; mirrors the reference `raon1`
 // graph. Not tuned; the GPU engine replaces it.
 class ReferenceModel {
 public:

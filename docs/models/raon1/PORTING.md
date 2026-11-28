@@ -6,8 +6,8 @@ while another agent uses `gufo serve --port 8901`.
 
 ## Order followed
 
-1. CPU reference in `src/models/raon1/reference.cpp` matched the patched llama.cpp
-   oracle before GPU work. Default comparison uses `GUFO_RAON1_NO_EFFORT=1` because
+1. CPU reference in `src/models/raon1/reference.cpp` matched the patched reference
+   runtime (oracle) before GPU work. Default comparison uses `GUFO_RAON1_NO_EFFORT=1` because
    the oracle ignores reasoning-effort tensors.
 2. GPU executor and custom HIP kernels produced logits; validate first-token logits
    against CPU and oracle before CLI/serve integration.
@@ -307,3 +307,43 @@ Interleaved, two banks: pp2048 GPU only 3193 -> default NPU (q/k/v/g + gate + sh
 pp16384 2193 -> 2245; plain tg 53.5. Earlier GPU-only reference (before the fusion) was about 3030 at pp2048.
 Flat at depth with sparse k=32,window=1024: pp2048 @ 4k 2475, @ 64k 2613, @ 128k 2604; tg 51 / 47.6 / 46.8.
 The 258000-deep run did not finish in 14 minutes and was stopped.
+
+## 2026-11-27: serve at depth, sparse attention, concurrency, loader
+
+What changed, in the order found:
+
+1. **Decode attention at depth.** Verifying a draft re-ran the per-key absorbed MLA kernel once per
+   row, so every extra verified token cost its full attention again (about 15 ms per row at 10K
+   context) and speculation gained nothing at depth. The WMMA kernel stages each 16-key latent tile
+   once and shares it across all rows (`MlaSplitWmmaKernel`): plain decode at 26K 35 to 46.6 tok/s,
+   a 3-row verify 61 to 34 ms. It rounds q, k, p and v to F16, so greedy text diverges from the
+   F32 kernel after a few hundred characters (`GUFO_RAON1_MLA_WMMA=0` restores the old kernel).
+2. **Thinking turns slowed down.** At temperature 1 the sampler fully sorted the 260K-token
+   vocabulary whenever the top 256 held under `top_p` of the mass, which high-entropy text does
+   often; the decode thread saturated one core while the GPU idled. The nucleus now grows 8x per
+   round against the exact normalizer (same result on 1,080 configurations): high-entropy prose at
+   10K depth 26 to 35 tok/s.
+3. **Sparse attention broke tool use.** With 256 protected tokens an agent replay picked the wrong
+   tool in 4 of 8 samples at 46K tokens because the tool definitions sit in the first 6K tokens.
+   Protected prefix of 4,096 or more: 0 of 8. Prefill keeps 256 (a larger prefix costs prefill speed
+   in proportion to its size), decode uses 8,192. When the prefix plus the local window already
+   cover the context, attention is exact. Needle retrieval did not catch this.
+4. **Two requests at once.** `Bank` now owns the rollback records, the recording flag and the
+   logit-row count, `stream()` follows the calling thread's bank, and the runner declares a
+   width-2 batched plan that runs each request on its own bank from its own thread.
+5. **Weights stayed mapped.** The loader copied quantized tensors from the GGUF mapping, which kept
+   18.4 GB faulted into the process for its whole life. Reclaim stalled on those pages (memory
+   pressure 25 to 30% of wall time), and shutdown took minutes. `hip::TensorUpload` plus
+   `madvise(DONTNEED)` on host-read tensors fixed it.
+6. **Reasoning effort.** Effort now maps to a thinking budget so the effort the jev plugin picks is
+   effective; the launcher default for this model is uncapped.
+
+Tried and reverted (interleaved A/B, keep only if it wins its row):
+
+- tiled recurrent prefill scan, syncs once per 16 tokens: +1.4% at 4K, -4.8% at 8K;
+- 16 tokens per hyper-connection dot block: -1.8%;
+- stricter drafting threshold (0.65 against 0.45): 27 against 33 tok/s;
+- choosing plain or drafted steps by measured tokens per millisecond: -8% on prose, no gain on code.
+
+A prefill change is only kept after at least three interleaved runs per side: separate runs minutes
+apart showed a false +5 to 7%.

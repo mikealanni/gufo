@@ -2,7 +2,7 @@
 
 Fast local inference for AMD Strix Halo (Ryzen AI MAX+ 395, Radeon 8060S
 `gfx1151`), with prefill shared between the GPU and the Ryzen AI NPU and
-speculative decoding on top, for Qwen, Inkling, Flint, GLM-5.3 Flash, Laguna and Ling models. Fork of [gufo-org/gufo](https://github.com/gufo-org/gufo) (MIT).
+speculative decoding on top, for Qwen, Inkling, Flint, GLM-5.3 Flash, Laguna, Ling and Raon models. Fork of [gufo-org/gufo](https://github.com/gufo-org/gufo) (MIT).
 
 ## What's new
 
@@ -39,6 +39,7 @@ speculative decoding on top, for Qwen, Inkling, Flint, GLM-5.3 Flash, Laguna and
 | GLM-5.3 Flash | AJ-IQ2_XXS / RCO-152E Q3_K_M | KDA q/k/v and shared expert, two-bank lock-step | DFlash2 with prompt-lookup drafts |
 | Laguna S 2.1 | UD-Q4_K_M | shared expert, two-bank pipeline | DFlash v1 (block-diffusion) |
 | Ling 3.2 Air | Q4_K_M | KDA q/k/v and shared expert, two-bank pipeline | MTP (embedded layer) |
+| Raon-1 mini | Q4_K_M | q/k/v/g, MLA gate and shared expert, two-bank pipeline | DFlash2 |
 
 ## Speed
 
@@ -197,6 +198,28 @@ Details: [docs/models/laguna](docs/models/laguna/)
 | prose, 4k context | 36.1 | 34.4 |
 
 Details: [docs/models/ling-3.2](docs/models/ling-3.2/)
+
+### Raon-1 mini
+
+| Prefill, tok/s (real text) | GPU + NPU, two banks |
+| --- | --- |
+| `-p 4096` | 3,103 |
+| `-p 8192` | 3,010 |
+
+| Depth, `-p 4096`, plain decode | pp, tok/s | tg, tok/s |
+| --- | --- | --- |
+| 32K | 2,539 | 44.4 |
+| 64K | 2,502 | 43.8 |
+| 128K | 2,499 | 42.7 |
+
+| Decode (DFlash2, temperature 1), tok/s | speculative |
+| --- | --- |
+| source code, 6K context | 63 to 73 |
+| thinking prose, 10K context | 36 to 39 |
+
+Above 16K tokens attention is block-sparse, with the system prompt and tool definitions always
+attended while decoding. Two simultaneous requests (`JOBS=2`) run at about two thirds of the
+single-request speed each. Details: [docs/models/raon1](docs/models/raon1/README.md)
 
 ## Quality
 
