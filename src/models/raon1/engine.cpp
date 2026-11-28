@@ -198,6 +198,10 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error) {
   tokens_.insert(tokens_.end(), tokens.begin(), tokens.end());
   commit_row_ = static_cast<std::uint32_t>(
       std::min<std::size_t>(last_rows, rocm::Executor::kHeadRows) - 1);
+  if (!tokens.empty() && !executor_->StoreCommitRow(*impl_, commit_row_)) {
+    AssignError(error, "committed logits copy failed");
+    return false;
+  }
   return true;
 }
 
@@ -236,7 +240,7 @@ bool Session::SaveSnapshot(std::span<std::uint8_t> out, std::string* error) {
   const std::size_t logits_at =
       sizeof(header) + tokens_.size() * sizeof(std::int32_t);
   std::vector<float> logits(vocab);
-  if (!executor_->ReadLogitRows(commit_row_, 1, logits.data())) {
+  if (!executor_->ReadCommitLogits(*impl_, logits.data())) {
     AssignError(error, "snapshot logits readback failed");
     return false;
   }
@@ -271,7 +275,7 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> in,
   commit_row_ = header.commit_row;
   std::vector<float> logits(vocab);
   std::memcpy(logits.data(), in.data() + logits_at, vocab * sizeof(float));
-  if (!executor_->WriteLogitRow(commit_row_, logits.data())) {
+  if (!executor_->WriteCommitLogits(*impl_, logits.data())) {
     AssignError(error, "snapshot logits restore failed");
     return false;
   }
@@ -300,7 +304,7 @@ bool Session::Sync(std::span<const std::int32_t> tokens, std::string* error) {
 
 std::vector<float> Session::Logits(std::string* error) const {
   std::vector<float> logits(executor_->config().vocab_size);
-  if (!executor_->ReadLogitRows(commit_row_, 1, logits.data())) {
+  if (!executor_->ReadCommitLogits(*impl_, logits.data())) {
     AssignError(error, "logit readback failed");
     return {};
   }
@@ -308,7 +312,7 @@ std::vector<float> Session::Logits(std::string* error) const {
 }
 
 std::int32_t Session::Argmax(std::string*) const {
-  return executor_->GreedyRows(commit_row_ + 1)[commit_row_];
+  return executor_->CommitArgmax(*impl_);
 }
 
 std::uint32_t Session::Position() const noexcept {
@@ -515,6 +519,10 @@ bool Session::DecodeStep(std::size_t max_tokens,
       return false;
   }
   commit_row_ = speculative ? keep - 1 : 0;
+  if (!executor_->StoreCommitRow(*impl_, commit_row_)) {
+    AssignError(error, "committed logits copy failed");
+    return false;
+  }
   tokens_.insert(tokens_.end(), chain.begin(), chain.begin() + keep);
   result->tokens.assign(chain.begin(), chain.begin() + keep);
 

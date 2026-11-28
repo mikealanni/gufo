@@ -4224,6 +4224,11 @@ public:
           .payload_version = kRaon1SnapshotPayloadVersion,
       };
     }
+    // Both banks exist before any decode runs concurrently, so a bank is
+    // never added while another thread reads the list.
+    std::string banks_error;
+    if (draft_)
+      (void)model_->EnsureBanks(kMaxConcurrentDecodes, &banks_error);
   }
 
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
@@ -4239,6 +4244,9 @@ public:
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
                 .multi_token_decode = draft_,
+                .batched_multi_token_decode = draft_,
+                .batched_multi_token_decode_max_width =
+                    draft_ ? kMaxConcurrentDecodes : 0,
                 .prefix_reuse = true,
                 .prefill_grid_tokens = 8192,
             },
@@ -4499,6 +4507,7 @@ public:
 
   void AdvanceBatch(
       std::span<const TextRunnerAdvance> advances) const override {
+    std::vector<std::exception_ptr> errors(advances.size());
     const bool ran = RunOnBanks(advances.size(), [&](std::size_t index) {
       const auto& advance = advances[index];
       auto& session = RequireRaon1State(advance.state.get()).session();
@@ -4506,13 +4515,20 @@ public:
       try {
         Advance(advance.state.get(), advance.token);
       } catch (...) {
+        errors[index] = std::current_exception();
         if (advance.failure)
-          *advance.failure = std::current_exception();
+          *advance.failure = errors[index];
       }
       session.BindBank(-1);
     });
-    if (!ran)
+    if (!ran) {
       TextModelRunner::AdvanceBatch(advances);
+      return;
+    }
+    for (std::size_t index = 0; index < advances.size(); ++index) {
+      if (errors[index] && !advances[index].failure)
+        std::rethrow_exception(errors[index]);
+    }
   }
 
   [[nodiscard]] std::size_t SnapshotPayloadBytes(

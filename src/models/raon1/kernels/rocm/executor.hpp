@@ -56,6 +56,8 @@ public:
     std::vector<float*> snap_conv;
     std::vector<float*> snap_state;
     std::uint32_t snap_position{0};
+    float* commit_logits{nullptr};
+    std::int32_t* commit_argmax{nullptr};
     ~Session();
   };
 
@@ -110,20 +112,24 @@ public:
                     std::string* error);
   bool RestoreSnapshot(Session& session, std::uint32_t position,
                        std::span<const std::uint8_t> in, std::string* error);
-  /// Drafter taps of the last forward of bank `bank` (0 for plain batches).
-  [[nodiscard]] const float* DflashCapture(int bank = 0) const {
-    return banks_[bank]->capture;
+  /// Drafter taps of the last forward of bank `bank`; negative means the bank
+  /// the calling thread is bound to (bank 0 when unbound), so sessions decoding
+  /// on different banks never see each other's features or positions.
+  [[nodiscard]] const float* DflashCapture(int bank = -1) const {
+    return (bank < 0 ? B() : *banks_[bank]).capture;
   }
-  [[nodiscard]] std::uint32_t DflashRows(int bank = 0) const {
-    return banks_[bank]->cap_rows;
+  [[nodiscard]] std::uint32_t DflashRows(int bank = -1) const {
+    return (bank < 0 ? B() : *banks_[bank]).cap_rows;
   }
-  [[nodiscard]] std::uint32_t DflashPosition() const {
-    return banks_[0]->cap_pos;
-  }
+  [[nodiscard]] std::uint32_t DflashPosition() const { return B().cap_pos; }
   /// Greedy token of each of the last `rows` rows of the last forward.
   std::vector<std::int32_t> GreedyRows(std::uint32_t rows);
   bool ReadLogitRows(std::uint32_t first, std::uint32_t count, float* dst);
   bool WriteLogitRow(std::uint32_t row, const float* src);
+  bool StoreCommitRow(Session& session, std::uint32_t row);
+  bool ReadCommitLogits(const Session& session, float* dst);
+  std::int32_t CommitArgmax(const Session& session);
+  bool WriteCommitLogits(Session& session, const float* src);
   [[nodiscard]] const DeviceTensor* TokenEmbedding() const;
   [[nodiscard]] const DeviceTensor* Output() const;
   bool Logits(Session& session, float* dst, std::string* error);

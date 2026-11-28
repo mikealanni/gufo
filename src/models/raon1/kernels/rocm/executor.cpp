@@ -166,6 +166,10 @@ Executor::Scratch::~Scratch() {
 }
 
 Executor::Session::~Session() {
+  if (commit_logits != nullptr)
+    (void)hipFree(commit_logits);
+  if (commit_argmax != nullptr)
+    (void)hipFree(commit_argmax);
   for (float* p : snap_conv) {
     if (p != nullptr)
       (void)hipFree(p);
@@ -2284,6 +2288,57 @@ bool Executor::WriteLogitRow(std::uint32_t row, const float* src) {
   hipStreamSynchronize(stream_);
   LB().last_rows = std::max<int>(LB().last_rows, static_cast<int>(row) + 1);
   return true;
+}
+
+bool Executor::StoreCommitRow(Session& session, std::uint32_t row) {
+  const std::size_t vocab = config_.vocab_size;
+  if (session.commit_logits == nullptr &&
+      (hipMalloc(reinterpret_cast<void**>(&session.commit_logits),
+                 vocab * sizeof(float)) != hipSuccess ||
+       hipMalloc(reinterpret_cast<void**>(&session.commit_argmax),
+                 sizeof(std::int32_t)) != hipSuccess)) {
+    return false;
+  }
+  Bank& bank = LB();
+  hipMemcpyAsync(session.commit_logits, bank.sc->logits + row * vocab,
+                 vocab * sizeof(float), hipMemcpyDeviceToDevice, bank.stream);
+  hipMemcpyAsync(session.commit_argmax, bank.sc->argmax + row,
+                 sizeof(std::int32_t), hipMemcpyDeviceToDevice, bank.stream);
+  return hipStreamSynchronize(bank.stream) == hipSuccess;
+}
+
+bool Executor::ReadCommitLogits(const Session& session, float* dst) {
+  if (session.commit_logits == nullptr)
+    return false;
+  return hipMemcpy(dst, session.commit_logits,
+                   config_.vocab_size * sizeof(float),
+                   hipMemcpyDeviceToHost) == hipSuccess;
+}
+
+std::int32_t Executor::CommitArgmax(const Session& session) {
+  std::int32_t out = 0;
+  if (session.commit_argmax != nullptr) {
+    hipMemcpy(&out, session.commit_argmax, sizeof(out), hipMemcpyDeviceToHost);
+  }
+  return out;
+}
+
+bool Executor::WriteCommitLogits(Session& session, const float* src) {
+  const std::size_t vocab = config_.vocab_size;
+  if (session.commit_logits == nullptr &&
+      (hipMalloc(reinterpret_cast<void**>(&session.commit_logits),
+                 vocab * sizeof(float)) != hipSuccess ||
+       hipMalloc(reinterpret_cast<void**>(&session.commit_argmax),
+                 sizeof(std::int32_t)) != hipSuccess)) {
+    return false;
+  }
+  std::int32_t best = 0;
+  for (std::uint32_t i = 1; i < vocab; ++i)
+    best = src[i] > src[best] ? static_cast<std::int32_t>(i) : best;
+  return hipMemcpy(session.commit_logits, src, vocab * sizeof(float),
+                   hipMemcpyHostToDevice) == hipSuccess &&
+         hipMemcpy(session.commit_argmax, &best, sizeof(best),
+                   hipMemcpyHostToDevice) == hipSuccess;
 }
 
 const DeviceTensor* Executor::TokenEmbedding() const {
